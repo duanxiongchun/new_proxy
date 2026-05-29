@@ -10,7 +10,7 @@
 - **对等密钥认证**：复用 WireGuard 密钥材料，通过 X25519 shared secret 和 HMAC-SHA256 进行用户态控制面协商。
 - **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端只接受该指纹对应证书。
 - **多 Peer 客户端**：客户端可同时配置多个 QUIC proxy peer，也可混合 WireGuard-only peer。
-- **来源诊断**：遥测输出提供 `"both"`, `"kernel"`, `"proxy"` source 标识，用于判断 peer 在用户态配置和内核 WireGuard 状态中的分布关系。
+- **来源诊断**：遥测输出提供 `"both"`, `"wireguard"`, `"proxy"` source 标识，用于判断 peer 在代理配置和 WireGuard 设备状态中的分布关系。
 - **聚合遥测**：通过 `new-proxy-cli` 查看 L3/L4 合并统计、QUIC 物理连接统计和活跃流数量，并直接输出 `source` 同步溯源字段。
 - **动态 Peer 管理**：运行期支持通过 CLI 添加和删除 Peer。
 
@@ -84,6 +84,12 @@ target/release/new-proxy-cli
 * **`Table`**（`auto` / `off`，默认 `auto`）：设置为 `auto` 时，网关启动会自动配置路由表和 `iptables` 代理规则，退出时自动回滚。若为 `off` 则跳过该行为，交由外部配置。
 * **`PreScript` / `pre_script`**：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
 * **`PostScript` / `post_script`**：在网关优雅退出并清理完所有路由和防火墙之后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
+
+### WireGuard 后端
+
+默认使用内核 WireGuard：程序通过 generic netlink 创建/配置 peer 并读取统计，不依赖 `wg set/show`。
+
+不能使用内核 WireGuard 的环境可设置 `NEW_PROXY_WG_USERSPACE=1`。此模式会启动 `wireguard-go <interface>`，然后直接连接 WireGuard UAPI Unix socket 配置私钥、监听端口、peer、AllowedIPs、endpoint，并读取统计；默认 socket 路径为 `/var/run/wireguard/<interface>.sock`。可用 `NEW_PROXY_WG_USERSPACE_BIN` 指定 `wireguard-go` 路径，用 `NEW_PROXY_WG_USERSPACE_SOCKET_DIR` 覆盖 socket 目录。
 
 ### 服务端配置
 

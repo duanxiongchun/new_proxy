@@ -38,7 +38,7 @@ use server_proxy::build_stream_handler;
 use stats_cli::run_cli_stats;
 use telemetry::TelemetryRegistry;
 #[cfg(test)]
-use wireguard::sync_peer_to_kernel;
+use wireguard::sync_peer_to_wireguard;
 
 type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
 
@@ -75,7 +75,7 @@ const MAX_TPROXY_CONNECTIONS: usize = 4096;
 const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
 
 #[cfg(test)]
-async fn sync_kernel_and_proxy_state(
+async fn sync_wireguard_and_proxy_state(
     interface_name: &str,
     state: &Arc<parking_lot::RwLock<GatewayState>>,
     peer_secrets: &Arc<parking_lot::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
@@ -83,10 +83,10 @@ async fn sync_kernel_and_proxy_state(
     l3_stats: &HashMap<[u8; 32], wireguard::WgPeerStats>,
 ) -> HashMap<[u8; 32], String> {
     let mut sources = HashMap::new();
-    let mut peers_to_sync_to_kernel = Vec::new();
+    let mut peers_to_sync_to_wireguard = Vec::new();
     let mut peers_to_sync_to_proxy = Vec::new();
 
-    // 1. Identify sources and find peers missing in kernel
+    // 1. Identify sources and find peers missing in WireGuard
     {
         let st = state.read();
         for peer in &st.config.peers {
@@ -94,7 +94,7 @@ async fn sync_kernel_and_proxy_state(
                 sources.insert(peer.public_key, "both".to_string());
             } else {
                 sources.insert(peer.public_key, "proxy".to_string());
-                peers_to_sync_to_kernel.push(peer.clone());
+                peers_to_sync_to_wireguard.push(peer.clone());
             }
         }
     }
@@ -102,16 +102,16 @@ async fn sync_kernel_and_proxy_state(
     // 2. Identify peers missing in proxy config
     for (&pub_key, wg_stats) in l3_stats {
         if let std::collections::hash_map::Entry::Vacant(entry) = sources.entry(pub_key) {
-            entry.insert("kernel".to_string());
+            entry.insert("wireguard".to_string());
             peers_to_sync_to_proxy.push((pub_key, wg_stats.clone()));
         }
     }
 
-    // 3. Perform synchronization to kernel through WireGuard generic netlink.
-    for peer in peers_to_sync_to_kernel {
+    // 3. Perform synchronization to WireGuard.
+    for peer in peers_to_sync_to_wireguard {
         let interface_name = interface_name.to_string();
         let _ = run_blocking_command(move || {
-            sync_peer_to_kernel(&interface_name, &peer)?;
+            sync_peer_to_wireguard(&interface_name, &peer)?;
             Ok(())
         })
         .await;
@@ -218,11 +218,11 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // 将配置文件中所有静态声明的对等体 (Peers) 下发同步到内核级 WireGuard 网卡
+    // 将配置文件中所有静态声明的对等体 (Peers) 下发同步到 WireGuard 设备
     for peer in &config.peers {
-        if let Err(e) = wireguard::sync_peer_to_kernel(&interface_name, peer) {
+        if let Err(e) = wireguard::sync_peer_to_wireguard(&interface_name, peer) {
             log::error!(
-                "Failed to sync peer {} to kernel WireGuard on boot: {}",
+                "Failed to sync peer {} to WireGuard on boot: {}",
                 encode_base64_32(&peer.public_key),
                 e
             );
@@ -230,7 +230,7 @@ async fn main() {
             std::process::exit(1);
         } else {
             log::info!(
-                "Successfully synced peer {} to kernel WireGuard on startup",
+                "Successfully synced peer {} to WireGuard on startup",
                 encode_base64_32(&peer.public_key)
             );
         }
@@ -542,7 +542,7 @@ mod tests {
             },
         );
 
-        let sources = sync_kernel_and_proxy_state(
+        let sources = sync_wireguard_and_proxy_state(
             "tun_test_sync",
             &gateway_state,
             &peer_secrets,
@@ -553,7 +553,7 @@ mod tests {
 
         assert_eq!(sources.get(&[1u8; 32]).unwrap(), "both");
         assert_eq!(sources.get(&[2u8; 32]).unwrap(), "proxy");
-        assert_eq!(sources.get(&[3u8; 32]).unwrap(), "kernel");
+        assert_eq!(sources.get(&[3u8; 32]).unwrap(), "wireguard");
 
         let st = gateway_state.read();
         let peer3 = st.config.peers.iter().find(|p| p.public_key == [3u8; 32]);
@@ -572,7 +572,7 @@ mod tests {
             .longest_match(std::net::IpAddr::V4("10.0.3.5".parse().unwrap()));
         assert_eq!(
             lookup_res, None,
-            "Kernel-synced peers are WireGuard-only unless they explicitly define ProxyPort"
+            "WireGuard-synced peers are WireGuard-only unless they explicitly define ProxyPort"
         );
 
         let secrets = peer_secrets.read();

@@ -13,6 +13,8 @@ SHORT_PARALLEL="${STABILITY_SHORT_PARALLEL:-4}"
 ARTIFACT_DIR="${STABILITY_ARTIFACT_DIR:-/tmp/new_proxy_stability_$(date +%Y%m%d_%H%M%S)}"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
+new_proxy_select_wireguard_backend
 SERVER_CONF="$ARTIFACT_DIR/srv_stab.conf"
 CLIENT_CONF="$ARTIFACT_DIR/cli_stab.conf"
 CLIENT2_CONF="$ARTIFACT_DIR/cli2_stab.conf"
@@ -56,7 +58,7 @@ cleanup() {
   ip netns delete client4_ns 2>/dev/null || true
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete server_ns 2>/dev/null || true
-  rm -f /run/new_proxy/srv_stab.sock /run/new_proxy/cli_stab.sock /tmp/client_proxy_active /tmp/new_proxy_wg_dump_mock
+  rm -f /run/new_proxy/srv_stab.sock /run/new_proxy/cli_stab.sock /tmp/client_proxy_active
 }
 trap cleanup EXIT
 
@@ -289,15 +291,7 @@ TARGET_PID=$!
 sleep 1
 
 echo "=== [3/7] Starting server/client proxies with 4 QUIC ports ==="
-now_ts="$(date +%s)"
-cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
-${NEW_PROXY_TEST_CLIENT2_PUBLIC_KEY}	(none)	10.0.5.2:50323	10.0.0.4/32	${now_ts}	3482	256	(none)
-${NEW_PROXY_TEST_CLIENT3_PUBLIC_KEY}	(none)	10.0.6.2:51820	10.0.0.3/32	${now_ts}	12500	8400	(none)
-${NEW_PROXY_TEST_CLIENT4_PUBLIC_KEY}	(none)	10.0.7.2:51820	10.0.0.5/32	${now_ts}	12500	8400	(none)
-EOF_MOCK_WG
-
-ip netns exec server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &
+ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 ip netns exec client1_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$ARTIFACT_DIR/client_daemon.log" 2>&1 &

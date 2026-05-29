@@ -19,6 +19,8 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
+new_proxy_select_wireguard_backend
 
 echo "======================================================================"
 echo "=== [1/8] Cleaning Up Pre-Existing Network Namespaces ==="
@@ -30,7 +32,6 @@ ip netns delete client2_ns 2>/dev/null || true
 rm -f /run/new_proxy/server_multi.sock
 rm -f /run/new_proxy/client1.sock
 rm -f /tmp/client_proxy_active
-rm -f /tmp/new_proxy_wg_dump_mock
 
 echo "=== [2/8] Creating Namespaces (Server, Router, Client1, Client2) ==="
 ip netns add server_ns
@@ -117,8 +118,6 @@ echo "=== [6/8] Writing Multi-Client Configuration Files ==="
 # Client 1: ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 # Client 2: AAAAA... (standard fallback peer)
 
-# NOTE: We do NOT write Client 2 peer here. Client 2 will be auto-synchronized
-# from the explicit mock kernel dump fixture to telemetry when stats are queried.
 cat > /tmp/server_multi.conf <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
@@ -158,15 +157,8 @@ echo "=== [7/8] Starting Services and Proxy Daemons ==="
 ip netns exec server_ns python3 -m http.server 8080 >/dev/null 2>&1 &
 HTTP_PID=$!
 
-# B. Create explicit mock dump data for WireGuard netlink-free test environments.
-now_ts="$(date +%s)"
-cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}	(none)	10.0.3.2:51820	10.0.0.3/32	${now_ts}	12500	8400	(none)
-${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
-EOF_MOCK_WG
-
 # C. Start Server Proxy Daemon
-ip netns exec server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 "$ROOT_DIR/target/debug/new_proxy" -config /tmp/server_multi.conf > /tmp/new_proxy_server_multi.log 2>&1 &
+ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config /tmp/server_multi.conf > /tmp/new_proxy_server_multi.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
@@ -211,7 +203,7 @@ ip netns delete server_ns
 ip netns delete router_ns
 ip netns delete client1_ns
 ip netns delete client2_ns
-rm -f /tmp/server_multi.conf /tmp/client1.conf /tmp/new_proxy_wg_dump_mock
+rm -f /tmp/server_multi.conf /tmp/client1.conf
 
 echo "======================================================================"
 echo "✓ [ALL PASS] Concurrent Multi-Client E2E Test Completed Successfully!"

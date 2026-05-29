@@ -8,6 +8,8 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
+new_proxy_select_wireguard_backend
 ARTIFACT_DIR="${DYNAMIC_PEER_ARTIFACT_DIR:-/tmp/new_proxy_dynamic_peer_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$ARTIFACT_DIR"
 
@@ -32,7 +34,6 @@ cleanup() {
   ip netns delete dyn_router_ns 2>/dev/null || true
   ip netns delete dyn_client_ns 2>/dev/null || true
   ip netns delete dyn_work_ns 2>/dev/null || true
-  rm -f /tmp/new_proxy_wg_dump_mock
 }
 trap cleanup EXIT
 
@@ -67,11 +68,6 @@ Table = off
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 AllowedIPs = 10.0.0.1/32
 EOF_CONF
-
-now_ts="$(date +%s)"
-cat > /tmp/new_proxy_wg_dump_mock <<EOF_WG
-${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	2048	1024	(none)
-EOF_WG
 
 echo "=== [1/6] Creating namespaces ==="
 ip netns add dyn_server_ns
@@ -131,10 +127,10 @@ ip netns exec dyn_client_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 
 echo "=== [3/6] Starting daemons ==="
 ip netns exec dyn_server_ns python3 -m http.server 8080 --bind 10.0.0.1 > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
-ip netns exec dyn_server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
+ip netns exec dyn_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
-ip netns exec dyn_client_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/client_dyn.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
+ip netns exec dyn_client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/client_dyn.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 2
 

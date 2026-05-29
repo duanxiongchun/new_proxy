@@ -1,8 +1,12 @@
 use crate::config::{decode_base64_32, PeerConfig};
 use std::collections::HashMap;
-use std::fs;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct WgPeerStats {
@@ -29,6 +33,8 @@ const WG_CMD_GET_DEVICE: u8 = 0;
 const WG_CMD_SET_DEVICE: u8 = 1;
 const WG_GENL_VERSION: u8 = 1;
 
+const WGDEVICE_A_PRIVATE_KEY: u16 = 3;
+const WGDEVICE_A_LISTEN_PORT: u16 = 6;
 const WGDEVICE_A_IFNAME: u16 = 2;
 const WGDEVICE_A_PEERS: u16 = 8;
 
@@ -47,6 +53,200 @@ const WGALLOWEDIP_A_CIDR_MASK: u16 = 3;
 const WGPEER_F_REMOVE_ME: u32 = 1 << 0;
 const WGPEER_F_REPLACE_ALLOWEDIPS: u32 = 1 << 1;
 
+const WG_USERSPACE_ENV: &str = "NEW_PROXY_WG_USERSPACE";
+const WG_USERSPACE_CMD_ENV: &str = "NEW_PROXY_WG_USERSPACE_CMD";
+const WG_USERSPACE_BIN_ENV: &str = "NEW_PROXY_WG_USERSPACE_BIN";
+const WG_USERSPACE_SOCKET_DIR_ENV: &str = "NEW_PROXY_WG_USERSPACE_SOCKET_DIR";
+const WG_GO_PREFER_ENV: &str = "WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD";
+
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty()
+                && !value.eq_ignore_ascii_case("0")
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("no")
+                && !value.eq_ignore_ascii_case("off")
+        }
+        Err(_) => false,
+    }
+}
+
+fn userspace_wireguard_enabled() -> bool {
+    env_flag_enabled(WG_USERSPACE_ENV)
+}
+
+fn userspace_pid_path(interface_name: &str) -> String {
+    format!("/run/new_proxy/{}.wireguard-userspace.pid", interface_name)
+}
+
+fn userspace_socket_path(interface_name: &str) -> String {
+    let dir = std::env::var(WG_USERSPACE_SOCKET_DIR_ENV)
+        .unwrap_or_else(|_| "/var/run/wireguard".to_string());
+    format!("{}/{}.sock", dir.trim_end_matches('/'), interface_name)
+}
+
+pub fn configure_device(
+    interface_name: &str,
+    private_key: &[u8; 32],
+    listen_port: Option<u16>,
+) -> Result<(), String> {
+    if userspace_wireguard_enabled() {
+        configure_userspace_device(interface_name, private_key, listen_port)
+    } else {
+        configure_kernel_device(interface_name, private_key, listen_port)
+    }
+}
+
+pub fn cleanup_device(interface_name: &str) {
+    if userspace_wireguard_enabled() {
+        cleanup_userspace_device(interface_name);
+    }
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", interface_name])
+        .output();
+}
+
+fn configure_kernel_device(
+    interface_name: &str,
+    private_key: &[u8; 32],
+    listen_port: Option<u16>,
+) -> Result<(), String> {
+    log::info!(
+        "Creating WireGuard interface '{}' if it does not exist",
+        interface_name
+    );
+    let _ = Command::new("ip")
+        .args(["link", "add", "dev", interface_name, "type", "wireguard"])
+        .output();
+    configure_kernel_device_key(interface_name, private_key, listen_port)
+}
+
+fn configure_userspace_device(
+    interface_name: &str,
+    private_key: &[u8; 32],
+    listen_port: Option<u16>,
+) -> Result<(), String> {
+    log::info!(
+        "Creating userspace WireGuard interface '{}'",
+        interface_name
+    );
+    ensure_wireguard_go_running(interface_name)?;
+    configure_userspace_device_key(interface_name, private_key, listen_port)
+}
+
+fn configure_kernel_device_key(
+    interface_name: &str,
+    private_key: &[u8; 32],
+    listen_port: Option<u16>,
+) -> Result<(), String> {
+    let mut attrs = attr_string(WGDEVICE_A_IFNAME, interface_name);
+    attrs.extend(attr_bytes(WGDEVICE_A_PRIVATE_KEY, private_key));
+    if let Some(port) = listen_port {
+        attrs.extend(attr_u16(WGDEVICE_A_LISTEN_PORT, port));
+    }
+
+    let mut sock = NetlinkSocket::connect().map_err(|e| e.to_string())?;
+    let family = wireguard_family_id(&mut sock).map_err(|e| e.to_string())?;
+    sock.request(
+        family,
+        NLM_F_REQUEST | NLM_F_ACK,
+        WG_CMD_SET_DEVICE,
+        WG_GENL_VERSION,
+        attrs,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn configure_userspace_device_key(
+    interface_name: &str,
+    private_key: &[u8; 32],
+    listen_port: Option<u16>,
+) -> Result<(), String> {
+    let mut request = format!("set=1\nprivate_key={}\n", bytes_to_hex(private_key));
+    if let Some(port) = listen_port {
+        request.push_str(&format!("listen_port={}\n", port));
+    }
+    request.push('\n');
+    uapi_set(interface_name, &request)
+}
+
+fn ensure_wireguard_go_running(interface_name: &str) -> Result<(), String> {
+    if Path::new(&userspace_socket_path(interface_name)).exists() {
+        return Ok(());
+    }
+
+    let mut command = userspace_command()?;
+    let bin = command.remove(0);
+    fs::create_dir_all("/run/new_proxy")
+        .map_err(|e| format!("Failed to create /run/new_proxy: {}", e))?;
+    let pid_path = userspace_pid_path(interface_name);
+
+    let mut cmd = Command::new(&bin);
+    cmd.args(&command)
+        .arg(interface_name)
+        .env(WG_GO_PREFER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = cmd.spawn().map_err(|e| {
+        format!(
+            "Failed to start userspace WireGuard command '{} {} {}': {}",
+            bin,
+            command.join(" "),
+            interface_name,
+            e
+        )
+    })?;
+
+    let pid = child.id();
+    File::create(&pid_path)
+        .and_then(|mut f| writeln!(f, "{}", pid))
+        .map_err(|e| format!("Failed to write {}: {}", pid_path, e))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if Path::new(&userspace_socket_path(interface_name)).exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(format!(
+        "userspace WireGuard command '{}' started for {}, but the UAPI socket did not become ready",
+        bin, interface_name
+    ))
+}
+
+fn userspace_command() -> Result<Vec<String>, String> {
+    let command = std::env::var(WG_USERSPACE_CMD_ENV)
+        .or_else(|_| std::env::var(WG_USERSPACE_BIN_ENV))
+        .unwrap_or_else(|_| "wireguard-go".to_string());
+    let parts = command
+        .split_whitespace()
+        .map(|part| part.to_string())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        Err(format!("{} must not be empty", WG_USERSPACE_CMD_ENV))
+    } else {
+        Ok(parts)
+    }
+}
+
+fn cleanup_userspace_device(interface_name: &str) {
+    let pid_path = userspace_pid_path(interface_name);
+    if let Ok(pid_text) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_text.trim().parse::<libc::pid_t>() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
+    let _ = fs::remove_file(pid_path);
+}
+
 pub async fn get_wg_dump_stats(interface: &str) -> Result<HashMap<[u8; 32], WgPeerStats>, String> {
     let interface = interface.to_string();
     tokio::task::spawn_blocking(move || get_wg_dump_stats_blocking(&interface))
@@ -58,6 +258,9 @@ fn get_wg_dump_stats_blocking(interface: &str) -> Result<HashMap<[u8; 32], WgPee
     if let Ok(path) = std::env::var("NEW_PROXY_WG_MOCK_DUMP") {
         return parse_wg_dump_text(&fs::read_to_string(path).map_err(|e| e.to_string())?);
     }
+    if userspace_wireguard_enabled() {
+        return get_wg_dump_stats_via_uapi(interface);
+    }
 
     match NetlinkSocket::connect().and_then(|mut sock| {
         wireguard_family_id(&mut sock).and_then(|family| get_device(&mut sock, family, interface))
@@ -68,22 +271,168 @@ fn get_wg_dump_stats_blocking(interface: &str) -> Result<HashMap<[u8; 32], WgPee
     }
 }
 
-pub fn sync_peer_to_kernel(interface_name: &str, peer: &PeerConfig) -> Result<(), String> {
+pub fn sync_peer_to_wireguard(interface_name: &str, peer: &PeerConfig) -> Result<(), String> {
     if std::env::var_os("NEW_PROXY_WG_SKIP_KERNEL_SYNC").is_some() {
         return Ok(());
+    }
+    if userspace_wireguard_enabled() {
+        return sync_peer_via_uapi(interface_name, peer);
     }
     let mut sock = NetlinkSocket::connect().map_err(|e| e.to_string())?;
     let family = wireguard_family_id(&mut sock).map_err(|e| e.to_string())?;
     set_peer(&mut sock, family, interface_name, peer).map_err(|e| e.to_string())
 }
 
-pub fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) -> Result<(), String> {
+pub fn remove_peer_from_wireguard(interface_name: &str, pub_key: [u8; 32]) -> Result<(), String> {
     if std::env::var_os("NEW_PROXY_WG_SKIP_KERNEL_SYNC").is_some() {
         return Ok(());
+    }
+    if userspace_wireguard_enabled() {
+        return remove_peer_via_uapi(interface_name, pub_key);
     }
     let mut sock = NetlinkSocket::connect().map_err(|e| e.to_string())?;
     let family = wireguard_family_id(&mut sock).map_err(|e| e.to_string())?;
     remove_peer(&mut sock, family, interface_name, pub_key).map_err(|e| e.to_string())
+}
+
+fn get_wg_dump_stats_via_uapi(interface: &str) -> Result<HashMap<[u8; 32], WgPeerStats>, String> {
+    let socket_path = userspace_socket_path(interface);
+    if !Path::new(&socket_path).exists() {
+        return Ok(HashMap::new());
+    }
+    let response = uapi_request(interface, "get=1\n\n")?;
+    parse_uapi_get_response(&response)
+}
+
+fn sync_peer_via_uapi(interface_name: &str, peer: &PeerConfig) -> Result<(), String> {
+    let mut request = format!(
+        "set=1\npublic_key={}\nreplace_allowed_ips=true\n",
+        bytes_to_hex(&peer.public_key)
+    );
+    if let Some(endpoint) = peer.endpoint {
+        request.push_str(&format!("endpoint={}\n", endpoint));
+    }
+    for allowed_ip in &peer.allowed_ips {
+        request.push_str(&format!("allowed_ip={}\n", allowed_ip));
+    }
+    request.push('\n');
+    uapi_set(interface_name, &request)
+}
+
+fn remove_peer_via_uapi(interface_name: &str, pub_key: [u8; 32]) -> Result<(), String> {
+    let request = format!(
+        "set=1\npublic_key={}\nremove=true\n\n",
+        bytes_to_hex(&pub_key)
+    );
+    uapi_set(interface_name, &request)
+}
+
+fn uapi_set(interface_name: &str, request: &str) -> Result<(), String> {
+    let response = uapi_request(interface_name, request)?;
+    parse_uapi_errno(&response)
+}
+
+fn uapi_request(interface_name: &str, request: &str) -> Result<String, String> {
+    let socket_path = userspace_socket_path(interface_name);
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
+        format!(
+            "Failed to connect WireGuard UAPI socket {}: {}",
+            socket_path, e
+        )
+    })?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Failed to write WireGuard UAPI request: {}", e))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("Failed to finish WireGuard UAPI request: {}", e))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("Failed to read WireGuard UAPI response: {}", e))?;
+    Ok(response)
+}
+
+fn parse_uapi_errno(response: &str) -> Result<(), String> {
+    for line in response.lines() {
+        if let Some(errno) = line.strip_prefix("errno=") {
+            return match errno.trim().parse::<i32>() {
+                Ok(0) => Ok(()),
+                Ok(code) => Err(format!("WireGuard UAPI returned errno={}", code)),
+                Err(e) => Err(format!("Invalid WireGuard UAPI errno '{}': {}", errno, e)),
+            };
+        }
+    }
+    Ok(())
+}
+
+fn parse_uapi_get_response(text: &str) -> Result<HashMap<[u8; 32], WgPeerStats>, String> {
+    parse_uapi_errno(text)?;
+
+    let mut stats = HashMap::new();
+    let mut current_key = None;
+    let mut current_stats = WgPeerStats::default();
+
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "public_key" => {
+                if let Some(pub_key) = current_key.take() {
+                    stats.insert(pub_key, std::mem::take(&mut current_stats));
+                }
+                current_key = Some(hex_to_key(value)?);
+            }
+            "endpoint" if current_key.is_some() => {
+                current_stats.endpoint = Some(value.to_string());
+            }
+            "allowed_ip" if current_key.is_some() => {
+                current_stats.allowed_ips.push(value.to_string());
+            }
+            "rx_bytes" if current_key.is_some() => {
+                current_stats.rx_bytes = value.parse().unwrap_or(0);
+            }
+            "tx_bytes" if current_key.is_some() => {
+                current_stats.tx_bytes = value.parse().unwrap_or(0);
+            }
+            "last_handshake_time_sec" if current_key.is_some() => {
+                current_stats.last_handshake = value.parse().unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(pub_key) = current_key {
+        stats.insert(pub_key, current_stats);
+    }
+    Ok(stats)
+}
+
+fn bytes_to_hex(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+fn hex_to_key(value: &str) -> Result<[u8; 32], String> {
+    let value = value.trim();
+    if value.len() != 64 {
+        return Err(format!(
+            "Invalid WireGuard UAPI key length: expected 64 hex chars, got {}",
+            value.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let start = idx * 2;
+        *slot = u8::from_str_radix(&value[start..start + 2], 16)
+            .map_err(|e| format!("Invalid WireGuard UAPI key hex: {}", e))?;
+    }
+    Ok(out)
 }
 
 fn parse_wg_dump_text(text: &str) -> Result<HashMap<[u8; 32], WgPeerStats>, String> {
@@ -557,6 +906,23 @@ mod tests {
         );
         let parsed = parse_wg_dump_text(&text).unwrap();
         let peer = parsed.get(&[0u8; 32]).unwrap();
+        assert_eq!(peer.endpoint.as_deref(), Some("1.2.3.4:51820"));
+        assert_eq!(peer.allowed_ips, vec!["10.0.0.2/32", "fd00::2/128"]);
+        assert_eq!(peer.last_handshake, 123);
+        assert_eq!(peer.rx_bytes, 456);
+        assert_eq!(peer.tx_bytes, 789);
+    }
+
+    #[test]
+    fn test_parse_uapi_get_response() {
+        let public_key = [7u8; 32];
+        let text = format!(
+            "private_key={}\nlisten_port=51820\npublic_key={}\nendpoint=1.2.3.4:51820\nallowed_ip=10.0.0.2/32\nallowed_ip=fd00::2/128\nlast_handshake_time_sec=123\nrx_bytes=456\ntx_bytes=789\nerrno=0\n",
+            bytes_to_hex(&[1u8; 32]),
+            bytes_to_hex(&public_key)
+        );
+        let parsed = parse_uapi_get_response(&text).unwrap();
+        let peer = parsed.get(&public_key).unwrap();
         assert_eq!(peer.endpoint.as_deref(), Some("1.2.3.4:51820"));
         assert_eq!(peer.allowed_ips, vec!["10.0.0.2/32", "fd00::2/128"]);
         assert_eq!(peer.last_handshake, 123);

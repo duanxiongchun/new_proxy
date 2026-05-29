@@ -11,7 +11,7 @@ use crate::runtime::{
     cleanup_peer_routes_and_tproxy, run_blocking_command, setup_peer_routes_and_tproxy,
 };
 use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry};
-use crate::wireguard::{get_wg_dump_stats, remove_peer_from_kernel, sync_peer_to_kernel};
+use crate::wireguard::{get_wg_dump_stats, remove_peer_from_wireguard, sync_peer_to_wireguard};
 use crate::{GatewayState, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -240,7 +240,7 @@ async fn handle_stats(
             let source = sources
                 .get(pub_key)
                 .cloned()
-                .unwrap_or_else(|| "kernel".to_string());
+                .unwrap_or_else(|| "wireguard".to_string());
 
             aggregated.push(UnifiedTelemetry {
                 public_key: encode_base64_32(pub_key),
@@ -531,21 +531,22 @@ async fn handle_add_peer(
     }
 
     let interface_name = context.interface_name.clone();
-    let new_peer_for_kernel = new_peer.clone();
-    if let Err(e) =
-        run_blocking_command(move || sync_peer_to_kernel(&interface_name, &new_peer_for_kernel))
-            .await
+    let new_peer_for_wireguard = new_peer.clone();
+    if let Err(e) = run_blocking_command(move || {
+        sync_peer_to_wireguard(&interface_name, &new_peer_for_wireguard)
+    })
+    .await
     {
         if let Some(pool) = prepared_client_pool.as_ref() {
-            pool.shutdown(b"Peer kernel sync failed");
+            pool.shutdown(b"Peer WireGuard sync failed");
         }
         if !table_off {
             let rollback_error =
                 rollback_peer_routes(context, &new_peer, old_peer.clone(), tproxy_port).await;
             let message = match rollback_error {
-                Ok(()) => format!("Failed to sync peer to kernel: {}", e),
+                Ok(()) => format!("Failed to sync peer to WireGuard: {}", e),
                 Err(rollback) => format!(
-                    "Failed to sync peer to kernel: {}; route rollback failed: {}",
+                    "Failed to sync peer to WireGuard: {}; route rollback failed: {}",
                     e, rollback
                 ),
             };
@@ -555,7 +556,7 @@ async fn handle_add_peer(
         write_error(
             stream,
             framed_response,
-            format!("Failed to sync peer to kernel: {}", e),
+            format!("Failed to sync peer to WireGuard: {}", e),
         )
         .await;
         return;
@@ -653,7 +654,8 @@ async fn handle_remove_peer(
     }
     let interface_name = context.interface_name.clone();
     if let Err(e) =
-        run_blocking_command(move || remove_peer_from_kernel(&interface_name, parsed_pub_key)).await
+        run_blocking_command(move || remove_peer_from_wireguard(&interface_name, parsed_pub_key))
+            .await
     {
         let restore_error = if routes_cleaned {
             match removed_peer.clone() {
@@ -665,10 +667,10 @@ async fn handle_remove_peer(
         };
         let message = match restore_error {
             Some(restore) => format!(
-                "Failed to remove kernel peer: {}; failed to restore peer routes/tproxy: {}",
+                "Failed to remove WireGuard peer: {}; failed to restore peer routes/tproxy: {}",
                 e, restore
             ),
-            None => format!("Failed to remove kernel peer: {}", e),
+            None => format!("Failed to remove WireGuard peer: {}", e),
         };
         write_error(stream, framed_response, message).await;
         return;

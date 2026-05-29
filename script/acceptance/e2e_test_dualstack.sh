@@ -11,6 +11,8 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
+new_proxy_select_wireguard_backend
 
 SERVER_PID=""
 CLIENT_PID=""
@@ -28,16 +30,16 @@ cleanup() {
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete server_ns 2>/dev/null || true
   rm -f /run/new_proxy/server_e2e.sock /run/new_proxy/client_e2e.sock
-  rm -f /tmp/e2e_server.conf /tmp/e2e_client.conf /tmp/new_proxy_wg_dump_mock
+  rm -f /tmp/e2e_server.conf /tmp/e2e_client.conf
 }
 trap cleanup EXIT
 
 echo "=== [1/7] Cleaning up existing namespaces ==="
-ip netns delete client_ns 2>/dev/null
-ip netns delete router_ns 2>/dev/null
-ip netns delete server_ns 2>/dev/null
+ip netns delete client_ns 2>/dev/null || true
+ip netns delete router_ns 2>/dev/null || true
+ip netns delete server_ns 2>/dev/null || true
 rm -f /run/new_proxy/server_e2e.sock /run/new_proxy/client_e2e.sock
-rm -f /tmp/e2e_server.conf /tmp/e2e_client.conf /tmp/new_proxy_wg_dump_mock
+rm -f /tmp/e2e_server.conf /tmp/e2e_client.conf
 
 echo "=== [2/7] Creating Client, Router, and Server Namespaces ==="
 ip netns add client_ns
@@ -145,18 +147,13 @@ ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32, fd00::1/128
 EOF_CONF
 
-now_ts="$(date +%s)"
-cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32,fd00::2/128	${now_ts}	3482	256	(none)
-EOF_MOCK_WG
-
 # 7.1 Start Server proxy daemon in server_ns
-ip netns exec server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 ./target/debug/new_proxy -config /tmp/e2e_server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
+ip netns exec server_ns ./target/debug/new_proxy -config /tmp/e2e_server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 # 7.2 Start Client proxy daemon in client_ns
-ip netns exec client_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 ./target/debug/new_proxy -config /tmp/e2e_client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
+ip netns exec client_ns ./target/debug/new_proxy -config /tmp/e2e_client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
 CLIENT_PID=$!
 sleep 2
 

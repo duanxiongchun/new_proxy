@@ -14,6 +14,8 @@ set -e
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
+new_proxy_select_wireguard_backend
 
 # Ensure script is run with sudo/root privileges
 if [ "$EUID" -ne 0 ]; then
@@ -29,7 +31,7 @@ ip netns delete server_ns 2>/dev/null || true
 rm -f /run/new_proxy/server.sock
 rm -f /run/new_proxy/client.sock
 rm -f /tmp/client_proxy_active
-rm -f /tmp/new_proxy_wg_dump_mock /tmp/scenario_server.conf /tmp/scenario_client.conf
+rm -f /tmp/scenario_server.conf /tmp/scenario_client.conf
 rm -f /tmp/scenario_server.conf /tmp/scenario_client.conf
 
 # -------------------------------------------------------------------------
@@ -118,12 +120,8 @@ echo "  流量路径:"
 echo "  [TCP]      router_ns ──► client_ns:TPROXY:1080 ──► QUIC Pool ──► server_ns:8080"
 echo "  [UDP/ICMP] client_ns ──► router_ns ──► server_ns (L3 native)"
 
-# 激活 mock 标志与显式 WireGuard dump fixture
+# 激活客户端代理路径标志
 touch /tmp/client_proxy_active
-now_ts="$(date +%s)"
-cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
-EOF_MOCK_WG
 
 cat > /tmp/scenario_server.conf <<EOF_CONF
 [Interface]
@@ -158,13 +156,12 @@ AllowedIPs = 10.0.0.1/32
 EOF_CONF
 
 # 启动 Server Daemon
-ip netns exec server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 \
-    ./target/debug/new_proxy -config /tmp/scenario_server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
+ip netns exec server_ns ./target/debug/new_proxy -config /tmp/scenario_server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 # 启动 Client Daemon (含 TPROXY 监听)
-ip netns exec client_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 ./target/debug/new_proxy -config /tmp/scenario_client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
+ip netns exec client_ns ./target/debug/new_proxy -config /tmp/scenario_client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
 CLIENT_PID=$!
 sleep 2
 
@@ -197,7 +194,7 @@ ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server
 
 echo ""
 echo "  预期结果:"
-echo "  L3 Transfer: 显示 WireGuard 控制面 UDP 流量 (mock kernel dump 数据)"
+echo "  L3 Transfer: 显示 WireGuard 后端统计数据"
 echo "  L4 Transfer: 显示 QUIC 卸载的 TCP 字节 (应 > 0)"
 echo "  Active Strm: TCP 完成后应为 0 (连接已关闭)"
 
@@ -262,7 +259,7 @@ ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server
 
 echo ""
 echo "  预期结果:"
-echo "  L3 Transfer: 增加 (mock kernel dump 显示全量 L3 流量)"
+echo "  L3 Transfer: 增加 (WireGuard 后端显示全量 L3 流量)"
 echo "  L4 Transfer: 保持 0 B (QUIC 完全未使用)"
 echo "  Active Strm: 0 (无 QUIC 流)"
 

@@ -206,7 +206,7 @@ pub fn telemetry_sources(
     for pub_key in l3_stats.keys() {
         sources
             .entry(*pub_key)
-            .or_insert_with(|| "kernel".to_string());
+            .or_insert_with(|| "wireguard".to_string());
     }
     sources
 }
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_sources_classifies_config_and_kernel_peers() {
+    fn test_telemetry_sources_classifies_config_and_wireguard_peers() {
         let peers = vec![PeerConfig {
             public_key: [1u8; 32],
             allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
@@ -452,6 +452,9 @@ mod tests {
 
         let sources = telemetry_sources(&peers, &l3_stats);
         assert_eq!(sources.get(&[1u8; 32]).map(String::as_str), Some("both"));
-        assert_eq!(sources.get(&[2u8; 32]).map(String::as_str), Some("kernel"));
+        assert_eq!(
+            sources.get(&[2u8; 32]).map(String::as_str),
+            Some("wireguard")
+        );
     }
 }
