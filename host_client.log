@@ -1,0 +1,9 @@
+[2026-05-28T09:28:22Z INFO  new_proxy] Loading hybrid secure proxy gateway configuration: client.conf
+[2026-05-28T09:28:22Z INFO  new_proxy] ------------------------------------------------------
+[2026-05-28T09:28:22Z INFO  new_proxy]          STARTING GATEWAY IN [ CLIENT MODE ]         
+[2026-05-28T09:28:22Z INFO  new_proxy] ------------------------------------------------------
+[2026-05-28T09:28:22Z INFO  new_proxy] Initiating userspace ECDH + HMAC-SHA256 control handshake to 10.0.2.2:51821
+[2026-05-28T09:28:22Z INFO  new_proxy::control] Sending control negotiation packet (Attempt 1/4) to 10.0.2.2:51821
+[2026-05-28T09:28:23Z INFO  new_proxy::control] Sending control negotiation packet (Attempt 2/4) to 10.0.2.2:51821
+[2026-05-28T09:28:23Z INFO  new_proxy::control] Sending control negotiation packet (Attempt 3/4) to 10.0.2.2:51821
+[2026-05-28T09:28:24Z INFO  new_proxy::control] Sending control negotiation packet (Attempt 4/4) to 10.0.2.2:51821

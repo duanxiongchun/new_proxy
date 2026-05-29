@@ -1,0 +1,14 @@
+[2026-05-28T12:30:58Z INFO  new_proxy] Loading hybrid secure proxy gateway configuration: server.conf
+[2026-05-28T12:30:58Z INFO  new_proxy] ------------------------------------------------------
+[2026-05-28T12:30:58Z INFO  new_proxy]          STARTING GATEWAY IN [ SERVER MODE ]         
+[2026-05-28T12:30:58Z INFO  new_proxy] ------------------------------------------------------
+[2026-05-28T12:30:58Z INFO  new_proxy::control] Userspace Control Server listening on UDP port 51821
+[2026-05-28T12:30:58Z INFO  new_proxy::quic_pool] QUIC Pool Listener running on UDP port 40002
+[2026-05-28T12:30:58Z INFO  new_proxy::quic_pool] QUIC Pool Listener running on UDP port 40001
+[2026-05-28T12:31:00Z INFO  new_proxy::quic_pool] New incoming QUIC connection from 10.0.1.2:42323
+[2026-05-28T12:31:00Z INFO  new_proxy::quic_pool] PSK Authentication SUCCESSFUL for peer: [211, 218, 30, 79, 130, 127, 248, 213, 77, 223, 214, 145, 47, 224, 141, 119, 227, 120, 39, 203, 116, 190, 245, 182, 89, 205, 131, 44, 1, 57, 93, 46]
+[2026-05-28T12:31:00Z INFO  new_proxy::quic_pool] New incoming QUIC connection from 10.0.1.2:42323
+[2026-05-28T12:31:00Z INFO  new_proxy::quic_pool] PSK Authentication SUCCESSFUL for peer: [211, 218, 30, 79, 130, 127, 248, 213, 77, 223, 214, 145, 47, 224, 141, 119, 227, 120, 39, 203, 116, 190, 245, 182, 89, 205, 131, 44, 1, 57, 93, 46]
+[2026-05-28T12:31:02Z INFO  new_proxy] Establishing userspace TCP proxy bridge to target destination: 10.0.0.1:8080
+[2026-05-28T12:31:02Z INFO  new_proxy] Establishing userspace TCP proxy bridge to target destination: 10.0.0.1:8080
+[2026-05-28T12:31:02Z INFO  new_proxy] Establishing userspace TCP proxy bridge to target destination: 10.0.0.1:8080

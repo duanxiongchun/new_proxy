@@ -1,0 +1,146 @@
+======================================================================
+=== [1/5] Setting Up Network Namespaces & Routing ===
+  ✓ 命名空间配置完成
+  路由: router_ns -> 10.0.0.1 via 10.0.1.2 (client_ns)
+  TPROXY: client_ns PREROUTING tcp->10.0.0.1 重定向到 :1080
+=== [2/5] Starting Target TCP & UDP Servers in Server Namespace ===
+
+=== [3/5] SCENARIO 1: Dual-Track Offloading & Telemetry Verification ===
+  流量路径:
+  [TCP]      router_ns ──► client_ns:TPROXY:1080 ──► QUIC Pool ──► server_ns:8080
+  [UDP/ICMP] client_ns ──► router_ns ──► server_ns (L3 native)
+
+  >> 发射并行并发流量...
+
+  >> 从网关拉取聚合遥测 (L3 WAN + L4 QUIC 分层):
+interface: new-proxy
+  mode: hybrid secure gateway (WireGuard L3 + QUIC L4 offload)
+  peers: 1
+
+peer: 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+  endpoint: 10.0.1.2:50322
+  allowed ips: 10.0.0.2/32, fd00::2/128
+  latest handshake: just now
+  transfer: 7.21 KiB received, 487 B sent
+  wireguard: 3.40 KiB received, 256 B sent
+  quic: active, 2 physical connections, 0 active streams
+  quic transfer: 3.81 KiB received, 231 B sent
+  quic connection 0:
+    endpoint: 10.0.1.2:42323
+    local port: 40001
+    transfer: 2.54 KiB received, 154 B sent
+    active streams: 0
+  quic connection 1:
+    endpoint: 10.0.1.2:42323
+    local port: 40002
+    transfer: 1.27 KiB received, 77 B sent
+    active streams: 0
+
+
+  预期结果:
+  L3 Transfer: 显示 WireGuard 控制面 UDP 流量 (mock wg 数据)
+  L4 Transfer: 显示 QUIC 卸载的 TCP 字节 (应 > 0)
+  Active Strm: TCP 完成后应为 0 (连接已关闭)
+
+=== [4/5] SCENARIO 2: Dynamic Peer Management (Hot-Add/Remove Peer) ===
+  A. 动态新增 Peer...
+Peer added successfully.
+  B. 验证 Peer 添加后遥测表 (应出现新 peer 行):
+interface: new-proxy
+  mode: hybrid secure gateway (WireGuard L3 + QUIC L4 offload)
+  peers: 2
+
+peer: 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+  endpoint: 10.0.1.2:50322
+  allowed ips: 10.0.0.2/32, fd00::2/128
+  latest handshake: just now
+  transfer: 7.21 KiB received, 487 B sent
+  wireguard: 3.40 KiB received, 256 B sent
+  quic: active, 2 physical connections, 0 active streams
+  quic transfer: 3.81 KiB received, 231 B sent
+  quic connection 0:
+    endpoint: 10.0.1.2:42323
+    local port: 40001
+    transfer: 2.54 KiB received, 154 B sent
+    active streams: 0
+  quic connection 1:
+    endpoint: 10.0.1.2:42323
+    local port: 40002
+    transfer: 1.27 KiB received, 77 B sent
+    active streams: 0
+
+peer: etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
+  allowed ips: 10.0.0.99/32
+  latest handshake: Never
+  transfer: 0 B received, 0 B sent
+  wireguard: 0 B received, 0 B sent
+  quic: inactive
+
+  C. 动态删除 Peer...
+Peer removed successfully.
+  D. 验证 Peer 删除后遥测表 (应只剩原始 peer):
+interface: new-proxy
+  mode: hybrid secure gateway (WireGuard L3 + QUIC L4 offload)
+  peers: 1
+
+peer: 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+  endpoint: 10.0.1.2:50322
+  allowed ips: 10.0.0.2/32, fd00::2/128
+  latest handshake: just now
+  transfer: 7.21 KiB received, 487 B sent
+  wireguard: 3.40 KiB received, 256 B sent
+  quic: active, 2 physical connections, 0 active streams
+  quic transfer: 3.81 KiB received, 231 B sent
+  quic connection 0:
+    endpoint: 10.0.1.2:42323
+    local port: 40001
+    transfer: 2.54 KiB received, 154 B sent
+    active streams: 0
+  quic connection 1:
+    endpoint: 10.0.1.2:42323
+    local port: 40002
+    transfer: 1.27 KiB received, 77 B sent
+    active streams: 0
+
+
+=== [5/5] SCENARIO 3: Standard WireGuard L3 Fallback Mode (No QUIC) ===
+  流量路径 (回退):
+  [ALL]  client_ns ──► router_ns ──► server_ns:8080 (native L3, no QUIC)
+
+  >> 发射相同流量 (纯 L3 回退路径)...
+
+  >> 从网关拉取回退模式遥测:
+interface: new-proxy
+  mode: hybrid secure gateway (WireGuard L3 + QUIC L4 offload)
+  peers: 1
+
+peer: 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+  endpoint: 10.0.1.2:50322
+  allowed ips: 10.0.0.2/32, fd00::2/128
+  latest handshake: just now
+  transfer: 18.92 KiB received, 12.19 KiB sent
+  wireguard: 15.12 KiB received, 11.97 KiB sent
+  quic: active, 2 physical connections, 0 active streams
+  quic transfer: 3.81 KiB received, 231 B sent
+  quic connection 0:
+    endpoint: 10.0.1.2:42323
+    local port: 40001
+    transfer: 2.54 KiB received, 154 B sent
+    active streams: 0
+  quic connection 1:
+    endpoint: 10.0.1.2:42323
+    local port: 40002
+    transfer: 1.27 KiB received, 77 B sent
+    active streams: 0
+
+
+  预期结果:
+  L3 Transfer: 增加 (mock wg 显示全量 L3 流量)
+  L4 Transfer: 保持 0 B (QUIC 完全未使用)
+  Active Strm: 0 (无 QUIC 流)
+
+=== Tearing Down Namespaces and Target Servers ===
+
+=======================================================================
+ ✓ [SUCCESS] All E2E Integration and CLI scenarios fully passed!
+=======================================================================

@@ -1,0 +1,7 @@
+[2026-05-28T09:28:53Z INFO  new_proxy] Loading hybrid secure proxy gateway configuration: server.conf
+[2026-05-28T09:28:53Z INFO  new_proxy] ------------------------------------------------------
+[2026-05-28T09:28:53Z INFO  new_proxy]          STARTING GATEWAY IN [ SERVER MODE ]         
+[2026-05-28T09:28:53Z INFO  new_proxy] ------------------------------------------------------
+[2026-05-28T09:28:53Z INFO  new_proxy::control] Userspace Control Server listening on UDP port 51821
+[2026-05-28T09:28:53Z INFO  new_proxy::quic_pool] QUIC Pool Listener running on UDP port 40001
+[2026-05-28T09:28:53Z INFO  new_proxy::quic_pool] QUIC Pool Listener running on UDP port 40002
