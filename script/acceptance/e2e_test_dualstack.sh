@@ -13,7 +13,7 @@ echo "=== [1/7] Cleaning up existing namespaces ==="
 ip netns delete client_ns 2>/dev/null
 ip netns delete router_ns 2>/dev/null
 ip netns delete server_ns 2>/dev/null
-rm -f /tmp/new_proxy_api.sock
+rm -f /run/new_proxy/server.sock
 
 echo "=== [2/7] Creating Client, Router, and Server Namespaces ==="
 ip netns add client_ns
@@ -95,7 +95,7 @@ sleep 2
 
 # 7.3 Use new-proxy-cli to fetch statistics from UDS inside the namespace
 echo "=== Fetching Aggregated Gateway Telemetry via CLI ==="
-ip netns exec server_ns ./target/debug/new-proxy-cli show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
 if [ $? -ne 0 ]; then
   echo "✗ [FAIL] CLI telemetry fetch failed"
   kill $SERVER_PID $CLIENT_PID 2>/dev/null

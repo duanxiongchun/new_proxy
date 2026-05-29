@@ -1,7 +1,7 @@
+use ini::Ini;
+use ipnet::IpNet;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use ipnet::IpNet;
-use ini::Ini;
 
 #[derive(Debug, Clone)]
 pub struct InterfaceConfig {
@@ -71,57 +71,79 @@ pub fn decode_base64_32(s: &str) -> Result<[u8; 32], String> {
         key.copy_from_slice(&buffer);
         Ok(key)
     } else {
-        Err(format!("Invalid key length: expected 32 bytes, got {}", buffer.len()))
+        Err(format!(
+            "Invalid key length: expected 32 bytes, got {}",
+            buffer.len()
+        ))
     }
 }
 
 impl GatewayConfig {
     pub fn load_from_file(path: &str) -> Result<Self, String> {
-        let ini = Ini::load_from_file(path)
-            .map_err(|e| format!("Failed to parse config file: {}", e))?;
+        let ini =
+            Ini::load_from_file(path).map_err(|e| format!("Failed to parse config file: {}", e))?;
 
         // 1. 解析 Interface
-        let interface_section = ini.section(Some("Interface"))
+        let interface_section = ini
+            .section(Some("Interface"))
             .ok_ok_or_else(|| "Missing [Interface] section".to_string())?;
 
-        let priv_key_str = interface_section.get("PrivateKey")
+        let priv_key_str = interface_section
+            .get("PrivateKey")
             .ok_ok_or_else(|| "Missing PrivateKey in [Interface]".to_string())?;
         let private_key = decode_base64_32(priv_key_str)?;
 
-        let addresses_str = interface_section.get("Address")
+        let addresses_str = interface_section
+            .get("Address")
             .ok_ok_or_else(|| "Missing Address in [Interface]".to_string())?;
         let mut addresses = Vec::new();
         for addr in addresses_str.split(',') {
-            let parsed = IpNet::from_str(addr.trim())
-                .map_err(|e| format!("Invalid Address: {}", e))?;
+            let parsed =
+                IpNet::from_str(addr.trim()).map_err(|e| format!("Invalid Address: {}", e))?;
             addresses.push(parsed);
         }
 
-        let listen_port = interface_section.get("ListenPort")
-            .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid ListenPort: {}", e)))
+        let listen_port = interface_section
+            .get("ListenPort")
+            .map(|s| {
+                s.parse::<u16>()
+                    .map_err(|e| format!("Invalid ListenPort: {}", e))
+            })
             .transpose()?;
 
-        let listen_control_port = interface_section.get("ListenControlPort")
-            .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid ListenControlPort: {}", e)))
+        let listen_control_port = interface_section
+            .get("ListenControlPort")
+            .map(|s| {
+                s.parse::<u16>()
+                    .map_err(|e| format!("Invalid ListenControlPort: {}", e))
+            })
             .transpose()?;
 
-        let tproxy_port = interface_section.get("TProxyPort")
-            .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid TProxyPort: {}", e)))
+        let tproxy_port = interface_section
+            .get("TProxyPort")
+            .map(|s| {
+                s.parse::<u16>()
+                    .map_err(|e| format!("Invalid TProxyPort: {}", e))
+            })
             .transpose()?;
 
-        let mtu = interface_section.get("MTU")
+        let mtu = interface_section
+            .get("MTU")
             .map(|s| s.parse::<u16>().unwrap_or(1400))
             .unwrap_or(1400);
 
-        let table = interface_section.get("Table")
+        let table = interface_section
+            .get("Table")
             .or_else(|| interface_section.get("table"))
             .map(|s| s.trim().to_string());
 
-        let pre_script = interface_section.get("PreScript")
+        let pre_script = interface_section
+            .get("PreScript")
             .or_else(|| interface_section.get("pre_script"))
             .map(|s| s.trim().to_string());
 
-        let post_script = interface_section.get("PostScript")
+        let post_script = interface_section
+            .get("PostScript")
             .or_else(|| interface_section.get("post_script"))
             .map(|s| s.trim().to_string());
 
@@ -141,11 +163,13 @@ impl GatewayConfig {
         let mut peers = Vec::new();
         for (section_name, section) in ini.iter() {
             if section_name.as_deref() == Some("Peer") {
-                let pub_key_str = section.get("PublicKey")
+                let pub_key_str = section
+                    .get("PublicKey")
                     .ok_ok_or_else(|| "Missing PublicKey in [Peer]".to_string())?;
                 let public_key = decode_base64_32(pub_key_str)?;
 
-                let allowed_ips_str = section.get("AllowedIPs")
+                let allowed_ips_str = section
+                    .get("AllowedIPs")
                     .ok_ok_or_else(|| "Missing AllowedIPs in [Peer]".to_string())?;
                 let mut allowed_ips = Vec::new();
                 for cidr in allowed_ips_str.split(',') {
@@ -154,12 +178,20 @@ impl GatewayConfig {
                     allowed_ips.push(parsed);
                 }
 
-                let endpoint = section.get("Endpoint")
-                    .map(|s| SocketAddr::from_str(s.trim()).map_err(|e| format!("Invalid Endpoint: {}", e)))
+                let endpoint = section
+                    .get("Endpoint")
+                    .map(|s| {
+                        SocketAddr::from_str(s.trim())
+                            .map_err(|e| format!("Invalid Endpoint: {}", e))
+                    })
                     .transpose()?;
 
-                let proxy_port = section.get("ProxyPort")
-                    .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid ProxyPort: {}", e)))
+                let proxy_port = section
+                    .get("ProxyPort")
+                    .map(|s| {
+                        s.parse::<u16>()
+                            .map_err(|e| format!("Invalid ProxyPort: {}", e))
+                    })
                     .transpose()?;
 
                 peers.push(PeerConfig {
@@ -173,11 +205,15 @@ impl GatewayConfig {
 
         // 3. 解析 QUICPool
         let quic_pool_section = ini.section(Some("QUICPool"));
-        let public_ipv4 = quic_pool_section.and_then(|s| s.get("PublicIPv4").map(|v| v.trim().to_string()));
-        let public_ipv6 = quic_pool_section.and_then(|s| s.get("PublicIPv6").map(|v| v.trim().to_string()));
-        let listen_ports = quic_pool_section.and_then(|s| s.get("ListenPorts"))
+        let public_ipv4 =
+            quic_pool_section.and_then(|s| s.get("PublicIPv4").map(|v| v.trim().to_string()));
+        let public_ipv6 =
+            quic_pool_section.and_then(|s| s.get("PublicIPv6").map(|v| v.trim().to_string()));
+        let listen_ports = quic_pool_section
+            .and_then(|s| s.get("ListenPorts"))
             .map(|ports_str| {
-                ports_str.split(',')
+                ports_str
+                    .split(',')
                     .map(|p| p.trim().parse::<u16>().unwrap_or(0))
                     .filter(|&p| p > 0)
                     .collect::<Vec<u16>>()
@@ -189,7 +225,11 @@ impl GatewayConfig {
             listen_ports,
         };
 
-        Ok(GatewayConfig { interface, peers, quic_pool })
+        Ok(GatewayConfig {
+            interface,
+            peers,
+            quic_pool,
+        })
     }
 }
 

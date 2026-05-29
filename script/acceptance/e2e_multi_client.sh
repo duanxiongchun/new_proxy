@@ -26,8 +26,8 @@ ip netns delete server_ns 2>/dev/null || true
 ip netns delete router_ns 2>/dev/null || true
 ip netns delete client1_ns 2>/dev/null || true
 ip netns delete client2_ns 2>/dev/null || true
-rm -f /tmp/new_proxy_api.sock
-rm -f /tmp/new_proxy_api_client.sock
+rm -f /run/new_proxy/server_multi.sock
+rm -f /run/new_proxy/client1.sock
 rm -f /tmp/client_proxy_active
 rm -f /tmp/wg
 
@@ -206,7 +206,7 @@ fi
 
 echo ""
 echo ">> Fetching Server Telemetry for all concurrent Clients..."
-ip netns exec server_ns "$ROOT_DIR/target/debug/new-proxy-cli" show
+ip netns exec server_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface server_multi show
 
 # Cleanup
 echo "Tearing down namespaces and processes..."

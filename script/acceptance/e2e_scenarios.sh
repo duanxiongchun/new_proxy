@@ -23,8 +23,8 @@ echo "======================================================================"
 ip netns delete client_ns 2>/dev/null || true
 ip netns delete router_ns 2>/dev/null || true
 ip netns delete server_ns 2>/dev/null || true
-rm -f /tmp/new_proxy_api.sock
-rm -f /tmp/new_proxy_api_client.sock
+rm -f /run/new_proxy/server.sock
+rm -f /run/new_proxy/client.sock
 rm -f /tmp/client_proxy_active
 
 # -------------------------------------------------------------------------
@@ -152,7 +152,7 @@ sleep 1
 
 echo ""
 echo "  >> 从网关拉取聚合遥测 (L3 WAN + L4 QUIC 分层):"
-ip netns exec server_ns ./target/debug/new-proxy-cli show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
 
 echo ""
 echo "  预期结果:"
@@ -169,16 +169,16 @@ echo "=== [4/5] SCENARIO 2: Dynamic Peer Management (Hot-Add/Remove Peer) ==="
 NEW_PEER_KEY="etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24="
 
 echo "  A. 动态新增 Peer..."
-ip netns exec server_ns ./target/debug/new-proxy-cli add-peer "$NEW_PEER_KEY" "10.0.0.99/32"
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface server add-peer "$NEW_PEER_KEY" "10.0.0.99/32"
 
 echo "  B. 验证 Peer 添加后遥测表 (应出现新 peer 行):"
-ip netns exec server_ns ./target/debug/new-proxy-cli show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
 
 echo "  C. 动态删除 Peer..."
-ip netns exec server_ns ./target/debug/new-proxy-cli remove-peer "$NEW_PEER_KEY"
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface server remove-peer "$NEW_PEER_KEY"
 
 echo "  D. 验证 Peer 删除后遥测表 (应只剩原始 peer):"
-ip netns exec server_ns ./target/debug/new-proxy-cli show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
 
 # -------------------------------------------------------------------------
 # 5. SCENARIO 3: WIREGUARD L3 FALLBACK (无 QUIC 代理, 纯 L3)
@@ -217,7 +217,7 @@ sleep 1
 
 echo ""
 echo "  >> 从网关拉取回退模式遥测:"
-ip netns exec server_ns ./target/debug/new-proxy-cli show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
 
 echo ""
 echo "  预期结果:"

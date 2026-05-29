@@ -48,7 +48,7 @@ cleanup() {
   ip netns delete client2_ns 2>/dev/null || true
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete server_ns 2>/dev/null || true
-  rm -f /tmp/new_proxy_api.sock /tmp/new_proxy_api_client.sock /tmp/client_proxy_active /tmp/wg
+  rm -f /run/new_proxy/server_stability.sock /run/new_proxy/client_stability.sock /tmp/client_proxy_active /tmp/wg
 }
 trap cleanup EXIT
 
@@ -233,7 +233,7 @@ def telemetry():
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(2)
-        sock.connect("/tmp/new_proxy_api.sock")
+        sock.connect("/run/new_proxy/server_stability.sock")
         sock.sendall(json.dumps({"type": "Stats"}).encode())
         sock.shutdown(socket.SHUT_WR)
         chunks = []

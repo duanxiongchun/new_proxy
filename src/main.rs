@@ -1,26 +1,26 @@
 mod config;
-mod routing;
 mod control;
 mod quic_pool;
 mod relay;
+mod routing;
 mod tproxy;
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use serde::{Serialize, Deserialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use config::{GatewayConfig, decode_base64_32};
-use routing::AllowedIPsRouter;
-use control::{ControlServer, ControlClient};
-use quic_pool::{QuicPoolServer, QuicPoolClient, QuicConnSnapshot};
+use config::{decode_base64_32, GatewayConfig};
+use control::{ControlClient, ControlServer};
+use quic_pool::{QuicConnSnapshot, QuicPoolClient, QuicPoolServer};
 use relay::PeerL4Stats;
+use routing::AllowedIPsRouter;
 
 // 统一的 L3/L4 遥测聚合数据结构 (用于 CLI 输出与 UDS JSON 传递)
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -92,14 +92,14 @@ impl TelemetryRegistry {
         for _ in 0..TELEMETRY_SHARDS {
             stats.push(Mutex::new(HashMap::new()));
         }
-        Self {
-            stats,
-        }
+        Self { stats }
     }
 
     pub fn get_or_create(&self, pub_key: [u8; 32]) -> Arc<PeerL4Stats> {
         let mut map = self.stats[self.shard_index(&pub_key)].lock().unwrap();
-        map.entry(pub_key).or_insert_with(|| Arc::new(PeerL4Stats::default())).clone()
+        map.entry(pub_key)
+            .or_insert_with(|| Arc::new(PeerL4Stats::default()))
+            .clone()
     }
 
     pub fn snapshot(&self) -> HashMap<[u8; 32], Arc<PeerL4Stats>> {
@@ -124,7 +124,7 @@ pub fn encode_base64_32(bytes: &[u8; 32]) -> String {
     let mut temp = 0u32;
     let mut bits = 0;
     let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    
+
     for &b in bytes {
         temp = (temp << 8) | b as u32;
         bits += 8;
@@ -153,7 +153,10 @@ fn set_tcp_keepalive(socket: &tokio::net::TcpStream) -> std::io::Result<()> {
 }
 
 // 目标地址代理协议头部编解码辅助函数
-pub async fn write_target_addr<W: AsyncWrite + Unpin>(w: &mut W, addr: SocketAddr) -> std::io::Result<()> {
+pub async fn write_target_addr<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    addr: SocketAddr,
+) -> std::io::Result<()> {
     match addr.ip() {
         IpAddr::V4(ipv4) => {
             w.write_all(&[0]).await?;
@@ -181,7 +184,12 @@ pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Resul
             r.read_exact(&mut octets).await?;
             IpAddr::V6(Ipv6Addr::from(octets))
         }
-        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid address type")),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid address type",
+            ))
+        }
     };
     let port = r.read_u16().await?;
     Ok(SocketAddr::new(ip, port))
@@ -198,18 +206,19 @@ pub async fn get_wg_dump_stats(interface: &str) -> Result<HashMap<[u8; 32], WgPe
 fn get_wg_dump_stats_blocking(interface: &str) -> Result<HashMap<[u8; 32], WgPeerStats>, String> {
     let output = match std::process::Command::new("wg")
         .args(["show", interface, "dump"])
-        .output() {
-            Ok(out) => out,
-            Err(_) => return Ok(HashMap::new()), // 优雅降级：若系统未安装 wg CLI，则返回空指标
-        };
-    
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return Ok(HashMap::new()), // 优雅降级：若系统未安装 wg CLI，则返回空指标
+    };
+
     if !output.status.success() {
         return Ok(HashMap::new());
     }
-    
+
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let mut stats = HashMap::new();
-    
+
     for line in stdout_str.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 8 {
@@ -227,15 +236,18 @@ fn get_wg_dump_stats_blocking(interface: &str) -> Result<HashMap<[u8; 32], WgPee
             let latest_handshake: u64 = parts[4].parse().unwrap_or(0);
             let rx_bytes: u64 = parts[5].parse().unwrap_or(0);
             let tx_bytes: u64 = parts[6].parse().unwrap_or(0);
-            
+
             if let Ok(pub_key) = decode_base64_32(peer_pub_b64) {
-                stats.insert(pub_key, WgPeerStats {
-                    allowed_ips,
-                    endpoint,
-                    rx_bytes,
-                    tx_bytes,
-                    last_handshake: latest_handshake,
-                });
+                stats.insert(
+                    pub_key,
+                    WgPeerStats {
+                        allowed_ips,
+                        endpoint,
+                        rx_bytes,
+                        tx_bytes,
+                        last_handshake: latest_handshake,
+                    },
+                );
             }
         }
     }
@@ -281,7 +293,10 @@ async fn handle_tproxy_connection(
     let original_dst = match tcp_socket.local_addr() {
         Ok(addr) => addr,
         Err(e) => {
-            log::warn!("Failed to retrieve original destination for intercepted connection: {}", e);
+            log::warn!(
+                "Failed to retrieve original destination for intercepted connection: {}",
+                e
+            );
             return;
         }
     };
@@ -292,7 +307,11 @@ async fn handle_tproxy_connection(
     };
 
     if let Some(peer_pub_key) = matched_peer {
-        log::info!("Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.", src_addr, original_dst);
+        log::info!(
+            "Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.",
+            src_addr,
+            original_dst
+        );
 
         let (mut quic_send, mut quic_recv, conn_stat) = match quic_pool.open_mux_stream().await {
             Ok(stream) => stream,
@@ -302,7 +321,10 @@ async fn handle_tproxy_connection(
             }
         };
 
-        if write_target_addr(&mut quic_send, original_dst).await.is_err() {
+        if write_target_addr(&mut quic_send, original_dst)
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -314,26 +336,31 @@ async fn handle_tproxy_connection(
                 return;
             }
             Ok(Err(e)) => {
-                log::warn!("Failed to read server proxy status for {}: {}", original_dst, e);
+                log::warn!(
+                    "Failed to read server proxy status for {}: {}",
+                    original_dst,
+                    e
+                );
                 return;
             }
             Err(_) => {
-                log::warn!("Timed out waiting for server proxy status for {}", original_dst);
+                log::warn!(
+                    "Timed out waiting for server proxy status for {}",
+                    original_dst
+                );
                 return;
             }
         }
 
         let stats = telemetry.get_or_create(peer_pub_key);
 
-        relay::relay_connections_with_conn_stat(
-            tcp_socket,
-            quic_send,
-            quic_recv,
-            stats,
-            conn_stat,
-        ).await;
+        relay::relay_connections_with_conn_stat(tcp_socket, quic_send, quic_recv, stats, conn_stat)
+            .await;
     } else {
-        log::debug!("Intercepted connection to {} does not match AllowedIPs. Dropped.", original_dst);
+        log::debug!(
+            "Intercepted connection to {} does not match AllowedIPs. Dropped.",
+            original_dst
+        );
     }
 }
 
@@ -354,19 +381,46 @@ async fn wait_for_shutdown() {
 
 #[cfg(not(unix))]
 async fn wait_for_shutdown() {
-    tokio::signal::ctrl_c().await.expect("failed to listen for ctrl_c");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl_c");
     log::info!("Received CTRL+C, shutting down...");
 }
 
-const MAX_TPROXY_CONNECTIONS: usize = 65536;
+const MAX_TPROXY_CONNECTIONS: usize = 8192;
 const MAX_QUIC_STREAM_HANDLERS: usize = 65536;
 
-fn interface_name_from_config_path(config_path: &str) -> String {
-    std::path::Path::new(config_path)
+fn interface_name_from_config_path(config_path: &str) -> Result<String, String> {
+    let name = std::path::Path::new(config_path)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("tun0")
-        .to_string()
+        .to_string();
+    validate_interface_name(&name)?;
+    Ok(name)
+}
+
+fn validate_interface_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 15 {
+        return Err(format!(
+            "Invalid interface name '{}': Linux interface names must be 1..=15 bytes",
+            name
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+    {
+        return Err(format!(
+            "Invalid interface name '{}': allowed characters are [A-Za-z0-9_.:-]",
+            name
+        ));
+    }
+    Ok(())
+}
+
+fn api_socket_path(interface_name: &str) -> String {
+    format!("/run/new_proxy/{}.sock", interface_name)
 }
 
 fn instance_routing_ids(interface_name: &str) -> (u32, u32) {
@@ -380,36 +434,39 @@ fn instance_routing_ids(interface_name: &str) -> (u32, u32) {
     (fwmark, table)
 }
 
-fn run_command_checked(cmd: &str) -> Result<(), String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
+fn run_command_checked(program: &str, args: &[String]) -> Result<(), String> {
+    let output = std::process::Command::new(program)
+        .args(args)
         .output()
-        .map_err(|e| format!("failed to execute '{}': {}", cmd, e))?;
+        .map_err(|e| format!("failed to execute '{} {}': {}", program, args.join(" "), e))?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "command '{}' failed with status {:?}: {}",
-            cmd,
+            "command '{} {}' failed with status {:?}: {}",
+            program,
+            args.join(" "),
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
 
-fn run_command_best_effort(cmd: &str) {
-    if let Err(e) = run_command_checked(cmd) {
+fn run_command_best_effort(program: &str, args: &[String]) {
+    if let Err(e) = run_command_checked(program, args) {
         log::debug!("{}", e);
     }
 }
 
-fn ensure_iptables_rule(tool: &str, rule: &str) -> Result<(), String> {
-    let check = format!("{} -t mangle -C {}", tool, rule);
-    if run_command_checked(&check).is_ok() {
+fn ensure_iptables_rule(tool: &str, rule: &[String]) -> Result<(), String> {
+    let mut check_args = vec!["-t".to_string(), "mangle".to_string(), "-C".to_string()];
+    check_args.extend(rule.iter().cloned());
+    if run_command_checked(tool, &check_args).is_ok() {
         return Ok(());
     }
-    run_command_checked(&format!("{} -t mangle -A {}", tool, rule))
+    let mut add_args = vec!["-t".to_string(), "mangle".to_string(), "-A".to_string()];
+    add_args.extend(rule.iter().cloned());
+    run_command_checked(tool, &add_args)
 }
 
 fn run_script(script: &str) {
@@ -442,27 +499,41 @@ fn setup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) -> Re
         }
     }
 
-    log::info!("Setting up automatic routing and iptables for interface: {}", interface_name);
+    log::info!(
+        "Setting up automatic routing and iptables for interface: {}",
+        interface_name
+    );
 
     // 1. Add addresses to the tun interface
     for addr in &config.interface.addresses {
-        let cmd = format!("ip addr replace {} dev {}", addr, interface_name);
-        run_command_checked(&cmd)?;
+        run_command_checked(
+            "ip",
+            &[
+                "addr".to_string(),
+                "replace".to_string(),
+                addr.to_string(),
+                "dev".to_string(),
+                interface_name.to_string(),
+            ],
+        )?;
     }
-    
+
     // Set interface UP and configure the parsed MTU to prevent PMTU fragmentation issues
-    run_command_checked(&format!("ip link set {} up mtu {}", interface_name, config.interface.mtu))?;
+    run_command_checked(
+        "ip",
+        &[
+            "link".to_string(),
+            "set".to_string(),
+            interface_name.to_string(),
+            "up".to_string(),
+            "mtu".to_string(),
+            config.interface.mtu.to_string(),
+        ],
+    )?;
 
     // 2. Add routes for AllowedIPs of all peers
     for peer in &config.peers {
-        for allowed_ip in &peer.allowed_ips {
-            let cmd = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                format!("ip route replace {} dev {}", allowed_ip, interface_name)
-            } else {
-                format!("ip -6 route replace {} dev {}", allowed_ip, interface_name)
-            };
-            run_command_checked(&cmd)?;
-        }
+        setup_peer_routes_and_tproxy(peer, config.interface.tproxy_port, interface_name)?;
     }
 
     // 3. Configure TPROXY iptables rules if TProxyPort is set
@@ -472,35 +543,153 @@ fn setup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) -> Re
         let mark_spec = format!("{:#x}/0xffffffff", fwmark);
 
         // IPv4 policy routing & local route
-        run_command_best_effort(&format!("ip rule del fwmark {:#x} lookup {}", fwmark, route_table));
-        run_command_checked(&format!("ip rule add fwmark {:#x} lookup {}", fwmark, route_table))?;
-        run_command_checked(&format!("ip route replace local 0.0.0.0/0 dev lo table {}", route_table))?;
+        run_command_best_effort(
+            "ip",
+            &[
+                "rule".to_string(),
+                "del".to_string(),
+                "fwmark".to_string(),
+                format!("{:#x}", fwmark),
+                "lookup".to_string(),
+                route_table.to_string(),
+            ],
+        );
+        run_command_checked(
+            "ip",
+            &[
+                "rule".to_string(),
+                "add".to_string(),
+                "fwmark".to_string(),
+                format!("{:#x}", fwmark),
+                "lookup".to_string(),
+                route_table.to_string(),
+            ],
+        )?;
+        run_command_checked(
+            "ip",
+            &[
+                "route".to_string(),
+                "replace".to_string(),
+                "local".to_string(),
+                "0.0.0.0/0".to_string(),
+                "dev".to_string(),
+                "lo".to_string(),
+                "table".to_string(),
+                route_table.to_string(),
+            ],
+        )?;
 
         // IPv6 policy routing & local route
-        run_command_best_effort(&format!("ip -6 rule del fwmark {:#x} lookup {}", fwmark, route_table));
-        run_command_checked(&format!("ip -6 rule add fwmark {:#x} lookup {}", fwmark, route_table))?;
-        run_command_checked(&format!("ip -6 route replace local ::/0 dev lo table {}", route_table))?;
+        run_command_best_effort(
+            "ip",
+            &[
+                "-6".to_string(),
+                "rule".to_string(),
+                "del".to_string(),
+                "fwmark".to_string(),
+                format!("{:#x}", fwmark),
+                "lookup".to_string(),
+                route_table.to_string(),
+            ],
+        );
+        run_command_checked(
+            "ip",
+            &[
+                "-6".to_string(),
+                "rule".to_string(),
+                "add".to_string(),
+                "fwmark".to_string(),
+                format!("{:#x}", fwmark),
+                "lookup".to_string(),
+                route_table.to_string(),
+            ],
+        )?;
+        run_command_checked(
+            "ip",
+            &[
+                "-6".to_string(),
+                "route".to_string(),
+                "replace".to_string(),
+                "local".to_string(),
+                "::/0".to_string(),
+                "dev".to_string(),
+                "lo".to_string(),
+                "table".to_string(),
+                route_table.to_string(),
+            ],
+        )?;
 
-        // Add PREROUTING rules for each AllowedIP
-        for peer in &config.peers {
-            for allowed_ip in &peer.allowed_ips {
-                if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                    let rule = format!(
-                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark {}",
-                        allowed_ip, tproxy_port, mark_spec
-                    );
-                    ensure_iptables_rule("iptables", &rule)?;
-                } else {
-                    let rule = format!(
-                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark {}",
-                        allowed_ip, tproxy_port, mark_spec
-                    );
-                    ensure_iptables_rule("ip6tables", &rule)?;
-                }
-            }
+        let _ = mark_spec;
+    }
+    Ok(())
+}
+
+fn setup_peer_routes_and_tproxy(
+    peer: &config::PeerConfig,
+    tproxy_port: Option<u16>,
+    interface_name: &str,
+) -> Result<(), String> {
+    let (fwmark, _) = instance_routing_ids(interface_name);
+    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
+
+    for allowed_ip in &peer.allowed_ips {
+        if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+            run_command_checked(
+                "ip",
+                &[
+                    "route".to_string(),
+                    "replace".to_string(),
+                    allowed_ip.to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            )?;
+        } else {
+            run_command_checked(
+                "ip",
+                &[
+                    "-6".to_string(),
+                    "route".to_string(),
+                    "replace".to_string(),
+                    allowed_ip.to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            )?;
+        }
+        if let Some(port) = tproxy_port {
+            ensure_tproxy_rule(*allowed_ip, port, &mark_spec)?;
         }
     }
     Ok(())
+}
+
+fn ensure_tproxy_rule(
+    allowed_ip: ipnet::IpNet,
+    tproxy_port: u16,
+    mark_spec: &str,
+) -> Result<(), String> {
+    let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+        ("iptables", "0.0.0.0")
+    } else {
+        ("ip6tables", "::")
+    };
+    let rule = vec![
+        "PREROUTING".to_string(),
+        "-p".to_string(),
+        "tcp".to_string(),
+        "-d".to_string(),
+        allowed_ip.to_string(),
+        "-j".to_string(),
+        "TPROXY".to_string(),
+        "--on-port".to_string(),
+        tproxy_port.to_string(),
+        "--on-ip".to_string(),
+        on_ip.to_string(),
+        "--tproxy-mark".to_string(),
+        mark_spec.to_string(),
+    ];
+    ensure_iptables_rule(tool, &rule)
 }
 
 fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
@@ -510,7 +699,10 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
         }
     }
 
-    log::info!("Cleaning up automatic routing and iptables for interface: {}", interface_name);
+    log::info!(
+        "Cleaning up automatic routing and iptables for interface: {}",
+        interface_name
+    );
 
     // 1. Remove TPROXY iptables rules if TProxyPort is set
     if let Some(tproxy_port) = config.interface.tproxy_port {
@@ -520,48 +712,206 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
 
         for peer in &config.peers {
             for allowed_ip in &peer.allowed_ips {
-                if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                    let cmd = format!(
-                        "iptables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark {}",
-                        allowed_ip,
-                        tproxy_port,
-                        mark_spec
-                    );
-                    run_command_best_effort(&cmd);
-                } else {
-                    let cmd = format!(
-                        "ip6tables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark {}",
-                        allowed_ip,
-                        tproxy_port,
-                        mark_spec
-                    );
-                    run_command_best_effort(&cmd);
-                }
+                cleanup_tproxy_rule(*allowed_ip, tproxy_port, &mark_spec);
             }
         }
 
         // Clean up policy routing & local routes
-        run_command_best_effort(&format!("ip rule del fwmark {:#x} lookup {}", fwmark, route_table));
-        run_command_best_effort(&format!("ip route del local 0.0.0.0/0 dev lo table {}", route_table));
-        run_command_best_effort(&format!("ip -6 rule del fwmark {:#x} lookup {}", fwmark, route_table));
-        run_command_best_effort(&format!("ip -6 route del local ::/0 dev lo table {}", route_table));
+        run_command_best_effort(
+            "ip",
+            &[
+                "rule".to_string(),
+                "del".to_string(),
+                "fwmark".to_string(),
+                format!("{:#x}", fwmark),
+                "lookup".to_string(),
+                route_table.to_string(),
+            ],
+        );
+        run_command_best_effort(
+            "ip",
+            &[
+                "route".to_string(),
+                "del".to_string(),
+                "local".to_string(),
+                "0.0.0.0/0".to_string(),
+                "dev".to_string(),
+                "lo".to_string(),
+                "table".to_string(),
+                route_table.to_string(),
+            ],
+        );
+        run_command_best_effort(
+            "ip",
+            &[
+                "-6".to_string(),
+                "rule".to_string(),
+                "del".to_string(),
+                "fwmark".to_string(),
+                format!("{:#x}", fwmark),
+                "lookup".to_string(),
+                route_table.to_string(),
+            ],
+        );
+        run_command_best_effort(
+            "ip",
+            &[
+                "-6".to_string(),
+                "route".to_string(),
+                "del".to_string(),
+                "local".to_string(),
+                "::/0".to_string(),
+                "dev".to_string(),
+                "lo".to_string(),
+                "table".to_string(),
+                route_table.to_string(),
+            ],
+        );
     }
 
     // 2. Remove routes and addresses injected during setup.
     for peer in &config.peers {
         for allowed_ip in &peer.allowed_ips {
-            let cmd = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                format!("ip route del {} dev {}", allowed_ip, interface_name)
+            if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                run_command_best_effort(
+                    "ip",
+                    &[
+                        "route".to_string(),
+                        "del".to_string(),
+                        allowed_ip.to_string(),
+                        "dev".to_string(),
+                        interface_name.to_string(),
+                    ],
+                );
             } else {
-                format!("ip -6 route del {} dev {}", allowed_ip, interface_name)
-            };
-            run_command_best_effort(&cmd);
+                run_command_best_effort(
+                    "ip",
+                    &[
+                        "-6".to_string(),
+                        "route".to_string(),
+                        "del".to_string(),
+                        allowed_ip.to_string(),
+                        "dev".to_string(),
+                        interface_name.to_string(),
+                    ],
+                );
+            }
         }
     }
 
     for addr in &config.interface.addresses {
-        run_command_best_effort(&format!("ip addr del {} dev {}", addr, interface_name));
+        run_command_best_effort(
+            "ip",
+            &[
+                "addr".to_string(),
+                "del".to_string(),
+                addr.to_string(),
+                "dev".to_string(),
+                interface_name.to_string(),
+            ],
+        );
     }
+}
+
+fn cleanup_tproxy_rule(allowed_ip: ipnet::IpNet, tproxy_port: u16, mark_spec: &str) {
+    let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+        ("iptables", "0.0.0.0")
+    } else {
+        ("ip6tables", "::")
+    };
+    let args = vec![
+        "-t".to_string(),
+        "mangle".to_string(),
+        "-D".to_string(),
+        "PREROUTING".to_string(),
+        "-p".to_string(),
+        "tcp".to_string(),
+        "-d".to_string(),
+        allowed_ip.to_string(),
+        "-j".to_string(),
+        "TPROXY".to_string(),
+        "--on-port".to_string(),
+        tproxy_port.to_string(),
+        "--on-ip".to_string(),
+        on_ip.to_string(),
+        "--tproxy-mark".to_string(),
+        mark_spec.to_string(),
+    ];
+    run_command_best_effort(tool, &args);
+}
+
+fn cleanup_peer_routes_and_tproxy(
+    peer: &config::PeerConfig,
+    tproxy_port: Option<u16>,
+    interface_name: &str,
+) {
+    let (fwmark, _) = instance_routing_ids(interface_name);
+    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
+    for allowed_ip in &peer.allowed_ips {
+        if let Some(port) = tproxy_port {
+            cleanup_tproxy_rule(*allowed_ip, port, &mark_spec);
+        }
+        if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+            run_command_best_effort(
+                "ip",
+                &[
+                    "route".to_string(),
+                    "del".to_string(),
+                    allowed_ip.to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            );
+        } else {
+            run_command_best_effort(
+                "ip",
+                &[
+                    "-6".to_string(),
+                    "route".to_string(),
+                    "del".to_string(),
+                    allowed_ip.to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            );
+        }
+    }
+}
+
+fn sync_peer_to_kernel(interface_name: &str, peer: &config::PeerConfig) {
+    let pub_key_b64 = encode_base64_32(&peer.public_key);
+    let allowed_ips_str = peer
+        .allowed_ips
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut args = vec![
+        "set".to_string(),
+        interface_name.to_string(),
+        "peer".to_string(),
+        pub_key_b64,
+        "allowed-ips".to_string(),
+        allowed_ips_str,
+    ];
+    if let Some(endpoint) = peer.endpoint {
+        args.push("endpoint".to_string());
+        args.push(endpoint.to_string());
+    }
+    run_command_best_effort("wg", &args);
+}
+
+fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) {
+    run_command_best_effort(
+        "wg",
+        &[
+            "set".to_string(),
+            interface_name.to_string(),
+            "peer".to_string(),
+            encode_base64_32(&pub_key),
+            "remove".to_string(),
+        ],
+    );
 }
 
 async fn sync_kernel_and_proxy_state(
@@ -599,7 +949,12 @@ async fn sync_kernel_and_proxy_state(
     // 3. Perform synchronization to kernel (wg CLI)
     for peer in peers_to_sync_to_kernel {
         let pub_key_b64 = encode_base64_32(&peer.public_key);
-        let allowed_ips_str = peer.allowed_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",");
+        let allowed_ips_str = peer
+            .allowed_ips
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let mut args = vec![
             "set".to_string(),
             interface_name.to_string(),
@@ -612,9 +967,7 @@ async fn sync_kernel_and_proxy_state(
             args.push("endpoint".to_string());
             args.push(endpoint.to_string());
         }
-        let _ = std::process::Command::new("wg")
-            .args(&args)
-            .output();
+        let _ = std::process::Command::new("wg").args(&args).output();
     }
 
     // 4. Perform synchronization to proxy (GatewayState peers & Trie router & peer_secrets)
@@ -630,7 +983,10 @@ async fn sync_kernel_and_proxy_state(
                 parsed_allowed_ips.push(ipnet);
             }
         }
-        let parsed_endpoint = wg_stats.endpoint.as_ref().and_then(|s| std::str::FromStr::from_str(s).ok());
+        let parsed_endpoint = wg_stats
+            .endpoint
+            .as_ref()
+            .and_then(|s| std::str::FromStr::from_str(s).ok());
 
         {
             let mut st = state.write().unwrap();
@@ -655,14 +1011,13 @@ async fn sync_kernel_and_proxy_state(
     sources
 }
 
-
 #[tokio::main]
 async fn main() {
     // 初始化日志系统
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
-    
+
     // CLI 遥测展示
     if args.len() > 1 && args[1] == "stats" {
         if let Err(e) = run_cli_stats().await {
@@ -683,7 +1038,10 @@ async fn main() {
         }
     }
 
-    log::info!("Loading hybrid secure proxy gateway configuration: {}", config_path);
+    log::info!(
+        "Loading hybrid secure proxy gateway configuration: {}",
+        config_path
+    );
     let config = match GatewayConfig::load_from_file(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -692,7 +1050,13 @@ async fn main() {
         }
     };
 
-    let interface_name = interface_name_from_config_path(&config_path);
+    let interface_name = match interface_name_from_config_path(&config_path) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
 
     // 执行 PreScript 脚本
     if let Some(ref pre_script) = config.interface.pre_script {
@@ -707,14 +1071,14 @@ async fn main() {
 
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
-    
+
     let mut initial_router = AllowedIPsRouter::new();
     for peer in &config.peers {
         for &allowed_ip in &peer.allowed_ips {
             initial_router.insert(allowed_ip, peer.public_key);
         }
     }
-    
+
     let gateway_state = Arc::new(std::sync::RwLock::new(GatewayState {
         config: config.clone(),
         router: initial_router,
@@ -733,29 +1097,54 @@ async fn main() {
     }
 
     // 智能自适应识别网关运行模式 (Server vs. Client)
-    let is_server = config.interface.listen_control_port.is_some() || !config.quic_pool.listen_ports.is_empty();
+    let is_server =
+        config.interface.listen_control_port.is_some() || !config.quic_pool.listen_ports.is_empty();
 
     // 运行在后台的 Unix Domain Socket API 服务器，处理动态命令与 stats 遥测
-    // 采用分立设计：服务端监听默认路径以供 CLI 直接查询，客户端监听独立路径，防止启动时相互覆盖套接字文件
-    let uds_path = if is_server {
-        "/tmp/new_proxy_api.sock"
-    } else {
-        "/tmp/new_proxy_api_client.sock"
-    };
-    let _ = std::fs::remove_file(uds_path);
-    let uds_listener = match tokio::net::UnixListener::bind(uds_path) {
-        Ok(l) => {
+    let uds_path = api_socket_path(&interface_name);
+    let uds_listener = match std::fs::create_dir_all("/run/new_proxy") {
+        Ok(()) => {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = std::fs::set_permissions(uds_path, std::fs::Permissions::from_mode(0o600)) {
-                    log::warn!("Failed to restrict API UDS socket permissions on {}: {}", uds_path, e);
+                let _ = std::fs::set_permissions(
+                    "/run/new_proxy",
+                    std::fs::Permissions::from_mode(0o700),
+                );
+            }
+            let _ = std::fs::remove_file(&uds_path);
+            match tokio::net::UnixListener::bind(&uds_path) {
+                Ok(l) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(e) = std::fs::set_permissions(
+                            &uds_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        ) {
+                            log::warn!(
+                                "Failed to restrict API UDS socket permissions on {}: {}",
+                                uds_path,
+                                e
+                            );
+                        }
+                    }
+                    Some(l)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to bind API UDS socket: {}. Telemetry query CLI will be disabled.",
+                        e
+                    );
+                    None
                 }
             }
-            Some(l)
         }
         Err(e) => {
-            log::warn!("Failed to bind API UDS socket: {}. Telemetry query CLI will be disabled.", e);
+            log::warn!(
+                "Failed to create /run/new_proxy: {}. Telemetry query CLI will be disabled.",
+                e
+            );
             None
         }
     };
@@ -763,7 +1152,8 @@ async fn main() {
     // 共享的 QUIC peer 连接注册表：
     // - server 模式下由 QuicPoolServer.run_with_registry 填充
     // - client 模式下不使用，始终为空
-    let shared_quic_registry: quic_pool::PeerConnRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let shared_quic_registry: quic_pool::PeerConnRegistry =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     if let Some(uds) = uds_listener {
         let telemetry_clone = telemetry_registry.clone();
@@ -772,7 +1162,7 @@ async fn main() {
         let server_secret_clone = server_secret.clone();
         let shared_quic_registry_uds = shared_quic_registry.clone();
         let interface_name_clone = interface_name.clone();
-        
+
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = uds.accept().await {
                 let telemetry = telemetry_clone.clone();
@@ -781,7 +1171,7 @@ async fn main() {
                 let server_secret = server_secret_clone.clone();
                 let shared_quic_registry = shared_quic_registry_uds.clone();
                 let interface_name = interface_name_clone.clone();
-                
+
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut temp = [0u8; 1024];
@@ -797,7 +1187,8 @@ async fn main() {
                                     if buf.len() > MAX_UDS_PAYLOAD {
                                         return Err("Payload too large");
                                     }
-                                    if let Ok(_) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                                    if let Ok(_) = serde_json::from_slice::<serde_json::Value>(&buf)
+                                    {
                                         break;
                                     }
                                 }
@@ -805,7 +1196,8 @@ async fn main() {
                             }
                         }
                         Ok(())
-                    }).await;
+                    })
+                    .await;
 
                     if read_result.is_err() || read_result.unwrap().is_err() {
                         return;
@@ -814,7 +1206,10 @@ async fn main() {
                     let cmd: CommandInput = match serde_json::from_slice(&buf) {
                         Ok(c) => c,
                         Err(e) => {
-                            let resp = ApiResponse { status: "Error".to_string(), message: Some(format!("Invalid request JSON: {}", e)) };
+                            let resp = ApiResponse {
+                                status: "Error".to_string(),
+                                message: Some(format!("Invalid request JSON: {}", e)),
+                            };
                             let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                             return;
                         }
@@ -822,14 +1217,16 @@ async fn main() {
 
                     match cmd {
                         CommandInput::Stats => {
-                            let l3_stats = get_wg_dump_stats(&interface_name).await.unwrap_or_default();
+                            let l3_stats =
+                                get_wg_dump_stats(&interface_name).await.unwrap_or_default();
                             let sources = sync_kernel_and_proxy_state(
                                 &interface_name,
                                 &state,
                                 &peer_secrets,
                                 &server_secret,
                                 &l3_stats,
-                            ).await;
+                            )
+                            .await;
                             let aggregated = {
                                 let mut aggregated = Vec::new();
                                 let mut seen = HashSet::new();
@@ -840,34 +1237,36 @@ async fn main() {
                                 let registry_map = telemetry.snapshot();
                                 // 从共享的 QUIC 连接注册表获取每连接统计
                                 let quic_registry = shared_quic_registry.lock().unwrap();
-                                
+
                                 for peer in peers {
                                     let pub_key = peer.public_key;
                                     let pub_key_b64 = encode_base64_32(&pub_key);
-                                    
+
                                     let wg_stats = l3_stats.get(&pub_key);
                                     let l3_rx = wg_stats.map(|s| s.rx_bytes).unwrap_or(0);
                                     let l3_tx = wg_stats.map(|s| s.tx_bytes).unwrap_or(0);
                                     let handshake = wg_stats.map(|s| s.last_handshake).unwrap_or(0);
-                                    
+
                                     // 从聚合注册表获取 L4 总量
-                                    let (l4_rx, l4_tx, active_streams) = if let Some(stats) = registry_map.get(&pub_key) {
-                                        (
-                                            stats.rx_bytes.load(Ordering::Relaxed),
-                                            stats.tx_bytes.load(Ordering::Relaxed),
-                                            stats.active_streams.load(Ordering::Relaxed),
-                                        )
-                                    } else {
-                                        (0, 0, 0)
-                                    };
-                                    
+                                    let (l4_rx, l4_tx, active_streams) =
+                                        if let Some(stats) = registry_map.get(&pub_key) {
+                                            (
+                                                stats.rx_bytes.load(Ordering::Relaxed),
+                                                stats.tx_bytes.load(Ordering::Relaxed),
+                                                stats.active_streams.load(Ordering::Relaxed),
+                                            )
+                                        } else {
+                                            (0, 0, 0)
+                                        };
+
                                     // 从 peer_conn_registry 获取每条物理 QUIC 连接的快照
                                     let quic_connections = quic_registry
                                         .get(&pub_key)
                                         .map(|conns| conns.iter().map(|c| c.snapshot()).collect())
                                         .unwrap_or_default();
-                                    
-                                    let endpoint = peer.endpoint
+
+                                    let endpoint = peer
+                                        .endpoint
                                         .map(|a| a.to_string())
                                         .or_else(|| wg_stats.and_then(|s| s.endpoint.clone()));
                                     let allowed_ips = if peer.allowed_ips.is_empty() {
@@ -875,12 +1274,12 @@ async fn main() {
                                     } else {
                                         peer.allowed_ips.iter().map(|ip| ip.to_string()).collect()
                                     };
-                                    
+
                                     let source = sources
                                         .get(&pub_key)
                                         .cloned()
                                         .unwrap_or_else(|| "both".to_string());
-                                    
+
                                     aggregated.push(UnifiedTelemetry {
                                         public_key: pub_key_b64,
                                         allowed_ips,
@@ -903,15 +1302,16 @@ async fn main() {
                                         continue;
                                     }
 
-                                    let (l4_rx, l4_tx, active_streams) = if let Some(stats) = registry_map.get(pub_key) {
-                                        (
-                                            stats.rx_bytes.load(Ordering::Relaxed),
-                                            stats.tx_bytes.load(Ordering::Relaxed),
-                                            stats.active_streams.load(Ordering::Relaxed),
-                                        )
-                                    } else {
-                                        (0, 0, 0)
-                                    };
+                                    let (l4_rx, l4_tx, active_streams) =
+                                        if let Some(stats) = registry_map.get(pub_key) {
+                                            (
+                                                stats.rx_bytes.load(Ordering::Relaxed),
+                                                stats.tx_bytes.load(Ordering::Relaxed),
+                                                stats.active_streams.load(Ordering::Relaxed),
+                                            )
+                                        } else {
+                                            (0, 0, 0)
+                                        };
                                     let quic_connections = quic_registry
                                         .get(pub_key)
                                         .map(|conns| conns.iter().map(|c| c.snapshot()).collect())
@@ -944,15 +1344,16 @@ async fn main() {
                                         continue;
                                     }
 
-                                    let (l4_rx, l4_tx, active_streams) = if let Some(stats) = registry_map.get(pub_key) {
-                                        (
-                                            stats.rx_bytes.load(Ordering::Relaxed),
-                                            stats.tx_bytes.load(Ordering::Relaxed),
-                                            stats.active_streams.load(Ordering::Relaxed),
-                                        )
-                                    } else {
-                                        (0, 0, 0)
-                                    };
+                                    let (l4_rx, l4_tx, active_streams) =
+                                        if let Some(stats) = registry_map.get(pub_key) {
+                                            (
+                                                stats.rx_bytes.load(Ordering::Relaxed),
+                                                stats.tx_bytes.load(Ordering::Relaxed),
+                                                stats.active_streams.load(Ordering::Relaxed),
+                                            )
+                                        } else {
+                                            (0, 0, 0)
+                                        };
                                     let quic_connections = quic_registry
                                         .get(pub_key)
                                         .map(|conns| conns.iter().map(|c| c.snapshot()).collect())
@@ -979,10 +1380,13 @@ async fn main() {
                                 }
                                 aggregated
                             };
-                            let _ = stream.write_all(&serde_json::to_vec(&aggregated).unwrap()).await;
+                            let _ = stream
+                                .write_all(&serde_json::to_vec(&aggregated).unwrap())
+                                .await;
                         }
                         CommandInput::Dump => {
-                            let l3_stats = get_wg_dump_stats(&interface_name).await.unwrap_or_default();
+                            let l3_stats =
+                                get_wg_dump_stats(&interface_name).await.unwrap_or_default();
                             let response = {
                                 let telemetry = telemetry.snapshot();
                                 let quic_registry = shared_quic_registry.lock().unwrap();
@@ -995,15 +1399,23 @@ async fn main() {
                                 for key in keys {
                                     let wg = l3_stats.get(&key);
                                     let l4 = telemetry.get(&key);
-                                    let l4_rx = l4.map(|s| s.rx_bytes.load(Ordering::Relaxed)).unwrap_or(0);
-                                    let l4_tx = l4.map(|s| s.tx_bytes.load(Ordering::Relaxed)).unwrap_or(0);
-                                    let active_streams = l4.map(|s| s.active_streams.load(Ordering::Relaxed)).unwrap_or(0);
-                                    let quic_connections = quic_registry.get(&key).map(|c| c.len()).unwrap_or(0);
+                                    let l4_rx =
+                                        l4.map(|s| s.rx_bytes.load(Ordering::Relaxed)).unwrap_or(0);
+                                    let l4_tx =
+                                        l4.map(|s| s.tx_bytes.load(Ordering::Relaxed)).unwrap_or(0);
+                                    let active_streams = l4
+                                        .map(|s| s.active_streams.load(Ordering::Relaxed))
+                                        .unwrap_or(0);
+                                    let quic_connections =
+                                        quic_registry.get(&key).map(|c| c.len()).unwrap_or(0);
                                     lines.push(format!(
                                         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                                         encode_base64_32(&key),
-                                        wg.and_then(|s| s.endpoint.clone()).unwrap_or_else(|| "(none)".to_string()),
-                                        wg.map(|s| s.allowed_ips.join(",")).filter(|s| !s.is_empty()).unwrap_or_else(|| "(none)".to_string()),
+                                        wg.and_then(|s| s.endpoint.clone())
+                                            .unwrap_or_else(|| "(none)".to_string()),
+                                        wg.map(|s| s.allowed_ips.join(","))
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or_else(|| "(none)".to_string()),
                                         wg.map(|s| s.last_handshake).unwrap_or(0),
                                         wg.map(|s| s.rx_bytes).unwrap_or(0),
                                         wg.map(|s| s.tx_bytes).unwrap_or(0),
@@ -1016,55 +1428,111 @@ async fn main() {
                             };
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                        CommandInput::AddPeer { public_key, allowed_ips, endpoint, proxy_port } => {
+                        CommandInput::AddPeer {
+                            public_key,
+                            allowed_ips,
+                            endpoint,
+                            proxy_port,
+                        } => {
                             let parsed_pub_key = match decode_base64_32(&public_key) {
                                 Ok(k) => k,
                                 Err(e) => {
-                                    let resp = ApiResponse { status: "Error".to_string(), message: Some(format!("Invalid public key: {}", e)) };
-                                    let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                    let resp = ApiResponse {
+                                        status: "Error".to_string(),
+                                        message: Some(format!("Invalid public key: {}", e)),
+                                    };
+                                    let _ =
+                                        stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                                     return;
                                 }
                             };
-                            
+
                             let mut parsed_allowed_ips = Vec::new();
                             for ip_str in allowed_ips {
                                 match std::str::FromStr::from_str(&ip_str) {
                                     Ok(ipnet) => parsed_allowed_ips.push(ipnet),
                                     Err(e) => {
-                                        let resp = ApiResponse { status: "Error".to_string(), message: Some(format!("Invalid allowed IP: {}", e)) };
-                                        let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                        let resp = ApiResponse {
+                                            status: "Error".to_string(),
+                                            message: Some(format!("Invalid allowed IP: {}", e)),
+                                        };
+                                        let _ = stream
+                                            .write_all(&serde_json::to_vec(&resp).unwrap())
+                                            .await;
                                         return;
                                     }
                                 }
                             }
-                            
+
                             let parsed_endpoint = match endpoint {
                                 Some(ep_str) => match std::str::FromStr::from_str(&ep_str) {
                                     Ok(addr) => Some(addr),
                                     Err(e) => {
-                                        let resp = ApiResponse { status: "Error".to_string(), message: Some(format!("Invalid endpoint: {}", e)) };
-                                        let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                        let resp = ApiResponse {
+                                            status: "Error".to_string(),
+                                            message: Some(format!("Invalid endpoint: {}", e)),
+                                        };
+                                        let _ = stream
+                                            .write_all(&serde_json::to_vec(&resp).unwrap())
+                                            .await;
                                         return;
                                     }
-                                }
+                                },
                                 None => None,
                             };
+
+                            let new_peer = config::PeerConfig {
+                                public_key: parsed_pub_key,
+                                allowed_ips: parsed_allowed_ips,
+                                endpoint: parsed_endpoint,
+                                proxy_port,
+                            };
+
+                            let (table_off, tproxy_port) = {
+                                let st = state.read().unwrap();
+                                (
+                                    st.config
+                                        .interface
+                                        .table
+                                        .as_deref()
+                                        .map(|t| t.eq_ignore_ascii_case("off"))
+                                        .unwrap_or(false),
+                                    st.config.interface.tproxy_port,
+                                )
+                            };
+                            if !table_off {
+                                if let Err(e) = setup_peer_routes_and_tproxy(
+                                    &new_peer,
+                                    tproxy_port,
+                                    &interface_name,
+                                ) {
+                                    let resp = ApiResponse {
+                                        status: "Error".to_string(),
+                                        message: Some(format!(
+                                            "Failed to sync peer routes/tproxy: {}",
+                                            e
+                                        )),
+                                    };
+                                    let _ =
+                                        stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                    return;
+                                }
+                            }
+                            sync_peer_to_kernel(&interface_name, &new_peer);
 
                             // 1. 动态生成并缓存 Diffie-Hellman 共享密钥
                             let peer_pub = PublicKey::from(parsed_pub_key);
                             let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
-                            peer_secrets.lock().unwrap().insert(parsed_pub_key, shared_secret);
+                            peer_secrets
+                                .lock()
+                                .unwrap()
+                                .insert(parsed_pub_key, shared_secret);
 
                             // 2. 动态更新 AllowedIPs 路由树与 peers 配置
                             {
                                 let mut st = state.write().unwrap();
                                 st.config.peers.retain(|p| p.public_key != parsed_pub_key);
-                                st.config.peers.push(config::PeerConfig {
-                                    public_key: parsed_pub_key,
-                                    allowed_ips: parsed_allowed_ips,
-                                    endpoint: parsed_endpoint,
-                                    proxy_port,
-                                });
+                                st.config.peers.push(new_peer);
                                 // 热重构 Trie
                                 let mut new_router = AllowedIPsRouter::new();
                                 for p in &st.config.peers {
@@ -1075,18 +1543,53 @@ async fn main() {
                                 st.router = new_router;
                             }
 
-                            let resp = ApiResponse { status: "Ok".to_string(), message: None };
+                            let resp = ApiResponse {
+                                status: "Ok".to_string(),
+                                message: None,
+                            };
                             let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                         }
                         CommandInput::RemovePeer { public_key } => {
                             let parsed_pub_key = match decode_base64_32(&public_key) {
                                 Ok(k) => k,
                                 Err(e) => {
-                                    let resp = ApiResponse { status: "Error".to_string(), message: Some(format!("Invalid public key: {}", e)) };
-                                    let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                    let resp = ApiResponse {
+                                        status: "Error".to_string(),
+                                        message: Some(format!("Invalid public key: {}", e)),
+                                    };
+                                    let _ =
+                                        stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                                     return;
                                 }
                             };
+
+                            let (removed_peer, table_off, tproxy_port) = {
+                                let st = state.read().unwrap();
+                                (
+                                    st.config
+                                        .peers
+                                        .iter()
+                                        .find(|p| p.public_key == parsed_pub_key)
+                                        .cloned(),
+                                    st.config
+                                        .interface
+                                        .table
+                                        .as_deref()
+                                        .map(|t| t.eq_ignore_ascii_case("off"))
+                                        .unwrap_or(false),
+                                    st.config.interface.tproxy_port,
+                                )
+                            };
+                            if let Some(peer) = &removed_peer {
+                                if !table_off {
+                                    cleanup_peer_routes_and_tproxy(
+                                        peer,
+                                        tproxy_port,
+                                        &interface_name,
+                                    );
+                                }
+                            }
+                            remove_peer_from_kernel(&interface_name, parsed_pub_key);
 
                             // 1. 动态移除 Shared Secret
                             peer_secrets.lock().unwrap().remove(&parsed_pub_key);
@@ -1105,7 +1608,10 @@ async fn main() {
                                 st.router = new_router;
                             }
 
-                            let resp = ApiResponse { status: "Ok".to_string(), message: None };
+                            let resp = ApiResponse {
+                                status: "Ok".to_string(),
+                                message: None,
+                            };
                             let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                         }
                     }
@@ -1119,7 +1625,10 @@ async fn main() {
         log::info!("         STARTING GATEWAY IN [ SERVER MODE ]         ");
         log::info!("------------------------------------------------------");
 
-        let listen_control_port = config.interface.listen_control_port.expect("Missing ListenControlPort for Server mode");
+        let listen_control_port = config
+            .interface
+            .listen_control_port
+            .expect("Missing ListenControlPort for Server mode");
         let session_cache = Arc::new(Mutex::new(HashMap::new()));
 
         // 启动用户态独立公网控制通道协商服务器 (传递动态 peer_secrets 哈希表)
@@ -1139,65 +1648,89 @@ async fn main() {
         });
 
         // 启动用户态多路复用平行 QUIC 物理池接收服务器
-        let quic_server = QuicPoolServer::new(
-            config.quic_pool.listen_ports.clone(),
-            session_cache.clone(),
-        );
+        let quic_server =
+            QuicPoolServer::new(config.quic_pool.listen_ports.clone(), session_cache.clone());
         // 删除多余的锁操作（shared_quic_registry 与 server 内部 registry 已通过 run_with_registry 共享）
         let telemetry_for_handler = telemetry_registry.clone();
         let shared_reg_for_server = shared_quic_registry.clone();
         let stream_handler_limit = Arc::new(tokio::sync::Semaphore::new(MAX_QUIC_STREAM_HANDLERS));
-        let handler = Arc::new(move |client_pub: [u8; 32], mut send_mux: quinn::SendStream, mut recv_mux: quinn::RecvStream, conn_stat: Arc<quic_pool::QuicConnStats>| {
-            let permit = match stream_handler_limit.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    log::warn!("QUIC stream handler limit reached; rejecting stream for peer {:?}", client_pub);
-                    return;
-                }
-            };
-            let stats = telemetry_for_handler.get_or_create(client_pub);
-            tokio::spawn(async move {
-                let _permit = permit;
-                let target_addr = match timeout(Duration::from_secs(5), read_target_addr(&mut recv_mux)).await {
-                    Ok(Ok(addr)) => addr,
-                    Ok(Err(e)) => {
-                        log::debug!("Failed to read target proxy address header: {}", e);
-                        return;
-                    }
+        let handler = Arc::new(
+            move |client_pub: [u8; 32],
+                  mut send_mux: quinn::SendStream,
+                  mut recv_mux: quinn::RecvStream,
+                  conn_stat: Arc<quic_pool::QuicConnStats>| {
+                let permit = match stream_handler_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
                     Err(_) => {
-                        log::debug!("Timed out reading target proxy address header");
+                        log::warn!(
+                            "QUIC stream handler limit reached; rejecting stream for peer {:?}",
+                            client_pub
+                        );
                         return;
                     }
                 };
-                
-                log::info!("Establishing userspace TCP proxy bridge to target destination: {}", target_addr);
-                match tokio::net::TcpStream::connect(target_addr).await {
-                    Ok(tcp_socket) => {
-                        if let Err(e) = set_tcp_keepalive(&tcp_socket) {
-                            log::warn!("Failed to set TCP Keep-Alive on target TCP stream: {}", e);
+                let stats = telemetry_for_handler.get_or_create(client_pub);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let target_addr = match timeout(
+                        Duration::from_secs(5),
+                        read_target_addr(&mut recv_mux),
+                    )
+                    .await
+                    {
+                        Ok(Ok(addr)) => addr,
+                        Ok(Err(e)) => {
+                            log::debug!("Failed to read target proxy address header: {}", e);
+                            return;
                         }
-                        if send_mux.write_all(&[1]).await.is_ok() {
-                            relay::relay_connections_with_conn_stat(
-                                tcp_socket, send_mux, recv_mux, stats, conn_stat
-                            ).await;
+                        Err(_) => {
+                            log::debug!("Timed out reading target proxy address header");
+                            return;
                         }
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to establish TCP connection to target {}: {}", target_addr, e);
-                        let _ = send_mux.write_all(&[0]).await;
-                    }
-                }
-            });
-        });
+                    };
 
-        if let Err(e) = quic_server.run_with_registry(handler, shared_reg_for_server).await {
+                    log::info!(
+                        "Establishing userspace TCP proxy bridge to target destination: {}",
+                        target_addr
+                    );
+                    match tokio::net::TcpStream::connect(target_addr).await {
+                        Ok(tcp_socket) => {
+                            if let Err(e) = set_tcp_keepalive(&tcp_socket) {
+                                log::warn!(
+                                    "Failed to set TCP Keep-Alive on target TCP stream: {}",
+                                    e
+                                );
+                            }
+                            if send_mux.write_all(&[1]).await.is_ok() {
+                                relay::relay_connections_with_conn_stat(
+                                    tcp_socket, send_mux, recv_mux, stats, conn_stat,
+                                )
+                                .await;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to establish TCP connection to target {}: {}",
+                                target_addr,
+                                e
+                            );
+                            let _ = send_mux.write_all(&[0]).await;
+                        }
+                    }
+                });
+            },
+        );
+
+        if let Err(e) = quic_server
+            .run_with_registry(handler, shared_reg_for_server)
+            .await
+        {
             log::error!("QUIC Pool Server error: {}", e);
             std::process::exit(1);
         }
 
         wait_for_shutdown().await;
         control_task.abort();
-
     } else {
         log::info!("------------------------------------------------------");
         log::info!("         STARTING GATEWAY IN [ CLIENT MODE ]         ");
@@ -1209,17 +1742,21 @@ async fn main() {
         }
 
         let peer = &config.peers[0];
-        let endpoint = peer.endpoint.expect("Error: Endpoint required for Client mode");
-        let proxy_port = peer.proxy_port.expect("Error: ProxyPort required for Client mode");
+        let endpoint = peer
+            .endpoint
+            .expect("Error: Endpoint required for Client mode");
+        let proxy_port = peer
+            .proxy_port
+            .expect("Error: ProxyPort required for Client mode");
 
         let control_addr = SocketAddr::new(endpoint.ip(), proxy_port);
-        let control_client = ControlClient::new(
-            config.interface.private_key,
-            peer.public_key,
-            control_addr,
-        );
+        let control_client =
+            ControlClient::new(config.interface.private_key, peer.public_key, control_addr);
 
-        log::info!("Initiating userspace ECDH + HMAC-SHA256 control handshake to {}", control_addr);
+        log::info!(
+            "Initiating userspace ECDH + HMAC-SHA256 control handshake to {}",
+            control_addr
+        );
         let (control_response, _control_socket) = match control_client.negotiate_config().await {
             Ok(res) => res,
             Err(e) => {
@@ -1233,7 +1770,8 @@ async fn main() {
             quic_endpoints.push(SocketAddr::new(endpoint.ip(), port));
         }
 
-        let client_pub_derived = PublicKey::from(&StaticSecret::from(config.interface.private_key)).to_bytes();
+        let client_pub_derived =
+            PublicKey::from(&StaticSecret::from(config.interface.private_key)).to_bytes();
         let quic_pool_client = Arc::new(QuicPoolClient::new(
             client_pub_derived,
             control_response.session_psk,
@@ -1241,13 +1779,19 @@ async fn main() {
         ));
 
         if let Err(e) = quic_pool_client.start_pool().await {
-            log::error!("Failed to establish physical parallel QUIC connection pool: {}", e);
+            log::error!(
+                "Failed to establish physical parallel QUIC connection pool: {}",
+                e
+            );
             std::process::exit(1);
         }
 
         quic_pool_client.clone().start_health_checker();
 
-        let tproxy_port = config.interface.tproxy_port.expect("Error: TProxyPort required for Client mode");
+        let tproxy_port = config
+            .interface
+            .tproxy_port
+            .expect("Error: TProxyPort required for Client mode");
         let tproxy_v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), tproxy_port);
         let tproxy_v4_listener = match tproxy::create_tproxy_listener(tproxy_v4_addr) {
             Ok(l) => l,
@@ -1260,13 +1804,19 @@ async fn main() {
         let tproxy_v6_listener = match tproxy::create_tproxy_listener(tproxy_v6_addr) {
             Ok(l) => Some(l),
             Err(e) => {
-                log::warn!("IPv6 TPROXY Listener bind FAILED: {}. IPv4 interception remains active.", e);
+                log::warn!(
+                    "IPv6 TPROXY Listener bind FAILED: {}. IPv4 interception remains active.",
+                    e
+                );
                 None
             }
         };
 
         log::info!("------------------------------------------------------");
-        log::info!("  TPROXY TCP transparent intercept running on port {} ", tproxy_port);
+        log::info!(
+            "  TPROXY TCP transparent intercept running on port {} ",
+            tproxy_port
+        );
         log::info!("  All TCP streams routed to AllowedIPs will offload to ");
         log::info!("  Parallel Userspace QUIC Connection Pool bypass L3 !  ");
         log::info!("------------------------------------------------------");
@@ -1305,36 +1855,62 @@ async fn main() {
 
 // CLI 遥测查看实用工具实现
 async fn run_cli_stats() -> Result<(), String> {
-    let mut stream = tokio::net::UnixStream::connect("/tmp/new_proxy_api.sock").await
-        .map_err(|e| format!("Cannot connect to gateway API socket. Gateway not running? Error: {}", e))?;
-    
+    let socket_path =
+        std::env::var("NEW_PROXY_API_SOCKET").unwrap_or_else(|_| api_socket_path("tun0"));
+    let mut stream = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .map_err(|e| {
+            format!(
+                "Cannot connect to gateway API socket. Gateway not running? Error: {}",
+                e
+            )
+        })?;
+
     // 发起 Stats 命令 JSON
     let cmd = CommandInput::Stats;
     let json_bytes = serde_json::to_vec(&cmd).unwrap();
     let _ = stream.write_all(&json_bytes).await;
     let _ = stream.shutdown().await;
-    
+
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await
+    stream
+        .read_to_end(&mut buf)
+        .await
         .map_err(|e| format!("Failed to read stats from socket: {}", e))?;
-    
-    let stats: Vec<UnifiedTelemetry> = serde_json::from_slice(&buf)
-        .map_err(|e| format!("Failed to parse JSON stats: {}", e))?;
-    
+
+    let stats: Vec<UnifiedTelemetry> =
+        serde_json::from_slice(&buf).map_err(|e| format!("Failed to parse JSON stats: {}", e))?;
+
     println!("\n+-------------------------------------------------------------------------------------------------------------------------------------------+");
     println!("|                                             HYBRID SECURE PROXY GATEWAY TELEMETRY                                                         |");
     println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
-    println!("| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |", "Peer Public Key", "Source", "L3 Transfer (RX/TX)", "L4 Transfer (RX/TX)", "Handshake (ago)", "Active Strm");
+    println!(
+        "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |",
+        "Peer Public Key",
+        "Source",
+        "L3 Transfer (RX/TX)",
+        "L4 Transfer (RX/TX)",
+        "Handshake (ago)",
+        "Active Strm"
+    );
     println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
-    
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
     for s in stats {
-        let l3_str = format!("{}/{}", format_bytes(s.l3_rx_bytes), format_bytes(s.l3_tx_bytes));
-        let l4_str = format!("{}/{}", format_bytes(s.l4_rx_bytes), format_bytes(s.l4_tx_bytes));
+        let l3_str = format!(
+            "{}/{}",
+            format_bytes(s.l3_rx_bytes),
+            format_bytes(s.l3_tx_bytes)
+        );
+        let l4_str = format!(
+            "{}/{}",
+            format_bytes(s.l4_rx_bytes),
+            format_bytes(s.l4_tx_bytes)
+        );
         let handshake_str = if s.last_handshake == 0 {
             "never".to_string()
         } else if now > s.last_handshake {
@@ -1342,15 +1918,10 @@ async fn run_cli_stats() -> Result<(), String> {
         } else {
             "0s".to_string()
         };
-        
+
         println!(
             "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |",
-            s.public_key,
-            s.source,
-            l3_str,
-            l4_str,
-            handshake_str,
-            s.active_streams
+            s.public_key, s.source, l3_str, l4_str, handshake_str, s.active_streams
         );
     }
     println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
@@ -1450,8 +2021,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_main_uds_api_server() {
-        use tokio::net::UnixListener;
         use std::fs;
+        use tokio::net::UnixListener;
 
         let test_uds_path = "/tmp/test_main_api.sock";
         let _ = fs::remove_file(test_uds_path);
@@ -1492,7 +2063,8 @@ mod tests {
         }));
         let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
         let server_secret = StaticSecret::from(config.interface.private_key);
-        let shared_quic_registry: quic_pool::PeerConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let shared_quic_registry: quic_pool::PeerConnRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // 2. 启动 UDS API 模拟服务端
         let _telemetry_clone = telemetry_registry.clone();
@@ -1531,24 +2103,41 @@ mod tests {
                             quic_connections: vec![],
                             source: "both".to_string(),
                         }];
-                        let _ = stream.write_all(&serde_json::to_vec(&response).unwrap()).await;
+                        let _ = stream
+                            .write_all(&serde_json::to_vec(&response).unwrap())
+                            .await;
                     }
                     CommandInput::Dump => {
                         let response = "mock_dump_line\n";
                         let _ = stream.write_all(response.as_bytes()).await;
                     }
-                    CommandInput::AddPeer { public_key, allowed_ips: _, endpoint: _, proxy_port: _ } => {
+                    CommandInput::AddPeer {
+                        public_key,
+                        allowed_ips: _,
+                        endpoint: _,
+                        proxy_port: _,
+                    } => {
                         let parsed_pub_key = decode_base64_32(&public_key).unwrap();
                         let peer_pub = PublicKey::from(parsed_pub_key);
-                        let shared_secret = server_secret_clone.diffie_hellman(&peer_pub).to_bytes();
-                        peer_secrets_clone.lock().unwrap().insert(parsed_pub_key, shared_secret);
+                        let shared_secret =
+                            server_secret_clone.diffie_hellman(&peer_pub).to_bytes();
+                        peer_secrets_clone
+                            .lock()
+                            .unwrap()
+                            .insert(parsed_pub_key, shared_secret);
 
-                        let resp = ApiResponse { status: "ok".to_string(), message: None };
+                        let resp = ApiResponse {
+                            status: "ok".to_string(),
+                            message: None,
+                        };
                         let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                     }
                     CommandInput::RemovePeer { public_key } => {
                         let _ = decode_base64_32(&public_key).unwrap();
-                        let resp = ApiResponse { status: "ok".to_string(), message: None };
+                        let resp = ApiResponse {
+                            status: "ok".to_string(),
+                            message: None,
+                        };
                         let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                     }
                 }
@@ -1560,7 +2149,9 @@ mod tests {
 
         // 3. 客户端发送 Stats 请求
         {
-            let mut stream = tokio::net::UnixStream::connect(test_uds_path).await.unwrap();
+            let mut stream = tokio::net::UnixStream::connect(test_uds_path)
+                .await
+                .unwrap();
             let cmd = CommandInput::Stats;
             let json_bytes = serde_json::to_vec(&cmd).unwrap();
             stream.write_all(&json_bytes).await.unwrap();
@@ -1579,8 +2170,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_main_uds_add_remove_peer() {
-        use tokio::net::UnixListener;
         use std::fs;
+        use tokio::net::UnixListener;
 
         let test_uds_path = "/tmp/test_main_api_add_remove.sock";
         let _ = fs::remove_file(test_uds_path);
@@ -1608,20 +2199,34 @@ mod tests {
 
                     let cmd: CommandInput = serde_json::from_slice(&buf).unwrap();
                     match cmd {
-                        CommandInput::AddPeer { public_key, allowed_ips: _, endpoint: _, proxy_port: _ } => {
+                        CommandInput::AddPeer {
+                            public_key,
+                            allowed_ips: _,
+                            endpoint: _,
+                            proxy_port: _,
+                        } => {
                             let parsed_pub_key = decode_base64_32(&public_key).unwrap();
                             let peer_pub = PublicKey::from(parsed_pub_key);
                             let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
-                            peer_secrets.lock().unwrap().insert(parsed_pub_key, shared_secret);
+                            peer_secrets
+                                .lock()
+                                .unwrap()
+                                .insert(parsed_pub_key, shared_secret);
 
-                            let resp = ApiResponse { status: "ok".to_string(), message: None };
+                            let resp = ApiResponse {
+                                status: "ok".to_string(),
+                                message: None,
+                            };
                             let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                         }
                         CommandInput::RemovePeer { public_key } => {
                             let parsed_pub_key = decode_base64_32(&public_key).unwrap();
                             peer_secrets.lock().unwrap().remove(&parsed_pub_key);
 
-                            let resp = ApiResponse { status: "ok".to_string(), message: None };
+                            let resp = ApiResponse {
+                                status: "ok".to_string(),
+                                message: None,
+                            };
                             let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                         }
                         _ => {}
@@ -1634,7 +2239,9 @@ mod tests {
 
         // AddPeer
         {
-            let mut stream = tokio::net::UnixStream::connect(test_uds_path).await.unwrap();
+            let mut stream = tokio::net::UnixStream::connect(test_uds_path)
+                .await
+                .unwrap();
             let cmd = CommandInput::AddPeer {
                 public_key: encode_base64_32(&[3u8; 32]),
                 allowed_ips: vec!["10.0.0.3/32".to_string()],
@@ -1653,7 +2260,9 @@ mod tests {
 
         // RemovePeer
         {
-            let mut stream = tokio::net::UnixStream::connect(test_uds_path).await.unwrap();
+            let mut stream = tokio::net::UnixStream::connect(test_uds_path)
+                .await
+                .unwrap();
             let cmd = CommandInput::RemovePeer {
                 public_key: encode_base64_32(&[3u8; 32]),
             };
@@ -1675,7 +2284,7 @@ mod tests {
     async fn test_peer_synchronization() {
         let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
         let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
-        
+
         let config = GatewayConfig {
             interface: config::InterfaceConfig {
                 private_key: server_secret.to_bytes(),
@@ -1700,7 +2309,7 @@ mod tests {
                     allowed_ips: vec!["10.0.2.0/24".parse().unwrap()],
                     endpoint: Some("127.0.0.1:12346".parse().unwrap()),
                     proxy_port: None,
-                }
+                },
             ],
             quic_pool: config::QUICPoolConfig {
                 public_ipv4: None,
@@ -1708,51 +2317,73 @@ mod tests {
                 listen_ports: vec![],
             },
         };
-        
+
         let initial_router = AllowedIPsRouter::new();
         let gateway_state = Arc::new(std::sync::RwLock::new(GatewayState {
             config,
             router: initial_router,
         }));
-        
+
         let mut l3_stats = HashMap::new();
-        l3_stats.insert([1u8; 32], WgPeerStats {
-            allowed_ips: vec!["10.0.1.0/24".to_string()],
-            endpoint: Some("127.0.0.1:12345".to_string()),
-            rx_bytes: 100,
-            tx_bytes: 200,
-            last_handshake: 0,
-        });
-        l3_stats.insert([3u8; 32], WgPeerStats {
-            allowed_ips: vec!["10.0.3.0/24".to_string()],
-            endpoint: Some("127.0.0.1:12347".to_string()),
-            rx_bytes: 300,
-            tx_bytes: 400,
-            last_handshake: 0,
-        });
-        
+        l3_stats.insert(
+            [1u8; 32],
+            WgPeerStats {
+                allowed_ips: vec!["10.0.1.0/24".to_string()],
+                endpoint: Some("127.0.0.1:12345".to_string()),
+                rx_bytes: 100,
+                tx_bytes: 200,
+                last_handshake: 0,
+            },
+        );
+        l3_stats.insert(
+            [3u8; 32],
+            WgPeerStats {
+                allowed_ips: vec!["10.0.3.0/24".to_string()],
+                endpoint: Some("127.0.0.1:12347".to_string()),
+                rx_bytes: 300,
+                tx_bytes: 400,
+                last_handshake: 0,
+            },
+        );
+
         let sources = sync_kernel_and_proxy_state(
             "tun_test_sync",
             &gateway_state,
             &peer_secrets,
             &server_secret,
             &l3_stats,
-        ).await;
-        
+        )
+        .await;
+
         assert_eq!(sources.get(&[1u8; 32]).unwrap(), "both");
         assert_eq!(sources.get(&[2u8; 32]).unwrap(), "proxy");
         assert_eq!(sources.get(&[3u8; 32]).unwrap(), "kernel");
-        
+
         let st = gateway_state.read().unwrap();
         let peer3 = st.config.peers.iter().find(|p| p.public_key == [3u8; 32]);
-        assert!(peer3.is_some(), "Peer [3u8; 32] should be synced to proxy config");
+        assert!(
+            peer3.is_some(),
+            "Peer [3u8; 32] should be synced to proxy config"
+        );
         let peer3_config = peer3.unwrap();
-        assert_eq!(peer3_config.allowed_ips[0], "10.0.3.0/24".parse::<ipnet::IpNet>().unwrap());
-        
-        let lookup_res = st.router.longest_match(std::net::IpAddr::V4("10.0.3.5".parse().unwrap()));
-        assert_eq!(lookup_res, Some([3u8; 32]), "Router should be able to resolve IP to [3u8; 32]");
-        
+        assert_eq!(
+            peer3_config.allowed_ips[0],
+            "10.0.3.0/24".parse::<ipnet::IpNet>().unwrap()
+        );
+
+        let lookup_res = st
+            .router
+            .longest_match(std::net::IpAddr::V4("10.0.3.5".parse().unwrap()));
+        assert_eq!(
+            lookup_res,
+            Some([3u8; 32]),
+            "Router should be able to resolve IP to [3u8; 32]"
+        );
+
         let secrets = peer_secrets.lock().unwrap();
-        assert!(secrets.contains_key(&[3u8; 32]), "Peer [3u8; 32] secret should be computed");
+        assert!(
+            secrets.contains_key(&[3u8; 32]),
+            "Peer [3u8; 32] secret should be computed"
+        );
     }
 }

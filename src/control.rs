@@ -1,15 +1,15 @@
+use hmac::{Hmac, Mac};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::{Arc, Mutex};
-use socket2::{Socket, Domain, Type, Protocol};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
-use rand::Rng;
-use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_CONTROL_WORKERS: usize = 1024;
@@ -108,25 +108,27 @@ impl ControlClient {
 
         // 2. 绑定本地 UDP 套接字 (根据对端 Endpoint IP 协议簇绑定，以在不同内核默认值下完美解决 IPV6_V6ONLY 限制)
         let socket = if self.server_control_endpoint.is_ipv6() {
-            UdpSocket::bind("[::]:0").await
+            UdpSocket::bind("[::]:0")
+                .await
                 .map_err(|e| format!("Failed to bind local IPv6 UDP socket: {}", e))?
         } else {
-            UdpSocket::bind("0.0.0.0:0").await
+            UdpSocket::bind("0.0.0.0:0")
+                .await
                 .map_err(|e| format!("Failed to bind local IPv4 UDP socket: {}", e))?
         };
 
         // 3. 构建 Request
         let mut client_nonce = [0u8; 16];
         rand::thread_rng().fill(&mut client_nonce);
-        
+
         let client_pub_derived = PublicKey::from(&client_secret).to_bytes();
         let req = ControlRequest {
             client_nonce,
             client_public_key: client_pub_derived,
         };
 
-        let payload = serde_json::to_vec(&req)
-            .map_err(|e| format!("Serialization error: {}", e))?;
+        let payload =
+            serde_json::to_vec(&req).map_err(|e| format!("Serialization error: {}", e))?;
         let mac = calculate_mac(&shared_secret, &payload);
 
         let signed_packet = SignedPacket { payload, mac };
@@ -139,17 +141,27 @@ impl ControlClient {
         loop {
             attempts += 1;
             if attempts > 4 {
-                return Err("Failed to negotiate with server: Control connection timeout".to_string());
+                return Err(
+                    "Failed to negotiate with server: Control connection timeout".to_string(),
+                );
             }
 
-            log::info!("Sending control negotiation packet (Attempt {}/4) to {}", attempts, self.server_control_endpoint);
-            if let Err(e) = socket.send_to(&packet_bytes, self.server_control_endpoint).await {
+            log::info!(
+                "Sending control negotiation packet (Attempt {}/4) to {}",
+                attempts,
+                self.server_control_endpoint
+            );
+            if let Err(e) = socket
+                .send_to(&packet_bytes, self.server_control_endpoint)
+                .await
+            {
                 log::warn!("Failed to send UDP packet: {}, retrying...", e);
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
 
-            match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await
+            {
                 Ok(Ok((len, src_addr))) => {
                     if src_addr != self.server_control_endpoint {
                         continue; // 过滤非服务端的恶意报文
@@ -170,7 +182,11 @@ impl ControlClient {
                     let wire: ControlResponseWire = serde_json::from_slice(&signed_resp.payload)
                         .map_err(|e| format!("Failed to parse response: {}", e))?;
                     let resp = ControlResponse {
-                        session_psk: derive_session_psk(&shared_secret, &client_nonce, &wire.server_nonce),
+                        session_psk: derive_session_psk(
+                            &shared_secret,
+                            &client_nonce,
+                            &wire.server_nonce,
+                        ),
                         server_nonce: wire.server_nonce,
                         port_pool: wire.port_pool,
                         public_ipv4: wire.public_ipv4,
@@ -262,30 +278,37 @@ impl ControlServer {
             Ok(sock) => {
                 let _ = sock.set_only_v6(false);
                 let _ = sock.set_reuse_address(true);
-                let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), self.listen_port);
+                let bind_addr =
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), self.listen_port);
                 if sock.bind(&bind_addr.into()).is_ok() {
                     let std_sock: StdUdpSocket = sock.into();
-                    std_sock.set_nonblocking(true).map_err(|e| format!("Failed to set nonblocking: {}", e))?;
-                    UdpSocket::from_std(std_sock).map_err(|e| format!("Failed to convert to Tokio UdpSocket: {}", e))?
+                    std_sock
+                        .set_nonblocking(true)
+                        .map_err(|e| format!("Failed to set nonblocking: {}", e))?;
+                    UdpSocket::from_std(std_sock)
+                        .map_err(|e| format!("Failed to convert to Tokio UdpSocket: {}", e))?
                 } else {
-                    UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port)).await
+                    UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port))
+                        .await
                         .map_err(|e| format!("Server failed to bind control UDP port: {}", e))?
                 }
             }
-            Err(_) => UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port)).await
-                .map_err(|e| format!("Server failed to bind control UDP port: {}", e))?
+            Err(_) => UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port))
+                .await
+                .map_err(|e| format!("Server failed to bind control UDP port: {}", e))?,
         };
 
         let socket = Arc::new(socket);
         let worker_limit = Arc::new(Semaphore::new(MAX_CONTROL_WORKERS));
-        log::info!("Userspace Control Server listening on UDP port {}", self.listen_port);
+        log::info!(
+            "Userspace Control Server listening on UDP port {}",
+            self.listen_port
+        );
 
         loop {
             let mut buf = [0u8; 2048];
             let (len, client_addr) = match socket.recv_from(&mut buf).await {
-                Ok((len, src_addr)) => {
-                    (len, src_addr)
-                }
+                Ok((len, src_addr)) => (len, src_addr),
                 Err(e) => {
                     log::warn!("Receive error: {}", e);
                     continue;
@@ -293,7 +316,11 @@ impl ControlServer {
             };
 
             if len == 0 || buf[0] != b'{' || buf[len - 1] != b'}' {
-                log::debug!("Fast discard obviously invalid control packet from {}, len={}", client_addr, len);
+                log::debug!(
+                    "Fast discard obviously invalid control packet from {}, len={}",
+                    client_addr,
+                    len
+                );
                 continue;
             }
 
@@ -307,7 +334,10 @@ impl ControlServer {
             let permit = match worker_limit.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    log::warn!("Control plane worker limit reached; dropping packet from {}", client_addr);
+                    log::warn!(
+                        "Control plane worker limit reached; dropping packet from {}",
+                        client_addr
+                    );
                     continue;
                 }
             };
@@ -324,15 +354,6 @@ impl ControlServer {
                     Err(_) => return,
                 };
 
-                // 2. 快速重放校验：检查 client_nonce 是否已被使用
-                {
-                    let mut cache = nonce_cache_clone.lock().unwrap();
-                    if !cache.insert(req.client_nonce) {
-                        log::warn!("Replayed ControlRequest detected from peer: {:?}, dropping request.", req.client_public_key);
-                        return;
-                    }
-                }
-
                 // 1. 查找客户端共享密钥
                 let shared_secret = {
                     let guard = peer_secrets_clone.lock().unwrap();
@@ -341,7 +362,10 @@ impl ControlServer {
                 let shared_secret = match shared_secret {
                     Some(secret) => secret,
                     None => {
-                        log::warn!("Received connection request from unconfigured peer: {:?}", req.client_public_key);
+                        log::warn!(
+                            "Received connection request from unconfigured peer: {:?}",
+                            req.client_public_key
+                        );
                         return;
                     }
                 };
@@ -352,10 +376,23 @@ impl ControlServer {
                     return;
                 }
 
-                // 3. 生成 Session_PSK 与 Response
+                // 3. 已认证后再记录 nonce，避免未认证流量污染 replay cache。
+                {
+                    let mut cache = nonce_cache_clone.lock().unwrap();
+                    if !cache.insert(req.client_nonce) {
+                        log::warn!(
+                            "Replayed ControlRequest detected from peer: {:?}, dropping request.",
+                            req.client_public_key
+                        );
+                        return;
+                    }
+                }
+
+                // 4. 生成 Session_PSK 与 Response
                 let mut server_nonce = [0u8; 16];
                 rand::thread_rng().fill(&mut server_nonce);
-                let session_psk = derive_session_psk(&shared_secret, &req.client_nonce, &server_nonce);
+                let session_psk =
+                    derive_session_psk(&shared_secret, &req.client_nonce, &server_nonce);
 
                 // 更新用户态会话缓存
                 {
@@ -398,10 +435,10 @@ mod tests {
         let payload = b"Hello, Secure Control Plane!";
         let mac = calculate_mac(&key, payload);
         assert!(verify_mac(&key, payload, &mac));
-        
+
         // Test invalid payload
         assert!(!verify_mac(&key, b"Hello, Secure Control Plane? ", &mac));
-        
+
         // Test invalid key
         let mut bad_key = key;
         bad_key[0] = 0;
@@ -422,7 +459,10 @@ mod tests {
         let server_shared = server_secret.diffie_hellman(&client_pub).to_bytes();
 
         let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
-        peer_secrets.lock().unwrap().insert(client_pub.to_bytes(), server_shared);
+        peer_secrets
+            .lock()
+            .unwrap()
+            .insert(client_pub.to_bytes(), server_shared);
 
         let session_cache = Arc::new(Mutex::new(HashMap::new()));
 

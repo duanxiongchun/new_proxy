@@ -1,6 +1,6 @@
-use std::net::{TcpListener as StdTcpListener, SocketAddr};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use tokio::net::TcpListener as TokioTcpListener;
-use socket2::{Socket, Domain, Type, Protocol};
 
 #[cfg(target_os = "linux")]
 use libc;
@@ -8,11 +8,16 @@ use libc;
 // 创建支持 TPROXY (IP_TRANSPARENT) 的透明代理套接字监听器
 // 采用自适应优雅降级设计：当检测到无 CAP_NET_ADMIN 权限或非 Linux 系统时，降级为普通 TCP 监听器
 pub fn create_tproxy_listener(addr: SocketAddr) -> Result<TokioTcpListener, String> {
-    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .map_err(|e| format!("Failed to create socket: {}", e))?;
 
-    socket.set_reuse_address(true)
+    socket
+        .set_reuse_address(true)
         .map_err(|e| format!("Failed to set SO_REUSEADDR: {}", e))?;
 
     #[cfg(target_os = "linux")]
@@ -52,14 +57,17 @@ pub fn create_tproxy_listener(addr: SocketAddr) -> Result<TokioTcpListener, Stri
     }
 
     // 绑定物理端口与开启 TCP 监听
-    socket.bind(&addr.into())
+    socket
+        .bind(&addr.into())
         .map_err(|e| format!("Failed to bind TPROXY socket to {}: {}", addr, e))?;
 
-    socket.listen(1024)
+    socket
+        .listen(1024)
         .map_err(|e| format!("Failed to listen on TPROXY socket: {}", e))?;
 
     let std_listener: StdTcpListener = socket.into();
-    std_listener.set_nonblocking(true)
+    std_listener
+        .set_nonblocking(true)
         .map_err(|e| format!("Failed to set non-blocking on std TCP listener: {}", e))?;
 
     TokioTcpListener::from_std(std_listener)

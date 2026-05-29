@@ -1,10 +1,10 @@
+use crate::quic_pool::QuicConnStats;
+use quinn::{RecvStream, SendStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use quinn::{SendStream, RecvStream};
-use crate::quic_pool::QuicConnStats;
 
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -69,7 +69,15 @@ pub async fn relay_connections_with_conn_stat(
     conn_stat: Arc<QuicConnStats>,
 ) {
     let (tcp_read, tcp_write) = tcp_socket.into_split();
-    relay_connections_generic(tcp_read, tcp_write, quic_send, quic_recv, stats, Some(conn_stat)).await;
+    relay_connections_generic(
+        tcp_read,
+        tcp_write,
+        quic_send,
+        quic_recv,
+        stats,
+        Some(conn_stat),
+    )
+    .await;
 }
 
 pub async fn relay_connections_generic<TR, TW, QR, QW>(
@@ -186,10 +194,7 @@ mod tests {
         let data = b"hello world";
         let counter1 = Arc::new(AtomicU64::new(0));
         let counter2 = Arc::new(AtomicU64::new(0));
-        let mut reader = CountingReader::new(
-            &data[..],
-            vec![counter1.clone(), counter2.clone()],
-        );
+        let mut reader = CountingReader::new(&data[..], vec![counter1.clone(), counter2.clone()]);
         let mut buf = vec![0u8; 64];
         let n = reader.read(&mut buf).await.unwrap();
         assert_eq!(n, data.len());
@@ -223,7 +228,8 @@ mod tests {
                 quic_client_read,
                 stats_clone,
                 Some(conn_stat_clone),
-            ).await;
+            )
+            .await;
         });
 
         // 写入 TCP 数据

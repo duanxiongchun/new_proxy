@@ -1,5 +1,5 @@
-use std::net::IpAddr;
 use ipnet::IpNet;
+use std::net::IpAddr;
 
 #[derive(Default)]
 struct TrieNode<V> {
@@ -126,15 +126,33 @@ mod tests {
         router.insert(IpNet::from_str("2001:db8::/32").unwrap(), "PeerD");
 
         // 1. LPM 验证：同时命中的情况下，必须返回掩码更长、更精准的 PeerA (L32 优先于 L16)
-        assert_eq!(router.longest_match(IpAddr::from_str("192.168.1.55").unwrap()), Some("PeerA"));
-        assert_eq!(router.longest_match(IpAddr::from_str("192.168.2.1").unwrap()), Some("PeerB"));
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("192.168.1.55").unwrap()),
+            Some("PeerA")
+        );
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("192.168.2.1").unwrap()),
+            Some("PeerB")
+        );
 
         // 2. 精确主机匹配
-        assert_eq!(router.longest_match(IpAddr::from_str("8.8.8.8").unwrap()), Some("PeerC"));
-        assert_eq!(router.longest_match(IpAddr::from_str("8.8.8.9").unwrap()), None);
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("8.8.8.8").unwrap()),
+            Some("PeerC")
+        );
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("8.8.8.9").unwrap()),
+            None
+        );
 
         // 3. IPv6 匹配
-        assert_eq!(router.longest_match(IpAddr::from_str("2001:db8::ffff").unwrap()), Some("PeerD"));
-        assert_eq!(router.longest_match(IpAddr::from_str("2001:db9::1").unwrap()), None);
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("2001:db8::ffff").unwrap()),
+            Some("PeerD")
+        );
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("2001:db9::1").unwrap()),
+            None
+        );
     }
 }

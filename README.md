@@ -147,14 +147,14 @@ sudo target/release/new_proxy -config conf/client.conf
 客户端需要把命中 `AllowedIPs` 的 TCP 流量导入本地 TPROXY 端口。示例：
 
 ```bash
-sudo ip rule add fwmark 1 lookup 100
-sudo ip route add local 0.0.0.0/0 dev lo table 100
+sudo ip rule add fwmark <derived_mark> lookup <derived_table>
+sudo ip route add local 0.0.0.0/0 dev lo table <derived_table>
 sudo iptables -t mangle -A PREROUTING \
   -p tcp -d 10.0.0.1 \
-  -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
+  -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark <derived_mark>/0xffffffff
 ```
 
-实际部署时应按业务网段替换 `10.0.0.1`。
+`Table = auto` 时程序会按接口名稳定派生 mark/table 并自动配置这些规则；手工配置时应按业务网段替换 `10.0.0.1`，并确保 mark/table 与实例一致。
 
 ## 系统服务管理 (Systemd)
 
@@ -194,31 +194,31 @@ sudo systemctl stop new_proxy@tun0
 查看服务端聚合遥测：
 
 ```bash
-target/release/new-proxy-cli show
+target/release/new-proxy-cli --interface tun0 show
 ```
 
 查看客户端聚合遥测：
 
 ```bash
-target/release/new-proxy-cli --client show
+target/release/new-proxy-cli --interface client show
 ```
 
 输出机器可读 dump：
 
 ```bash
-target/release/new-proxy-cli dump
+target/release/new-proxy-cli --interface tun0 dump
 ```
 
 动态添加 Peer：
 
 ```bash
-target/release/new-proxy-cli add-peer <public_key> <allowed_ips> [endpoint] [proxy_port]
+target/release/new-proxy-cli --interface tun0 add-peer <public_key> <allowed_ips> [endpoint] [proxy_port]
 ```
 
 动态删除 Peer：
 
 ```bash
-target/release/new-proxy-cli remove-peer <public_key>
+target/release/new-proxy-cli --interface tun0 remove-peer <public_key>
 ```
 
 ## 测试

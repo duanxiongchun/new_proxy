@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::io::{Read, BufWriter};
+use std::io::{BufWriter, Read};
 use std::net::Shutdown;
-use serde::{Serialize, Deserialize};
+use std::os::unix::net::UnixStream;
 
 // 每条物理 QUIC 连接的统计快照（与 quic_pool::QuicConnSnapshot 字段完全对齐）
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -35,8 +35,15 @@ pub struct UnifiedTelemetry {
 pub enum CommandInput {
     Stats,
     Dump,
-    AddPeer { public_key: String, allowed_ips: Vec<String>, endpoint: Option<String>, proxy_port: Option<u16> },
-    RemovePeer { public_key: String },
+    AddPeer {
+        public_key: String,
+        allowed_ips: Vec<String>,
+        endpoint: Option<String>,
+        proxy_port: Option<u16>,
+    },
+    RemovePeer {
+        public_key: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -45,21 +52,35 @@ pub struct ApiResponse {
     pub message: Option<String>,
 }
 
-const DEFAULT_SERVER_UDS_PATH: &str = "/tmp/new_proxy_api.sock";
-const DEFAULT_CLIENT_UDS_PATH: &str = "/tmp/new_proxy_api_client.sock";
+const DEFAULT_SERVER_UDS_PATH: &str = "/run/new_proxy/tun0.sock";
+const DEFAULT_CLIENT_UDS_PATH: &str = "/run/new_proxy/client.sock";
+
+fn socket_path_for_interface(interface_name: &str) -> String {
+    format!("/run/new_proxy/{}.sock", interface_name)
+}
 
 fn connect_uds(path: &str) -> Result<UnixStream, String> {
-    UnixStream::connect(path)
-        .map_err(|e| format!("Cannot connect to daemon socket ({}): {}\n  → Is the gateway daemon running?", path, e))
+    UnixStream::connect(path).map_err(|e| {
+        format!(
+            "Cannot connect to daemon socket ({}): {}\n  → Is the gateway daemon running?",
+            path, e
+        )
+    })
 }
 
 fn send_command(path: &str, cmd: &CommandInput) -> Result<String, String> {
     let mut stream = connect_uds(path)?;
     let payload = serde_json::to_vec(cmd).unwrap();
-    stream.write_all(&payload).map_err(|e| format!("Write error: {}", e))?;
-    stream.shutdown(Shutdown::Write).map_err(|e| format!("Shutdown write error: {}", e))?;
+    stream
+        .write_all(&payload)
+        .map_err(|e| format!("Write error: {}", e))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("Shutdown write error: {}", e))?;
     let mut buf = String::new();
-    stream.read_to_string(&mut buf).map_err(|e| format!("Read error: {}", e))?;
+    stream
+        .read_to_string(&mut buf)
+        .map_err(|e| format!("Read error: {}", e))?;
     Ok(buf)
 }
 
@@ -97,15 +118,29 @@ fn fmt_handshake_ago(ts: u64) -> String {
     if secs < 60 {
         format!("{} second{} ago", secs, if secs == 1 { "" } else { "s" })
     } else if secs < 3600 {
-        let m = secs / 60; let s = secs % 60;
+        let m = secs / 60;
+        let s = secs % 60;
         if s == 0 {
             format!("{} minute{} ago", m, if m == 1 { "" } else { "s" })
         } else {
-            format!("{} minute{}, {} second{} ago", m, if m == 1 { "" } else { "s" }, s, if s == 1 { "" } else { "s" })
+            format!(
+                "{} minute{}, {} second{} ago",
+                m,
+                if m == 1 { "" } else { "s" },
+                s,
+                if s == 1 { "" } else { "s" }
+            )
         }
     } else {
-        let h = secs / 3600; let m = (secs % 3600) / 60;
-        format!("{} hour{}, {} minute{} ago", h, if h == 1 { "" } else { "s" }, m, if m == 1 { "" } else { "s" })
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!(
+            "{} hour{}, {} minute{} ago",
+            h,
+            if h == 1 { "" } else { "s" },
+            m,
+            if m == 1 { "" } else { "s" }
+        )
     }
 }
 
@@ -115,7 +150,11 @@ fn print_wg_style(peers: &[UnifiedTelemetry]) {
     let mut w = BufWriter::new(out.lock());
 
     writeln!(w, "interface: new-proxy").unwrap();
-    writeln!(w, "  mode: hybrid secure gateway (WireGuard L3 + QUIC L4 offload)").unwrap();
+    writeln!(
+        w,
+        "  mode: hybrid secure gateway (WireGuard L3 + QUIC L4 offload)"
+    )
+    .unwrap();
     writeln!(w, "  peers: {}", peers.len()).unwrap();
     writeln!(w).unwrap();
 
@@ -138,33 +177,62 @@ fn print_wg_style(peers: &[UnifiedTelemetry]) {
             writeln!(w, "  allowed ips: (none)").unwrap();
         }
 
-        writeln!(w, "  latest handshake: {}", fmt_handshake_ago(peer.last_handshake)).unwrap();
+        writeln!(
+            w,
+            "  latest handshake: {}",
+            fmt_handshake_ago(peer.last_handshake)
+        )
+        .unwrap();
 
         let total_rx = peer.l3_rx_bytes.saturating_add(peer.l4_rx_bytes);
         let total_tx = peer.l3_tx_bytes.saturating_add(peer.l4_tx_bytes);
-        writeln!(w, "  transfer: {} received, {} sent",
-            fmt_bytes(total_rx), fmt_bytes(total_tx)).unwrap();
-        writeln!(w, "  wireguard: {} received, {} sent",
-            fmt_bytes(peer.l3_rx_bytes), fmt_bytes(peer.l3_tx_bytes)).unwrap();
+        writeln!(
+            w,
+            "  transfer: {} received, {} sent",
+            fmt_bytes(total_rx),
+            fmt_bytes(total_tx)
+        )
+        .unwrap();
+        writeln!(
+            w,
+            "  wireguard: {} received, {} sent",
+            fmt_bytes(peer.l3_rx_bytes),
+            fmt_bytes(peer.l3_tx_bytes)
+        )
+        .unwrap();
 
         if peer.quic_connections.is_empty() && peer.l4_rx_bytes == 0 && peer.l4_tx_bytes == 0 {
             writeln!(w, "  quic: inactive").unwrap();
         } else {
             let conn_count = peer.quic_connections.len();
-            writeln!(w, "  quic: active, {} physical connection{}, {} active stream{}",
+            writeln!(
+                w,
+                "  quic: active, {} physical connection{}, {} active stream{}",
                 conn_count,
                 if conn_count == 1 { "" } else { "s" },
                 peer.active_streams,
-                if peer.active_streams == 1 { "" } else { "s" }).unwrap();
-            writeln!(w, "  quic transfer: {} received, {} sent",
-                fmt_bytes(peer.l4_rx_bytes), fmt_bytes(peer.l4_tx_bytes)).unwrap();
+                if peer.active_streams == 1 { "" } else { "s" }
+            )
+            .unwrap();
+            writeln!(
+                w,
+                "  quic transfer: {} received, {} sent",
+                fmt_bytes(peer.l4_rx_bytes),
+                fmt_bytes(peer.l4_tx_bytes)
+            )
+            .unwrap();
 
             for (i, conn) in peer.quic_connections.iter().enumerate() {
                 writeln!(w, "  quic connection {}:", i).unwrap();
                 writeln!(w, "    endpoint: {}", conn.remote_addr).unwrap();
                 writeln!(w, "    local port: {}", conn.local_port).unwrap();
-                writeln!(w, "    transfer: {} received, {} sent",
-                    fmt_bytes(conn.rx_bytes), fmt_bytes(conn.tx_bytes)).unwrap();
+                writeln!(
+                    w,
+                    "    transfer: {} received, {} sent",
+                    fmt_bytes(conn.rx_bytes),
+                    fmt_bytes(conn.tx_bytes)
+                )
+                .unwrap();
                 writeln!(w, "    active streams: {}", conn.active_streams).unwrap();
             }
         }
@@ -175,12 +243,10 @@ fn print_wg_style(peers: &[UnifiedTelemetry]) {
 
 pub fn run_cli_stats(socket_path: &str) {
     match send_command(socket_path, &CommandInput::Stats) {
-        Ok(json) => {
-            match serde_json::from_str::<Vec<UnifiedTelemetry>>(&json) {
-                Ok(peers) => print_wg_style(&peers),
-                Err(e) => eprintln!("Failed to parse gateway response: {}\nRaw: {}", e, json),
-            }
-        }
+        Ok(json) => match serde_json::from_str::<Vec<UnifiedTelemetry>>(&json) {
+            Ok(peers) => print_wg_style(&peers),
+            Err(e) => eprintln!("Failed to parse gateway response: {}\nRaw: {}", e, json),
+        },
         Err(e) => eprintln!("Error: {}", e),
     }
 }
@@ -192,21 +258,30 @@ pub fn run_cli_dump(socket_path: &str) {
     }
 }
 
-pub fn run_cli_add_peer(socket_path: &str, public_key: String, allowed_ips: Vec<String>, endpoint: Option<String>, proxy_port: Option<u16>) {
-    let cmd = CommandInput::AddPeer { public_key, allowed_ips, endpoint, proxy_port };
+pub fn run_cli_add_peer(
+    socket_path: &str,
+    public_key: String,
+    allowed_ips: Vec<String>,
+    endpoint: Option<String>,
+    proxy_port: Option<u16>,
+) {
+    let cmd = CommandInput::AddPeer {
+        public_key,
+        allowed_ips,
+        endpoint,
+        proxy_port,
+    };
     match send_command(socket_path, &cmd) {
-        Ok(json) => {
-            match serde_json::from_str::<ApiResponse>(&json) {
-                Ok(resp) => {
-                    if resp.status.eq_ignore_ascii_case("ok") {
-                        println!("Peer added successfully.");
-                    } else {
-                        eprintln!("Failed to add peer: {}", resp.message.unwrap_or_default());
-                    }
+        Ok(json) => match serde_json::from_str::<ApiResponse>(&json) {
+            Ok(resp) => {
+                if resp.status.eq_ignore_ascii_case("ok") {
+                    println!("Peer added successfully.");
+                } else {
+                    eprintln!("Failed to add peer: {}", resp.message.unwrap_or_default());
                 }
-                Err(_) => println!("{}", json),
             }
-        }
+            Err(_) => println!("{}", json),
+        },
         Err(e) => eprintln!("Error: {}", e),
     }
 }
@@ -214,28 +289,29 @@ pub fn run_cli_add_peer(socket_path: &str, public_key: String, allowed_ips: Vec<
 pub fn run_cli_remove_peer(socket_path: &str, public_key: String) {
     let cmd = CommandInput::RemovePeer { public_key };
     match send_command(socket_path, &cmd) {
-        Ok(json) => {
-            match serde_json::from_str::<ApiResponse>(&json) {
-                Ok(resp) => {
-                    if resp.status.eq_ignore_ascii_case("ok") {
-                        println!("Peer removed successfully.");
-                    } else {
-                        eprintln!("Failed to remove peer: {}", resp.message.unwrap_or_default());
-                    }
+        Ok(json) => match serde_json::from_str::<ApiResponse>(&json) {
+            Ok(resp) => {
+                if resp.status.eq_ignore_ascii_case("ok") {
+                    println!("Peer removed successfully.");
+                } else {
+                    eprintln!(
+                        "Failed to remove peer: {}",
+                        resp.message.unwrap_or_default()
+                    );
                 }
-                Err(_) => println!("{}", json),
             }
-        }
+            Err(_) => println!("{}", json),
+        },
         Err(e) => eprintln!("Error: {}", e),
     }
 }
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  new-proxy-cli [--client | --socket <path>] show");
-    eprintln!("  new-proxy-cli [--client | --socket <path>] dump");
-    eprintln!("  new-proxy-cli [--client | --socket <path>] add-peer <public_key> <allowed_ips> [endpoint] [proxy_port]");
-    eprintln!("  new-proxy-cli [--client | --socket <path>] remove-peer <public_key>");
+    eprintln!("  new-proxy-cli [--client | --interface <name> | --socket <path>] show");
+    eprintln!("  new-proxy-cli [--client | --interface <name> | --socket <path>] dump");
+    eprintln!("  new-proxy-cli [--client | --interface <name> | --socket <path>] add-peer <public_key> <allowed_ips> [endpoint] [proxy_port]");
+    eprintln!("  new-proxy-cli [--client | --interface <name> | --socket <path>] remove-peer <public_key>");
 }
 
 fn main() {
@@ -254,6 +330,14 @@ fn main() {
                     std::process::exit(2);
                 }
                 socket_path = args[idx + 1].clone();
+                idx += 2;
+            }
+            "--interface" => {
+                if idx + 1 >= args.len() {
+                    print_usage();
+                    std::process::exit(2);
+                }
+                socket_path = socket_path_for_interface(&args[idx + 1]);
                 idx += 2;
             }
             _ => break,
@@ -280,7 +364,13 @@ fn main() {
                 .collect();
             let endpoint = args.get(idx + 3).cloned();
             let proxy_port = args.get(idx + 4).and_then(|s| s.parse::<u16>().ok());
-            run_cli_add_peer(&socket_path, args[idx + 1].clone(), allowed_ips, endpoint, proxy_port);
+            run_cli_add_peer(
+                &socket_path,
+                args[idx + 1].clone(),
+                allowed_ips,
+                endpoint,
+                proxy_port,
+            );
         }
         "remove-peer" => {
             if args.len() != idx + 2 {
@@ -366,8 +456,8 @@ mod tests {
 
     #[test]
     fn test_cli_uds_commands() {
-        use std::os::unix::net::UnixListener;
         use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
         use std::thread;
 
         let uds_path = "/tmp/test_uds_cli.sock";
@@ -382,10 +472,11 @@ mod tests {
                     let mut buf = [0u8; 1024];
                     if let Ok(n) = stream.read(&mut buf) {
                         let req_str = String::from_utf8_lossy(&buf[..n]);
-                        
+
                         if req_str.contains("Stats") {
                             let mock_telemetry = vec![UnifiedTelemetry {
-                                public_key: "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=".to_string(),
+                                public_key: "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4="
+                                    .to_string(),
                                 allowed_ips: vec!["10.0.0.2/32".to_string()],
                                 endpoint: Some("1.2.3.4:51820".to_string()),
                                 l3_rx_bytes: 100,

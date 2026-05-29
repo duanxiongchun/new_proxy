@@ -250,7 +250,7 @@ AllowedIPs = 10.0.0.2/32, fd00::2/128
     +--------------------------------+
       |
       |--- 1. 发起 Unix Domain Socket 链接 -----------------+
-      |    (路径: /tmp/new_proxy_api.sock)                 |
+      |    (路径: /run/new_proxy/<interface>.sock)          |
       |                                                    v
       |=== 2. 发送 JSON 格式指令 ==================> [ 代理网关守护进程 ]
       |    - Command::Stats (查看状态)               - 动态 AllowedIPs Trie
@@ -320,17 +320,17 @@ AllowedIPs = 10.0.0.2/32, fd00::2/128
 
 - **展示当前状态与实时聚合统计** (类似于 `wg show`)：
   ```bash
-  new-proxy-cli show
+  new-proxy-cli --interface tun0 show
   ```
 - **导出机器可读的 tab 分隔统计** (类似于 `wg show dump`)：
   ```bash
-  new-proxy-cli dump
+  new-proxy-cli --interface tun0 dump
   ```
 - **动态增加 Peer**：
   ```bash
-  new-proxy-cli add-peer <public_key> <allowed_ips> [endpoint] [proxy_port]
+  new-proxy-cli --interface tun0 add-peer <public_key> <allowed_ips> [endpoint] [proxy_port]
   ```
 - **动态删除 Peer**：
   ```bash
-  new-proxy-cli remove-peer <public_key>
+  new-proxy-cli --interface tun0 remove-peer <public_key>
   ```
