@@ -129,7 +129,8 @@ impl GatewayConfig {
 
         let mtu = interface_section
             .get("MTU")
-            .map(|s| s.parse::<u16>().unwrap_or(1400))
+            .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid MTU: {}", e)))
+            .transpose()?
             .unwrap_or(1400);
 
         let table = interface_section
@@ -214,10 +215,15 @@ impl GatewayConfig {
             .map(|ports_str| {
                 ports_str
                     .split(',')
-                    .map(|p| p.trim().parse::<u16>().unwrap_or(0))
-                    .filter(|&p| p > 0)
-                    .collect::<Vec<u16>>()
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| {
+                        p.trim().parse::<u16>().map_err(|e| {
+                            format!("Invalid QUICPool ListenPorts entry '{}': {}", p, e)
+                        })
+                    })
+                    .collect::<Result<Vec<u16>, String>>()
             })
+            .transpose()?
             .unwrap_or_default();
         let quic_pool = QUICPoolConfig {
             public_ipv4,

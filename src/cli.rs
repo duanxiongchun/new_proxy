@@ -71,17 +71,30 @@ fn connect_uds(path: &str) -> Result<UnixStream, String> {
 fn send_command(path: &str, cmd: &CommandInput) -> Result<String, String> {
     let mut stream = connect_uds(path)?;
     let payload = serde_json::to_vec(cmd).unwrap();
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&payload);
     stream
-        .write_all(&payload)
+        .write_all(&framed)
         .map_err(|e| format!("Write error: {}", e))?;
     stream
         .shutdown(Shutdown::Write)
         .map_err(|e| format!("Shutdown write error: {}", e))?;
-    let mut buf = String::new();
+    let mut raw = Vec::new();
     stream
-        .read_to_string(&mut buf)
+        .read_to_end(&mut raw)
         .map_err(|e| format!("Read error: {}", e))?;
-    Ok(buf)
+    let body = if raw.len() >= 4 {
+        let len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        if len == raw.len().saturating_sub(4) {
+            &raw[4..]
+        } else {
+            &raw[..]
+        }
+    } else {
+        &raw[..]
+    };
+    String::from_utf8(body.to_vec()).map_err(|e| format!("Invalid UTF-8 response: {}", e))
 }
 
 /// 将字节数格式化为人类可读形式（与 wg show 一致）

@@ -1,9 +1,9 @@
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
 use rand::Rng;
 use rustls::client::ServerCertVerified;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +15,53 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AUTH_PACKET_LEN: usize = 2048;
 const MAX_INCOMING_QUIC_CONNECTIONS: usize = 4096;
+
+fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoint, String> {
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| "No async runtime found for QUIC".to_string())?;
+    let v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    let v6_result = (|| -> Result<Endpoint, String> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|e| format!("create IPv6 UDP socket failed: {}", e))?;
+        socket
+            .set_only_v6(false)
+            .map_err(|e| format!("disable IPV6_V6ONLY failed: {}", e))?;
+        socket
+            .bind(&v6_addr.into())
+            .map_err(|e| format!("bind [::]:{} failed: {}", port, e))?;
+        let udp_socket: std::net::UdpSocket = socket.into();
+        Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config.clone()),
+            udp_socket,
+            runtime.clone(),
+        )
+        .map_err(|e| format!("create dual-stack QUIC endpoint failed: {}", e))
+    })();
+
+    match v6_result {
+        Ok(endpoint) => {
+            log::info!(
+                "QUIC listener bound on [::]:{} with IPV6_V6ONLY=false",
+                port
+            );
+            Ok(endpoint)
+        }
+        Err(v6_err) => {
+            let v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+            Endpoint::server(server_config, v4_addr).map_err(|v4_err| {
+                format!(
+                    "Failed to start QUIC listener on UDP port {}: IPv6 dual-stack bind failed: {}; IPv4 bind failed: {}",
+                    port, v6_err, v4_err
+                )
+            })
+        }
+    }
+}
 
 pub type StreamHandler =
     Arc<dyn Fn([u8; 32], quinn::SendStream, quinn::RecvStream, Arc<QuicConnStats>) + Send + Sync>;
@@ -543,13 +590,7 @@ impl QuicPoolServer {
 
         let mut listeners = Vec::new();
         for port in self.listen_ports {
-            let bind_addr = format!("0.0.0.0:{}", port);
-            let parsed_addr = bind_addr
-                .parse()
-                .map_err(|e| format!("Failed to parse server bind address {}: {}", bind_addr, e))?;
-            let endpoint = Endpoint::server(server_config.clone(), parsed_addr).map_err(|e| {
-                format!("Failed to start QUIC listener on UDP port {}: {}", port, e)
-            })?;
+            let endpoint = bind_server_endpoint(server_config.clone(), port)?;
             listeners.push((port, endpoint));
         }
 

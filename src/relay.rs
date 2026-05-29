@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
 pub struct PeerL4Stats {
@@ -179,7 +180,15 @@ where
         if n == 0 {
             return Ok(copied);
         }
-        writer.write_all(&buf[..n]).await?;
+        match tokio::time::timeout(RELAY_WRITE_TIMEOUT, writer.write_all(&buf[..n])).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "relay write timeout",
+                ));
+            }
+        }
         copied += n as u64;
     }
 }

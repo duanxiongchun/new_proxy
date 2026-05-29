@@ -6,7 +6,7 @@ mod routing;
 mod tproxy;
 
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,12 @@ pub struct ApiResponse {
 pub struct GatewayState {
     pub config: GatewayConfig,
     pub router: AllowedIPsRouter<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeMode {
+    Server,
+    Client,
 }
 
 // 用户态 L4 (QUIC) 遥测注册中心
@@ -430,6 +436,107 @@ fn api_socket_path(interface_name: &str) -> String {
     format!("/run/new_proxy/{}.sock", interface_name)
 }
 
+fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, String> {
+    let server_mode =
+        config.interface.listen_control_port.is_some() || !config.quic_pool.listen_ports.is_empty();
+    if server_mode {
+        if config.interface.listen_control_port.is_none() {
+            return Err(
+                "Invalid server config: ListenControlPort is required when QUICPool.ListenPorts is set"
+                    .to_string(),
+            );
+        }
+        if config.quic_pool.listen_ports.is_empty() {
+            return Err(
+                "Invalid server config: QUICPool.ListenPorts must contain at least one port"
+                    .to_string(),
+            );
+        }
+        return Ok(RuntimeMode::Server);
+    }
+
+    if config.peers.is_empty() {
+        return Err("Invalid client config: at least one [Peer] is required".to_string());
+    }
+    let peer = &config.peers[0];
+    if peer.endpoint.is_none() {
+        return Err("Invalid client config: first peer must define Endpoint".to_string());
+    }
+    if peer.proxy_port.is_none() {
+        return Err("Invalid client config: first peer must define ProxyPort".to_string());
+    }
+    if config.interface.tproxy_port.is_none() {
+        return Err("Invalid client config: TProxyPort is required".to_string());
+    }
+    Ok(RuntimeMode::Client)
+}
+
+fn validate_gateway_config(config: &GatewayConfig) -> Result<RuntimeMode, String> {
+    if let Some(table) = config.interface.table.as_deref() {
+        if !table.eq_ignore_ascii_case("auto") && !table.eq_ignore_ascii_case("off") {
+            return Err(format!(
+                "Invalid Table value '{}': expected auto or off",
+                table
+            ));
+        }
+    }
+    let mut seen_quic_ports = HashSet::new();
+    for port in &config.quic_pool.listen_ports {
+        if !seen_quic_ports.insert(*port) {
+            return Err(format!("Duplicate QUICPool ListenPorts entry: {}", port));
+        }
+    }
+    for peer in &config.peers {
+        if peer.allowed_ips.is_empty() {
+            return Err(format!(
+                "Peer {} has no AllowedIPs",
+                encode_base64_32(&peer.public_key)
+            ));
+        }
+    }
+    determine_runtime_mode(config)
+}
+
+fn telemetry_sources(
+    peers: &[config::PeerConfig],
+    l3_stats: &HashMap<[u8; 32], WgPeerStats>,
+) -> HashMap<[u8; 32], String> {
+    let mut sources = HashMap::new();
+    for peer in peers {
+        if l3_stats.contains_key(&peer.public_key) {
+            sources.insert(peer.public_key, "both".to_string());
+        } else {
+            sources.insert(peer.public_key, "proxy".to_string());
+        }
+    }
+    for pub_key in l3_stats.keys() {
+        sources
+            .entry(*pub_key)
+            .or_insert_with(|| "kernel".to_string());
+    }
+    sources
+}
+
+fn select_quic_endpoint_ip(
+    control_response: &control::ControlResponse,
+    fallback_endpoint: SocketAddr,
+) -> Result<IpAddr, String> {
+    if fallback_endpoint.is_ipv6() {
+        if let Some(public_ipv6) = &control_response.public_ipv6 {
+            return public_ipv6
+                .parse::<Ipv6Addr>()
+                .map(IpAddr::V6)
+                .map_err(|e| format!("Invalid server PublicIPv6 '{}': {}", public_ipv6, e));
+        }
+    } else if let Some(public_ipv4) = &control_response.public_ipv4 {
+        return public_ipv4
+            .parse::<Ipv4Addr>()
+            .map(IpAddr::V4)
+            .map_err(|e| format!("Invalid server PublicIPv4 '{}': {}", public_ipv4, e));
+    }
+    Ok(fallback_endpoint.ip())
+}
+
 fn instance_routing_ids(interface_name: &str) -> (u32, u32) {
     let mut hash = 0x811c9dc5u32;
     for byte in interface_name.as_bytes() {
@@ -472,6 +579,85 @@ where
     tokio::task::spawn_blocking(op)
         .await
         .map_err(|e| format!("blocking command worker failed: {}", e))?
+}
+
+struct UdsRequest {
+    command: CommandInput,
+    framed: bool,
+}
+
+async fn read_uds_command(stream: &mut tokio::net::UnixStream) -> Result<UdsRequest, String> {
+    const MAX_UDS_PAYLOAD: usize = 65536;
+    const UDS_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let first = timeout(UDS_READ_TIMEOUT, stream.read_u8())
+        .await
+        .map_err(|_| "UDS request read timeout".to_string())?
+        .map_err(|e| format!("UDS request read error: {}", e))?;
+
+    let mut buf = Vec::new();
+    let framed = first != b'{';
+    if !framed {
+        buf.push(first);
+        let mut temp = [0u8; 1024];
+        timeout(UDS_READ_TIMEOUT, async {
+            loop {
+                match stream.read(&mut temp).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&temp[..n]);
+                        if buf.len() > MAX_UDS_PAYLOAD {
+                            return Err("UDS request payload too large".to_string());
+                        }
+                    }
+                    Err(e) => return Err(format!("UDS request read error: {}", e)),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| "UDS request read timeout".to_string())??;
+    } else {
+        let mut len_bytes = [0u8; 4];
+        len_bytes[0] = first;
+        timeout(UDS_READ_TIMEOUT, stream.read_exact(&mut len_bytes[1..]))
+            .await
+            .map_err(|_| "UDS request length read timeout".to_string())?
+            .map_err(|e| format!("UDS request length read error: {}", e))?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        if len == 0 || len > MAX_UDS_PAYLOAD {
+            return Err(format!("Invalid UDS request payload length: {}", len));
+        }
+        buf.resize(len, 0);
+        timeout(UDS_READ_TIMEOUT, stream.read_exact(&mut buf))
+            .await
+            .map_err(|_| "UDS request payload read timeout".to_string())?
+            .map_err(|e| format!("UDS request payload read error: {}", e))?;
+    }
+
+    serde_json::from_slice(&buf)
+        .map(|command| UdsRequest { command, framed })
+        .map_err(|e| format!("Invalid request JSON: {}", e))
+}
+
+async fn write_uds_json<T: Serialize>(
+    stream: &mut tokio::net::UnixStream,
+    value: &T,
+    framed: bool,
+) -> std::io::Result<()> {
+    let payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    write_uds_payload(stream, &payload, framed).await
+}
+
+async fn write_uds_payload(
+    stream: &mut tokio::net::UnixStream,
+    payload: &[u8],
+    framed: bool,
+) -> std::io::Result<()> {
+    if framed {
+        stream.write_u32(payload.len() as u32).await?;
+    }
+    stream.write_all(payload).await
 }
 
 fn ensure_iptables_rule(tool: &str, rule: &[String]) -> Result<(), String> {
@@ -922,16 +1108,66 @@ fn cleanup_peer_routes_and_tproxy(
     peer: &config::PeerConfig,
     tproxy_port: Option<u16>,
     interface_name: &str,
-) {
+) -> Result<(), String> {
     let (fwmark, _) = instance_routing_ids(interface_name);
     let mark_spec = format!("{:#x}/0xffffffff", fwmark);
+    let mut errors = Vec::new();
     for allowed_ip in &peer.allowed_ips {
         if let Some(port) = tproxy_port {
-            cleanup_tproxy_rule(*allowed_ip, port, &mark_spec);
-            cleanup_mss_clamp_rule(*allowed_ip);
+            let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                ("iptables", "0.0.0.0")
+            } else {
+                ("ip6tables", "::")
+            };
+            let tproxy_args = vec![
+                "-t".to_string(),
+                "mangle".to_string(),
+                "-D".to_string(),
+                "PREROUTING".to_string(),
+                "-p".to_string(),
+                "tcp".to_string(),
+                "-d".to_string(),
+                allowed_ip.to_string(),
+                "-j".to_string(),
+                "TPROXY".to_string(),
+                "--on-port".to_string(),
+                port.to_string(),
+                "--on-ip".to_string(),
+                on_ip.to_string(),
+                "--tproxy-mark".to_string(),
+                mark_spec.clone(),
+            ];
+            if let Err(e) = run_command_checked(tool, &tproxy_args) {
+                errors.push(e);
+            }
+
+            let mss_tool = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                "iptables"
+            } else {
+                "ip6tables"
+            };
+            let mss_args = vec![
+                "-t".to_string(),
+                "mangle".to_string(),
+                "-D".to_string(),
+                "PREROUTING".to_string(),
+                "-p".to_string(),
+                "tcp".to_string(),
+                "--tcp-flags".to_string(),
+                "SYN,RST".to_string(),
+                "SYN".to_string(),
+                "-d".to_string(),
+                allowed_ip.to_string(),
+                "-j".to_string(),
+                "TCPMSS".to_string(),
+                "--clamp-mss-to-pmtud".to_string(),
+            ];
+            if let Err(e) = run_command_checked(mss_tool, &mss_args) {
+                errors.push(e);
+            }
         }
-        if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-            run_command_best_effort(
+        let route_result = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+            run_command_checked(
                 "ip",
                 &[
                     "route".to_string(),
@@ -940,9 +1176,9 @@ fn cleanup_peer_routes_and_tproxy(
                     "dev".to_string(),
                     interface_name.to_string(),
                 ],
-            );
+            )
         } else {
-            run_command_best_effort(
+            run_command_checked(
                 "ip",
                 &[
                     "-6".to_string(),
@@ -952,8 +1188,16 @@ fn cleanup_peer_routes_and_tproxy(
                     "dev".to_string(),
                     interface_name.to_string(),
                 ],
-            );
+            )
+        };
+        if let Err(e) = route_result {
+            errors.push(e);
         }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -980,8 +1224,8 @@ fn sync_peer_to_kernel(interface_name: &str, peer: &config::PeerConfig) -> Resul
     run_command_checked("wg", &args)
 }
 
-fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) {
-    run_command_best_effort(
+fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) -> Result<(), String> {
+    run_command_checked(
         "wg",
         &[
             "set".to_string(),
@@ -990,9 +1234,10 @@ fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) {
             encode_base64_32(&pub_key),
             "remove".to_string(),
         ],
-    );
+    )
 }
 
+#[cfg(test)]
 async fn sync_kernel_and_proxy_state(
     interface_name: &str,
     state: &Arc<std::sync::RwLock<GatewayState>>,
@@ -1019,7 +1264,7 @@ async fn sync_kernel_and_proxy_state(
 
     // 2. Identify peers missing in proxy config
     for (&pub_key, wg_stats) in l3_stats {
-        if let Entry::Vacant(entry) = sources.entry(pub_key) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = sources.entry(pub_key) {
             entry.insert("kernel".to_string());
             peers_to_sync_to_proxy.push((pub_key, wg_stats.clone()));
         }
@@ -1123,6 +1368,14 @@ async fn main() {
         }
     };
 
+    let runtime_mode = match validate_gateway_config(&config) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
     // 执行 PreScript 脚本
     if let Some(ref pre_script) = config.interface.pre_script {
         run_script(pre_script);
@@ -1165,10 +1418,6 @@ async fn main() {
     // 初始化会话与 Nonce 动态共享缓存（用于 UDS 动态清理）
     let session_cache = Arc::new(Mutex::new(HashMap::new()));
     let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
-
-    // 智能自适应识别网关运行模式 (Server vs. Client)
-    let is_server =
-        config.interface.listen_control_port.is_some() || !config.quic_pool.listen_ports.is_empty();
 
     // 运行在后台的 Unix Domain Socket API 服务器，处理动态命令与 stats 遥测
     let uds_path = api_socket_path(&interface_name);
@@ -1245,7 +1494,7 @@ async fn main() {
                             status: "Error".to_string(),
                             message: Some("UDS client limit reached".to_string()),
                         };
-                        let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                        let _ = write_uds_json(&mut stream, &resp, false).await;
                         continue;
                     }
                 };
@@ -1261,56 +1510,24 @@ async fn main() {
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let mut buf = Vec::new();
-                    let mut temp = [0u8; 1024];
-                    const MAX_UDS_PAYLOAD: usize = 65536; // 64KB
-                    const UDS_READ_TIMEOUT: Duration = Duration::from_secs(2);
-
-                    let read_result = timeout(UDS_READ_TIMEOUT, async {
-                        loop {
-                            match stream.read(&mut temp).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    buf.extend_from_slice(&temp[..n]);
-                                    if buf.len() > MAX_UDS_PAYLOAD {
-                                        return Err("Payload too large");
-                                    }
-                                }
-                                Err(_) => return Err("Read error"),
-                            }
-                        }
-                        Ok(())
-                    })
-                    .await;
-
-                    if read_result.is_err() || read_result.unwrap().is_err() {
-                        return;
-                    }
-
-                    let cmd: CommandInput = match serde_json::from_slice(&buf) {
-                        Ok(c) => c,
+                    let request = match read_uds_command(&mut stream).await {
+                        Ok(request) => request,
                         Err(e) => {
                             let resp = ApiResponse {
                                 status: "Error".to_string(),
-                                message: Some(format!("Invalid request JSON: {}", e)),
+                                message: Some(e),
                             };
-                            let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                            let _ = write_uds_json(&mut stream, &resp, false).await;
                             return;
                         }
                     };
+                    let framed_response = request.framed;
+                    let cmd = request.command;
 
                     match cmd {
                         CommandInput::Stats => {
                             let l3_stats =
                                 get_wg_dump_stats(&interface_name).await.unwrap_or_default();
-                            let sources = sync_kernel_and_proxy_state(
-                                &interface_name,
-                                &state,
-                                &peer_secrets,
-                                &server_secret,
-                                &l3_stats,
-                            )
-                            .await;
                             let aggregated = {
                                 let mut aggregated = Vec::new();
                                 let mut seen = HashSet::new();
@@ -1318,6 +1535,7 @@ async fn main() {
                                     let st = state.read().unwrap();
                                     st.config.peers.clone()
                                 };
+                                let sources = telemetry_sources(&peers, &l3_stats);
                                 let registry_map = telemetry.snapshot();
                                 // 从共享的 QUIC 连接注册表获取每连接统计
                                 let quic_registry = shared_quic_registry.lock().unwrap();
@@ -1464,9 +1682,7 @@ async fn main() {
                                 }
                                 aggregated
                             };
-                            let _ = stream
-                                .write_all(&serde_json::to_vec(&aggregated).unwrap())
-                                .await;
+                            let _ = write_uds_json(&mut stream, &aggregated, framed_response).await;
                         }
                         CommandInput::Dump => {
                             let l3_stats =
@@ -1511,7 +1727,12 @@ async fn main() {
                                 lines.sort();
                                 lines.join("\n")
                             };
-                            let _ = stream.write_all(response.as_bytes()).await;
+                            let _ = write_uds_payload(
+                                &mut stream,
+                                response.as_bytes(),
+                                framed_response,
+                            )
+                            .await;
                         }
                         CommandInput::AddPeer {
                             public_key,
@@ -1527,7 +1748,7 @@ async fn main() {
                                         message: Some(format!("Invalid public key: {}", e)),
                                     };
                                     let _ =
-                                        stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                        write_uds_json(&mut stream, &resp, framed_response).await;
                                     return;
                                 }
                             };
@@ -1541,12 +1762,19 @@ async fn main() {
                                             status: "Error".to_string(),
                                             message: Some(format!("Invalid allowed IP: {}", e)),
                                         };
-                                        let _ = stream
-                                            .write_all(&serde_json::to_vec(&resp).unwrap())
+                                        let _ = write_uds_json(&mut stream, &resp, framed_response)
                                             .await;
                                         return;
                                     }
                                 }
+                            }
+                            if parsed_allowed_ips.is_empty() {
+                                let resp = ApiResponse {
+                                    status: "Error".to_string(),
+                                    message: Some("AllowedIPs must not be empty".to_string()),
+                                };
+                                let _ = write_uds_json(&mut stream, &resp, framed_response).await;
+                                return;
                             }
 
                             let parsed_endpoint = match endpoint {
@@ -1557,8 +1785,7 @@ async fn main() {
                                             status: "Error".to_string(),
                                             message: Some(format!("Invalid endpoint: {}", e)),
                                         };
-                                        let _ = stream
-                                            .write_all(&serde_json::to_vec(&resp).unwrap())
+                                        let _ = write_uds_json(&mut stream, &resp, framed_response)
                                             .await;
                                         return;
                                     }
@@ -1594,7 +1821,7 @@ async fn main() {
                                 if let Some(peer) = old_peer.clone() {
                                     let interface_name = interface_name.clone();
                                     let _ = run_blocking_command(move || {
-                                        cleanup_peer_routes_and_tproxy(
+                                        let _ = cleanup_peer_routes_and_tproxy(
                                             &peer,
                                             tproxy_port,
                                             &interface_name,
@@ -1619,7 +1846,7 @@ async fn main() {
                                     let new_peer_for_cleanup = new_peer.clone();
                                     let interface_name_for_cleanup = interface_name.clone();
                                     let _ = run_blocking_command(move || {
-                                        cleanup_peer_routes_and_tproxy(
+                                        let _ = cleanup_peer_routes_and_tproxy(
                                             &new_peer_for_cleanup,
                                             tproxy_port,
                                             &interface_name_for_cleanup,
@@ -1646,7 +1873,7 @@ async fn main() {
                                         )),
                                     };
                                     let _ =
-                                        stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                        write_uds_json(&mut stream, &resp, framed_response).await;
                                     return;
                                 }
                             }
@@ -1664,7 +1891,7 @@ async fn main() {
                                     let new_peer_for_cleanup = new_peer.clone();
                                     let interface_name_for_cleanup = interface_name.clone();
                                     let _ = run_blocking_command(move || {
-                                        cleanup_peer_routes_and_tproxy(
+                                        let _ = cleanup_peer_routes_and_tproxy(
                                             &new_peer_for_cleanup,
                                             tproxy_port,
                                             &interface_name_for_cleanup,
@@ -1688,7 +1915,7 @@ async fn main() {
                                     status: "Error".to_string(),
                                     message: Some(format!("Failed to sync peer to kernel: {}", e)),
                                 };
-                                let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                let _ = write_uds_json(&mut stream, &resp, framed_response).await;
                                 return;
                             }
 
@@ -1719,7 +1946,7 @@ async fn main() {
                                 status: "Ok".to_string(),
                                 message: None,
                             };
-                            let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                            let _ = write_uds_json(&mut stream, &resp, framed_response).await;
                         }
                         CommandInput::RemovePeer { public_key } => {
                             let parsed_pub_key = match decode_base64_32(&public_key) {
@@ -1730,7 +1957,7 @@ async fn main() {
                                         message: Some(format!("Invalid public key: {}", e)),
                                     };
                                     let _ =
-                                        stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                        write_uds_json(&mut stream, &resp, framed_response).await;
                                     return;
                                 }
                             };
@@ -1752,32 +1979,8 @@ async fn main() {
                                     st.config.interface.tproxy_port,
                                 )
                             };
-                            if let Some(peer) = &removed_peer {
-                                if !table_off {
-                                    let peer = peer.clone();
-                                    let interface_name_for_cleanup = interface_name.clone();
-                                    let _ = run_blocking_command(move || {
-                                        cleanup_peer_routes_and_tproxy(
-                                            &peer,
-                                            tproxy_port,
-                                            &interface_name_for_cleanup,
-                                        );
-                                        Ok(())
-                                    })
-                                    .await;
-                                }
-                            }
-                            let interface_name_for_kernel = interface_name.clone();
-                            let _ = run_blocking_command(move || {
-                                remove_peer_from_kernel(&interface_name_for_kernel, parsed_pub_key);
-                                Ok(())
-                            })
-                            .await;
 
-                            // 1. 动态移除 Shared Secret
                             peer_secrets.write().unwrap().remove(&parsed_pub_key);
-
-                            // 2. 动态移除会话与 Nonce 缓存
                             session_cache.lock().unwrap().remove(&parsed_pub_key);
                             auth_nonce_cache.lock().unwrap().remove(&parsed_pub_key);
                             if let Some(conns) =
@@ -1788,11 +1991,9 @@ async fn main() {
                                 }
                             }
 
-                            // 2. 动态移除 AllowedIPs 路由
                             {
                                 let mut st = state.write().unwrap();
                                 st.config.peers.retain(|p| p.public_key != parsed_pub_key);
-                                // 热重构 Trie
                                 let mut new_router = AllowedIPsRouter::new();
                                 for p in &st.config.peers {
                                     for &allowed_ip in &p.allowed_ips {
@@ -1802,11 +2003,46 @@ async fn main() {
                                 st.router = new_router;
                             }
 
+                            let mut remove_errors = Vec::new();
+                            if let Some(peer) = &removed_peer {
+                                if !table_off {
+                                    let peer = peer.clone();
+                                    let interface_name_for_cleanup = interface_name.clone();
+                                    if let Err(e) = run_blocking_command(move || {
+                                        cleanup_peer_routes_and_tproxy(
+                                            &peer,
+                                            tproxy_port,
+                                            &interface_name_for_cleanup,
+                                        )
+                                    })
+                                    .await
+                                    {
+                                        remove_errors
+                                            .push(format!("failed to clean routes/tproxy: {}", e));
+                                    }
+                                }
+                            }
+                            let interface_name_for_kernel = interface_name.clone();
+                            if let Err(e) = run_blocking_command(move || {
+                                remove_peer_from_kernel(&interface_name_for_kernel, parsed_pub_key)
+                            })
+                            .await
+                            {
+                                remove_errors.push(format!("failed to remove kernel peer: {}", e));
+                            }
+
                             let resp = ApiResponse {
                                 status: "Ok".to_string(),
-                                message: None,
+                                message: if remove_errors.is_empty() {
+                                    None
+                                } else {
+                                    Some(format!(
+                                        "Peer removed; cleanup warnings: {}",
+                                        remove_errors.join("; ")
+                                    ))
+                                },
                             };
-                            let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                            let _ = write_uds_json(&mut stream, &resp, framed_response).await;
                         }
                     }
                 });
@@ -1814,15 +2050,17 @@ async fn main() {
         });
     }
 
-    if is_server {
+    if runtime_mode == RuntimeMode::Server {
         log::info!("------------------------------------------------------");
         log::info!("         STARTING GATEWAY IN [ SERVER MODE ]         ");
         log::info!("------------------------------------------------------");
 
-        let listen_control_port = config
-            .interface
-            .listen_control_port
-            .expect("Missing ListenControlPort for Server mode");
+        let Some(listen_control_port) = config.interface.listen_control_port else {
+            log::error!("Server config validation failed to enforce ListenControlPort");
+            let cleanup_config = gateway_state.read().unwrap().config.clone();
+            cleanup_runtime(&cleanup_config, &interface_name);
+            std::process::exit(1);
+        };
 
         // 启动用户态独立公网控制通道协商服务器 (传递动态 peer_secrets 哈希表)
         let control_server = ControlServer::new(
@@ -1993,9 +2231,19 @@ async fn main() {
             }
         };
 
+        let quic_endpoint_ip = match select_quic_endpoint_ip(&control_response, endpoint) {
+            Ok(ip) => ip,
+            Err(e) => {
+                log::error!("{}", e);
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+
         let mut quic_endpoints = Vec::new();
         for &port in &control_response.port_pool {
-            quic_endpoints.push(SocketAddr::new(endpoint.ip(), port));
+            quic_endpoints.push(SocketAddr::new(quic_endpoint_ip, port));
         }
 
         let client_pub_derived =
@@ -2102,7 +2350,14 @@ async fn run_cli_stats() -> Result<(), String> {
     // 发起 Stats 命令 JSON
     let cmd = CommandInput::Stats;
     let json_bytes = serde_json::to_vec(&cmd).unwrap();
-    let _ = stream.write_all(&json_bytes).await;
+    stream
+        .write_u32(json_bytes.len() as u32)
+        .await
+        .map_err(|e| format!("Failed to write stats request length: {}", e))?;
+    stream
+        .write_all(&json_bytes)
+        .await
+        .map_err(|e| format!("Failed to write stats request: {}", e))?;
     let _ = stream.shutdown().await;
 
     let mut buf = Vec::new();
@@ -2111,8 +2366,19 @@ async fn run_cli_stats() -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to read stats from socket: {}", e))?;
 
+    let body = if buf.len() >= 4 {
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len == buf.len().saturating_sub(4) {
+            &buf[4..]
+        } else {
+            &buf[..]
+        }
+    } else {
+        &buf[..]
+    };
+
     let stats: Vec<UnifiedTelemetry> =
-        serde_json::from_slice(&buf).map_err(|e| format!("Failed to parse JSON stats: {}", e))?;
+        serde_json::from_slice(body).map_err(|e| format!("Failed to parse JSON stats: {}", e))?;
 
     println!("\n+-------------------------------------------------------------------------------------------------------------------------------------------+");
     println!("|                                             HYBRID SECURE PROXY GATEWAY TELEMETRY                                                         |");
@@ -2226,6 +2492,95 @@ mod tests {
         let mut reader = Cursor::new(buf);
         let decoded_addr = read_target_addr(&mut reader).await.unwrap();
         assert_eq!(addr, decoded_addr);
+    }
+
+    #[tokio::test]
+    async fn test_uds_raw_request_gets_raw_response() {
+        use std::fs;
+        use tokio::net::UnixListener;
+
+        let test_uds_path = "/tmp/test_uds_raw_compat.sock";
+        let _ = fs::remove_file(test_uds_path);
+        let listener = UnixListener::bind(test_uds_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_uds_command(&mut stream).await.unwrap();
+            assert!(!request.framed);
+            match request.command {
+                CommandInput::Stats => {}
+                _ => panic!("unexpected command"),
+            }
+            let resp = ApiResponse {
+                status: "Ok".to_string(),
+                message: None,
+            };
+            write_uds_json(&mut stream, &resp, request.framed)
+                .await
+                .unwrap();
+        });
+
+        let mut client = tokio::net::UnixStream::connect(test_uds_path)
+            .await
+            .unwrap();
+        let cmd = serde_json::to_vec(&CommandInput::Stats).unwrap();
+        client.write_all(&cmd).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(resp.first(), Some(&b'{'));
+        let api_resp: ApiResponse = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(api_resp.status, "Ok");
+
+        server.await.unwrap();
+        let _ = fs::remove_file(test_uds_path);
+    }
+
+    #[tokio::test]
+    async fn test_uds_framed_request_gets_framed_response() {
+        use std::fs;
+        use tokio::net::UnixListener;
+
+        let test_uds_path = "/tmp/test_uds_framed_compat.sock";
+        let _ = fs::remove_file(test_uds_path);
+        let listener = UnixListener::bind(test_uds_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_uds_command(&mut stream).await.unwrap();
+            assert!(request.framed);
+            match request.command {
+                CommandInput::Stats => {}
+                _ => panic!("unexpected command"),
+            }
+            let resp = ApiResponse {
+                status: "Ok".to_string(),
+                message: Some("framed".to_string()),
+            };
+            write_uds_json(&mut stream, &resp, request.framed)
+                .await
+                .unwrap();
+        });
+
+        let mut client = tokio::net::UnixStream::connect(test_uds_path)
+            .await
+            .unwrap();
+        let cmd = serde_json::to_vec(&CommandInput::Stats).unwrap();
+        client.write_u32(cmd.len() as u32).await.unwrap();
+        client.write_all(&cmd).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let len = u32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]) as usize;
+        assert_eq!(len, resp.len() - 4);
+        let api_resp: ApiResponse = serde_json::from_slice(&resp[4..]).unwrap();
+        assert_eq!(api_resp.status, "Ok");
+        assert_eq!(api_resp.message.as_deref(), Some("framed"));
+
+        server.await.unwrap();
+        let _ = fs::remove_file(test_uds_path);
     }
 
     #[test]
