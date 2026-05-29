@@ -218,6 +218,24 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // 将配置文件中所有静态声明的对等体 (Peers) 下发同步到内核级 WireGuard 网卡
+    for peer in &config.peers {
+        if let Err(e) = wireguard::sync_peer_to_kernel(&interface_name, peer) {
+            log::error!(
+                "Failed to sync peer {} to kernel WireGuard on boot: {}",
+                encode_base64_32(&peer.public_key),
+                e
+            );
+            cleanup_runtime(&config, &interface_name);
+            std::process::exit(1);
+        } else {
+            log::info!(
+                "Successfully synced peer {} to kernel WireGuard on startup",
+                encode_base64_32(&peer.public_key)
+            );
+        }
+    }
+
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
 

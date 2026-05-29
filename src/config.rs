@@ -263,14 +263,17 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn test_key() -> String {
+        crate::app_config::encode_base64_32(&[0xabu8; 32])
+    }
+
     #[test]
     fn test_base64_decode_success() {
-        // Base64 encoded version
-        let test_key = "q8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8s=";
-        let decoded = decode_base64_32(test_key).unwrap();
+        let encoded = test_key();
+        let decoded = decode_base64_32(&encoded).unwrap();
         assert_eq!(decoded[0], 171);
-        assert_eq!(decoded[1], 203);
-        assert_eq!(decoded[2], 203);
+        assert_eq!(decoded[1], 171);
+        assert_eq!(decoded[2], 171);
     }
 
     #[test]
@@ -283,9 +286,11 @@ mod tests {
     #[test]
     fn test_load_config_success() {
         let path = "test_temp_success.conf";
-        let content = r#"
+        let key = test_key();
+        let content = format!(
+            r#"
 [Interface]
-PrivateKey = q8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8s=
+PrivateKey = {key}
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
@@ -293,7 +298,7 @@ TProxyPort = 1080
 MTU = 1420
 
 [Peer]
-PublicKey = q8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8s=
+PublicKey = {key}
 AllowedIPs = 10.0.0.2/32, fd00::2/128
 Endpoint = 1.2.3.4:51820
 ProxyPort = 40001
@@ -302,7 +307,8 @@ ProxyPort = 40001
 PublicIPv4 = 1.2.3.4
 PublicIPv6 = 2001:db8::1
 ListenPorts = 40001, 40002
-"#;
+"#
+        );
         fs::write(path, content).unwrap();
 
         let config = GatewayConfig::load_from_file(path).unwrap();
@@ -321,11 +327,14 @@ ListenPorts = 40001, 40002
     #[test]
     fn test_load_config_missing_interface() {
         let path = "test_temp_missing_if.conf";
-        let content = r#"
+        let key = test_key();
+        let content = format!(
+            r#"
 [Peer]
-PublicKey = q8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8s=
+PublicKey = {key}
 AllowedIPs = 10.0.0.2/32
-"#;
+"#
+        );
         fs::write(path, content).unwrap();
 
         let res = GatewayConfig::load_from_file(path);
@@ -338,11 +347,14 @@ AllowedIPs = 10.0.0.2/32
     #[test]
     fn test_load_config_invalid_address() {
         let path = "test_temp_invalid_addr.conf";
-        let content = r#"
+        let key = test_key();
+        let content = format!(
+            r#"
 [Interface]
-PrivateKey = q8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8s=
+PrivateKey = {key}
 Address = 10.0.0.1/33
-"#;
+"#
+        );
         fs::write(path, content).unwrap();
 
         let res = GatewayConfig::load_from_file(path);

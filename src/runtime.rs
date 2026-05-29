@@ -1,3 +1,6 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
+
 use crate::config::{GatewayConfig, PeerConfig};
 
 pub async fn run_blocking_command<F>(op: F) -> Result<(), String>
@@ -38,6 +41,59 @@ pub fn cleanup_runtime(config: &GatewayConfig, interface_name: &str) {
     }
 }
 
+fn configure_wireguard_device(
+    interface_name: &str,
+    private_key: &[u8; 32],
+    listen_port: Option<u16>,
+) -> Result<(), String> {
+    log::info!(
+        "Creating virtual WireGuard interface '{}' if it does not exist",
+        interface_name
+    );
+    // 1. Ensure the wireguard link exists
+    let _ = Command::new("ip")
+        .args(&["link", "add", "dev", interface_name, "type", "wireguard"])
+        .output();
+
+    // 2. Configure private key and listen port securely using wg set via stdin
+    let private_key_base64 = crate::app_config::encode_base64_32(private_key);
+    let mut args = vec![
+        "set".to_string(),
+        interface_name.to_string(),
+        "private-key".to_string(),
+        "/dev/stdin".to_string(),
+    ];
+    if let Some(port) = listen_port {
+        args.push("listen-port".to_string());
+        args.push(port.to_string());
+    }
+
+    let mut child = Command::new("wg")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn wg set command: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(private_key_base64.as_bytes())
+            .map_err(|e| format!("Failed to write private key to wg set: {}", e))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for wg set command: {}", e))?;
+
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("wg set failed: {}", err_msg));
+    }
+
+    Ok(())
+}
+
 pub fn setup_routes_and_iptables(
     config: &GatewayConfig,
     interface_name: &str,
@@ -53,6 +109,13 @@ pub fn setup_routes_and_iptables(
         "Setting up automatic routing and iptables for interface: {}",
         interface_name
     );
+
+    // 自动在内核中创建并配置该 WireGuard 虚拟设备 (私钥 & 监听端口)
+    configure_wireguard_device(
+        interface_name,
+        &config.interface.private_key,
+        config.interface.listen_port,
+    )?;
 
     for addr in &config.interface.addresses {
         run_command_checked(
@@ -418,6 +481,11 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
             ],
         );
     }
+
+    log::info!("Deleting virtual WireGuard interface '{}'", interface_name);
+    let _ = Command::new("ip")
+        .args(&["link", "del", "dev", interface_name])
+        .output();
 }
 
 fn peer_has_l4_proxy(peer: &PeerConfig) -> bool {

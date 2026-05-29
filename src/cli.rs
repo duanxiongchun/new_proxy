@@ -310,11 +310,13 @@ fn print_usage() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut socket_path = DEFAULT_SERVER_UDS_PATH.to_string();
+    let mut explicit_socket = false;
     let mut idx = 1;
     while idx < args.len() {
         match args[idx].as_str() {
             "--client" => {
                 socket_path = DEFAULT_CLIENT_UDS_PATH.to_string();
+                explicit_socket = true;
                 idx += 1;
             }
             "--socket" => {
@@ -323,6 +325,7 @@ fn main() {
                     std::process::exit(2);
                 }
                 socket_path = args[idx + 1].clone();
+                explicit_socket = true;
                 idx += 2;
             }
             "--interface" => {
@@ -331,9 +334,38 @@ fn main() {
                     std::process::exit(2);
                 }
                 socket_path = socket_path_for_interface(&args[idx + 1]);
+                explicit_socket = true;
                 idx += 2;
             }
             _ => break,
+        }
+    }
+
+    // Smart auto-discovery if socket path was not explicitly provided and the default server path does not exist
+    if !explicit_socket && !std::path::Path::new(&socket_path).exists() {
+        if let Ok(entries) = std::fs::read_dir("/run/new_proxy") {
+            let mut sockets = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "sock") {
+                    sockets.push(path);
+                }
+            }
+            if sockets.len() == 1 {
+                let discovered = sockets[0].to_string_lossy().to_string();
+                eprintln!("Note: Default socket '{}' not found.", socket_path);
+                eprintln!(
+                    "      Auto-detecting and connecting to active daemon socket: '{}'\n",
+                    discovered
+                );
+                socket_path = discovered;
+            } else if sockets.len() > 1 {
+                eprintln!("Note: Default socket '{}' not found, but multiple active sockets were detected:", socket_path);
+                for s in &sockets {
+                    eprintln!("  - {}", s.to_string_lossy());
+                }
+                eprintln!("Please specify one using '--interface <name>' or '--socket <path>'.\n");
+            }
         }
     }
 
@@ -458,6 +490,7 @@ mod tests {
         use std::thread;
 
         let uds_path = "/tmp/test_uds_cli.sock";
+        let public_key = "test-public-key".to_string();
         let _ = std::fs::remove_file(uds_path);
 
         let listener = UnixListener::bind(uds_path).unwrap();
@@ -472,8 +505,7 @@ mod tests {
 
                         if req_str.contains("Stats") {
                             let mock_telemetry = vec![UnifiedTelemetry {
-                                public_key: "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4="
-                                    .to_string(),
+                                public_key: "test-public-key".to_string(),
                                 allowed_ips: vec!["10.0.0.2/32".to_string()],
                                 endpoint: Some("1.2.3.4:51820".to_string()),
                                 l3_rx_bytes: 100,
@@ -514,7 +546,7 @@ mod tests {
         // 验证 run_cli_add_peer
         run_cli_add_peer(
             uds_path,
-            "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=".to_string(),
+            public_key.clone(),
             vec!["10.0.0.99/32".to_string()],
             None,
             None,
@@ -522,11 +554,7 @@ mod tests {
         .unwrap();
 
         // 验证 run_cli_remove_peer
-        run_cli_remove_peer(
-            uds_path,
-            "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=".to_string(),
-        )
-        .unwrap();
+        run_cli_remove_peer(uds_path, public_key).unwrap();
 
         let _ = handle.join();
         let _ = std::fs::remove_file(uds_path);

@@ -9,6 +9,9 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+
 SERVER_PID=""
 CLIENT_PID=""
 HTTP_PID=""
@@ -109,9 +112,9 @@ fi
 echo "✓ [SUCCESS] Dual-stack physical network WAN path verified successfully."
 
 echo "=== [7/7] Starting Gateway Daemons and Verifying IPC CLI ==="
-cat > /tmp/e2e_server.conf <<'EOF_CONF'
+cat > /tmp/e2e_server.conf <<EOF_CONF
 [Interface]
-PrivateKey = 1WL7OPPOABmaRVdjR6JoliATNsjOVFO1bE8gM113POM=
+PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
@@ -123,20 +126,20 @@ PublicIPv6 = fd00:2::2
 ListenPorts = 40001, 40002
 
 [Peer]
-PublicKey = 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
 AllowedIPs = 10.0.0.2/32, fd00::2/128
 EOF_CONF
 
-cat > /tmp/e2e_client.conf <<'EOF_CONF'
+cat > /tmp/e2e_client.conf <<EOF_CONF
 [Interface]
-PrivateKey = etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
+PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24, fd00::2/64
 TProxyPort = 1080
 MTU = 1400
 Table = off
 
 [Peer]
-PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
+PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32, fd00::1/128
@@ -144,7 +147,7 @@ EOF_CONF
 
 now_ts="$(date +%s)"
 cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=	(none)	10.0.1.2:50322	10.0.0.2/32,fd00::2/128	${now_ts}	3482	256	(none)
+${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32,fd00::2/128	${now_ts}	3482	256	(none)
 EOF_MOCK_WG
 
 # 7.1 Start Server proxy daemon in server_ns

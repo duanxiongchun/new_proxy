@@ -18,6 +18,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 
 echo "======================================================================"
 echo "=== [1/8] Cleaning Up Pre-Existing Network Namespaces ==="
@@ -112,15 +113,15 @@ ip netns exec client1_ns iptables -t mangle -A OUTPUT -p tcp -d 10.0.0.1 -j MARK
 
 echo "=== [6/8] Writing Multi-Client Configuration Files ==="
 # Private keys:
-# Server: 1WL7OPPOABmaRVdjR6JoliATNsjOVFO1bE8gM113POM=
-# Client 1: etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
+# Server: ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
+# Client 1: ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 # Client 2: AAAAA... (standard fallback peer)
 
 # NOTE: We do NOT write Client 2 peer here. Client 2 will be auto-synchronized
 # from the explicit mock kernel dump fixture to telemetry when stats are queried.
-cat > /tmp/server_multi.conf <<'EOF_CONF'
+cat > /tmp/server_multi.conf <<EOF_CONF
 [Interface]
-PrivateKey = 1WL7OPPOABmaRVdjR6JoliATNsjOVFO1bE8gM113POM=
+PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
@@ -133,20 +134,20 @@ ListenPorts = 40001, 40002
 
 # Client 1: Custom Proxy Client Peer
 [Peer]
-PublicKey = 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
 AllowedIPs = 10.0.0.2/32
 EOF_CONF
 
-cat > /tmp/client1.conf <<'EOF_CONF'
+cat > /tmp/client1.conf <<EOF_CONF
 [Interface]
-PrivateKey = etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
+PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24, fd00::2/64
 TProxyPort = 1080
 MTU = 1400
 Table = off
 
 [Peer]
-PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
+PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
@@ -160,8 +161,8 @@ HTTP_PID=$!
 # B. Create explicit mock dump data for WireGuard netlink-free test environments.
 now_ts="$(date +%s)"
 cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=	(none)	10.0.3.2:51820	10.0.0.3/32	${now_ts}	12500	8400	(none)
-09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
+${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}	(none)	10.0.3.2:51820	10.0.0.3/32	${now_ts}	12500	8400	(none)
+${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
 EOF_MOCK_WG
 
 # C. Start Server Proxy Daemon

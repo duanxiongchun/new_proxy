@@ -12,6 +12,7 @@ LONG_THREADS="${STABILITY_LONG_THREADS:-8}"
 SHORT_PARALLEL="${STABILITY_SHORT_PARALLEL:-4}"
 ARTIFACT_DIR="${STABILITY_ARTIFACT_DIR:-/tmp/new_proxy_stability_$(date +%Y%m%d_%H%M%S)}"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 SERVER_CONF="$ARTIFACT_DIR/srv_stab.conf"
 CLIENT_CONF="$ARTIFACT_DIR/cli_stab.conf"
 CLIENT2_CONF="$ARTIFACT_DIR/cli2_stab.conf"
@@ -74,9 +75,9 @@ mkdir -p "$ARTIFACT_DIR"
 : > "$ARTIFACT_DIR/udp.log"
 : > "$ARTIFACT_DIR/ping.log"
 
-cat > "$SERVER_CONF" <<'EOF_CONF'
+cat > "$SERVER_CONF" <<EOF_CONF
 [Interface]
-PrivateKey = 1WL7OPPOABmaRVdjR6JoliATNsjOVFO1bE8gM113POM=
+PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
@@ -89,49 +90,49 @@ ListenPorts = 40001, 40002, 40003, 40004
 
 # Client 1: Custom Proxy Client Peer (Defined in config, so it's 'both')
 [Peer]
-PublicKey = 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
 AllowedIPs = 10.0.0.2/32, fd00::2/128
 
 # Client 2: second independent QUIC proxy peer
 [Peer]
-PublicKey = g1WrftphD9z9b0/TX7tGOuqh1C2KpkFgGKC4jB3uz0s=
+PublicKey = ${NEW_PROXY_TEST_CLIENT2_PUBLIC_KEY}
 AllowedIPs = 10.0.0.4/32
 
 # Client 3/4: WireGuard-only peers; they must not enter any QUIC pool.
 [Peer]
-PublicKey = qv8C4Z9KlAlTjsc73+rRV7ePh6WAD0lr8+gilJwXdiE=
+PublicKey = ${NEW_PROXY_TEST_CLIENT3_PUBLIC_KEY}
 AllowedIPs = 10.0.0.3/32
 
 [Peer]
-PublicKey = DPvsO0uZuAK43BHWbY9kZvN7ZS2SPL5TcYYpugnXxRw=
+PublicKey = ${NEW_PROXY_TEST_CLIENT4_PUBLIC_KEY}
 AllowedIPs = 10.0.0.5/32
 EOF_CONF
 
-cat > "$CLIENT_CONF" <<'EOF_CONF'
+cat > "$CLIENT_CONF" <<EOF_CONF
 [Interface]
-PrivateKey = etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
+PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24, fd00::2/64
 TProxyPort = 1080
 MTU = 1400
 Table = off
 
 [Peer]
-PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
+PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32, fd00::1/128
 EOF_CONF
 
-cat > "$CLIENT2_CONF" <<'EOF_CONF'
+cat > "$CLIENT2_CONF" <<EOF_CONF
 [Interface]
-PrivateKey = hkUqKGHX5jbtCBUjiAvin8bxzy5JFKviYYJ0coE52Eg=
+PrivateKey = ${NEW_PROXY_TEST_CLIENT2_PRIVATE_KEY}
 Address = 10.0.0.4/24
 TProxyPort = 1080
 MTU = 1400
 Table = off
 
 [Peer]
-PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
+PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
@@ -290,10 +291,10 @@ sleep 1
 echo "=== [3/7] Starting server/client proxies with 4 QUIC ports ==="
 now_ts="$(date +%s)"
 cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
-g1WrftphD9z9b0/TX7tGOuqh1C2KpkFgGKC4jB3uz0s=	(none)	10.0.5.2:50323	10.0.0.4/32	${now_ts}	3482	256	(none)
-qv8C4Z9KlAlTjsc73+rRV7ePh6WAD0lr8+gilJwXdiE=	(none)	10.0.6.2:51820	10.0.0.3/32	${now_ts}	12500	8400	(none)
-DPvsO0uZuAK43BHWbY9kZvN7ZS2SPL5TcYYpugnXxRw=	(none)	10.0.7.2:51820	10.0.0.5/32	${now_ts}	12500	8400	(none)
+${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
+${NEW_PROXY_TEST_CLIENT2_PUBLIC_KEY}	(none)	10.0.5.2:50323	10.0.0.4/32	${now_ts}	3482	256	(none)
+${NEW_PROXY_TEST_CLIENT3_PUBLIC_KEY}	(none)	10.0.6.2:51820	10.0.0.3/32	${now_ts}	12500	8400	(none)
+${NEW_PROXY_TEST_CLIENT4_PUBLIC_KEY}	(none)	10.0.7.2:51820	10.0.0.5/32	${now_ts}	12500	8400	(none)
 EOF_MOCK_WG
 
 ip netns exec server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &

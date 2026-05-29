@@ -550,8 +550,12 @@ mod tests {
 
     #[test]
     fn test_parse_wg_dump_text() {
-        let text = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\t(none)\t1.2.3.4:51820\t10.0.0.2/32,fd00::2/128\t123\t456\t789\t(none)\n";
-        let parsed = parse_wg_dump_text(text).unwrap();
+        let public_key = crate::app_config::encode_base64_32(&[0u8; 32]);
+        let text = format!(
+            "{}\t(none)\t1.2.3.4:51820\t10.0.0.2/32,fd00::2/128\t123\t456\t789\t(none)\n",
+            public_key
+        );
+        let parsed = parse_wg_dump_text(&text).unwrap();
         let peer = parsed.get(&[0u8; 32]).unwrap();
         assert_eq!(peer.endpoint.as_deref(), Some("1.2.3.4:51820"));
         assert_eq!(peer.allowed_ips, vec!["10.0.0.2/32", "fd00::2/128"]);

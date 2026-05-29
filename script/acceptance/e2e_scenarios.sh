@@ -12,6 +12,9 @@
 
 set -e
 
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+
 # Ensure script is run with sudo/root privileges
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root / using sudo."
@@ -119,12 +122,12 @@ echo "  [UDP/ICMP] client_ns ──► router_ns ──► server_ns (L3 native)
 touch /tmp/client_proxy_active
 now_ts="$(date +%s)"
 cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
-09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
+${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
 EOF_MOCK_WG
 
-cat > /tmp/scenario_server.conf <<'EOF_CONF'
+cat > /tmp/scenario_server.conf <<EOF_CONF
 [Interface]
-PrivateKey = 1WL7OPPOABmaRVdjR6JoliATNsjOVFO1bE8gM113POM=
+PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
@@ -135,20 +138,20 @@ PublicIPv4 = 10.0.2.2
 ListenPorts = 40001, 40002
 
 [Peer]
-PublicKey = 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
 AllowedIPs = 10.0.0.2/32
 EOF_CONF
 
-cat > /tmp/scenario_client.conf <<'EOF_CONF'
+cat > /tmp/scenario_client.conf <<EOF_CONF
 [Interface]
-PrivateKey = etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
+PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
 TProxyPort = 1080
 MTU = 1400
 Table = off
 
 [Peer]
-PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
+PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
@@ -204,7 +207,7 @@ echo "  Active Strm: TCP 完成后应为 0 (连接已关闭)"
 echo ""
 echo "=== [4/5] SCENARIO 2: Dynamic Peer Management (Hot-Add/Remove Peer) ==="
 
-NEW_PEER_KEY="etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24="
+NEW_PEER_KEY="${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}"
 
 echo "  A. 动态新增 Peer..."
 ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server add-peer "$NEW_PEER_KEY" "10.0.0.99/32"
