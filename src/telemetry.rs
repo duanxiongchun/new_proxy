@@ -1,8 +1,9 @@
 use crate::quic_pool::QuicConnSnapshot;
 use crate::relay::PeerL4Stats;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UnifiedTelemetry {
@@ -35,7 +36,7 @@ impl TelemetryRegistry {
     }
 
     pub fn get_or_create(&self, pub_key: [u8; 32]) -> Arc<PeerL4Stats> {
-        let mut map = self.stats[self.shard_index(&pub_key)].lock().unwrap();
+        let mut map = self.stats[self.shard_index(&pub_key)].lock();
         map.entry(pub_key)
             .or_insert_with(|| Arc::new(PeerL4Stats::default()))
             .clone()
@@ -44,7 +45,7 @@ impl TelemetryRegistry {
     pub fn snapshot(&self) -> HashMap<[u8; 32], Arc<PeerL4Stats>> {
         let mut snapshot = HashMap::new();
         for shard in &self.stats {
-            let map = shard.lock().unwrap();
+            let map = shard.lock();
             snapshot.extend(map.iter().map(|(k, v)| (*k, v.clone())));
         }
         snapshot

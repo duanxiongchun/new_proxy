@@ -1,3 +1,4 @@
+use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
 use rand::Rng;
 use rustls::client::ServerCertVerified;
@@ -5,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -16,6 +17,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AUTH_PACKET_LEN: usize = 2048;
 const MAX_INCOMING_QUIC_CONNECTIONS: usize = 4096;
+static NEXT_QUIC_CONN_RECORD_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct PoolRuntimeConfig {
+    session_psk: [u8; 32],
+    server_cert_sha256: [u8; 32],
+    endpoints: Vec<SocketAddr>,
+}
+
+#[derive(Clone)]
+struct ControlRefreshConfig {
+    private_key: [u8; 32],
+    server_public_key: [u8; 32],
+    control_endpoint: SocketAddr,
+    fallback_endpoint: SocketAddr,
+}
 
 fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoint, String> {
     let runtime =
@@ -167,11 +184,10 @@ pub fn cert_sha256(certs: &[rustls::Certificate]) -> Result<[u8; 32], String> {
 // 2. 客户端 QUIC 物理连接池
 pub struct QuicPoolClient {
     client_public_key: [u8; 32],
-    session_psk: [u8; 32],
-    server_cert_sha256: [u8; 32],
-    endpoints: Vec<SocketAddr>,
-    slots: Arc<Mutex<Vec<PoolSlot>>>,
-    rr_index: Arc<Mutex<usize>>,
+    runtime_config: Arc<RwLock<PoolRuntimeConfig>>,
+    refresh_config: Option<ControlRefreshConfig>,
+    slots: Arc<RwLock<Vec<PoolSlot>>>,
+    rr_index: Arc<AtomicUsize>,
     endpoint: Arc<Mutex<Option<Endpoint>>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -184,19 +200,63 @@ struct PoolSlot {
 }
 
 impl QuicPoolClient {
+    #[allow(dead_code)]
     pub fn new(
         client_public_key: [u8; 32],
         session_psk: [u8; 32],
         server_cert_sha256: [u8; 32],
         endpoints: Vec<SocketAddr>,
     ) -> Self {
-        Self {
+        Self::new_internal(
             client_public_key,
             session_psk,
             server_cert_sha256,
             endpoints,
-            slots: Arc::new(Mutex::new(Vec::new())),
-            rr_index: Arc::new(Mutex::new(0)),
+            None,
+        )
+    }
+
+    pub fn new_with_refresh(
+        client_public_key: [u8; 32],
+        session_psk: [u8; 32],
+        server_cert_sha256: [u8; 32],
+        endpoints: Vec<SocketAddr>,
+        private_key: [u8; 32],
+        server_public_key: [u8; 32],
+        control_endpoint: SocketAddr,
+        fallback_endpoint: SocketAddr,
+    ) -> Self {
+        Self::new_internal(
+            client_public_key,
+            session_psk,
+            server_cert_sha256,
+            endpoints,
+            Some(ControlRefreshConfig {
+                private_key,
+                server_public_key,
+                control_endpoint,
+                fallback_endpoint,
+            }),
+        )
+    }
+
+    fn new_internal(
+        client_public_key: [u8; 32],
+        session_psk: [u8; 32],
+        server_cert_sha256: [u8; 32],
+        endpoints: Vec<SocketAddr>,
+        refresh_config: Option<ControlRefreshConfig>,
+    ) -> Self {
+        Self {
+            client_public_key,
+            runtime_config: Arc::new(RwLock::new(PoolRuntimeConfig {
+                session_psk,
+                server_cert_sha256,
+                endpoints,
+            })),
+            refresh_config,
+            slots: Arc::new(RwLock::new(Vec::new())),
+            rr_index: Arc::new(AtomicUsize::new(0)),
             endpoint: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -205,35 +265,48 @@ impl QuicPoolClient {
     pub fn shutdown(&self, reason: &'static [u8]) {
         self.shutdown.store(true, Ordering::Relaxed);
         {
-            let slots = self.slots.lock().unwrap();
+            let slots = self.slots.read();
             for slot in slots.iter() {
                 slot.conn.close(0u32.into(), reason);
             }
         }
-        if let Some(endpoint) = self.endpoint.lock().unwrap().as_ref() {
+        if let Some(endpoint) = self.endpoint.lock().as_ref() {
             endpoint.close(0u32.into(), reason);
         }
     }
 
     // 启动物理连接池，在后台并发拉起多路 QUIC 链接
     pub async fn start_pool(&self) -> Result<(), String> {
-        if self.endpoints.is_empty() {
+        let runtime_config = self.runtime_config.read().clone();
+        if runtime_config.endpoints.is_empty() {
             return Err("Empty endpoints pool".to_string());
         }
 
-        // 配置 0 证书验证的客户端配置
+        let endpoint = Self::create_client_endpoint(&runtime_config)?;
+        *self.endpoint.lock() = Some(endpoint.clone());
+
+        let slots = self
+            .connect_all_endpoints(&endpoint, &runtime_config)
+            .await?;
+
+        log::info!(
+            "Successfully initialized QUIC connection pool with {} active links",
+            slots.len()
+        );
+        *self.slots.write() = slots;
+        Ok(())
+    }
+
+    fn build_client_config(server_cert_sha256: [u8; 32]) -> ClientConfig {
         let mut rustls_config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
-                expected_sha256: self.server_cert_sha256,
+                expected_sha256: server_cert_sha256,
             }))
             .with_no_client_auth();
-
-        // 开启 ALPN
         rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
 
         let mut client_config = ClientConfig::new(Arc::new(rustls_config));
-        // 配置连接保活与传输超时
         let mut transport = quinn::TransportConfig::default();
         transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
         transport.keep_alive_interval(Some(Duration::from_secs(5)));
@@ -241,9 +314,15 @@ impl QuicPoolClient {
         transport.receive_window(quinn::VarInt::from(16 * 1024 * 1024u32));
         transport.send_window(16 * 1024 * 1024);
         client_config.transport_config(Arc::new(transport));
+        client_config
+    }
 
-        // 绑定本地客户端 UDP 端口
-        let bind_addr = if self.endpoints[0].is_ipv6() {
+    fn create_client_endpoint(runtime_config: &PoolRuntimeConfig) -> Result<Endpoint, String> {
+        if runtime_config.endpoints.is_empty() {
+            return Err("Empty endpoints pool".to_string());
+        }
+        let client_config = Self::build_client_config(runtime_config.server_cert_sha256);
+        let bind_addr = if runtime_config.endpoints[0].is_ipv6() {
             "[::]:0"
         } else {
             "0.0.0.0:0"
@@ -251,19 +330,24 @@ impl QuicPoolClient {
         let mut endpoint = Endpoint::client(bind_addr.parse().unwrap())
             .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
         endpoint.set_default_client_config(client_config);
-        *self.endpoint.lock().unwrap() = Some(endpoint.clone());
+        Ok(endpoint)
+    }
 
+    async fn connect_all_endpoints(
+        &self,
+        endpoint: &Endpoint,
+        runtime_config: &PoolRuntimeConfig,
+    ) -> Result<Vec<PoolSlot>, String> {
         let mut join_set = tokio::task::JoinSet::new();
 
-        // 并发连向推上来的公网 UDP 端口池
-        for &target_addr in &self.endpoints {
+        for &target_addr in &runtime_config.endpoints {
             log::info!(
                 "Establishing physical QUIC connection pool link to {}",
                 target_addr
             );
             let endpoint_clone = endpoint.clone();
             let client_public_key = self.client_public_key;
-            let session_psk = self.session_psk;
+            let session_psk = runtime_config.session_psk;
             join_set.spawn(async move {
                 Self::connect_authenticated_with(
                     endpoint_clone,
@@ -290,12 +374,7 @@ impl QuicPoolClient {
             );
         }
 
-        log::info!(
-            "Successfully initialized QUIC connection pool with {} active links",
-            slots.len()
-        );
-        *self.slots.lock().unwrap() = slots;
-        Ok(())
+        Ok(slots)
     }
 
     // 执行应用层 HMAC-PSK 强认证
@@ -331,7 +410,9 @@ impl QuicPoolClient {
         send.write_all(&bytes)
             .await
             .map_err(|e| format!("Auth write error: {}", e))?;
-        send.shutdown().await.unwrap();
+        send.shutdown()
+            .await
+            .map_err(|e| format!("Auth shutdown error: {}", e))?;
 
         // 等待服务端响应 "OK"
         let mut resp = [0u8; 2];
@@ -401,17 +482,16 @@ impl QuicPoolClient {
             attempts += 1;
 
             let (conn, conn_stat, total_conns) = {
-                let slots = self.slots.lock().unwrap();
+                let slots = self.slots.read();
                 if slots.is_empty() {
                     return Err("No active QUIC connections in pool".to_string());
                 }
 
-                let mut idx = self.rr_index.lock().unwrap();
-                let i = *idx % slots.len();
+                let idx = self.rr_index.fetch_add(1, Ordering::Relaxed);
+                let i = idx % slots.len();
                 let selected_conn = slots[i].conn.clone();
                 let selected_stat = Arc::new(slots[i].stats.clone());
                 let total = slots.len();
-                *idx += 1;
                 (selected_conn, selected_stat, total)
             };
 
@@ -452,9 +532,14 @@ impl QuicPoolClient {
                     break;
                 }
 
-                let (endpoints, endpoint_opt) = {
-                    let ep = self.endpoint.lock().unwrap();
-                    (self.endpoints.clone(), ep.clone())
+                let runtime_config = self.runtime_config.read().clone();
+                let (endpoints, session_psk, endpoint_opt) = {
+                    let ep = self.endpoint.lock();
+                    (
+                        runtime_config.endpoints.clone(),
+                        runtime_config.session_psk,
+                        ep.clone(),
+                    )
                 };
 
                 let endpoint = match endpoint_opt {
@@ -462,7 +547,7 @@ impl QuicPoolClient {
                     None => continue,
                 };
 
-                let active_slots = self.slots.lock().unwrap().clone();
+                let active_slots = self.slots.read().clone();
 
                 let mut reconnects = tokio::task::JoinSet::new();
 
@@ -479,7 +564,6 @@ impl QuicPoolClient {
                         let endpoint_clone = endpoint.clone();
                         let target_addr = slot.endpoint;
                         let client_public_key = self.client_public_key;
-                        let session_psk = self.session_psk;
                         reconnects.spawn(async move {
                             (
                                 Some(i),
@@ -497,7 +581,7 @@ impl QuicPoolClient {
                 }
 
                 let missing_endpoints = {
-                    let slots = self.slots.lock().unwrap();
+                    let slots = self.slots.read();
                     endpoints
                         .iter()
                         .copied()
@@ -514,7 +598,6 @@ impl QuicPoolClient {
                     );
                     let endpoint_clone = endpoint.clone();
                     let client_public_key = self.client_public_key;
-                    let session_psk = self.session_psk;
                     reconnects.spawn(async move {
                         (
                             None,
@@ -530,6 +613,7 @@ impl QuicPoolClient {
                     });
                 }
 
+                let mut auth_failures = 0usize;
                 while let Some(result) = reconnects.join_next().await {
                     let (slot_index, target_addr, reconnect_result) = match result {
                         Ok(result) => result,
@@ -541,7 +625,7 @@ impl QuicPoolClient {
 
                     match reconnect_result {
                         Ok(new_slot) => {
-                            let mut slots = self.slots.lock().unwrap();
+                            let mut slots = self.slots.write();
                             if let Some(i) = slot_index {
                                 if i < slots.len() && slots[i].endpoint == target_addr {
                                     slots[i] = new_slot;
@@ -559,12 +643,69 @@ impl QuicPoolClient {
                             }
                         }
                         Err(e) => {
+                            if e.contains("PSK Authentication failed")
+                                || e.contains("PSK Authentication timed out")
+                            {
+                                auth_failures += 1;
+                            }
                             log::warn!("{}", e);
                         }
                     }
                 }
+
+                if auth_failures >= endpoints.len().max(1) {
+                    if let Err(e) = self.refresh_control_config().await {
+                        log::warn!("Failed to refresh QUIC session after auth failures: {}", e);
+                    }
+                }
             }
         });
+    }
+
+    async fn refresh_control_config(&self) -> Result<(), String> {
+        let Some(refresh) = self.refresh_config.clone() else {
+            return Err("control refresh is not configured for this pool".to_string());
+        };
+
+        log::info!(
+            "Refreshing QUIC control session for peer {}",
+            crate::app_config::encode_base64_32(&refresh.server_public_key)
+        );
+        let control_client = crate::control::ControlClient::new(
+            refresh.private_key,
+            refresh.server_public_key,
+            refresh.control_endpoint,
+        );
+        let (control_response, _control_socket) = control_client.negotiate_config().await?;
+        let quic_endpoint_ip = crate::app_config::select_quic_endpoint_ip(
+            &control_response,
+            refresh.fallback_endpoint,
+        )?;
+        let endpoints = control_response
+            .port_pool
+            .iter()
+            .map(|&port| SocketAddr::new(quic_endpoint_ip, port))
+            .collect::<Vec<_>>();
+        let runtime_config = PoolRuntimeConfig {
+            session_psk: control_response.session_psk,
+            server_cert_sha256: control_response.quic_cert_sha256,
+            endpoints,
+        };
+
+        let endpoint = Self::create_client_endpoint(&runtime_config)?;
+        let slots = self
+            .connect_all_endpoints(&endpoint, &runtime_config)
+            .await?;
+
+        if let Some(old_endpoint) = self.endpoint.lock().replace(endpoint) {
+            old_endpoint.close(0u32.into(), b"QUIC session refreshed");
+        }
+        for slot in self.slots.write().drain(..) {
+            slot.conn.close(0u32.into(), b"QUIC session refreshed");
+        }
+        *self.runtime_config.write() = runtime_config;
+        *self.slots.write() = slots;
+        Ok(())
     }
 }
 
@@ -574,6 +715,7 @@ pub type PeerConnRegistry = Arc<Mutex<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
 
 #[derive(Clone)]
 pub struct QuicConnRecord {
+    id: u64,
     pub stats: QuicConnStats,
     conn: Connection,
 }
@@ -590,14 +732,14 @@ impl QuicConnRecord {
 
 pub struct QuicPoolServer {
     listen_ports: Vec<u16>,
-    session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     auth_nonce_cache: Arc<Mutex<HashMap<[u8; 32], crate::control::NonceCache>>>,
 }
 
 impl QuicPoolServer {
     pub fn new(
         listen_ports: Vec<u16>,
-        session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+        session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
         auth_nonce_cache: Arc<Mutex<HashMap<[u8; 32], crate::control::NonceCache>>>,
     ) -> Self {
         Self {
@@ -735,7 +877,7 @@ impl QuicPoolServer {
 
                         // 查找临时协商的 PSK 缓存
                         let authenticated_psk = {
-                            let cache = session_cache.lock().unwrap();
+                            let cache = session_cache.read();
                             if let Some(psk) = cache.get(&auth_packet.client_public_key) {
                                 if crate::control::verify_mac(
                                     psk,
@@ -764,7 +906,7 @@ impl QuicPoolServer {
                         };
 
                         {
-                            let mut cache = auth_nonce_cache.lock().unwrap();
+                            let mut cache = auth_nonce_cache.lock();
                             let peer_cache = cache
                                 .entry(auth_packet.client_public_key)
                                 .or_insert_with(|| crate::control::NonceCache::new(4096));
@@ -787,13 +929,15 @@ impl QuicPoolServer {
 
                         // 2. 为这条物理连接创建统计句柄，注册到 peer_conn_registry
                         let client_pub_key = auth_packet.client_public_key;
+                        let record_id = NEXT_QUIC_CONN_RECORD_ID.fetch_add(1, Ordering::Relaxed);
                         let conn_stat = Arc::new(QuicConnStats::new(remote_addr, port));
                         {
-                            let mut registry = peer_conn_registry.lock().unwrap();
+                            let mut registry = peer_conn_registry.lock();
                             registry
                                 .entry(client_pub_key)
                                 .or_default()
                                 .push(QuicConnRecord {
+                                    id: record_id,
                                     stats: (*conn_stat).clone(),
                                     conn: conn.clone(),
                                 });
@@ -802,13 +946,13 @@ impl QuicPoolServer {
                         let _guard = TelemetryRegistryGuard {
                             registry: peer_conn_registry.clone(),
                             client_pub_key,
-                            remote_addr,
+                            record_id,
                         };
 
                         // 3. 进入多路复用流接收循环
                         while let Ok((send_mux, recv_mux)) = conn.accept_bi().await {
                             let still_authorized = {
-                                let cache = session_cache.lock().unwrap();
+                                let cache = session_cache.read();
                                 cache
                                     .get(&client_pub_key)
                                     .map(|psk| *psk == connection_psk)
@@ -841,17 +985,16 @@ impl QuicPoolServer {
 struct TelemetryRegistryGuard {
     registry: PeerConnRegistry,
     client_pub_key: [u8; 32],
-    remote_addr: SocketAddr,
+    record_id: u64,
 }
 
 impl Drop for TelemetryRegistryGuard {
     fn drop(&mut self) {
-        if let Ok(mut registry) = self.registry.lock() {
-            if let Some(conns) = registry.get_mut(&self.client_pub_key) {
-                conns.retain(|record| record.stats.remote_addr != self.remote_addr);
-                if conns.is_empty() {
-                    registry.remove(&self.client_pub_key);
-                }
+        let mut registry = self.registry.lock();
+        if let Some(conns) = registry.get_mut(&self.client_pub_key) {
+            conns.retain(|record| record.id != self.record_id);
+            if conns.is_empty() {
+                registry.remove(&self.client_pub_key);
             }
         }
     }
@@ -882,15 +1025,12 @@ mod tests {
         };
 
         // 2. 初始化服务端
-        let session_cache = Arc::new(Mutex::new(HashMap::new()));
+        let session_cache = Arc::new(RwLock::new(HashMap::new()));
         let peer_registry = Arc::new(Mutex::new(HashMap::new()));
 
         let client_pub_key = [7u8; 32];
         let session_psk = [9u8; 32];
-        session_cache
-            .lock()
-            .unwrap()
-            .insert(client_pub_key, session_psk);
+        session_cache.write().insert(client_pub_key, session_psk);
 
         let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
         let server = QuicPoolServer::new(vec![port], session_cache.clone(), auth_nonce_cache);
@@ -958,7 +1098,7 @@ mod tests {
 
         // 7. 验证流量统计与快照
         {
-            let registry = peer_registry.lock().unwrap();
+            let registry = peer_registry.lock();
             assert!(registry.contains_key(&client_pub_key));
             let stats = &registry[&client_pub_key];
             assert_eq!(stats.len(), 1);
@@ -976,7 +1116,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 9. 关闭客户端连接，验证 Registry 自动清理
-        if let Some(slot) = client_arc.slots.lock().unwrap().first() {
+        if let Some(slot) = client_arc.slots.read().first() {
             slot.conn.close(0u32.into(), b"Test shutdown");
         }
 
@@ -984,7 +1124,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         {
-            let registry = peer_registry.lock().unwrap();
+            let registry = peer_registry.lock();
             assert!(registry.is_empty() || !registry.contains_key(&client_pub_key));
         }
     }

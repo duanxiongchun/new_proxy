@@ -1,11 +1,12 @@
 use hmac::{Hmac, Mac};
+use parking_lot::{Mutex, RwLock};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -246,27 +247,61 @@ impl NonceCache {
     }
 }
 
+use std::time::Instant;
+
+struct IpRateLimiter {
+    history: Mutex<HashMap<IpAddr, (Instant, f64)>>,
+}
+
+impl IpRateLimiter {
+    fn new() -> Self {
+        Self {
+            history: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn check_limit(&self, ip: IpAddr) -> bool {
+        let mut history = self.history.lock();
+        if history.len() > 10000 {
+            let now = Instant::now();
+            history.retain(|_, (last_seen, _)| now.duration_since(*last_seen).as_secs() < 60);
+        }
+        let now = Instant::now();
+        let (last_seen, tokens) = history.entry(ip).or_insert((now, 10.0));
+        let elapsed = now.duration_since(*last_seen).as_secs_f64();
+        *last_seen = now;
+        *tokens = (*tokens + elapsed * 5.0).min(10.0);
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // 3. 服务端控制面协商服务
 pub struct ControlServer {
     listen_port: u16,
-    pub peer_secrets: Arc<std::sync::RwLock<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Derived_Shared_Secret}
+    pub peer_secrets: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Derived_Shared_Secret}
     quic_ports: Vec<u16>,
     public_ipv4: Option<String>,
     public_ipv6: Option<String>,
     quic_cert_sha256: [u8; 32],
-    session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Session_PSK}
+    session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Session_PSK}
     nonce_cache: Arc<Mutex<NonceCache>>,
+    rate_limiter: Arc<IpRateLimiter>,
 }
 
 impl ControlServer {
     pub fn new(
         listen_port: u16,
-        peer_secrets: Arc<std::sync::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
+        peer_secrets: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
         quic_ports: Vec<u16>,
         public_ipv4: Option<String>,
         public_ipv6: Option<String>,
         quic_cert_sha256: [u8; 32],
-        session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+        session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     ) -> Self {
         Self {
             listen_port,
@@ -277,6 +312,7 @@ impl ControlServer {
             quic_cert_sha256,
             session_cache,
             nonce_cache: Arc::new(Mutex::new(NonceCache::new(4096))),
+            rate_limiter: Arc::new(IpRateLimiter::new()),
         }
     }
 
@@ -348,6 +384,14 @@ impl ControlServer {
                 continue;
             }
 
+            if !self.rate_limiter.check_limit(client_addr.ip()) {
+                log::debug!(
+                    "Rate limit exceeded for control packet from {}; dropping.",
+                    client_addr
+                );
+                continue;
+            }
+
             let socket_clone = socket.clone();
             let peer_secrets_clone = self.peer_secrets.clone();
             let session_cache_clone = self.session_cache.clone();
@@ -381,7 +425,7 @@ impl ControlServer {
 
                 // 1. 查找客户端共享密钥
                 let shared_secret = {
-                    let guard = peer_secrets_clone.read().unwrap();
+                    let guard = peer_secrets_clone.read();
                     guard.get(&req.client_public_key).cloned()
                 };
                 let shared_secret = match shared_secret {
@@ -403,7 +447,7 @@ impl ControlServer {
 
                 // 3. 已认证后再记录 nonce，避免未认证流量污染 replay cache。
                 {
-                    let mut cache = nonce_cache_clone.lock().unwrap();
+                    let mut cache = nonce_cache_clone.lock();
                     if !cache.insert(req.client_nonce) {
                         log::warn!(
                             "Replayed ControlRequest detected from peer: {:?}, dropping request.",
@@ -421,7 +465,7 @@ impl ControlServer {
 
                 // 更新用户态会话缓存
                 {
-                    let mut cache = session_cache_clone.lock().unwrap();
+                    let mut cache = session_cache_clone.write();
                     cache.insert(req.client_public_key, session_psk);
                 }
 
@@ -485,13 +529,12 @@ mod tests {
         // 2. 预计算 Diffie-Hellman 共享密钥
         let server_shared = server_secret.diffie_hellman(&client_pub).to_bytes();
 
-        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
         peer_secrets
             .write()
-            .unwrap()
             .insert(client_pub.to_bytes(), server_shared);
 
-        let session_cache = Arc::new(Mutex::new(HashMap::new()));
+        let session_cache = Arc::new(RwLock::new(HashMap::new()));
 
         // 3. 在随机的可用 UDP 端口上拉起 ControlServer
         let server_port = {
@@ -533,7 +576,7 @@ mod tests {
         assert!(resp.session_psk != [0u8; 32]);
 
         // 验证服务端 session cache 里成功缓存了该 session_psk
-        let cache = session_cache.lock().unwrap();
+        let cache = session_cache.read();
         assert_eq!(cache.get(&client_pub.to_bytes()), Some(&resp.session_psk));
 
         server_task.abort();
@@ -546,12 +589,11 @@ mod tests {
         let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
         let shared_secret = server_secret.diffie_hellman(&client_pub).to_bytes();
 
-        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
         peer_secrets
             .write()
-            .unwrap()
             .insert(client_pub.to_bytes(), shared_secret);
-        let session_cache = Arc::new(Mutex::new(HashMap::new()));
+        let session_cache = Arc::new(RwLock::new(HashMap::new()));
 
         let server_port = {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -593,7 +635,7 @@ mod tests {
                 .is_err(),
             "bad HMAC request must not receive a response"
         );
-        assert!(session_cache.lock().unwrap().is_empty());
+        assert!(session_cache.read().is_empty());
 
         let good_packet = SignedPacket {
             mac: calculate_mac(&shared_secret, &payload),
@@ -606,10 +648,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(serde_json::from_slice::<SignedPacket>(&buf[..len]).is_ok());
-        assert!(session_cache
-            .lock()
-            .unwrap()
-            .contains_key(&client_pub.to_bytes()));
+        assert!(session_cache.read().contains_key(&client_pub.to_bytes()));
 
         socket.send_to(&good_bytes, server_addr).await.unwrap();
         assert!(

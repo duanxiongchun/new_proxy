@@ -81,6 +81,67 @@ pub async fn relay_connections_with_conn_stat(
     .await;
 }
 
+use parking_lot::Mutex;
+use std::sync::OnceLock;
+
+static BUFFER_POOL: OnceLock<BufferPool> = OnceLock::new();
+
+struct BufferPool {
+    pool: Mutex<Vec<Box<[u8; 16 * 1024]>>>,
+}
+
+impl BufferPool {
+    fn global() -> &'static BufferPool {
+        BUFFER_POOL.get_or_init(|| BufferPool {
+            pool: Mutex::new(Vec::with_capacity(64)),
+        })
+    }
+
+    fn get() -> Box<[u8; 16 * 1024]> {
+        if let Some(buf) = Self::global().pool.lock().pop() {
+            buf
+        } else {
+            Box::new([0u8; 16 * 1024])
+        }
+    }
+
+    fn put(buf: Box<[u8; 16 * 1024]>) {
+        let mut p = Self::global().pool.lock();
+        if p.len() < 128 {
+            p.push(buf);
+        }
+    }
+}
+
+struct PooledBuffer(Option<Box<[u8; 16 * 1024]>>);
+
+impl PooledBuffer {
+    fn new() -> Self {
+        Self(Some(BufferPool::get()))
+    }
+}
+
+impl std::ops::Deref for PooledBuffer {
+    type Target = [u8; 16 * 1024];
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for PooledBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.0.take() {
+            BufferPool::put(buf);
+        }
+    }
+}
+
 pub async fn relay_connections_generic<TR, TW, QR, QW>(
     tcp_read: TR,
     tcp_write: TW,
@@ -135,20 +196,34 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     let mut s2c = server_to_client;
 
     tokio::select! {
-        _ = &mut c2s => {
+        res = &mut c2s => {
+            if let Err(e) = res {
+                log::error!("Client→Server relay worker task panicked or failed: {:?}", e);
+            }
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     s2c.abort();
                 }
-                _ = &mut s2c => {}
+                res2 = &mut s2c => {
+                    if let Err(e) = res2 {
+                        log::error!("Server→Client relay worker task panicked or failed: {:?}", e);
+                    }
+                }
             }
         }
-        _ = &mut s2c => {
+        res = &mut s2c => {
+            if let Err(e) = res {
+                log::error!("Server→Client relay worker task panicked or failed: {:?}", e);
+            }
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     c2s.abort();
                 }
-                _ = &mut c2s => {}
+                res2 = &mut c2s => {
+                    if let Err(e) = res2 {
+                        log::error!("Client→Server relay worker task panicked or failed: {:?}", e);
+                    }
+                }
             }
         }
     }
@@ -165,7 +240,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = Box::new([0u8; 16 * 1024]);
+    let mut buf = PooledBuffer::new();
     let mut copied = 0u64;
     loop {
         let n = match tokio::time::timeout(RELAY_IDLE_TIMEOUT, reader.read(&mut buf[..])).await {

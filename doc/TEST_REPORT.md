@@ -4,7 +4,7 @@
 
 - 项目版本：`new_proxy v5.0.0`
 - 报告日期：2026-05-29
-- 主要测试对象：模块拆分后的配置、UDS API/server、TPROXY TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer、聚合遥测、稳定性与 perf smoke
+- 主要测试对象：配置冲突校验、UDS API/server、TPROXY TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer 并发/冲突防护、聚合遥测、稳定性与 perf smoke
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
@@ -29,12 +29,18 @@ cargo fmt --check: PASS
 cargo check: PASS
 cargo test:
   new_proxy_cli: 9 passed; 0 failed
-  new_proxy: 38 passed; 0 failed
+  new_proxy: 40 passed; 0 failed
 cargo build --bins: PASS
 cargo build --release --bins: PASS
 ```
 
-结论：**全部 47 个 Rust 单元测试通过（0 失败）**。
+新增回归覆盖：
+
+- 静态配置拒绝重复 peer public key、重复 AllowedIPs 和重叠 AllowedIPs。
+- UDS 动态 AddPeer 拒绝请求内重复 AllowedIPs，并拒绝与其他 peer 重叠的 AllowedIPs。
+- 保留 QUIC registry、动态 peer remove、control HMAC/replay、TPROXY listener、relay、telemetry 等既有覆盖。
+
+结论：**全部 49 个 Rust 单元测试通过（0 失败）**。
 
 ### 2. 脚本语法与 Python 编译检查
 
@@ -118,7 +124,7 @@ sudo bash script/acceptance/e2e_dynamic_client_peer.sh
 产物目录：
 
 ```text
-/tmp/new_proxy_dynamic_peer_20260529_145509
+/tmp/new_proxy_dynamic_peer_20260529_153720
 ```
 
 关键结果：
@@ -142,7 +148,7 @@ sudo STABILITY_DURATION=60 STABILITY_SAMPLE_INTERVAL=10 bash script/acceptance/s
 产物目录：
 
 ```text
-/tmp/new_proxy_stability_20260529_145917
+/tmp/new_proxy_stability_20260529_154039
 ```
 
 关键结果：
@@ -156,9 +162,9 @@ Short curl OK/FAIL: 1160/0
 UDP OK/FAIL: 36/0
 Ping OK/FAIL: 120/0
 Worst per-peer QUIC balance CV: 0.19%
-Client RSS MiB: 14.1 -> 14.3 (+1.77%)
-Client2 RSS MiB: 12.0 -> 12.5 (+3.73%)
-Server RSS MiB: 11.8 -> 13.1 (+10.81%)
+Client RSS MiB: 11.7 -> 11.7 (+0.00%)
+Client2 RSS MiB: 10.4 -> 10.4 (+0.00%)
+Server RSS MiB: 12.3 -> 12.6 (+2.19%)
 ```
 
 通过准则：
@@ -185,16 +191,16 @@ sudo bash script/perf/perf_smoke.sh
 产物目录：
 
 ```text
-/tmp/new_proxy_perf_smoke_20260529_145640
+/tmp/new_proxy_perf_smoke_20260529_154303
 ```
 
 关键结果：
 
 ```text
-TTFB p50: 0.003495s
-TTFB p95: 0.004175s
-TTFB max: 0.004433s
-Throughput: 71.667 MiB/s
+TTFB p50: 0.003378s
+TTFB p95: 0.003859s
+TTFB max: 0.004898s
+Throughput: 71.710 MiB/s
 ✓ [SUCCESS] Perf smoke passed
 ```
 
@@ -202,4 +208,4 @@ Throughput: 71.667 MiB/s
 
 ## 总结
 
-本轮执行的格式、编译、单元、脚本语法、E2E、稳定性和 perf smoke 全部通过。拆分后的模块单元测试已迁移到对应模块，`main.rs` 仅保留跨模块 peer 同步测试。
+本轮执行的格式、编译、单元、脚本语法、Python 编译、E2E、动态 peer、稳定性和 perf smoke 全部通过。新增的并发/冲突/清理相关回归覆盖已纳入单元测试。

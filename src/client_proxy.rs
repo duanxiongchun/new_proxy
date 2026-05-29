@@ -39,11 +39,15 @@ pub async fn build_peer_quic_pool(
         .map(|&port| SocketAddr::new(quic_endpoint_ip, port))
         .collect::<Vec<_>>();
     let client_pub_derived = PublicKey::from(&StaticSecret::from(private_key)).to_bytes();
-    let quic_pool_client = Arc::new(QuicPoolClient::new(
+    let quic_pool_client = Arc::new(QuicPoolClient::new_with_refresh(
         client_pub_derived,
         control_response.session_psk,
         control_response.quic_cert_sha256,
         quic_endpoints,
+        private_key,
+        peer.public_key,
+        control_addr,
+        endpoint,
     ));
     quic_pool_client.start_pool().await?;
     quic_pool_client.clone().start_health_checker();
@@ -53,7 +57,7 @@ pub async fn build_peer_quic_pool(
 pub async fn run_tproxy_accept_loop(
     listener: TcpListener,
     quic_pools: PeerQuicPools,
-    state: Arc<std::sync::RwLock<GatewayState>>,
+    state: Arc<parking_lot::RwLock<GatewayState>>,
     telemetry: Arc<TelemetryRegistry>,
     connection_limit: Arc<tokio::sync::Semaphore>,
 ) {
@@ -79,7 +83,7 @@ async fn handle_tproxy_connection(
     tcp_socket: TcpStream,
     src_addr: SocketAddr,
     quic_pools: PeerQuicPools,
-    state: Arc<std::sync::RwLock<GatewayState>>,
+    state: Arc<parking_lot::RwLock<GatewayState>>,
     telemetry: Arc<TelemetryRegistry>,
 ) {
     if let Err(e) = set_tcp_keepalive(&tcp_socket) {
@@ -98,13 +102,13 @@ async fn handle_tproxy_connection(
     };
 
     let matched_peer = {
-        let st = state.read().unwrap();
+        let st = state.read();
         st.router.longest_match(original_dst.ip())
     };
 
     if let Some(peer_pub_key) = matched_peer {
         let quic_pool = {
-            let pools = quic_pools.read().unwrap();
+            let pools = quic_pools.read();
             pools.get(&peer_pub_key).cloned()
         };
         let Some(quic_pool) = quic_pool else {

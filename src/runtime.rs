@@ -264,9 +264,7 @@ pub fn cleanup_peer_routes_and_tproxy(
                 "TCPMSS".to_string(),
                 "--clamp-mss-to-pmtud".to_string(),
             ];
-            if let Err(e) = run_command_checked(mss_tool, &mss_args) {
-                errors.push(e);
-            }
+            run_command_best_effort(mss_tool, &mss_args);
         }
         let route_result = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
             run_command_checked(

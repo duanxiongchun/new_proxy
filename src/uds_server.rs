@@ -13,9 +13,10 @@ use crate::runtime::{
 use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry};
 use crate::wireguard::{get_wg_dump_stats, remove_peer_from_kernel, sync_peer_to_kernel};
 use crate::{GatewayState, PeerQuicPools};
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -24,16 +25,17 @@ const MAX_UDS_CLIENTS: usize = 1024;
 #[derive(Clone)]
 pub struct UdsServerContext {
     pub telemetry: Arc<TelemetryRegistry>,
-    pub state: Arc<std::sync::RwLock<GatewayState>>,
-    pub peer_secrets: Arc<std::sync::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
+    pub state: Arc<RwLock<GatewayState>>,
+    pub peer_secrets: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     pub server_secret: StaticSecret,
     pub shared_quic_registry: quic_pool::PeerConnRegistry,
     pub interface_name: String,
-    pub session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    pub session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     pub auth_nonce_cache: Arc<Mutex<HashMap<[u8; 32], NonceCache>>>,
     pub client_quic_pools: PeerQuicPools,
     pub client_private_key: [u8; 32],
     pub runtime_mode: RuntimeMode,
+    pub peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub fn bind_listener(interface_name: &str) -> Option<UnixListener> {
@@ -161,12 +163,12 @@ async fn handle_stats(
         let mut aggregated = Vec::new();
         let mut seen = HashSet::new();
         let peers = {
-            let st = context.state.read().unwrap();
+            let st = context.state.read();
             st.config.peers.clone()
         };
         let sources = telemetry_sources(&peers, &l3_stats);
         let registry_map = context.telemetry.snapshot();
-        let quic_registry = context.shared_quic_registry.lock().unwrap();
+        let quic_registry = context.shared_quic_registry.lock();
 
         for peer in peers {
             let pub_key = peer.public_key;
@@ -310,7 +312,7 @@ async fn handle_dump(
         .unwrap_or_default();
     let response = {
         let telemetry = context.telemetry.snapshot();
-        let quic_registry = context.shared_quic_registry.lock().unwrap();
+        let quic_registry = context.shared_quic_registry.lock();
         let mut keys = HashSet::new();
         keys.extend(l3_stats.keys().copied());
         keys.extend(telemetry.keys().copied());
@@ -420,8 +422,11 @@ async fn handle_add_peer(
         proxy_port,
     };
 
-    let (table_off, tproxy_port, old_peer) = {
-        let state = context.state.read().unwrap();
+    let _mutation_guard = context.peer_mutation_lock.lock().await;
+
+    let (table_off, tproxy_port, old_peer, conflict) = {
+        let state = context.state.read();
+        let conflict = find_allowed_ip_conflict(&state.config.peers, &new_peer);
         (
             state
                 .config
@@ -437,8 +442,13 @@ async fn handle_add_peer(
                 .iter()
                 .find(|peer| peer.public_key == parsed_pub_key)
                 .cloned(),
+            conflict,
         )
     };
+    if let Some(conflict) = conflict {
+        write_error(stream, framed_response, conflict).await;
+        return;
+    }
 
     if context.runtime_mode == RuntimeMode::Client {
         match (new_peer.endpoint, new_peer.proxy_port) {
@@ -485,33 +495,37 @@ async fn handle_add_peer(
 
     if !table_off {
         if let Some(peer) = old_peer.clone() {
-            let interface_name = context.interface_name.clone();
-            let _ = run_blocking_command(move || {
-                let _ = cleanup_peer_routes_and_tproxy(&peer, tproxy_port, &interface_name);
-                Ok(())
-            })
-            .await;
+            if let Err(e) = cleanup_peer_routes(context, peer, tproxy_port).await {
+                if let Some(pool) = prepared_client_pool.as_ref() {
+                    pool.shutdown(b"Peer route cleanup failed");
+                }
+                write_error(
+                    stream,
+                    framed_response,
+                    format!("Failed to clean old peer routes/tproxy: {}", e),
+                )
+                .await;
+                return;
+            }
         }
     }
 
     if !table_off {
-        let new_peer_for_routes = new_peer.clone();
-        let interface_name = context.interface_name.clone();
-        let setup_result = run_blocking_command(move || {
-            setup_peer_routes_and_tproxy(&new_peer_for_routes, tproxy_port, &interface_name)
-        })
-        .await;
+        let setup_result = setup_peer_routes(context, new_peer.clone(), tproxy_port).await;
         if let Err(e) = setup_result {
             if let Some(pool) = prepared_client_pool.as_ref() {
                 pool.shutdown(b"Peer route setup failed");
             }
-            rollback_peer_routes(context, &new_peer, old_peer.clone(), tproxy_port).await;
-            write_error(
-                stream,
-                framed_response,
-                format!("Failed to sync peer routes/tproxy: {}", e),
-            )
-            .await;
+            let rollback_error =
+                rollback_peer_routes(context, &new_peer, old_peer.clone(), tproxy_port).await;
+            let message = match rollback_error {
+                Ok(()) => format!("Failed to sync peer routes/tproxy: {}", e),
+                Err(rollback) => format!(
+                    "Failed to sync peer routes/tproxy: {}; rollback failed: {}",
+                    e, rollback
+                ),
+            };
+            write_error(stream, framed_response, message).await;
             return;
         }
     }
@@ -526,7 +540,17 @@ async fn handle_add_peer(
             pool.shutdown(b"Peer kernel sync failed");
         }
         if !table_off {
-            rollback_peer_routes(context, &new_peer, old_peer.clone(), tproxy_port).await;
+            let rollback_error =
+                rollback_peer_routes(context, &new_peer, old_peer.clone(), tproxy_port).await;
+            let message = match rollback_error {
+                Ok(()) => format!("Failed to sync peer to kernel: {}", e),
+                Err(rollback) => format!(
+                    "Failed to sync peer to kernel: {}; route rollback failed: {}",
+                    e, rollback
+                ),
+            };
+            write_error(stream, framed_response, message).await;
+            return;
         }
         write_error(
             stream,
@@ -542,11 +566,10 @@ async fn handle_add_peer(
     context
         .peer_secrets
         .write()
-        .unwrap()
         .insert(parsed_pub_key, shared_secret);
 
     {
-        let mut state = context.state.write().unwrap();
+        let mut state = context.state.write();
         state
             .config
             .peers
@@ -557,7 +580,7 @@ async fn handle_add_peer(
 
     if context.runtime_mode == RuntimeMode::Client {
         let old_pool = {
-            let mut pools = context.client_quic_pools.write().unwrap();
+            let mut pools = context.client_quic_pools.write();
             if let Some(pool) = prepared_client_pool {
                 pools.insert(parsed_pub_key, pool)
             } else {
@@ -591,8 +614,10 @@ async fn handle_remove_peer(
         }
     };
 
+    let _mutation_guard = context.peer_mutation_lock.lock().await;
+
     let (removed_peer, table_off, tproxy_port) = {
-        let state = context.state.read().unwrap();
+        let state = context.state.read();
         (
             state
                 .config
@@ -611,45 +636,61 @@ async fn handle_remove_peer(
         )
     };
 
-    context
-        .peer_secrets
-        .write()
-        .unwrap()
-        .remove(&parsed_pub_key);
-    context
-        .session_cache
-        .lock()
-        .unwrap()
-        .remove(&parsed_pub_key);
-    context
-        .auth_nonce_cache
-        .lock()
-        .unwrap()
-        .remove(&parsed_pub_key);
+    let mut routes_cleaned = false;
+    if let Some(peer) = &removed_peer {
+        if !table_off {
+            if let Err(e) = cleanup_peer_routes(context, peer.clone(), tproxy_port).await {
+                write_error(
+                    stream,
+                    framed_response,
+                    format!("Failed to clean peer routes/tproxy: {}", e),
+                )
+                .await;
+                return;
+            }
+            routes_cleaned = true;
+        }
+    }
+    let interface_name = context.interface_name.clone();
+    if let Err(e) =
+        run_blocking_command(move || remove_peer_from_kernel(&interface_name, parsed_pub_key)).await
+    {
+        let restore_error = if routes_cleaned {
+            match removed_peer.clone() {
+                Some(peer) => setup_peer_routes(context, peer, tproxy_port).await.err(),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let message = match restore_error {
+            Some(restore) => format!(
+                "Failed to remove kernel peer: {}; failed to restore peer routes/tproxy: {}",
+                e, restore
+            ),
+            None => format!("Failed to remove kernel peer: {}", e),
+        };
+        write_error(stream, framed_response, message).await;
+        return;
+    }
+
+    context.peer_secrets.write().remove(&parsed_pub_key);
+    context.session_cache.write().remove(&parsed_pub_key);
+    context.auth_nonce_cache.lock().remove(&parsed_pub_key);
 
     if context.runtime_mode == RuntimeMode::Client {
-        if let Some(pool) = context
-            .client_quic_pools
-            .write()
-            .unwrap()
-            .remove(&parsed_pub_key)
-        {
+        if let Some(pool) = context.client_quic_pools.write().remove(&parsed_pub_key) {
             pool.shutdown(b"Peer removed");
         }
     }
-    if let Some(conns) = context
-        .shared_quic_registry
-        .lock()
-        .unwrap()
-        .remove(&parsed_pub_key)
-    {
+    if let Some(conns) = context.shared_quic_registry.lock().remove(&parsed_pub_key) {
         for conn in conns {
             conn.close(b"Peer removed");
         }
     }
 
     {
-        let mut state = context.state.write().unwrap();
+        let mut state = context.state.write();
         state
             .config
             .peers
@@ -657,36 +698,75 @@ async fn handle_remove_peer(
         state.router = rebuild_l4_router(&state.config.peers);
     }
 
-    let mut remove_errors = Vec::new();
-    if let Some(peer) = &removed_peer {
-        if !table_off {
-            let peer = peer.clone();
-            let interface_name = context.interface_name.clone();
-            if let Err(e) = run_blocking_command(move || {
-                cleanup_peer_routes_and_tproxy(&peer, tproxy_port, &interface_name)
-            })
-            .await
-            {
-                remove_errors.push(format!("failed to clean routes/tproxy: {}", e));
+    write_ok(stream, framed_response, None).await;
+}
+
+fn find_allowed_ip_conflict(
+    peers: &[config::PeerConfig],
+    new_peer: &config::PeerConfig,
+) -> Option<String> {
+    for (i, allowed_ip) in new_peer.allowed_ips.iter().enumerate() {
+        if new_peer.allowed_ips[..i].contains(allowed_ip) {
+            return Some(format!(
+                "Duplicate AllowedIPs entry {} in AddPeer request",
+                allowed_ip
+            ));
+        }
+    }
+
+    for peer in peers {
+        if peer.public_key == new_peer.public_key {
+            continue;
+        }
+        for existing_ip in &peer.allowed_ips {
+            for new_ip in &new_peer.allowed_ips {
+                if ipnets_overlap(*existing_ip, *new_ip) {
+                    return Some(format!(
+                        "Overlapping AllowedIPs entries {} and {} used by peers {} and {}",
+                        existing_ip,
+                        new_ip,
+                        encode_base64_32(&peer.public_key),
+                        encode_base64_32(&new_peer.public_key)
+                    ));
+                }
             }
         }
     }
-    let interface_name = context.interface_name.clone();
-    if let Err(e) =
-        run_blocking_command(move || remove_peer_from_kernel(&interface_name, parsed_pub_key)).await
-    {
-        remove_errors.push(format!("failed to remove kernel peer: {}", e));
-    }
+    None
+}
 
-    let message = if remove_errors.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "Peer removed; cleanup warnings: {}",
-            remove_errors.join("; ")
-        ))
-    };
-    write_ok(stream, framed_response, message).await;
+fn ipnets_overlap(a: ipnet::IpNet, b: ipnet::IpNet) -> bool {
+    match (a, b) {
+        (ipnet::IpNet::V4(a), ipnet::IpNet::V4(b)) => {
+            a.contains(&b.network()) || b.contains(&a.network())
+        }
+        (ipnet::IpNet::V6(a), ipnet::IpNet::V6(b)) => {
+            a.contains(&b.network()) || b.contains(&a.network())
+        }
+        _ => false,
+    }
+}
+
+async fn setup_peer_routes(
+    context: &UdsServerContext,
+    peer: config::PeerConfig,
+    tproxy_port: Option<u16>,
+) -> Result<(), String> {
+    let interface_name = context.interface_name.clone();
+    run_blocking_command(move || setup_peer_routes_and_tproxy(&peer, tproxy_port, &interface_name))
+        .await
+}
+
+async fn cleanup_peer_routes(
+    context: &UdsServerContext,
+    peer: config::PeerConfig,
+    tproxy_port: Option<u16>,
+) -> Result<(), String> {
+    let interface_name = context.interface_name.clone();
+    run_blocking_command(move || {
+        cleanup_peer_routes_and_tproxy(&peer, tproxy_port, &interface_name)
+    })
+    .await
 }
 
 async fn rollback_peer_routes(
@@ -694,20 +774,22 @@ async fn rollback_peer_routes(
     new_peer: &config::PeerConfig,
     old_peer: Option<config::PeerConfig>,
     tproxy_port: Option<u16>,
-) {
-    let new_peer = new_peer.clone();
-    let interface_name = context.interface_name.clone();
-    let _ = run_blocking_command(move || {
-        let _ = cleanup_peer_routes_and_tproxy(&new_peer, tproxy_port, &interface_name);
-        Ok(())
-    })
-    .await;
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    if let Err(e) = cleanup_peer_routes(context, new_peer.clone(), tproxy_port).await {
+        errors.push(format!("failed to clean new peer routes/tproxy: {}", e));
+    }
     if let Some(peer) = old_peer {
-        let interface_name = context.interface_name.clone();
-        let _ = run_blocking_command(move || {
-            setup_peer_routes_and_tproxy(&peer, tproxy_port, &interface_name)
-        })
-        .await;
+        if let Err(e) = setup_peer_routes(context, peer, tproxy_port).await {
+            errors.push(format!("failed to restore old peer routes/tproxy: {}", e));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -771,19 +853,20 @@ mod tests {
 
         UdsServerContext {
             telemetry,
-            state: Arc::new(std::sync::RwLock::new(GatewayState {
+            state: Arc::new(RwLock::new(GatewayState {
                 config,
                 router: AllowedIPsRouter::new(),
             })),
-            peer_secrets: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             server_secret: StaticSecret::from([1u8; 32]),
             shared_quic_registry: Arc::new(Mutex::new(HashMap::new())),
             interface_name: "nonexistent_interface".to_string(),
-            session_cache: Arc::new(Mutex::new(HashMap::new())),
+            session_cache: Arc::new(RwLock::new(HashMap::new())),
             auth_nonce_cache: Arc::new(Mutex::new(HashMap::new())),
-            client_quic_pools: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            client_quic_pools: Arc::new(RwLock::new(HashMap::new())),
             client_private_key: [1u8; 32],
             runtime_mode: RuntimeMode::Server,
+            peer_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -867,24 +950,59 @@ mod tests {
 
     #[test]
     fn test_remove_peer_caches_are_cleared_together() {
-        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let session_cache = Arc::new(Mutex::new(HashMap::new()));
+        let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
+        let session_cache = Arc::new(RwLock::new(HashMap::new()));
         let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
 
         let pub_key = [5u8; 32];
-        peer_secrets.write().unwrap().insert(pub_key, [10u8; 32]);
-        session_cache.lock().unwrap().insert(pub_key, [15u8; 32]);
+        peer_secrets.write().insert(pub_key, [10u8; 32]);
+        session_cache.write().insert(pub_key, [15u8; 32]);
         auth_nonce_cache
             .lock()
-            .unwrap()
             .insert(pub_key, crate::control::NonceCache::new(10));
 
-        peer_secrets.write().unwrap().remove(&pub_key);
-        session_cache.lock().unwrap().remove(&pub_key);
-        auth_nonce_cache.lock().unwrap().remove(&pub_key);
+        peer_secrets.write().remove(&pub_key);
+        session_cache.write().remove(&pub_key);
+        auth_nonce_cache.lock().remove(&pub_key);
 
-        assert!(!peer_secrets.read().unwrap().contains_key(&pub_key));
-        assert!(!session_cache.lock().unwrap().contains_key(&pub_key));
-        assert!(!auth_nonce_cache.lock().unwrap().contains_key(&pub_key));
+        assert!(!peer_secrets.read().contains_key(&pub_key));
+        assert!(!session_cache.read().contains_key(&pub_key));
+        assert!(!auth_nonce_cache.lock().contains_key(&pub_key));
+    }
+
+    #[test]
+    fn test_add_peer_rejects_duplicate_and_overlapping_allowed_ips() {
+        let existing_peer = PeerConfig {
+            public_key: [2u8; 32],
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            endpoint: None,
+            proxy_port: None,
+        };
+        let mut new_peer = PeerConfig {
+            public_key: [3u8; 32],
+            allowed_ips: vec!["10.0.0.128/25".parse().unwrap()],
+            endpoint: None,
+            proxy_port: None,
+        };
+
+        assert!(
+            find_allowed_ip_conflict(&[existing_peer.clone()], &new_peer)
+                .unwrap()
+                .contains("Overlapping AllowedIPs")
+        );
+
+        new_peer.allowed_ips = vec![
+            "10.1.0.0/24".parse().unwrap(),
+            "10.1.0.0/24".parse().unwrap(),
+        ];
+        assert!(
+            find_allowed_ip_conflict(&[existing_peer.clone()], &new_peer)
+                .unwrap()
+                .contains("Duplicate AllowedIPs")
+        );
+
+        new_peer.public_key = existing_peer.public_key;
+        new_peer.allowed_ips = vec!["10.0.0.128/25".parse().unwrap()];
+        assert!(find_allowed_ip_conflict(&[existing_peer], &new_peer).is_none());
     }
 }

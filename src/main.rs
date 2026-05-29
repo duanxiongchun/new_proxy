@@ -19,7 +19,7 @@ mod wireguard;
 use client_proxy::{build_peer_quic_pool, run_tproxy_accept_loop};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub use app_config::encode_base64_32;
@@ -40,7 +40,7 @@ use telemetry::TelemetryRegistry;
 #[cfg(test)]
 use wireguard::sync_peer_to_kernel;
 
-type PeerQuicPools = Arc<std::sync::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
+type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
 
 // 动态网关共享运行时状态 (支持 AllowedIPs 路由基数树热重载)
 pub struct GatewayState {
@@ -77,8 +77,8 @@ const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
 #[cfg(test)]
 async fn sync_kernel_and_proxy_state(
     interface_name: &str,
-    state: &Arc<std::sync::RwLock<GatewayState>>,
-    peer_secrets: &Arc<std::sync::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
+    state: &Arc<parking_lot::RwLock<GatewayState>>,
+    peer_secrets: &Arc<parking_lot::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     server_secret: &StaticSecret,
     l3_stats: &HashMap<[u8; 32], wireguard::WgPeerStats>,
 ) -> HashMap<[u8; 32], String> {
@@ -88,7 +88,7 @@ async fn sync_kernel_and_proxy_state(
 
     // 1. Identify sources and find peers missing in kernel
     {
-        let st = state.read().unwrap();
+        let st = state.read();
         for peer in &st.config.peers {
             if l3_stats.contains_key(&peer.public_key) {
                 sources.insert(peer.public_key, "both".to_string());
@@ -122,7 +122,7 @@ async fn sync_kernel_and_proxy_state(
         // Generates and caches the DH shared secret
         let peer_pub = PublicKey::from(pub_key);
         let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
-        peer_secrets.write().unwrap().insert(pub_key, shared_secret);
+        peer_secrets.write().insert(pub_key, shared_secret);
 
         let mut parsed_allowed_ips = Vec::new();
         for ip_str in &wg_stats.allowed_ips {
@@ -136,7 +136,7 @@ async fn sync_kernel_and_proxy_state(
             .and_then(|s| std::str::FromStr::from_str(s).ok());
 
         {
-            let mut st = state.write().unwrap();
+            let mut st = state.write();
             st.config.peers.retain(|p| p.public_key != pub_key);
             st.config.peers.push(config::PeerConfig {
                 public_key: pub_key,
@@ -223,16 +223,16 @@ async fn main() {
 
     let initial_router = rebuild_l4_router(&config.peers);
 
-    let gateway_state = Arc::new(std::sync::RwLock::new(GatewayState {
+    let gateway_state = Arc::new(parking_lot::RwLock::new(GatewayState {
         config: config.clone(),
         router: initial_router,
     }));
 
     // 初始化控制面 Peer Secrets 动态共享哈希表
-    let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let peer_secrets = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let server_secret = StaticSecret::from(config.interface.private_key);
     {
-        let mut secrets_guard = peer_secrets.write().unwrap();
+        let mut secrets_guard = peer_secrets.write();
         for peer in &config.peers {
             let peer_pub = PublicKey::from(peer.public_key);
             let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
@@ -241,15 +241,16 @@ async fn main() {
     }
 
     // 初始化会话与 Nonce 动态共享缓存（用于 UDS 动态清理）
-    let session_cache = Arc::new(Mutex::new(HashMap::new()));
-    let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+    let session_cache = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let auth_nonce_cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     // 共享的 QUIC peer 连接注册表：
     // - server 模式下由 QuicPoolServer.run_with_registry 填充
     // - client 模式下不使用，始终为空
     let shared_quic_registry: quic_pool::PeerConnRegistry =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let client_quic_pools: PeerQuicPools = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let client_quic_pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     if let Some(listener) = uds_server::bind_listener(&interface_name) {
         uds_server::start(
@@ -266,6 +267,7 @@ async fn main() {
                 client_quic_pools: client_quic_pools.clone(),
                 client_private_key: config.interface.private_key,
                 runtime_mode,
+                peer_mutation_lock: peer_mutation_lock.clone(),
             },
         );
     }
@@ -277,7 +279,7 @@ async fn main() {
 
         let Some(listen_control_port) = config.interface.listen_control_port else {
             log::error!("Server config validation failed to enforce ListenControlPort");
-            let cleanup_config = gateway_state.read().unwrap().config.clone();
+            let cleanup_config = gateway_state.read().config.clone();
             cleanup_runtime(&cleanup_config, &interface_name);
             std::process::exit(1);
         };
@@ -286,7 +288,7 @@ async fn main() {
             Ok(cert) => cert,
             Err(e) => {
                 log::error!("Failed to generate QUIC certificate: {}", e);
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                let cleanup_config = gateway_state.read().config.clone();
                 cleanup_runtime(&cleanup_config, &interface_name);
                 std::process::exit(1);
             }
@@ -295,7 +297,7 @@ async fn main() {
             Ok(fingerprint) => fingerprint,
             Err(e) => {
                 log::error!("Failed to fingerprint QUIC certificate: {}", e);
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                let cleanup_config = gateway_state.read().config.clone();
                 cleanup_runtime(&cleanup_config, &interface_name);
                 std::process::exit(1);
             }
@@ -316,7 +318,7 @@ async fn main() {
             Ok(handle) => handle,
             Err(e) => {
                 log::error!("Control plane server failed to start: {}", e);
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                let cleanup_config = gateway_state.read().config.clone();
                 cleanup_runtime(&cleanup_config, &interface_name);
                 std::process::exit(1);
             }
@@ -338,7 +340,7 @@ async fn main() {
         {
             log::error!("QUIC Pool Server error: {}", e);
             control_task.abort();
-            let cleanup_config = gateway_state.read().unwrap().config.clone();
+            let cleanup_config = gateway_state.read().config.clone();
             cleanup_runtime(&cleanup_config, &interface_name);
             std::process::exit(1);
         }
@@ -363,10 +365,7 @@ async fn main() {
         for peer in &proxy_peers {
             match build_peer_quic_pool(config.interface.private_key, peer).await {
                 Ok(pool) => {
-                    client_quic_pools
-                        .write()
-                        .unwrap()
-                        .insert(peer.public_key, pool);
+                    client_quic_pools.write().insert(peer.public_key, pool);
                 }
                 Err(e) => {
                     log::error!(
@@ -374,7 +373,7 @@ async fn main() {
                         encode_base64_32(&peer.public_key),
                         e
                     );
-                    let cleanup_config = gateway_state.read().unwrap().config.clone();
+                    let cleanup_config = gateway_state.read().config.clone();
                     cleanup_runtime(&cleanup_config, &interface_name);
                     std::process::exit(1);
                 }
@@ -388,7 +387,7 @@ async fn main() {
                 Some(port) => port,
                 None => {
                     log::error!("Error: TProxyPort required for Client mode");
-                    let cleanup_config = gateway_state.read().unwrap().config.clone();
+                    let cleanup_config = gateway_state.read().config.clone();
                     cleanup_runtime(&cleanup_config, &interface_name);
                     std::process::exit(1);
                 }
@@ -398,7 +397,7 @@ async fn main() {
                 Ok(l) => l,
                 Err(e) => {
                     log::error!("IPv4 TPROXY Listener bind FAILED: {}", e);
-                    let cleanup_config = gateway_state.read().unwrap().config.clone();
+                    let cleanup_config = gateway_state.read().config.clone();
                     cleanup_runtime(&cleanup_config, &interface_name);
                     std::process::exit(1);
                 }
@@ -450,7 +449,7 @@ async fn main() {
     }
 
     // 自动清理路由与 iptables
-    let cleanup_config = gateway_state.read().unwrap().config.clone();
+    let cleanup_config = gateway_state.read().config.clone();
     cleanup_runtime(&cleanup_config, &interface_name);
 }
 
@@ -462,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_synchronization() {
         let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
-        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let peer_secrets = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let config = GatewayConfig {
             interface: config::InterfaceConfig {
@@ -498,7 +497,7 @@ mod tests {
         };
 
         let initial_router = AllowedIPsRouter::new();
-        let gateway_state = Arc::new(std::sync::RwLock::new(GatewayState {
+        let gateway_state = Arc::new(parking_lot::RwLock::new(GatewayState {
             config,
             router: initial_router,
         }));
@@ -538,7 +537,7 @@ mod tests {
         assert_eq!(sources.get(&[2u8; 32]).unwrap(), "proxy");
         assert_eq!(sources.get(&[3u8; 32]).unwrap(), "kernel");
 
-        let st = gateway_state.read().unwrap();
+        let st = gateway_state.read();
         let peer3 = st.config.peers.iter().find(|p| p.public_key == [3u8; 32]);
         assert!(
             peer3.is_some(),
@@ -558,7 +557,7 @@ mod tests {
             "Kernel-synced peers are WireGuard-only unless they explicitly define ProxyPort"
         );
 
-        let secrets = peer_secrets.read().unwrap();
+        let secrets = peer_secrets.read();
         assert!(
             secrets.contains_key(&[3u8; 32]),
             "Peer [3u8; 32] secret should be computed"

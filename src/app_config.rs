@@ -83,15 +83,57 @@ pub fn validate_gateway_config(config: &GatewayConfig) -> Result<RuntimeMode, St
             return Err(format!("Duplicate QUICPool ListenPorts entry: {}", port));
         }
     }
+    let mut seen_peer_keys = HashSet::new();
+    let mut seen_allowed_ips: HashMap<ipnet::IpNet, [u8; 32]> = HashMap::new();
     for peer in &config.peers {
+        if !seen_peer_keys.insert(peer.public_key) {
+            return Err(format!(
+                "Duplicate Peer PublicKey: {}",
+                encode_base64_32(&peer.public_key)
+            ));
+        }
         if peer.allowed_ips.is_empty() {
             return Err(format!(
                 "Peer {} has no AllowedIPs",
                 encode_base64_32(&peer.public_key)
             ));
         }
+        for allowed_ip in &peer.allowed_ips {
+            if let Some(existing_peer) = seen_allowed_ips.get(allowed_ip) {
+                return Err(format!(
+                    "Duplicate AllowedIPs entry {} used by peers {} and {}",
+                    allowed_ip,
+                    encode_base64_32(existing_peer),
+                    encode_base64_32(&peer.public_key)
+                ));
+            }
+            for (existing_ip, existing_peer) in &seen_allowed_ips {
+                if ipnets_overlap(*allowed_ip, *existing_ip) {
+                    return Err(format!(
+                        "Overlapping AllowedIPs entries {} and {} used by peers {} and {}",
+                        existing_ip,
+                        allowed_ip,
+                        encode_base64_32(existing_peer),
+                        encode_base64_32(&peer.public_key)
+                    ));
+                }
+            }
+            seen_allowed_ips.insert(*allowed_ip, peer.public_key);
+        }
     }
     determine_runtime_mode(config)
+}
+
+fn ipnets_overlap(a: ipnet::IpNet, b: ipnet::IpNet) -> bool {
+    match (a, b) {
+        (ipnet::IpNet::V4(a), ipnet::IpNet::V4(b)) => {
+            a.contains(&b.network()) || b.contains(&a.network())
+        }
+        (ipnet::IpNet::V6(a), ipnet::IpNet::V6(b)) => {
+            a.contains(&b.network()) || b.contains(&a.network())
+        }
+        _ => false,
+    }
 }
 
 pub fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, String> {
@@ -311,6 +353,41 @@ mod tests {
         assert!(validate_gateway_config(&server_config)
             .unwrap_err()
             .contains("has no AllowedIPs"));
+    }
+
+    #[test]
+    fn test_validate_gateway_config_rejects_duplicate_peers_and_overlapping_allowed_ips() {
+        let peer1 = PeerConfig {
+            public_key: [2u8; 32],
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            proxy_port: Some(51821),
+        };
+        let mut peer2 = PeerConfig {
+            public_key: [3u8; 32],
+            allowed_ips: vec!["10.0.0.128/25".parse().unwrap()],
+            endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            proxy_port: Some(51821),
+        };
+        let mut config = client_config(vec![peer1.clone(), peer2.clone()]);
+
+        assert!(validate_gateway_config(&config)
+            .unwrap_err()
+            .contains("Overlapping AllowedIPs"));
+
+        peer2.public_key = peer1.public_key;
+        peer2.allowed_ips = vec!["10.1.0.0/24".parse().unwrap()];
+        config.peers = vec![peer1.clone(), peer2.clone()];
+        assert!(validate_gateway_config(&config)
+            .unwrap_err()
+            .contains("Duplicate Peer PublicKey"));
+
+        peer2.public_key = [3u8; 32];
+        peer2.allowed_ips = peer1.allowed_ips.clone();
+        config.peers = vec![peer1, peer2];
+        assert!(validate_gateway_config(&config)
+            .unwrap_err()
+            .contains("Duplicate AllowedIPs"));
     }
 
     #[test]

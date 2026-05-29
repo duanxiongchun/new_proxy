@@ -346,6 +346,7 @@ dependencies = [
  "ipnet",
  "libc",
  "log",
+ "parking_lot",
  "quinn",
  "rand",
  "rcgen",
