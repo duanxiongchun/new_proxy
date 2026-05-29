@@ -118,8 +118,28 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
     });
 
-    // 4. 等待双方彻底关闭
-    let _ = tokio::join!(client_to_server, server_to_client);
+    // 4. 并发等待双方关闭，配合 10 秒优雅半关闭超时机制，彻底根治死锁/连接悬挂泄露
+    let mut c2s = client_to_server;
+    let mut s2c = server_to_client;
+
+    tokio::select! {
+        _ = &mut c2s => {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    s2c.abort();
+                }
+                _ = &mut s2c => {}
+            }
+        }
+        _ = &mut s2c => {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    c2s.abort();
+                }
+                _ = &mut c2s => {}
+            }
+        }
+    }
 
     // 5. 流结束后递减活跃计数
     stats.active_streams.fetch_sub(1, Ordering::Relaxed);

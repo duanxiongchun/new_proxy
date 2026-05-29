@@ -175,6 +175,8 @@ struct PeerTelemetry {
 网关使用一站式配置文件，整合了双栈 WireGuard 与平行 QUIC 连接池的配置，并支持基于路由表和自定义脚本的网卡生命周期自愈管理：
 
 ### 7.1 Interface 核心字段说明
+接口名与 WireGuard/wg-quick 保持一致：来自配置文件 basename，例如 `tun0.conf` 对应接口 `tun0`，`client.conf` 对应接口 `client`。所有自动路由、`wg show <interface> dump` 与清理逻辑都使用这个接口名。
+
 * **`Table`**（可选，支持 `Table` 或 `table`）：
   * **`auto` 或未配置 (默认值)**：网关在启动时会自动将 `Address` 绑定到 tun 设备，自动将所有 Peer 的 `AllowedIPs` 注入系统路由表（通过 `ip route`），并配置本地策略路由（`fwmark 1 lookup 100`）和 TPROXY 的 `iptables` / `ip6tables` 拦截规则。在程序退出时，会自动、无损地回滚删除所有注入的路由及防火墙规则。
   * **`off`**：网关不做任何路由和 `iptables` 的修改，完全交由用户或外部脚本接管。
@@ -332,4 +334,3 @@ AllowedIPs = 10.0.0.2/32, fd00::2/128
   ```bash
   new-proxy-cli remove-peer <public_key>
   ```
-

@@ -4,13 +4,15 @@ use std::sync::{Arc, Mutex};
 use socket2::{Socket, Domain, Type, Protocol};
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
+const MAX_CONTROL_WORKERS: usize = 1024;
 
 // 1. 控制面协商协议数据结构
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -22,6 +24,7 @@ pub struct ControlRequest {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ControlResponse {
     pub server_nonce: [u8; 16],
+    #[serde(skip)]
     pub session_psk: [u8; 32],
     pub port_pool: Vec<u16>,
     pub public_ipv4: Option<String>,
@@ -50,6 +53,22 @@ pub fn verify_mac(key: &[u8; 32], data: &[u8], expected_mac: &[u8; 32]) -> bool 
     let mut mac = HmacSha256::new_from_slice(key).unwrap();
     mac.update(data);
     mac.verify_slice(expected_mac).is_ok()
+}
+
+pub fn derive_session_psk(
+    shared_secret: &[u8; 32],
+    client_nonce: &[u8; 16],
+    server_nonce: &[u8; 16],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"new_proxy control session psk v1");
+    hasher.update(shared_secret);
+    hasher.update(client_nonce);
+    hasher.update(server_nonce);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 // 2. 客户端控制面协商引擎
@@ -140,8 +159,9 @@ impl ControlClient {
                     }
 
                     // 反序列化配置
-                    let resp: ControlResponse = serde_json::from_slice(&signed_resp.payload)
+                    let mut resp: ControlResponse = serde_json::from_slice(&signed_resp.payload)
                         .map_err(|e| format!("Failed to parse response: {}", e))?;
+                    resp.session_psk = derive_session_psk(&shared_secret, &client_nonce, &resp.server_nonce);
 
                     log::info!("Successfully negotiated PSK and received QUIC pool configuration!");
                     return Ok((resp, socket));
@@ -159,6 +179,36 @@ impl ControlClient {
     }
 }
 
+pub struct NonceCache {
+    seen: std::collections::HashSet<[u8; 16]>,
+    queue: std::collections::VecDeque<[u8; 16]>,
+    capacity: usize,
+}
+
+impl NonceCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            queue: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    pub fn insert(&mut self, nonce: [u8; 16]) -> bool {
+        if self.seen.contains(&nonce) {
+            return false;
+        }
+        if self.queue.len() >= self.capacity {
+            if let Some(oldest) = self.queue.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.queue.push_back(nonce);
+        self.seen.insert(nonce);
+        true
+    }
+}
+
 // 3. 服务端控制面协商服务
 pub struct ControlServer {
     listen_port: u16,
@@ -167,6 +217,7 @@ pub struct ControlServer {
     public_ipv4: Option<String>,
     public_ipv6: Option<String>,
     session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Session_PSK}
+    nonce_cache: Arc<Mutex<NonceCache>>,
 }
 
 impl ControlServer {
@@ -185,6 +236,7 @@ impl ControlServer {
             public_ipv4,
             public_ipv6,
             session_cache,
+            nonce_cache: Arc::new(Mutex::new(NonceCache::new(4096))),
         }
     }
 
@@ -211,6 +263,7 @@ impl ControlServer {
         };
 
         let socket = Arc::new(socket);
+        let worker_limit = Arc::new(Semaphore::new(MAX_CONTROL_WORKERS));
         log::info!("Userspace Control Server listening on UDP port {}", self.listen_port);
 
         loop {
@@ -225,14 +278,31 @@ impl ControlServer {
                 }
             };
 
+            // 1. 快速轻量级预检 (DDoS 防护)
+            // - 最小包长：有效的 SignedPacket 序列化 JSON 必定大于 120 字节
+            // - 结构验证：JSON 报文首尾必须为 '{' 和 '}'
+            if len < 120 || buf[0] != b'{' || buf[len - 1] != b'}' {
+                log::debug!("Fast discard obviously invalid control packet from {}, len={}", client_addr, len);
+                continue;
+            }
+
             let socket_clone = socket.clone();
             let peer_secrets_clone = self.peer_secrets.clone();
             let session_cache_clone = self.session_cache.clone();
+            let nonce_cache_clone = self.nonce_cache.clone();
             let ports_clone = self.quic_ports.clone();
             let v4_clone = self.public_ipv4.clone();
             let v6_clone = self.public_ipv6.clone();
+            let permit = match worker_limit.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    log::warn!("Control plane worker limit reached; dropping packet from {}", client_addr);
+                    continue;
+                }
+            };
 
             tokio::spawn(async move {
+                let _permit = permit;
                 let signed_packet: SignedPacket = match serde_json::from_slice(&buf[..len]) {
                     Ok(p) => p,
                     Err(_) => return,
@@ -242,6 +312,15 @@ impl ControlServer {
                     Ok(r) => r,
                     Err(_) => return,
                 };
+
+                // 2. 快速重放校验：检查 client_nonce 是否已被使用
+                {
+                    let mut cache = nonce_cache_clone.lock().unwrap();
+                    if !cache.insert(req.client_nonce) {
+                        log::warn!("Replayed ControlRequest detected from peer: {:?}, dropping request.", req.client_public_key);
+                        return;
+                    }
+                }
 
                 // 1. 查找客户端共享密钥
                 let shared_secret = {
@@ -263,17 +342,15 @@ impl ControlServer {
                 }
 
                 // 3. 生成 Session_PSK 与 Response
-                let mut session_psk = [0u8; 32];
-                rand::thread_rng().fill(&mut session_psk);
+                let mut server_nonce = [0u8; 16];
+                rand::thread_rng().fill(&mut server_nonce);
+                let session_psk = derive_session_psk(&shared_secret, &req.client_nonce, &server_nonce);
 
                 // 更新用户态会话缓存
                 {
                     let mut cache = session_cache_clone.lock().unwrap();
                     cache.insert(req.client_public_key, session_psk);
                 }
-
-                let mut server_nonce = [0u8; 16];
-                rand::thread_rng().fill(&mut server_nonce);
 
                 let resp = ControlResponse {
                     server_nonce,
@@ -326,9 +403,9 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
 
         // 1. 生成客户端与服务端的 Noise 密钥对
-        let client_secret = StaticSecret::new(rand::thread_rng());
+        let client_secret = StaticSecret::random_from_rng(rand::thread_rng());
         let client_pub = PublicKey::from(&client_secret);
-        let server_secret = StaticSecret::new(rand::thread_rng());
+        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
         let server_pub = PublicKey::from(&server_secret);
 
         // 2. 预计算 Diffie-Hellman 共享密钥

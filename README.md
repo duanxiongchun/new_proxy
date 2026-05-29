@@ -111,6 +111,8 @@ AllowedIPs = 10.0.0.2/32, fd00::2/128
 sudo target/release/new_proxy -config conf/server.conf
 ```
 
+接口名遵循 WireGuard/wg-quick 习惯：由配置文件名去掉 `.conf` 后得到。上面的命令会使用接口名 `server`；如果要使用 `tun0`，请把配置文件命名为 `tun0.conf` 并用 `-config .../tun0.conf` 启动。
+
 ### 客户端配置
 
 客户端需要配置本地 TPROXY 端口、服务端 endpoint、控制面端口和目标 `AllowedIPs`：
@@ -138,6 +140,8 @@ AllowedIPs = 10.0.0.1/32, fd00::1/128
 sudo target/release/new_proxy -config conf/client.conf
 ```
 
+同样，`conf/client.conf` 会使用接口名 `client`；需要兼容现有 `tun0` 路由/脚本时，请使用 `tun0.conf`。
+
 ### TPROXY 路由规则
 
 客户端需要把命中 `AllowedIPs` 的 TCP 流量导入本地 TPROXY 端口。示例：
@@ -157,32 +161,32 @@ sudo iptables -t mangle -A PREROUTING \
 安装 Debian 包后，可以使用 systemd 来管理和守护 `new_proxy` 实例。服务采用了模块化/模板化设计（`new_proxy@.service`），支持在一台机器上同时管理多个不同配置的网关实例：
 
 ### 1. 配置实例
-准备您的配置文件（如 `server.conf` 或 `client.conf`），并移动到配置目录下：
+准备您的配置文件（实例名即接口名，与 WireGuard/wg-quick 一致），并移动到配置目录下：
 ```bash
-sudo cp conf/server.conf /etc/new_proxy/server.conf
+sudo cp conf/server.conf /etc/new_proxy/tun0.conf
 ```
 *注意：服务加载的配置文件路径为 `/etc/new_proxy/<interface_name>.conf`。*
 
 ### 2. 启动与自启服务
-以实例名（配置文件名，如 `server`）启动服务：
+以实例名（接口名，如 `tun0`）启动服务：
 ```bash
-# 启动 server 实例
-sudo systemctl start new_proxy@server
+# 启动 tun0 实例
+sudo systemctl start new_proxy@tun0
 
 # 设置开机自启
-sudo systemctl enable new_proxy@server
+sudo systemctl enable new_proxy@tun0
 ```
 
 ### 3. 管理服务状态
 ```bash
 # 查看服务运行状态
-sudo systemctl status new_proxy@server
+sudo systemctl status new_proxy@tun0
 
 # 查看服务实时日志
-sudo journalctl -u new_proxy@server -f
+sudo journalctl -u new_proxy@tun0 -f
 
 # 停止服务
-sudo systemctl stop new_proxy@server
+sudo systemctl stop new_proxy@tun0
 ```
 
 ## CLI 使用

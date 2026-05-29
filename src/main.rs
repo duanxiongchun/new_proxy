@@ -247,12 +247,21 @@ async fn run_tproxy_accept_loop(
     quic_pool: Arc<QuicPoolClient>,
     state: Arc<std::sync::RwLock<GatewayState>>,
     telemetry: Arc<TelemetryRegistry>,
+    connection_limit: Arc<tokio::sync::Semaphore>,
 ) {
     while let Ok((tcp_socket, src_addr)) = listener.accept().await {
+        let permit = match connection_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                log::warn!("TPROXY connection limit reached; dropping {}", src_addr);
+                continue;
+            }
+        };
         let quic_pool = quic_pool.clone();
         let state = state.clone();
         let telemetry = telemetry.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             handle_tproxy_connection(tcp_socket, src_addr, quic_pool, state, telemetry).await;
         });
     }
@@ -277,12 +286,12 @@ async fn handle_tproxy_connection(
         }
     };
 
-    let matched = {
+    let matched_peer = {
         let st = state.read().unwrap();
-        st.router.longest_match(original_dst.ip()).is_some()
+        st.router.longest_match(original_dst.ip())
     };
 
-    if matched {
+    if let Some(peer_pub_key) = matched_peer {
         log::info!("Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.", src_addr, original_dst);
 
         let (mut quic_send, mut quic_recv, conn_stat) = match quic_pool.open_mux_stream().await {
@@ -314,16 +323,7 @@ async fn handle_tproxy_connection(
             }
         }
 
-        let server_pub_key = {
-            let st = state.read().unwrap();
-            st.config.peers.first().map(|p| p.public_key)
-        };
-
-        let stats = if let Some(pub_key) = server_pub_key {
-            telemetry.get_or_create(pub_key)
-        } else {
-            Arc::new(PeerL4Stats::default())
-        };
+        let stats = telemetry.get_or_create(peer_pub_key);
 
         relay::relay_connections_with_conn_stat(
             tcp_socket,
@@ -358,11 +358,47 @@ async fn wait_for_shutdown() {
     log::info!("Received CTRL+C, shutting down...");
 }
 
-fn run_command_silently(cmd: &str) {
-    let _ = std::process::Command::new("sh")
+const MAX_TPROXY_CONNECTIONS: usize = 65536;
+const MAX_QUIC_STREAM_HANDLERS: usize = 65536;
+
+fn interface_name_from_config_path(config_path: &str) -> String {
+    std::path::Path::new(config_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tun0")
+        .to_string()
+}
+
+fn run_command_checked(cmd: &str) -> Result<(), String> {
+    let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
-        .output();
+        .output()
+        .map_err(|e| format!("failed to execute '{}': {}", cmd, e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "command '{}' failed with status {:?}: {}",
+            cmd,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn run_command_best_effort(cmd: &str) {
+    if let Err(e) = run_command_checked(cmd) {
+        log::debug!("{}", e);
+    }
+}
+
+fn ensure_iptables_rule(tool: &str, rule: &str) -> Result<(), String> {
+    let check = format!("{} -t mangle -C {}", tool, rule);
+    if run_command_checked(&check).is_ok() {
+        return Ok(());
+    }
+    run_command_checked(&format!("{} -t mangle -A {}", tool, rule))
 }
 
 fn run_script(script: &str) {
@@ -387,41 +423,34 @@ fn run_script(script: &str) {
     }
 }
 
-fn setup_routes_and_iptables(config: &GatewayConfig, config_path: &str) {
+fn setup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) -> Result<(), String> {
     if let Some(ref t) = config.interface.table {
         if t.to_lowercase() == "off" {
             log::info!("Table is off. Skipping automatic routing and iptables setup.");
-            return;
+            return Ok(());
         }
     }
-
-    // Determine interface name from config path, defaulting to "tun0"
-    let interface_name = std::path::Path::new(config_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("tun0")
-        .to_string();
 
     log::info!("Setting up automatic routing and iptables for interface: {}", interface_name);
 
     // 1. Add addresses to the tun interface
     for addr in &config.interface.addresses {
-        let cmd = format!("ip addr add {} dev {}", addr, interface_name);
-        run_command_silently(&cmd);
+        let cmd = format!("ip addr replace {} dev {}", addr, interface_name);
+        run_command_checked(&cmd)?;
     }
     
     // Set interface UP
-    run_command_silently(&format!("ip link set {} up", interface_name));
+    run_command_checked(&format!("ip link set {} up", interface_name))?;
 
     // 2. Add routes for AllowedIPs of all peers
     for peer in &config.peers {
         for allowed_ip in &peer.allowed_ips {
             let cmd = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                format!("ip route add {} dev {}", allowed_ip, interface_name)
+                format!("ip route replace {} dev {}", allowed_ip, interface_name)
             } else {
-                format!("ip -6 route add {} dev {}", allowed_ip, interface_name)
+                format!("ip -6 route replace {} dev {}", allowed_ip, interface_name)
             };
-            run_command_silently(&cmd);
+            run_command_checked(&cmd)?;
         }
     }
 
@@ -430,48 +459,43 @@ fn setup_routes_and_iptables(config: &GatewayConfig, config_path: &str) {
         log::info!("Setting up TPROXY iptables rules on port {}", tproxy_port);
 
         // IPv4 policy routing & local route
-        run_command_silently("ip rule add fwmark 1 lookup 100");
-        run_command_silently("ip route add local 0.0.0.0/0 dev lo table 100");
+        run_command_best_effort("ip rule del fwmark 1 lookup 100");
+        run_command_checked("ip rule add fwmark 1 lookup 100")?;
+        run_command_checked("ip route replace local 0.0.0.0/0 dev lo table 100")?;
 
         // IPv6 policy routing & local route
-        run_command_silently("ip -6 rule add fwmark 1 lookup 100");
-        run_command_silently("ip -6 route add local ::/0 dev lo table 100");
+        run_command_best_effort("ip -6 rule del fwmark 1 lookup 100");
+        run_command_checked("ip -6 rule add fwmark 1 lookup 100")?;
+        run_command_checked("ip -6 route replace local ::/0 dev lo table 100")?;
 
         // Add PREROUTING rules for each AllowedIP
         for peer in &config.peers {
             for allowed_ip in &peer.allowed_ips {
                 if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                    let cmd = format!(
-                        "iptables -t mangle -A PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1",
-                        allowed_ip,
-                        tproxy_port
+                    let rule = format!(
+                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1",
+                        allowed_ip, tproxy_port
                     );
-                    run_command_silently(&cmd);
+                    ensure_iptables_rule("iptables", &rule)?;
                 } else {
-                    let cmd = format!(
-                        "ip6tables -t mangle -A PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark 0x1/0x1",
-                        allowed_ip,
-                        tproxy_port
+                    let rule = format!(
+                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark 0x1/0x1",
+                        allowed_ip, tproxy_port
                     );
-                    run_command_silently(&cmd);
+                    ensure_iptables_rule("ip6tables", &rule)?;
                 }
             }
         }
     }
+    Ok(())
 }
 
-fn cleanup_routes_and_iptables(config: &GatewayConfig, config_path: &str) {
+fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
     if let Some(ref t) = config.interface.table {
         if t.to_lowercase() == "off" {
             return;
         }
     }
-
-    let interface_name = std::path::Path::new(config_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("tun0")
-        .to_string();
 
     log::info!("Cleaning up automatic routing and iptables for interface: {}", interface_name);
 
@@ -487,23 +511,39 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, config_path: &str) {
                         allowed_ip,
                         tproxy_port
                     );
-                    run_command_silently(&cmd);
+                    run_command_best_effort(&cmd);
                 } else {
                     let cmd = format!(
                         "ip6tables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark 0x1/0x1",
                         allowed_ip,
                         tproxy_port
                     );
-                    run_command_silently(&cmd);
+                    run_command_best_effort(&cmd);
                 }
             }
         }
 
         // Clean up policy routing & local routes
-        run_command_silently("ip rule del fwmark 1 lookup 100");
-        run_command_silently("ip route del local 0.0.0.0/0 dev lo table 100");
-        run_command_silently("ip -6 rule del fwmark 1 lookup 100");
-        run_command_silently("ip -6 route del local ::/0 dev lo table 100");
+        run_command_best_effort("ip rule del fwmark 1 lookup 100");
+        run_command_best_effort("ip route del local 0.0.0.0/0 dev lo table 100");
+        run_command_best_effort("ip -6 rule del fwmark 1 lookup 100");
+        run_command_best_effort("ip -6 route del local ::/0 dev lo table 100");
+    }
+
+    // 2. Remove routes and addresses injected during setup.
+    for peer in &config.peers {
+        for allowed_ip in &peer.allowed_ips {
+            let cmd = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                format!("ip route del {} dev {}", allowed_ip, interface_name)
+            } else {
+                format!("ip -6 route del {} dev {}", allowed_ip, interface_name)
+            };
+            run_command_best_effort(&cmd);
+        }
+    }
+
+    for addr in &config.interface.addresses {
+        run_command_best_effort(&format!("ip addr del {} dev {}", addr, interface_name));
     }
 }
 
@@ -635,11 +675,7 @@ async fn main() {
         }
     };
 
-    let interface_name = std::path::Path::new(&config_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("tun0")
-        .to_string();
+    let interface_name = interface_name_from_config_path(&config_path);
 
     // 执行 PreScript 脚本
     if let Some(ref pre_script) = config.interface.pre_script {
@@ -647,7 +683,10 @@ async fn main() {
     }
 
     // 自动配置路由与 iptables
-    setup_routes_and_iptables(&config, &config_path);
+    if let Err(e) = setup_routes_and_iptables(&config, &interface_name) {
+        eprintln!("Failed to setup routes and firewall rules: {}", e);
+        std::process::exit(1);
+    }
 
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
@@ -688,7 +727,16 @@ async fn main() {
     };
     let _ = std::fs::remove_file(uds_path);
     let uds_listener = match tokio::net::UnixListener::bind(uds_path) {
-        Ok(l) => Some(l),
+        Ok(l) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) = std::fs::set_permissions(uds_path, std::fs::Permissions::from_mode(0o600)) {
+                    log::warn!("Failed to restrict API UDS socket permissions on {}: {}", uds_path, e);
+                }
+            }
+            Some(l)
+        }
         Err(e) => {
             log::warn!("Failed to bind API UDS socket: {}. Telemetry query CLI will be disabled.", e);
             None
@@ -1081,10 +1129,20 @@ async fn main() {
         // 删除多余的锁操作（shared_quic_registry 与 server 内部 registry 已通过 run_with_registry 共享）
         let telemetry_for_handler = telemetry_registry.clone();
         let shared_reg_for_server = shared_quic_registry.clone();
+        let stream_handler_limit = Arc::new(tokio::sync::Semaphore::new(MAX_QUIC_STREAM_HANDLERS));
         let quic_run_task = tokio::spawn(async move {
+            let stream_handler_limit = stream_handler_limit.clone();
             let handler = Arc::new(move |client_pub: [u8; 32], mut send_mux: quinn::SendStream, mut recv_mux: quinn::RecvStream, conn_stat: Arc<quic_pool::QuicConnStats>| {
+                let permit = match stream_handler_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        log::warn!("QUIC stream handler limit reached; rejecting stream for peer {:?}", client_pub);
+                        return;
+                    }
+                };
                 let stats = telemetry_for_handler.get_or_create(client_pub);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let target_addr = match timeout(Duration::from_secs(5), read_target_addr(&mut recv_mux)).await {
                         Ok(Ok(addr)) => addr,
                         Ok(Err(e)) => {
@@ -1198,12 +1256,14 @@ async fn main() {
         log::info!("  Parallel Userspace QUIC Connection Pool bypass L3 !  ");
         log::info!("------------------------------------------------------");
 
+        let tproxy_connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_TPROXY_CONNECTIONS));
         if let Some(listener) = tproxy_v6_listener {
             tokio::spawn(run_tproxy_accept_loop(
                 listener,
                 quic_pool_client.clone(),
                 gateway_state.clone(),
                 telemetry_registry.clone(),
+                tproxy_connection_limit.clone(),
             ));
         }
 
@@ -1213,13 +1273,14 @@ async fn main() {
                 quic_pool_client.clone(),
                 gateway_state.clone(),
                 telemetry_registry.clone(),
+                tproxy_connection_limit.clone(),
             ) => {}
             _ = wait_for_shutdown() => {}
         }
     }
 
     // 自动清理路由与 iptables
-    cleanup_routes_and_iptables(&config, &config_path);
+    cleanup_routes_and_iptables(&config, &interface_name);
 
     // 执行 PostScript 脚本
     if let Some(ref post_script) = config.interface.post_script {

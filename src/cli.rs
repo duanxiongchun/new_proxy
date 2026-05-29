@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::io::{Read, BufWriter};
+use std::net::Shutdown;
 use serde::{Serialize, Deserialize};
 
 // 每条物理 QUIC 连接的统计快照（与 quic_pool::QuicConnSnapshot 字段完全对齐）
@@ -56,7 +57,7 @@ fn send_command(path: &str, cmd: &CommandInput) -> Result<String, String> {
     let mut stream = connect_uds(path)?;
     let payload = serde_json::to_vec(cmd).unwrap();
     stream.write_all(&payload).map_err(|e| format!("Write error: {}", e))?;
-    drop(stream.try_clone().ok()); // trigger EOF on server side
+    stream.shutdown(Shutdown::Write).map_err(|e| format!("Shutdown write error: {}", e))?;
     let mut buf = String::new();
     stream.read_to_string(&mut buf).map_err(|e| format!("Read error: {}", e))?;
     Ok(buf)

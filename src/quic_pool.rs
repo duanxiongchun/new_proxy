@@ -95,6 +95,7 @@ pub struct QuicPoolClient {
     session_psk: [u8; 32],
     endpoints: Vec<SocketAddr>,
     connections: Arc<Mutex<Vec<Connection>>>,
+    conn_endpoints: Arc<Mutex<Vec<SocketAddr>>>,
     // 每条物理连接独立的流量统计
     pub conn_stats: Arc<Mutex<Vec<QuicConnStats>>>,
     rr_index: Arc<Mutex<usize>>,
@@ -108,6 +109,7 @@ impl QuicPoolClient {
             session_psk,
             endpoints,
             connections: Arc::new(Mutex::new(Vec::new())),
+            conn_endpoints: Arc::new(Mutex::new(Vec::new())),
             conn_stats: Arc::new(Mutex::new(Vec::new())),
             rr_index: Arc::new(Mutex::new(0)),
             endpoint: Arc::new(Mutex::new(None)),
@@ -147,6 +149,7 @@ impl QuicPoolClient {
         *self.endpoint.lock().unwrap() = Some(endpoint.clone());
 
         let mut conns = Vec::new();
+        let mut conn_endpoints = Vec::new();
         let mut stats = Vec::new();
 
         // 并发连向推上来的公网 UDP 端口池
@@ -177,6 +180,7 @@ impl QuicPoolClient {
             let local_port = target_addr.port();
             let remote_addr = conn.remote_address();
             stats.push(QuicConnStats::new(remote_addr, local_port));
+            conn_endpoints.push(target_addr);
             conns.push(conn);
         }
 
@@ -186,6 +190,7 @@ impl QuicPoolClient {
 
         log::info!("Successfully initialized QUIC connection pool with {} active links", conns.len());
         *self.connections.lock().unwrap() = conns;
+        *self.conn_endpoints.lock().unwrap() = conn_endpoints;
         *self.conn_stats.lock().unwrap() = stats;
         Ok(())
     }
@@ -285,23 +290,22 @@ impl QuicPoolClient {
                     None => continue,
                 };
                 
-                let conns_len = {
+                let active_slots = {
                     let conns = self.connections.lock().unwrap();
-                    conns.len()
+                    let conn_endpoints = self.conn_endpoints.lock().unwrap();
+                    conns.iter()
+                        .cloned()
+                        .zip(conn_endpoints.iter().copied())
+                        .collect::<Vec<_>>()
                 };
                 
-                for i in 0..conns_len {
-                    let conn = {
-                        let conns = self.connections.lock().unwrap();
-                        conns[i].clone()
-                    };
+                for (i, (conn, target_addr)) in active_slots.iter().enumerate() {
                     let need_reconnect = conn.close_reason().is_some();
                     
                     if need_reconnect {
-                        let target_addr = endpoints[i];
                         log::info!("Connection index {} to {} is dead. Reconnecting...", i, target_addr);
                         
-                        match endpoint.connect(target_addr, "localhost") {
+                        match endpoint.connect(*target_addr, "localhost") {
                             Ok(connecting) => {
                                 match connecting.await {
                                     Ok(new_conn) => {
@@ -313,8 +317,10 @@ impl QuicPoolClient {
                                             log::info!("Successfully re-established dead connection to {}", target_addr);
                                             let mut conns = self.connections.lock().unwrap();
                                             let mut stats = self.conn_stats.lock().unwrap();
-                                            conns[i] = new_conn.clone();
-                                            stats[i] = QuicConnStats::new(new_conn.remote_address(), target_addr.port());
+                                            if i < conns.len() && i < stats.len() {
+                                                conns[i] = new_conn.clone();
+                                                stats[i] = QuicConnStats::new(new_conn.remote_address(), target_addr.port());
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -325,6 +331,42 @@ impl QuicPoolClient {
                             Err(e) => {
                                 log::warn!("Failed to initiate reconnection to {}: {}", target_addr, e);
                             }
+                        }
+                    }
+                }
+
+                let missing_endpoints = {
+                    let conn_endpoints = self.conn_endpoints.lock().unwrap();
+                    endpoints.iter()
+                        .copied()
+                        .filter(|endpoint_addr| !conn_endpoints.contains(endpoint_addr))
+                        .collect::<Vec<_>>()
+                };
+
+                for target_addr in missing_endpoints {
+                    log::info!("Connection to {} is missing from pool. Connecting...", target_addr);
+                    match endpoint.connect(target_addr, "localhost") {
+                        Ok(connecting) => match connecting.await {
+                            Ok(new_conn) => {
+                                if let Err(e) = self.authenticate_connection(&new_conn).await {
+                                    log::warn!("Authentication failed on recovered link {}: {}", target_addr, e);
+                                    new_conn.close(0u32.into(), b"Auth failed");
+                                } else {
+                                    log::info!("Successfully added recovered connection to {}", target_addr);
+                                    let mut conns = self.connections.lock().unwrap();
+                                    let mut conn_endpoints = self.conn_endpoints.lock().unwrap();
+                                    let mut stats = self.conn_stats.lock().unwrap();
+                                    conns.push(new_conn.clone());
+                                    conn_endpoints.push(target_addr);
+                                    stats.push(QuicConnStats::new(new_conn.remote_address(), target_addr.port()));
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Recovery connection handshake failed to {}: {}", target_addr, e);
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("Failed to initiate recovery connection to {}: {}", target_addr, e);
                         }
                     }
                 }
