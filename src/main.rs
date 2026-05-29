@@ -38,6 +38,7 @@ pub struct UnifiedTelemetry {
     pub active_streams: u64,
     // 每条物理 QUIC 连接的独立统计（无代理时为空）
     pub quic_connections: Vec<QuicConnSnapshot>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -310,6 +311,268 @@ async fn handle_tproxy_connection(
     }
 }
 
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+    tokio::select! {
+        _ = sigint.recv() => {
+            log::info!("Received SIGINT, shutting down...");
+        }
+        _ = sigterm.recv() => {
+            log::info!("Received SIGTERM, shutting down...");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown() {
+    tokio::signal::ctrl_c().await.expect("failed to listen for ctrl_c");
+    log::info!("Received CTRL+C, shutting down...");
+}
+
+fn run_command_silently(cmd: &str) {
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output();
+}
+
+fn run_script(script: &str) {
+    log::info!("Executing script: {}", script);
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output();
+    match output {
+        Ok(out) => {
+            if !out.status.success() {
+                log::warn!("Script exited with error: {:?}", out.status);
+                log::warn!("Script stdout: {}", String::from_utf8_lossy(&out.stdout));
+                log::warn!("Script stderr: {}", String::from_utf8_lossy(&out.stderr));
+            } else {
+                log::info!("Script completed successfully.");
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to execute script '{}': {}", script, e);
+        }
+    }
+}
+
+fn setup_routes_and_iptables(config: &GatewayConfig, config_path: &str) {
+    if let Some(ref t) = config.interface.table {
+        if t.to_lowercase() == "off" {
+            log::info!("Table is off. Skipping automatic routing and iptables setup.");
+            return;
+        }
+    }
+
+    // Determine interface name from config path, defaulting to "tun0"
+    let interface_name = std::path::Path::new(config_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tun0")
+        .to_string();
+
+    log::info!("Setting up automatic routing and iptables for interface: {}", interface_name);
+
+    // 1. Add addresses to the tun interface
+    for addr in &config.interface.addresses {
+        let cmd = format!("ip addr add {} dev {}", addr, interface_name);
+        run_command_silently(&cmd);
+    }
+    
+    // Set interface UP
+    run_command_silently(&format!("ip link set {} up", interface_name));
+
+    // 2. Add routes for AllowedIPs of all peers
+    for peer in &config.peers {
+        for allowed_ip in &peer.allowed_ips {
+            let cmd = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                format!("ip route add {} dev {}", allowed_ip, interface_name)
+            } else {
+                format!("ip -6 route add {} dev {}", allowed_ip, interface_name)
+            };
+            run_command_silently(&cmd);
+        }
+    }
+
+    // 3. Configure TPROXY iptables rules if TProxyPort is set
+    if let Some(tproxy_port) = config.interface.tproxy_port {
+        log::info!("Setting up TPROXY iptables rules on port {}", tproxy_port);
+
+        // IPv4 policy routing & local route
+        run_command_silently("ip rule add fwmark 1 lookup 100");
+        run_command_silently("ip route add local 0.0.0.0/0 dev lo table 100");
+
+        // IPv6 policy routing & local route
+        run_command_silently("ip -6 rule add fwmark 1 lookup 100");
+        run_command_silently("ip -6 route add local ::/0 dev lo table 100");
+
+        // Add PREROUTING rules for each AllowedIP
+        for peer in &config.peers {
+            for allowed_ip in &peer.allowed_ips {
+                if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                    let cmd = format!(
+                        "iptables -t mangle -A PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1",
+                        allowed_ip,
+                        tproxy_port
+                    );
+                    run_command_silently(&cmd);
+                } else {
+                    let cmd = format!(
+                        "ip6tables -t mangle -A PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark 0x1/0x1",
+                        allowed_ip,
+                        tproxy_port
+                    );
+                    run_command_silently(&cmd);
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_routes_and_iptables(config: &GatewayConfig, config_path: &str) {
+    if let Some(ref t) = config.interface.table {
+        if t.to_lowercase() == "off" {
+            return;
+        }
+    }
+
+    let interface_name = std::path::Path::new(config_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tun0")
+        .to_string();
+
+    log::info!("Cleaning up automatic routing and iptables for interface: {}", interface_name);
+
+    // 1. Remove TPROXY iptables rules if TProxyPort is set
+    if let Some(tproxy_port) = config.interface.tproxy_port {
+        log::info!("Tearing down TPROXY iptables rules on port {}", tproxy_port);
+
+        for peer in &config.peers {
+            for allowed_ip in &peer.allowed_ips {
+                if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                    let cmd = format!(
+                        "iptables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1",
+                        allowed_ip,
+                        tproxy_port
+                    );
+                    run_command_silently(&cmd);
+                } else {
+                    let cmd = format!(
+                        "ip6tables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark 0x1/0x1",
+                        allowed_ip,
+                        tproxy_port
+                    );
+                    run_command_silently(&cmd);
+                }
+            }
+        }
+
+        // Clean up policy routing & local routes
+        run_command_silently("ip rule del fwmark 1 lookup 100");
+        run_command_silently("ip route del local 0.0.0.0/0 dev lo table 100");
+        run_command_silently("ip -6 rule del fwmark 1 lookup 100");
+        run_command_silently("ip -6 route del local ::/0 dev lo table 100");
+    }
+}
+
+async fn sync_kernel_and_proxy_state(
+    interface_name: &str,
+    state: &Arc<std::sync::RwLock<GatewayState>>,
+    peer_secrets: &Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    server_secret: &StaticSecret,
+    l3_stats: &HashMap<[u8; 32], WgPeerStats>,
+) -> HashMap<[u8; 32], String> {
+    let mut sources = HashMap::new();
+    let mut peers_to_sync_to_kernel = Vec::new();
+    let mut peers_to_sync_to_proxy = Vec::new();
+
+    // 1. Identify sources and find peers missing in kernel
+    {
+        let st = state.read().unwrap();
+        for peer in &st.config.peers {
+            if l3_stats.contains_key(&peer.public_key) {
+                sources.insert(peer.public_key, "both".to_string());
+            } else {
+                sources.insert(peer.public_key, "proxy".to_string());
+                peers_to_sync_to_kernel.push(peer.clone());
+            }
+        }
+    }
+
+    // 2. Identify peers missing in proxy config
+    for (&pub_key, wg_stats) in l3_stats {
+        if !sources.contains_key(&pub_key) {
+            sources.insert(pub_key, "kernel".to_string());
+            peers_to_sync_to_proxy.push((pub_key, wg_stats.clone()));
+        }
+    }
+
+    // 3. Perform synchronization to kernel (wg CLI)
+    for peer in peers_to_sync_to_kernel {
+        let pub_key_b64 = encode_base64_32(&peer.public_key);
+        let allowed_ips_str = peer.allowed_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",");
+        let mut args = vec![
+            "set".to_string(),
+            interface_name.to_string(),
+            "peer".to_string(),
+            pub_key_b64,
+            "allowed-ips".to_string(),
+            allowed_ips_str,
+        ];
+        if let Some(endpoint) = peer.endpoint {
+            args.push("endpoint".to_string());
+            args.push(endpoint.to_string());
+        }
+        let _ = std::process::Command::new("wg")
+            .args(&args)
+            .output();
+    }
+
+    // 4. Perform synchronization to proxy (GatewayState peers & Trie router & peer_secrets)
+    for (pub_key, wg_stats) in peers_to_sync_to_proxy {
+        // Generates and caches the DH shared secret
+        let peer_pub = PublicKey::from(pub_key);
+        let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
+        peer_secrets.lock().unwrap().insert(pub_key, shared_secret);
+
+        let mut parsed_allowed_ips = Vec::new();
+        for ip_str in &wg_stats.allowed_ips {
+            if let Ok(ipnet) = std::str::FromStr::from_str(ip_str) {
+                parsed_allowed_ips.push(ipnet);
+            }
+        }
+        let parsed_endpoint = wg_stats.endpoint.as_ref().and_then(|s| std::str::FromStr::from_str(s).ok());
+
+        {
+            let mut st = state.write().unwrap();
+            st.config.peers.retain(|p| p.public_key != pub_key);
+            st.config.peers.push(config::PeerConfig {
+                public_key: pub_key,
+                allowed_ips: parsed_allowed_ips,
+                endpoint: parsed_endpoint,
+                proxy_port: Some(51821),
+            });
+            // Hot-rebuild allowed IPs Trie router
+            let mut new_router = AllowedIPsRouter::new();
+            for p in &st.config.peers {
+                for &allowed_ip in &p.allowed_ips {
+                    new_router.insert(allowed_ip, p.public_key);
+                }
+            }
+            st.router = new_router;
+        }
+    }
+
+    sources
+}
+
+
 #[tokio::main]
 async fn main() {
     // 初始化日志系统
@@ -345,6 +608,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // 执行 PreScript 脚本
+    if let Some(ref pre_script) = config.interface.pre_script {
+        run_script(pre_script);
+    }
+
+    // 自动配置路由与 iptables
+    setup_routes_and_iptables(&config, &config_path);
 
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
@@ -453,6 +724,13 @@ async fn main() {
                     match cmd {
                         CommandInput::Stats => {
                             let l3_stats = get_wg_dump_stats("tun0").await.unwrap_or_default();
+                            let sources = sync_kernel_and_proxy_state(
+                                "tun0",
+                                &state,
+                                &peer_secrets,
+                                &server_secret,
+                                &l3_stats,
+                            ).await;
                             let aggregated = {
                                 let mut aggregated = Vec::new();
                                 let mut seen = HashSet::new();
@@ -499,6 +777,11 @@ async fn main() {
                                         peer.allowed_ips.iter().map(|ip| ip.to_string()).collect()
                                     };
                                     
+                                    let source = sources
+                                        .get(&pub_key)
+                                        .cloned()
+                                        .unwrap_or_else(|| "both".to_string());
+                                    
                                     aggregated.push(UnifiedTelemetry {
                                         public_key: pub_key_b64,
                                         allowed_ips,
@@ -510,6 +793,7 @@ async fn main() {
                                         l4_tx_bytes: l4_tx,
                                         active_streams,
                                         quic_connections,
+                                        source,
                                     });
                                     seen.insert(pub_key);
                                 }
@@ -534,6 +818,11 @@ async fn main() {
                                         .map(|conns| conns.iter().map(|c| c.snapshot()).collect())
                                         .unwrap_or_default();
 
+                                    let source = sources
+                                        .get(pub_key)
+                                        .cloned()
+                                        .unwrap_or_else(|| "kernel".to_string());
+
                                     aggregated.push(UnifiedTelemetry {
                                         public_key: encode_base64_32(pub_key),
                                         allowed_ips: wg_stats.allowed_ips.clone(),
@@ -545,6 +834,7 @@ async fn main() {
                                         l4_tx_bytes: l4_tx,
                                         active_streams,
                                         quic_connections,
+                                        source,
                                     });
                                     seen.insert(*pub_key);
                                 }
@@ -569,6 +859,11 @@ async fn main() {
                                         .map(|conns| conns.iter().map(|c| c.snapshot()).collect())
                                         .unwrap_or_default();
 
+                                    let source = sources
+                                        .get(pub_key)
+                                        .cloned()
+                                        .unwrap_or_else(|| "proxy".to_string());
+
                                     aggregated.push(UnifiedTelemetry {
                                         public_key: encode_base64_32(pub_key),
                                         allowed_ips: Vec::new(),
@@ -580,6 +875,7 @@ async fn main() {
                                         l4_tx_bytes: l4_tx,
                                         active_streams,
                                         quic_connections,
+                                        source,
                                     });
                                 }
                                 aggregated
@@ -790,9 +1086,7 @@ async fn main() {
         });
 
         let _ = quic_run_task.await;
-        
-        // 保持服务器主任务与 Tokio 运行时永久活化，防止运行时提前销毁导致 UDS/QUIC 异步任务被强行中止
-        let () = std::future::pending().await;
+        wait_for_shutdown().await;
 
     } else {
         log::info!("------------------------------------------------------");
@@ -875,11 +1169,22 @@ async fn main() {
             ));
         }
 
-        run_tproxy_accept_loop(
-            tproxy_v4_listener,
-            quic_pool_client.clone(),
-            gateway_state.clone(),
-        ).await;
+        tokio::select! {
+            _ = run_tproxy_accept_loop(
+                tproxy_v4_listener,
+                quic_pool_client.clone(),
+                gateway_state.clone(),
+            ) => {}
+            _ = wait_for_shutdown() => {}
+        }
+    }
+
+    // 自动清理路由与 iptables
+    cleanup_routes_and_iptables(&config, &config_path);
+
+    // 执行 PostScript 脚本
+    if let Some(ref post_script) = config.interface.post_script {
+        run_script(post_script);
     }
 }
 
@@ -901,11 +1206,11 @@ async fn run_cli_stats() -> Result<(), String> {
     let stats: Vec<UnifiedTelemetry> = serde_json::from_slice(&buf)
         .map_err(|e| format!("Failed to parse JSON stats: {}", e))?;
     
-    println!("\n+------------------------------------------------------------------------------------------------------------------------------------+");
-    println!("|                                             HYBRID SECURE PROXY GATEWAY TELEMETRY                                                  |");
-    println!("+------------------------------------------------------------------------------------------------------------------------------------+");
-    println!("| {:<44} | {:<20} | {:<20} | {:<20} | {:<12} |", "Peer Public Key", "L3 Transfer (RX/TX)", "L4 Transfer (RX/TX)", "Handshake (ago)", "Active Strm");
-    println!("+------------------------------------------------------------------------------------------------------------------------------------+");
+    println!("\n+-------------------------------------------------------------------------------------------------------------------------------------------+");
+    println!("|                                             HYBRID SECURE PROXY GATEWAY TELEMETRY                                                         |");
+    println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
+    println!("| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |", "Peer Public Key", "Source", "L3 Transfer (RX/TX)", "L4 Transfer (RX/TX)", "Handshake (ago)", "Active Strm");
+    println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
     
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -924,15 +1229,16 @@ async fn run_cli_stats() -> Result<(), String> {
         };
         
         println!(
-            "| {:<44} | {:<20} | {:<20} | {:<20} | {:<12} |",
+            "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |",
             s.public_key,
+            s.source,
             l3_str,
             l4_str,
             handshake_str,
             s.active_streams
         );
     }
-    println!("+------------------------------------------------------------------------------------------------------------------------------------+");
+    println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
     Ok(())
 }
 
@@ -1046,6 +1352,9 @@ mod tests {
                 listen_control_port: Some(51820),
                 tproxy_port: Some(8080),
                 mtu: 1420,
+                table: None,
+                pre_script: None,
+                post_script: None,
             },
             peers: vec![config::PeerConfig {
                 public_key: [2u8; 32],
@@ -1105,6 +1414,7 @@ mod tests {
                             l4_tx_bytes: 80,
                             active_streams: 0,
                             quic_connections: vec![],
+                            source: "both".to_string(),
                         }];
                         let _ = stream.write_all(&serde_json::to_vec(&response).unwrap()).await;
                     }
@@ -1244,5 +1554,90 @@ mod tests {
 
         let _ = server_handle.await;
         let _ = fs::remove_file(test_uds_path);
+    }
+
+    #[tokio::test]
+    async fn test_peer_synchronization() {
+        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
+        
+        let config = GatewayConfig {
+            interface: config::InterfaceConfig {
+                private_key: server_secret.to_bytes(),
+                addresses: vec![],
+                listen_port: Some(51820),
+                listen_control_port: None,
+                tproxy_port: None,
+                mtu: 1420,
+                table: None,
+                pre_script: None,
+                post_script: None,
+            },
+            peers: vec![
+                config::PeerConfig {
+                    public_key: [1u8; 32],
+                    allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+                    endpoint: Some("127.0.0.1:12345".parse().unwrap()),
+                    proxy_port: None,
+                },
+                config::PeerConfig {
+                    public_key: [2u8; 32],
+                    allowed_ips: vec!["10.0.2.0/24".parse().unwrap()],
+                    endpoint: Some("127.0.0.1:12346".parse().unwrap()),
+                    proxy_port: None,
+                }
+            ],
+            quic_pool: config::QUICPoolConfig {
+                public_ipv4: None,
+                public_ipv6: None,
+                listen_ports: vec![],
+            },
+        };
+        
+        let initial_router = AllowedIPsRouter::new();
+        let gateway_state = Arc::new(std::sync::RwLock::new(GatewayState {
+            config,
+            router: initial_router,
+        }));
+        
+        let mut l3_stats = HashMap::new();
+        l3_stats.insert([1u8; 32], WgPeerStats {
+            allowed_ips: vec!["10.0.1.0/24".to_string()],
+            endpoint: Some("127.0.0.1:12345".to_string()),
+            rx_bytes: 100,
+            tx_bytes: 200,
+            last_handshake: 0,
+        });
+        l3_stats.insert([3u8; 32], WgPeerStats {
+            allowed_ips: vec!["10.0.3.0/24".to_string()],
+            endpoint: Some("127.0.0.1:12347".to_string()),
+            rx_bytes: 300,
+            tx_bytes: 400,
+            last_handshake: 0,
+        });
+        
+        let sources = sync_kernel_and_proxy_state(
+            "tun_test_sync",
+            &gateway_state,
+            &peer_secrets,
+            &server_secret,
+            &l3_stats,
+        ).await;
+        
+        assert_eq!(sources.get(&[1u8; 32]).unwrap(), "both");
+        assert_eq!(sources.get(&[2u8; 32]).unwrap(), "proxy");
+        assert_eq!(sources.get(&[3u8; 32]).unwrap(), "kernel");
+        
+        let st = gateway_state.read().unwrap();
+        let peer3 = st.config.peers.iter().find(|p| p.public_key == [3u8; 32]);
+        assert!(peer3.is_some(), "Peer [3u8; 32] should be synced to proxy config");
+        let peer3_config = peer3.unwrap();
+        assert_eq!(peer3_config.allowed_ips[0], "10.0.3.0/24".parse::<ipnet::IpNet>().unwrap());
+        
+        let lookup_res = st.router.longest_match(std::net::IpAddr::V4("10.0.3.5".parse().unwrap()));
+        assert_eq!(lookup_res, Some([3u8; 32]), "Router should be able to resolve IP to [3u8; 32]");
+        
+        let secrets = peer_secrets.lock().unwrap();
+        assert!(secrets.contains_key(&[3u8; 32]), "Peer [3u8; 32] secret should be computed");
     }
 }

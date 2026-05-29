@@ -26,6 +26,7 @@ pub struct UnifiedTelemetry {
     pub l4_tx_bytes: u64,
     pub active_streams: u64,
     pub quic_connections: Vec<QuicConnSnapshot>,
+    pub source: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -124,6 +125,7 @@ fn print_wg_style(peers: &[UnifiedTelemetry]) {
 
     for peer in peers {
         writeln!(w, "peer: {}", peer.public_key).unwrap();
+        writeln!(w, "  source: {}", peer.source).unwrap();
 
         if let Some(ep) = &peer.endpoint {
             writeln!(w, "  endpoint: {}", ep).unwrap();
@@ -331,6 +333,7 @@ mod tests {
             l4_tx_bytes: 0,
             active_streams: 0,
             quic_connections: vec![],
+            source: "both".to_string(),
         };
         print_wg_style(&[peer]); // 应打印 L3-only 行
     }
@@ -355,6 +358,7 @@ mod tests {
             l4_tx_bytes: 231,
             active_streams: 0,
             quic_connections: vec![conn],
+            source: "both".to_string(),
         };
         print_wg_style(&[peer]);
     }
@@ -390,6 +394,7 @@ mod tests {
                                 l4_tx_bytes: 400,
                                 active_streams: 0,
                                 quic_connections: vec![],
+                                source: "both".to_string(),
                             }];
                             let resp = serde_json::to_vec(&mock_telemetry).unwrap();
                             let _ = stream.write_all(&resp);

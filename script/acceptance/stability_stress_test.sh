@@ -44,10 +44,11 @@ cleanup() {
       kill -9 "$pid" 2>/dev/null
     fi
   done
-  ip netns delete client_ns 2>/dev/null
-  ip netns delete router_ns 2>/dev/null
-  ip netns delete server_ns 2>/dev/null
-  rm -f /tmp/new_proxy_api.sock /tmp/new_proxy_api_client.sock /tmp/client_proxy_active
+  ip netns delete client1_ns 2>/dev/null || true
+  ip netns delete client2_ns 2>/dev/null || true
+  ip netns delete router_ns 2>/dev/null || true
+  ip netns delete server_ns 2>/dev/null || true
+  rm -f /tmp/new_proxy_api.sock /tmp/new_proxy_api_client.sock /tmp/client_proxy_active /tmp/wg
 }
 trap cleanup EXIT
 
@@ -72,12 +73,14 @@ PrivateKey = 1WL7OPPOABmaRVdjR6JoliATNsjOVFO1bE8gM113POM=
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
+Table = off
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
 PublicIPv6 = fd00:2::2
 ListenPorts = 40001, 40002, 40003, 40004
 
+# Client 1: Custom Proxy Client Peer (Defined in config, so it's 'both')
 [Peer]
 PublicKey = 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
 AllowedIPs = 10.0.0.2/32, fd00::2/128
@@ -89,6 +92,7 @@ PrivateKey = etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
 Address = 10.0.0.2/24, fd00::2/64
 TProxyPort = 1080
 MTU = 1400
+Table = off
 
 [Peer]
 PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
@@ -99,43 +103,80 @@ EOF_CONF
 
 echo "=== [1/7] Setting up namespaces ==="
 cleanup
-ip netns add client_ns
-ip netns add router_ns
 ip netns add server_ns
+ip netns add router_ns
+ip netns add client1_ns
+ip netns add client2_ns
 
-ip link add veth-client type veth peer name veth-router-c
-ip link set veth-client netns client_ns
-ip link set veth-router-c netns router_ns
+# Server <-> Router
 ip link add veth-server type veth peer name veth-router-s
 ip link set veth-server netns server_ns
 ip link set veth-router-s netns router_ns
 
-ip netns exec client_ns ip addr add 10.0.1.2/24 dev veth-client
-ip netns exec client_ns ip link set veth-client up
-ip netns exec client_ns ip link set lo up
-ip netns exec client_ns ip addr add 10.0.0.2/32 dev lo
-ip netns exec client_ns ip route add default via 10.0.1.1
-ip netns exec client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
+# Client 1 <-> Router
+ip link add veth-client1 type veth peer name veth-router-c1
+ip link set veth-client1 netns client1_ns
+ip link set veth-router-c1 netns router_ns
 
+# Client 2 <-> Router
+ip link add veth-client2 type veth peer name veth-router-c2
+ip link set veth-client2 netns client2_ns
+ip link set veth-router-c2 netns router_ns
+
+# Server NS
 ip netns exec server_ns ip addr add 10.0.2.2/24 dev veth-server
 ip netns exec server_ns ip link set veth-server up
 ip netns exec server_ns ip link set lo up
 ip netns exec server_ns ip addr add 10.0.0.1/32 dev lo
-ip netns exec server_ns ip route add default via 10.0.2.1
-ip netns exec server_ns ip route add 10.0.0.1/32 dev lo scope host
 
-ip netns exec router_ns ip addr add 10.0.1.1/24 dev veth-router-c
-ip netns exec router_ns ip link set veth-router-c up
+# Client 1 NS (Custom Proxy)
+ip netns exec client1_ns ip addr add 10.0.1.2/24 dev veth-client1
+ip netns exec client1_ns ip link set veth-client1 up
+ip netns exec client1_ns ip link set lo up
+ip netns exec client1_ns ip addr add 10.0.0.2/32 dev lo
+
+# Client 2 NS (Standard WG Fallback)
+ip netns exec client2_ns ip addr add 10.0.3.2/24 dev veth-client2
+ip netns exec client2_ns ip link set veth-client2 up
+ip netns exec client2_ns ip link set lo up
+ip netns exec client2_ns ip addr add 10.0.0.3/32 dev lo
+
+# Router NS
 ip netns exec router_ns ip addr add 10.0.2.1/24 dev veth-router-s
 ip netns exec router_ns ip link set veth-router-s up
+ip netns exec router_ns ip addr add 10.0.1.1/24 dev veth-router-c1
+ip netns exec router_ns ip link set veth-router-c1 up
+ip netns exec router_ns ip addr add 10.0.3.1/24 dev veth-router-c2
+ip netns exec router_ns ip link set veth-router-c2 up
 ip netns exec router_ns ip link set lo up
-ip netns exec router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
-ip netns exec router_ns ip route add 10.0.0.1/32 via 10.0.1.2
-ip netns exec client_ns ip route add 10.0.0.1/32 via 10.0.1.1
 
-ip netns exec client_ns ip rule add fwmark 1 lookup 100
-ip netns exec client_ns ip route add local 0.0.0.0/0 dev lo table 100
-ip netns exec client_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
+# Enable IP forwarding
+ip netns exec router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
+ip netns exec client1_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Clients Gateway Routes
+ip netns exec client1_ns ip route add default via 10.0.1.1
+ip netns exec client1_ns ip route add 10.0.0.1/32 via 10.0.1.1
+
+ip netns exec client2_ns ip route add default via 10.0.3.1
+ip netns exec client2_ns ip route add 10.0.0.1/32 via 10.0.3.1
+
+# Server Gateway & Client Routes
+ip netns exec server_ns ip route add default via 10.0.2.1
+ip netns exec server_ns ip route add 10.0.0.2/32 via 10.0.2.1
+ip netns exec server_ns ip route add 10.0.0.3/32 via 10.0.2.1
+ip netns exec server_ns ip route add 10.0.0.1/32 dev lo scope host
+
+# Router Routing Table
+ip netns exec router_ns ip route add 10.0.0.1/32 via 10.0.2.2
+ip netns exec router_ns ip route add 10.0.0.2/32 via 10.0.1.2
+ip netns exec router_ns ip route add 10.0.0.3/32 via 10.0.3.2
+
+# Client 1 TPROXY Interception Setup
+ip netns exec client1_ns ip rule add fwmark 1 lookup 100
+ip netns exec client1_ns ip route add local 0.0.0.0/0 dev lo table 100
+ip netns exec client1_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
+ip netns exec client1_ns iptables -t mangle -A OUTPUT -p tcp -d 10.0.0.1 -j MARK --set-mark 1
 
 echo "=== [2/7] Starting target TCP/UDP server ==="
 ip netns exec server_ns python3 "$ROOT_DIR/script/acceptance/stability_server.py" > "$ARTIFACT_DIR/target_server.log" 2>&1 &
@@ -143,15 +184,28 @@ TARGET_PID=$!
 sleep 1
 
 echo "=== [3/7] Starting server/client proxies with 4 QUIC ports ==="
-ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &
+# Create Mock wg command to emulate kernel WireGuard dump stats
+cat > /tmp/wg <<'EOF_MOCK_WG'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [ "$3" = "dump" ]; then
+    # Client 2 (kernel-only)
+    echo -e "vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=\t(none)\t10.0.3.2:51820\t10.0.0.3/32\t$(date +%s)\t12500\t8400\t(none)"
+    # Client 1 (both / proxy)
+    echo -e "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=\t(none)\t10.0.1.2:50322\t10.0.0.2/32\t$(date +%s)\t3482\t256\t(none)"
+fi
+EOF_MOCK_WG
+chmod +x /tmp/wg
+
+PATH="/tmp:$PATH" ip netns exec server_ns env PATH="/tmp:$PATH" "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
-ip netns exec client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$ARTIFACT_DIR/client_daemon.log" 2>&1 &
+ip netns exec client1_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$ARTIFACT_DIR/client_daemon.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
 
-echo "=== [4/7] Verifying initial TCP path ==="
+echo "=== [4/7] Verifying initial TCP paths for both clients ==="
 ip netns exec router_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
+ip netns exec client2_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
 
 monitor_once() {
   python3 - "$METRICS" "$SERVER_PID" "$CLIENT_PID" "$START_TS" <<'PY'
@@ -216,6 +270,13 @@ short_loop() {
         echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
       fi &
     done
+    for _ in $(seq 1 "$SHORT_PARALLEL"); do
+      if ip netns exec client2_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
+        echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
+      else
+        echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
+      fi &
+    done
     wait
     sleep 1
   done
@@ -224,7 +285,19 @@ short_loop() {
 udp_loop() {
   end=$((START_TS + DURATION))
   while [ "$(date +%s)" -lt "$end" ]; do
-    if ip netns exec client_ns python3 - <<'PY'
+    if ip netns exec client1_ns python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.sendto(b"stability-udp", ("10.0.2.2", 8081))
+print(s.recvfrom(1024)[0].decode(errors="replace"))
+PY
+    then
+      echo "$(date +%s) OK" >> "$ARTIFACT_DIR/udp.log"
+    else
+      echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/udp.log"
+    fi
+    if ip netns exec client2_ns python3 - <<'PY'
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(2)
@@ -243,7 +316,12 @@ PY
 ping_loop() {
   end=$((START_TS + DURATION))
   while [ "$(date +%s)" -lt "$end" ]; do
-    if ip netns exec client_ns ping -c 1 -W 2 10.0.2.2 >/dev/null; then
+    if ip netns exec client1_ns ping -c 1 -W 2 10.0.2.2 >/dev/null; then
+      echo "$(date +%s) OK" >> "$ARTIFACT_DIR/ping.log"
+    else
+      echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/ping.log"
+    fi
+    if ip netns exec client2_ns ping -c 1 -W 2 10.0.2.2 >/dev/null; then
       echo "$(date +%s) OK" >> "$ARTIFACT_DIR/ping.log"
     else
       echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/ping.log"

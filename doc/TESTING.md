@@ -100,6 +100,24 @@
   * **输入**：拦截到一个从 IPv6 源地址发往 `AllowedIPs` IPv6 子网的 TCP SYN 报文，原 MSS 字段标称为 `1440`。网卡 MTU 设置为 `1400`，封装层开销 76 字节。
   * **预期输出**：网关的 MSS 裁剪模块强制将其修改为 `1324` 字节，校验和重新计算，报文成功流转，证明双轨自动夹逼机制高度精准。
 
+### 1.6 对等体双向自适应互补同步单元测试套件 (Peer Auto-Sync Test Suite)
+本套件用于确保内核态 WireGuard peer 配置与网关用户态 GatewayState 内存配置在出现不一致时，能被自动、无损地互补补充，并计算正确的预同步 source 标识。
+
+* **测试用例 1.6.1：内核至用户态同步 (Kernel -> Proxy Sync)**
+  * **输入**：配置 `GatewayState` 仅包含 PeerA，而 Mock `wg dump` 返回 PeerA (both) 和 PeerB (仅内核持有的 Peer)。
+  * **验证**：调用 `sync_kernel_and_proxy_state`。
+  * **预期输出**：
+    1. 返回的 `sources` 映射表中：PeerA 被标记为 `"both"`，PeerB 被标记为 `"kernel"`；
+    2. PeerB 被自动补充到 `GatewayState` 的 peer 配置列表中；
+    3. `GatewayState` 的 AllowedIPs Trie 树完成热重建，使得查找 PeerB 对应的内网 IP 时能瞬间精准命中，证明 L4 拦截机制已对 PeerB 激活；
+    4. 自动为 PeerB 协商/计算 Noise_IK 握手所需的 Diffie-Hellman 控制面共享密钥并缓存。
+* **测试用例 1.6.2：用户态至内核同步 (Proxy -> Kernel Sync)**
+  * **输入**：配置 `GatewayState` 包含 PeerA 和 PeerC (仅用户态配置持有的 Peer)，而 Mock `wg dump` 仅返回 PeerA。
+  * **验证**：调用 `sync_kernel_and_proxy_state`。
+  * **预期输出**：
+    1. 返回的 `sources` 映射表中：PeerA 被标记为 `"both"`，PeerC 被标记为 `"proxy"`；
+    2. 系统自动向内核驱动下发 `wg set` 配置指令，自动将 PeerC 的公钥、AllowedIPs 等信息配置绑定至系统 tun 网卡设备，确保 PeerC 对应的 L3 UDP/ICMP 双栈数据通道正常开启。
+
 ---
 
 ## 2. 端到端集成测试 (End-to-End Tests)
@@ -320,3 +338,25 @@ kill $SERVER_PID $CLIENT_PID
    $$CV = \frac{\sigma}{\mu} < 5\%$$
 3. **物理内存平直**：1 小时长稳测试后期，内存增长不超过基线的 10%，无内存持续泄漏迹象。
 
+---
+
+## 6. 并发多客户端 E2E 混合网络集成测试 (E2E Multi-Client Hybrid Integration Test)
+
+为了验证服务端网关在处理大规模复杂网络拓扑下的并发性能、对等体状态隔离性，以及完美向下兼容传统客户端的混合组网能力，我们设计并编写了 **`e2e_multi_client.sh`** 并发集成测试。
+
+### 6.1 测试拓扑结构
+* **测试节点**：1 个服务端节点 (`server_ns`)，1 个核心网关路由节点 (`router_ns`)，以及 2 个并发运行的客户端节点。
+* **客户端类型**：
+  * **Client 1 (`client1_ns`) [定制代理客户端]**：运行 `new_proxy` 客户端守护进程，通过本地 TPROXY 强行劫持 TCP 目的流量，将其自动封装进入 **QUIC 平行物理连接池** 进行用户态分流转发。
+  * **Client 2 (`client2_ns`) [标准 WireGuard 客户端]**：不启动任何用户态代理守护进程，不配置任何 TPROXY 劫持规则。所有的 TCP、UDP 和 ICMP 流量完全流经标准 L3 物理加密信道，测试服务端的向下兼容与回退承载能力。### 6.2 测试验证步骤与动态互补同步校验 (`e2e_multi_client.sh`)
+1. **多网口与命名空间宣告**：拉起 4 个独立的 Linux Network Namespace，使用 3 对 veth 虚拟网口对将其连接，并建立标准的 Linux 主机静态网段寻址路由。
+2. **多 Peer 不对称启动**：服务端 `server_multi.conf` 仅配置 Client 1 的 peer 公钥，**有意将 Client 2 排除在用户态配置文件之外**。
+3. **并发流量发射与 TPROXY Interception**：
+   * 在 Client 1 命名空间中并发发起 `curl` 业务请求。为了支持本地流量的劫持，Client 1 增加了 `iptables OUTPUT` 链 mangle MARK 规则，强行将本地生成的 TCP 流量重定向至 TPROXY，验证数据是否成功流经 QUIC 用户态连接池并产生非零 offloading 流量。
+   * 在 Client 2 命名空间中并发发起 `curl` 业务请求。验证在无客户端代理的情况下，连接是否能平滑通过 L3 链路自适应回退访问成功。
+4. **遥测数据动态互补同步验证**：
+   * 调用 `new-proxy-cli show` 刮取并核验服务端遥测数据。
+   * **预期输出**：
+     - **Client 1 (Proxy)**：对应的条目中，`quic: active`，显示非零 `quic transfer` 字节（如 `775 B`），且其 `source` 状态标识为 `"both"`。
+     - **Client 2 (Fallback)**：对应的条目在第一次 `show` 时自动在内核 `wg dump` 抓取发现，**在服务运行时动态补充/同步至服务端用户态 GatewayConfig 和 AllowedIPs 基数树中**；其 `source` 状态标识为 `"kernel"`，且显示正确的 L3/WireGuard 传输数据（如 `12.21 KiB`）。
+     - 后续所有的 telemetry 采集和查询中，Client 2 的状态均自动持久化地对齐为 `"both"`，证明双端自适应对等体互补同步机制健壮无损。

@@ -1,14 +1,13 @@
 # new_proxy
 
-`new_proxy` 是一个高性能混合多协议安全代理网关。它将 WireGuard 风格的 L3 通道和用户态 QUIC L4 多路复用通道组合起来：UDP、ICMP 等三层流量走内核态 L3 通道，TCP 流量通过 TPROXY 拦截后走用户态 QUIC 连接池，从而规避 TCP-over-VPN 的队头阻塞问题。
-
-## 主要功能
+`new_proxy` 是一个高性能混合多协议安全代理网关。它将 WireGuard 风格的 L3 通道和用户态 QUIC L4 多路复用通道组合起来：UDP、ICMP 等三层流量走内核态 L3 通道，TCP 流量通过 TPROXY 拦截后走用户态 QUIC 连接池，从而规避 TCP-over-VPN 的队头阻塞问题。## 主要功能
 
 - **双轨数据面**：L3 WireGuard 风格通道承载 UDP/ICMP，L4 QUIC 多路复用通道承载 TCP。
 - **TPROXY 透明拦截**：客户端按 `AllowedIPs` 判断 TCP 目的地址，命中后透明导入 QUIC 池。
 - **多物理 QUIC 连接池**：服务端可配置多个 UDP 端口，客户端自动建立并轮询分流。
 - **对等密钥认证**：复用 WireGuard 密钥材料进行用户态控制面协商。
-- **聚合遥测**：通过 `new-proxy-cli` 查看 L3/L4 合并统计、QUIC 物理连接统计和活跃流数量。
+- **双向自适应互补同步**：当 `new-proxy-cli` 与内核 `wg` 配置不一致时，自动双向补全对等体配置（热重建 AllowedIPs 路由树并生成 Noise_IK 共享密钥对），提供 `"both"`, `"kernel"`, `"proxy"` 预同步前置源诊断标识。
+- **聚合遥测**：通过 `new-proxy-cli` 查看 L3/L4 合并统计、QUIC 物理连接统计和活跃流数量，并直接输出 `source` 同步溯源字段。
 - **动态 Peer 管理**：运行期支持通过 CLI 添加和删除 Peer。
 
 ## 目录结构
@@ -56,7 +55,10 @@ target/release/new-proxy-cli
 
 ## 配置方式
 
-示例配置位于 `conf/`。
+示例配置位于 `conf/`。支持以下高级配置项：
+* **`Table`**（`auto` / `off`，默认 `auto`）：设置为 `auto` 时，网关启动会自动配置路由表和 `iptables` 代理规则，退出时自动回滚。若为 `off` 则跳过该行为，交由外部配置。
+* **`PreScript` / `pre_script`**：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
+* **`PostScript` / `post_script`**：在网关优雅退出并清理完所有路由和防火墙之后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
 
 ### 服务端配置
 
@@ -68,6 +70,9 @@ PrivateKey = <server_private_key_base64>
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
+Table = auto
+PreScript = echo "Server starting..."
+PostScript = echo "Server stopped cleanly."
 
 [QUICPool]
 PublicIPv4 = <server_public_ipv4>
@@ -95,6 +100,9 @@ PrivateKey = <client_private_key_base64>
 Address = 10.0.0.2/24, fd00::2/64
 TProxyPort = 1080
 MTU = 1400
+Table = auto
+PreScript = echo "Client starting..." && sysctl -w net.ipv4.ip_forward=1
+PostScript = echo "Client stopped cleanly."
 
 [Peer]
 PublicKey = <server_public_key_base64>

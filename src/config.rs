@@ -11,6 +11,9 @@ pub struct InterfaceConfig {
     pub listen_control_port: Option<u16>,
     pub tproxy_port: Option<u16>,
     pub mtu: u16,
+    pub table: Option<String>,
+    pub pre_script: Option<String>,
+    pub post_script: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +112,18 @@ impl GatewayConfig {
             .map(|s| s.parse::<u16>().unwrap_or(1400))
             .unwrap_or(1400);
 
+        let table = interface_section.get("Table")
+            .or_else(|| interface_section.get("table"))
+            .map(|s| s.trim().to_string());
+
+        let pre_script = interface_section.get("PreScript")
+            .or_else(|| interface_section.get("pre_script"))
+            .map(|s| s.trim().to_string());
+
+        let post_script = interface_section.get("PostScript")
+            .or_else(|| interface_section.get("post_script"))
+            .map(|s| s.trim().to_string());
+
         let interface = InterfaceConfig {
             private_key,
             addresses,
@@ -116,6 +131,9 @@ impl GatewayConfig {
             listen_control_port,
             tproxy_port,
             mtu,
+            table,
+            pre_script,
+            post_script,
         };
 
         // 2. 解析 Peers

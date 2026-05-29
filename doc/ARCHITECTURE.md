@@ -154,13 +154,34 @@ struct PeerTelemetry {
   2. 读取内存中该 Peer 关联的 L4 原子计数器；
   3. **自适应合并**：若该 Peer 是定制双轨客户端，网关会在内存中瞬时合并 L3 与 L4 数据返回给 CLI；若该 Peer 是标准官方客户端（用户态无 QUIC 连接池），网关则直接输出该 Peer 的内核 L3 统计数据，实现天然的双模向下兼容。
 
+### 6.3 内核与用户态对等体双向自适应互补同步 (Bidirectional Kernel <-> Userspace Auto-Sync)
+由于网络管理员在配置网关时可能会同时使用两种配置管理工具（如 `new-proxy-cli` 和标准的 `wg`），从而导致内核 WireGuard 状态与网关用户态配置不一致。网关在每次执行 `show` (Stats) 遥测抓取时，会触发**双向自适应互补同步机制**：
+1. **内核向用户态同步 (Kernel -> Proxy Config)**：
+   - 若发现某些 Peer 仅存在于内核中（通过 `wg` 注入），但网关用户态 `GatewayState` 内存配置和 Trie 路由树中缺失该 Peer；
+   - 网关会**自动将该 Peer 补全到用户态配置中**，瞬时完成 **Noise_IK 控制面协商密钥计算** 并**热重建 AllowedIPs LPM 路由基数树**，使其对应的 TCP 流量立刻能被 TPROXY 拦截后走 QUIC 卸载。
+2. **用户态向内核同步 (Proxy Config -> Kernel)**：
+   - 若发现某些 Peer 存在于用户态配置中（如通过 `new-proxy-cli` 动态添加），但内核 WireGuard 驱动中没有该 Peer；
+   - 网关会**自动在内核中创建并绑定该 Peer**（底层自动调用 `wg set <interface> peer <pub_key> allowed-ips <ips> [endpoint]` 命令），确保该 Peer 的 L3（UDP/ICMP）双栈流量通道正常连通。
+3. **前置状态源标识 (Pre-Sync Source Labels)**：
+   - 为了协助网络诊断，CLI 的 `show` 输出或 UDS 遥测流对每个 Peer 附加了 `source` 状态标识（代表同步互补之前的两端分布状态）：
+     - **`both`**：上一次 `show` 之前，内核态与用户态均有此 Peer，处于完全对齐状态。
+     - **`kernel`**：仅内核态持有该 Peer，现已自动补充同步至用户态。
+     - **`proxy`**：仅用户态（控制面）持有该 Peer，现已自动同步绑定至内核态驱动。
+
 ---
 
 ## 7. 配置文件规范示例 (Zero-Client Config)
 
-网关使用一站式配置文件，整合了双栈 WireGuard 与平行 QUIC 连接池的配置：
+网关使用一站式配置文件，整合了双栈 WireGuard 与平行 QUIC 连接池的配置，并支持基于路由表和自定义脚本的网卡生命周期自愈管理：
 
-### 7.1 客户端双栈配置示例 (`client.conf`)
+### 7.1 Interface 核心字段说明
+* **`Table`**（可选，支持 `Table` 或 `table`）：
+  * **`auto` 或未配置 (默认值)**：网关在启动时会自动将 `Address` 绑定到 tun 设备，自动将所有 Peer 的 `AllowedIPs` 注入系统路由表（通过 `ip route`），并配置本地策略路由（`fwmark 1 lookup 100`）和 TPROXY 的 `iptables` / `ip6tables` 拦截规则。在程序退出时，会自动、无损地回滚删除所有注入的路由及防火墙规则。
+  * **`off`**：网关不做任何路由和 `iptables` 的修改，完全交由用户或外部脚本接管。
+* **`PreScript` / `pre_script`**（可选）：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
+* **`PostScript` / `post_script`**（可选）：程序优雅停止并清理完所有路由与 iptables 拦截规则后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
+
+### 7.2 客户端双栈配置示例 (`client.conf`)
 ```ini
 [Interface]
 PrivateKey = client_wg_private_key_base64...
@@ -168,6 +189,13 @@ Address = 10.0.0.2/24, fd00::2/64
 # 客户端本地透明代理拦截端口 (支持 IPv4 和 IPv6 监听)
 TProxyPort = 1080
 MTU = 1400
+
+# 自动注入路由和代理 iptables 规则 (不写或 auto 为开启，off 为关闭)
+Table = auto
+# 前置启动脚本
+PreScript = echo "Client gateway is starting..." && sysctl -w net.ipv4.ip_forward=1
+# 后置停止脚本
+PostScript = echo "Client gateway has stopped cleanly."
 
 [Peer]
 PublicKey = server_wg_public_key_base64...
@@ -179,7 +207,7 @@ ProxyPort = 51821
 AllowedIPs = 192.168.1.0/24, 8.8.8.8/32, 2001:db8:1::/48
 ```
 
-### 7.2 服务端双栈配置示例 (`server.conf`)
+### 7.3 服务端双栈配置示例 (`server.conf`)
 ```ini
 [Interface]
 PrivateKey = server_wg_private_key_base64...
@@ -187,6 +215,13 @@ Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 # 公网独立 UDP 控制端口监听
 ListenControlPort = 51821
+
+# 自动绑定 IP 并拉起网卡 (不写或 auto 为开启，off 为关闭)
+Table = auto
+# 前置启动脚本
+PreScript = echo "Server gateway is starting..."
+# 后置停止脚本
+PostScript = echo "Server gateway has stopped cleanly."
 
 # 动态物理 QUIC 端口池配置 (支持双栈推送)
 [QUICPool]

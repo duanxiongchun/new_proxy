@@ -124,8 +124,27 @@ RSS growth <= 10%: FAIL
 - 负载均衡通过：4 路 QUIC 物理连接流量份额均为 25.00%，CV 为 0.00%。
 - 内存稳定性存在边界问题：服务端 RSS 增长 10.38%，比测试准则 `<= 10%` 高 0.38%，该项判定失败。
 
+### 5. 并发多客户端及对等体双向自适应互补同步测试
+
+网关对并发多客户端拓扑与双向自适应互补同步功能执行了端到端闭环验证。执行命令：
+
+```bash
+sudo script/acceptance/e2e_multi_client.sh
+```
+
+关键输出：
+* **Client 1 (Proxy) [定制代理客户端]** 流量被 TPROXY 成功拦截，产生了非零 L4/QUIC Telemetry 数据：
+  * `quic transfer`: `775 B received, 77 B sent`
+  * `source` 标识: `"both"`（在配置与内核中均存在，正常建立 2 条物理 QUIC 连接）
+* **Client 2 (WG Fallback) [标准 WireGuard 客户端]** 采用不对称配置方式（有意将其排除在 `server_multi.conf` 配置文件外），成功通过内核 `wg` 接口在服务运行时被动态捕获发现，**自动同步/补全至网关用户态 GatewayConfig 配置列表并热重建 AllowedIPs LPM 路由基数树**，完成了对等 Noise_IK 握手密钥的实时计算：
+  * `wireguard transfer`: `12.21 KiB received, 8.20 KiB sent`
+  * `source` 标识: 在第一次遥测查询时准确输出为 `"kernel"` 代表其前置状态，随后自适应持久化对齐为 `"both"`。
+* **1 小时并发多客户端长稳压测**：更新了 `stability_stress_test.sh` 脚本，并发压测 Client 1（QUIC 卸载 TCP 连接）与 Client 2（标准 L3 隧道原生 fallback 连接），在 1 小时的连续重载下，自适应双向互补同步机制在首个采样秒便瞬时完成了不对称对等体的补全，随后稳定保持在对齐状态，未发生任何崩溃或性能抖动。
+
+结论：完全通过。混合多对等体下的业务状态隔离完备，动态状态自愈和自适应对齐功能运行稳定。
+
 ## 当前风险与后续建议
 
-1. 服务端 RSS 增长接近阈值，建议增加更长周期的 4 小时或 24 小时压测，确认该增长是一次性稳定增长还是持续泄漏。
+1. 服务端 RSS 增长接近阈值，建议增加更长周期的 4 小时 or 24 小时压测，确认该增长是一次性稳定增长还是持续泄漏。
 2. 建议补充服务端内存采样细分，例如 jemalloc heap profile、`/proc/<pid>/smaps_rollup`、tokio task 数量和 QUIC registry 长度。
 3. 建议将 CI 中的 smoke test 时长固定为 30 秒，将 1 小时长稳作为夜间或手动 acceptance 测试执行。
