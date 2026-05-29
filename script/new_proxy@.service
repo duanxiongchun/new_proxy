@@ -1,0 +1,16 @@
+[Unit]
+Description=Hybrid Secure Proxy Gateway - Interface %I
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/duanxiongchun/new_proxy
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/new_proxy
+ExecStart=/usr/bin/new_proxy -config /etc/new_proxy/%i.conf
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
