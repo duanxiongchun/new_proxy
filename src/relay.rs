@@ -164,10 +164,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; 16 * 1024];
+    let mut buf = Box::new([0u8; 16 * 1024]);
     let mut copied = 0u64;
     loop {
-        let n = match tokio::time::timeout(RELAY_IDLE_TIMEOUT, reader.read(&mut buf)).await {
+        let n = match tokio::time::timeout(RELAY_IDLE_TIMEOUT, reader.read(&mut buf[..])).await {
             Ok(res) => res?,
             Err(_) => {
                 return Err(std::io::Error::new(

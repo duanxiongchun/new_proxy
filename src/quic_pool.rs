@@ -11,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AUTH_PACKET_LEN: usize = 2048;
 const MAX_INCOMING_QUIC_CONNECTIONS: usize = 4096;
 
@@ -172,33 +174,13 @@ impl QuicPoolClient {
             let client_public_key = self.client_public_key;
             let session_psk = self.session_psk;
             join_set.spawn(async move {
-                let conn = match endpoint_clone.connect(target_addr, "localhost") {
-                    Ok(connecting) => connecting
-                        .await
-                        .map_err(|e| format!("QUIC connection failed to {}: {}", target_addr, e))?,
-                    Err(e) => {
-                        return Err(format!(
-                            "QUIC connect initiation failed to {}: {}",
-                            target_addr, e
-                        ))
-                    }
-                };
-
-                if let Err(e) =
-                    Self::authenticate_connection_with(client_public_key, session_psk, &conn).await
-                {
-                    conn.close(0u32.into(), b"Auth failed");
-                    return Err(format!(
-                        "PSK Authentication failed on link {}: {}",
-                        target_addr, e
-                    ));
-                }
-
-                Ok(PoolSlot {
-                    endpoint: target_addr,
-                    stats: QuicConnStats::new(conn.remote_address(), target_addr.port()),
-                    conn,
-                })
+                Self::connect_authenticated_with(
+                    endpoint_clone,
+                    target_addr,
+                    client_public_key,
+                    session_psk,
+                )
+                .await
             });
         }
 
@@ -226,10 +208,6 @@ impl QuicPoolClient {
     }
 
     // 执行应用层 HMAC-PSK 强认证
-    async fn authenticate_connection(&self, conn: &Connection) -> Result<(), String> {
-        Self::authenticate_connection_with(self.client_public_key, self.session_psk, conn).await
-    }
-
     async fn authenticate_connection_with(
         client_public_key: [u8; 32],
         session_psk: [u8; 32],
@@ -278,6 +256,50 @@ impl QuicPoolClient {
         }
     }
 
+    async fn connect_authenticated_with(
+        endpoint: Endpoint,
+        target_addr: SocketAddr,
+        client_public_key: [u8; 32],
+        session_psk: [u8; 32],
+    ) -> Result<PoolSlot, String> {
+        let connecting = endpoint
+            .connect(target_addr, "localhost")
+            .map_err(|e| format!("QUIC connect initiation failed to {}: {}", target_addr, e))?;
+        let conn = timeout(CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| format!("QUIC connection timed out to {}", target_addr))?
+            .map_err(|e| format!("QUIC connection failed to {}: {}", target_addr, e))?;
+
+        match timeout(
+            AUTH_TIMEOUT,
+            Self::authenticate_connection_with(client_public_key, session_psk, &conn),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                conn.close(0u32.into(), b"Auth failed");
+                return Err(format!(
+                    "PSK Authentication failed on link {}: {}",
+                    target_addr, e
+                ));
+            }
+            Err(_) => {
+                conn.close(0u32.into(), b"Auth timeout");
+                return Err(format!(
+                    "PSK Authentication timed out on link {}",
+                    target_addr
+                ));
+            }
+        }
+
+        Ok(PoolSlot {
+            endpoint: target_addr,
+            stats: QuicConnStats::new(conn.remote_address(), target_addr.port()),
+            conn,
+        })
+    }
+
     // 从活跃的平行物理池中轮询获取一个健康的流，同时返回对应的连接统计句柄
     pub async fn open_mux_stream(
         &self,
@@ -314,12 +336,16 @@ impl QuicPoolClient {
                 continue;
             }
 
-            match conn.open_bi().await {
-                Ok((send, recv)) => {
+            match timeout(OPEN_STREAM_TIMEOUT, conn.open_bi()).await {
+                Ok(Ok((send, recv))) => {
                     return Ok((send, recv, conn_stat));
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     log::warn!("Failed to open stream, link might be dead: {}", e);
+                    continue;
+                }
+                Err(_) => {
+                    log::warn!("Timed out opening mux stream on a QUIC link; trying another link");
                     continue;
                 }
             }
@@ -344,6 +370,8 @@ impl QuicPoolClient {
 
                 let active_slots = self.slots.lock().unwrap().clone();
 
+                let mut reconnects = tokio::task::JoinSet::new();
+
                 for (i, slot) in active_slots.iter().enumerate() {
                     let need_reconnect = slot.conn.close_reason().is_some();
 
@@ -354,55 +382,23 @@ impl QuicPoolClient {
                             slot.endpoint
                         );
 
-                        match endpoint.connect(slot.endpoint, "localhost") {
-                            Ok(connecting) => {
-                                match connecting.await {
-                                    Ok(new_conn) => {
-                                        // 握手成功后立即发起首个 Stream 的 PSK 应用层认证
-                                        if let Err(e) =
-                                            self.authenticate_connection(&new_conn).await
-                                        {
-                                            log::warn!(
-                                                "Re-authentication failed on link {}: {}",
-                                                slot.endpoint,
-                                                e
-                                            );
-                                            new_conn.close(0u32.into(), b"Auth failed");
-                                        } else {
-                                            log::info!(
-                                                "Successfully re-established dead connection to {}",
-                                                slot.endpoint
-                                            );
-                                            let mut slots = self.slots.lock().unwrap();
-                                            if i < slots.len() {
-                                                slots[i] = PoolSlot {
-                                                    endpoint: slot.endpoint,
-                                                    stats: QuicConnStats::new(
-                                                        new_conn.remote_address(),
-                                                        slot.endpoint.port(),
-                                                    ),
-                                                    conn: new_conn.clone(),
-                                                };
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Reconnection handshake failed to {}: {}",
-                                            slot.endpoint,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Failed to initiate reconnection to {}: {}",
-                                    slot.endpoint,
-                                    e
-                                );
-                            }
-                        }
+                        let endpoint_clone = endpoint.clone();
+                        let target_addr = slot.endpoint;
+                        let client_public_key = self.client_public_key;
+                        let session_psk = self.session_psk;
+                        reconnects.spawn(async move {
+                            (
+                                Some(i),
+                                target_addr,
+                                Self::connect_authenticated_with(
+                                    endpoint_clone,
+                                    target_addr,
+                                    client_public_key,
+                                    session_psk,
+                                )
+                                .await,
+                            )
+                        });
                     }
                 }
 
@@ -422,45 +418,54 @@ impl QuicPoolClient {
                         "Connection to {} is missing from pool. Connecting...",
                         target_addr
                     );
-                    match endpoint.connect(target_addr, "localhost") {
-                        Ok(connecting) => match connecting.await {
-                            Ok(new_conn) => {
-                                if let Err(e) = self.authenticate_connection(&new_conn).await {
-                                    log::warn!(
-                                        "Authentication failed on recovered link {}: {}",
-                                        target_addr,
-                                        e
-                                    );
-                                    new_conn.close(0u32.into(), b"Auth failed");
-                                } else {
+                    let endpoint_clone = endpoint.clone();
+                    let client_public_key = self.client_public_key;
+                    let session_psk = self.session_psk;
+                    reconnects.spawn(async move {
+                        (
+                            None,
+                            target_addr,
+                            Self::connect_authenticated_with(
+                                endpoint_clone,
+                                target_addr,
+                                client_public_key,
+                                session_psk,
+                            )
+                            .await,
+                        )
+                    });
+                }
+
+                while let Some(result) = reconnects.join_next().await {
+                    let (slot_index, target_addr, reconnect_result) = match result {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::warn!("QUIC recovery worker failed: {}", e);
+                            continue;
+                        }
+                    };
+
+                    match reconnect_result {
+                        Ok(new_slot) => {
+                            let mut slots = self.slots.lock().unwrap();
+                            if let Some(i) = slot_index {
+                                if i < slots.len() && slots[i].endpoint == target_addr {
+                                    slots[i] = new_slot;
                                     log::info!(
-                                        "Successfully added recovered connection to {}",
+                                        "Successfully re-established dead connection to {}",
                                         target_addr
                                     );
-                                    self.slots.lock().unwrap().push(PoolSlot {
-                                        endpoint: target_addr,
-                                        stats: QuicConnStats::new(
-                                            new_conn.remote_address(),
-                                            target_addr.port(),
-                                        ),
-                                        conn: new_conn.clone(),
-                                    });
                                 }
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Recovery connection handshake failed to {}: {}",
-                                    target_addr,
-                                    e
+                            } else if !slots.iter().any(|slot| slot.endpoint == target_addr) {
+                                slots.push(new_slot);
+                                log::info!(
+                                    "Successfully added recovered connection to {}",
+                                    target_addr
                                 );
                             }
-                        },
+                        }
                         Err(e) => {
-                            log::warn!(
-                                "Failed to initiate recovery connection to {}: {}",
-                                target_addr,
-                                e
-                            );
+                            log::warn!("{}", e);
                         }
                     }
                 }
@@ -527,14 +532,10 @@ impl QuicPoolServer {
             let parsed_addr = bind_addr
                 .parse()
                 .map_err(|e| format!("Failed to parse server bind address {}: {}", bind_addr, e))?;
-            match Endpoint::server(server_config.clone(), parsed_addr) {
-                Ok(endpoint) => listeners.push((port, endpoint)),
-                Err(e) => log::error!("Failed to start QUIC listener on UDP port {}: {}", port, e),
-            }
-        }
-
-        if listeners.is_empty() {
-            return Err("Failed to start any QUIC listener".to_string());
+            let endpoint = Endpoint::server(server_config.clone(), parsed_addr).map_err(|e| {
+                format!("Failed to start QUIC listener on UDP port {}: {}", port, e)
+            })?;
+            listeners.push((port, endpoint));
         }
 
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING_QUIC_CONNECTIONS));
@@ -566,10 +567,14 @@ impl QuicPoolServer {
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let conn = match connecting.await {
-                            Ok(c) => c,
-                            Err(e) => {
+                        let conn = match timeout(CONNECT_TIMEOUT, connecting).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
                                 log::warn!("QUIC incoming connection handshake failed: {}", e);
+                                return;
+                            }
+                            Err(_) => {
+                                log::warn!("QUIC incoming connection handshake timed out");
                                 return;
                             }
                         };

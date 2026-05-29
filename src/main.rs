@@ -389,6 +389,7 @@ async fn wait_for_shutdown() {
 
 const MAX_TPROXY_CONNECTIONS: usize = 8192;
 const MAX_QUIC_STREAM_HANDLERS: usize = 65536;
+const MAX_UDS_CLIENTS: usize = 1024;
 
 fn interface_name_from_config_path(config_path: &str) -> Result<String, String> {
     let name = std::path::Path::new(config_path)
@@ -878,7 +879,7 @@ fn cleanup_peer_routes_and_tproxy(
     }
 }
 
-fn sync_peer_to_kernel(interface_name: &str, peer: &config::PeerConfig) {
+fn sync_peer_to_kernel(interface_name: &str, peer: &config::PeerConfig) -> Result<(), String> {
     let pub_key_b64 = encode_base64_32(&peer.public_key);
     let allowed_ips_str = peer
         .allowed_ips
@@ -898,7 +899,7 @@ fn sync_peer_to_kernel(interface_name: &str, peer: &config::PeerConfig) {
         args.push("endpoint".to_string());
         args.push(endpoint.to_string());
     }
-    run_command_best_effort("wg", &args);
+    run_command_checked("wg", &args)
 }
 
 fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) {
@@ -1164,7 +1165,19 @@ async fn main() {
         let interface_name_clone = interface_name.clone();
 
         tokio::spawn(async move {
+            let uds_client_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UDS_CLIENTS));
             while let Ok((mut stream, _)) = uds.accept().await {
+                let permit = match uds_client_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let resp = ApiResponse {
+                            status: "Error".to_string(),
+                            message: Some("UDS client limit reached".to_string()),
+                        };
+                        let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                        continue;
+                    }
+                };
                 let telemetry = telemetry_clone.clone();
                 let state = state_clone.clone();
                 let peer_secrets = peer_secrets_clone.clone();
@@ -1173,6 +1186,7 @@ async fn main() {
                 let interface_name = interface_name_clone.clone();
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let mut buf = Vec::new();
                     let mut temp = [0u8; 1024];
                     const MAX_UDS_PAYLOAD: usize = 65536; // 64KB
@@ -1186,10 +1200,6 @@ async fn main() {
                                     buf.extend_from_slice(&temp[..n]);
                                     if buf.len() > MAX_UDS_PAYLOAD {
                                         return Err("Payload too large");
-                                    }
-                                    if let Ok(_) = serde_json::from_slice::<serde_json::Value>(&buf)
-                                    {
-                                        break;
                                     }
                                 }
                                 Err(_) => return Err("Read error"),
@@ -1506,6 +1516,11 @@ async fn main() {
                                     tproxy_port,
                                     &interface_name,
                                 ) {
+                                    cleanup_peer_routes_and_tproxy(
+                                        &new_peer,
+                                        tproxy_port,
+                                        &interface_name,
+                                    );
                                     let resp = ApiResponse {
                                         status: "Error".to_string(),
                                         message: Some(format!(
@@ -1518,7 +1533,21 @@ async fn main() {
                                     return;
                                 }
                             }
-                            sync_peer_to_kernel(&interface_name, &new_peer);
+                            if let Err(e) = sync_peer_to_kernel(&interface_name, &new_peer) {
+                                if !table_off {
+                                    cleanup_peer_routes_and_tproxy(
+                                        &new_peer,
+                                        tproxy_port,
+                                        &interface_name,
+                                    );
+                                }
+                                let resp = ApiResponse {
+                                    status: "Error".to_string(),
+                                    message: Some(format!("Failed to sync peer to kernel: {}", e)),
+                                };
+                                let _ = stream.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                                return;
+                            }
 
                             // 1. 动态生成并缓存 Diffie-Hellman 共享密钥
                             let peer_pub = PublicKey::from(parsed_pub_key);
