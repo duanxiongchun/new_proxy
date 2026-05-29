@@ -16,6 +16,9 @@ const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AUTH_PACKET_LEN: usize = 2048;
 const MAX_INCOMING_QUIC_CONNECTIONS: usize = 4096;
 
+pub type StreamHandler =
+    Arc<dyn Fn([u8; 32], quinn::SendStream, quinn::RecvStream, Arc<QuicConnStats>) + Send + Sync>;
+
 // 1. QUIC 隧道内应用层 PSK 认证报文
 #[derive(Serialize, Deserialize, Debug)]
 pub struct QuicAuthPacket {
@@ -146,8 +149,8 @@ impl QuicPoolClient {
         let mut transport = quinn::TransportConfig::default();
         transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
         transport.keep_alive_interval(Some(Duration::from_secs(5)));
-        transport.stream_receive_window(quinn::VarInt::try_from(8 * 1024 * 1024u32).unwrap());
-        transport.receive_window(quinn::VarInt::try_from(16 * 1024 * 1024u32).unwrap());
+        transport.stream_receive_window(quinn::VarInt::from(8 * 1024 * 1024u32));
+        transport.receive_window(quinn::VarInt::from(16 * 1024 * 1024u32));
         transport.send_window(16 * 1024 * 1024);
         client_config.transport_config(Arc::new(transport));
 
@@ -476,7 +479,23 @@ impl QuicPoolClient {
 
 // 3. 服务端 QUIC 接收端与验证服务
 // 每个已认证的对端连接 → 聚合统计（按 client_pub_key）
-pub type PeerConnRegistry = Arc<Mutex<HashMap<[u8; 32], Vec<QuicConnStats>>>>;
+pub type PeerConnRegistry = Arc<Mutex<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
+
+#[derive(Clone)]
+pub struct QuicConnRecord {
+    pub stats: QuicConnStats,
+    conn: Connection,
+}
+
+impl QuicConnRecord {
+    pub fn snapshot(&self) -> QuicConnSnapshot {
+        self.stats.snapshot()
+    }
+
+    pub fn close(&self, reason: &'static [u8]) {
+        self.conn.close(0u32.into(), reason);
+    }
+}
 
 pub struct QuicPoolServer {
     listen_ports: Vec<u16>,
@@ -500,12 +519,7 @@ impl QuicPoolServer {
     // 启动服务端 QUIC 引擎（使用外部传入的 registry，用于与 UDS 层共享统计数据）
     pub async fn run_with_registry(
         self,
-        handler: Arc<
-            dyn Fn([u8; 32], quinn::SendStream, quinn::RecvStream, Arc<QuicConnStats>)
-                + Send
-                + Sync
-                + 'static,
-        >,
+        handler: StreamHandler,
         external_registry: PeerConnRegistry,
     ) -> Result<(), String> {
         let (certs, key) = generate_self_signed_cert()?;
@@ -522,8 +536,8 @@ impl QuicPoolServer {
         let mut transport = quinn::TransportConfig::default();
         transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
         transport.keep_alive_interval(Some(Duration::from_secs(5)));
-        transport.stream_receive_window(quinn::VarInt::try_from(8 * 1024 * 1024u32).unwrap());
-        transport.receive_window(quinn::VarInt::try_from(16 * 1024 * 1024u32).unwrap());
+        transport.stream_receive_window(quinn::VarInt::from(8 * 1024 * 1024u32));
+        transport.receive_window(quinn::VarInt::from(16 * 1024 * 1024u32));
         transport.send_window(16 * 1024 * 1024);
         server_config.transport_config(Arc::new(transport));
 
@@ -686,8 +700,11 @@ impl QuicPoolServer {
                             let mut registry = peer_conn_registry.lock().unwrap();
                             registry
                                 .entry(client_pub_key)
-                                .or_insert_with(Vec::new)
-                                .push((*conn_stat).clone());
+                                .or_default()
+                                .push(QuicConnRecord {
+                                    stats: (*conn_stat).clone(),
+                                    conn: conn.clone(),
+                                });
                         }
 
                         let _guard = TelemetryRegistryGuard {
@@ -698,6 +715,18 @@ impl QuicPoolServer {
 
                         // 3. 进入多路复用流接收循环
                         while let Ok((send_mux, recv_mux)) = conn.accept_bi().await {
+                            let still_authorized = {
+                                let cache = session_cache.lock().unwrap();
+                                cache.contains_key(&client_pub_key)
+                            };
+                            if !still_authorized {
+                                log::warn!(
+                                    "Closing QUIC connection from removed peer {:?}",
+                                    client_pub_key
+                                );
+                                conn.close(0u32.into(), b"Peer removed");
+                                break;
+                            }
                             let handler = handler.clone();
                             let stat_clone = conn_stat.clone();
                             tokio::spawn(async move {
@@ -724,7 +753,7 @@ impl Drop for TelemetryRegistryGuard {
     fn drop(&mut self) {
         if let Ok(mut registry) = self.registry.lock() {
             if let Some(conns) = registry.get_mut(&self.client_pub_key) {
-                conns.retain(|s| s.remote_addr != self.remote_addr);
+                conns.retain(|record| record.stats.remote_addr != self.remote_addr);
                 if conns.is_empty() {
                     registry.remove(&self.client_pub_key);
                 }
@@ -817,7 +846,7 @@ mod tests {
             assert!(registry.contains_key(&client_pub_key));
             let stats = &registry[&client_pub_key];
             assert_eq!(stats.len(), 1);
-            assert_eq!(stats[0].local_port, port);
+            assert_eq!(stats[0].stats.local_port, port);
 
             let snapshot = stats[0].snapshot();
             assert_eq!(snapshot.local_port, port);

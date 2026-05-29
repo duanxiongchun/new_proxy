@@ -2,9 +2,6 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use tokio::net::TcpListener as TokioTcpListener;
 
-#[cfg(target_os = "linux")]
-use libc;
-
 // 创建支持 TPROXY (IP_TRANSPARENT) 的透明代理套接字监听器
 // 采用自适应优雅降级设计：当检测到无 CAP_NET_ADMIN 权限或非 Linux 系统时，降级为普通 TCP 监听器
 pub fn create_tproxy_listener(addr: SocketAddr) -> Result<TokioTcpListener, String> {

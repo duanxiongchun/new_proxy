@@ -6,7 +6,7 @@ mod routing;
 mod tproxy;
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -118,6 +118,12 @@ impl TelemetryRegistry {
     }
 }
 
+impl Default for TelemetryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // 极其高效轻量内置的 Base64 编码器
 pub fn encode_base64_32(bytes: &[u8; 32]) -> String {
     let mut out = String::new();
@@ -137,7 +143,7 @@ pub fn encode_base64_32(bytes: &[u8; 32]) -> String {
         temp <<= 6 - bits;
         out.push(chars[(temp & 0x3F) as usize] as char);
     }
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push('=');
     }
     out
@@ -459,6 +465,15 @@ fn run_command_best_effort(program: &str, args: &[String]) {
     }
 }
 
+async fn run_blocking_command<F>(op: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|e| format!("blocking command worker failed: {}", e))?
+}
+
 fn ensure_iptables_rule(tool: &str, rule: &[String]) -> Result<(), String> {
     let mut check_args = vec!["-t".to_string(), "mangle".to_string(), "-C".to_string()];
     check_args.extend(rule.iter().cloned());
@@ -489,6 +504,13 @@ fn run_script(script: &str) {
         Err(e) => {
             log::error!("Failed to execute script '{}': {}", script, e);
         }
+    }
+}
+
+fn cleanup_runtime(config: &GatewayConfig, interface_name: &str) {
+    cleanup_routes_and_iptables(config, interface_name);
+    if let Some(ref post_script) = config.interface.post_script {
+        run_script(post_script);
     }
 }
 
@@ -686,7 +708,10 @@ fn ensure_mss_clamp_rule(allowed_ip: ipnet::IpNet) -> Result<(), String> {
         "--clamp-mss-to-pmtud".to_string(),
     ];
     ensure_iptables_rule(tool, &rule).map_err(|e| {
-        log::warn!("Failed to set TCPMSS clamping rule (might be unsupported in this environment): {}", e);
+        log::warn!(
+            "Failed to set TCPMSS clamping rule (might be unsupported in this environment): {}",
+            e
+        );
         e
     })
 }
@@ -994,34 +1019,20 @@ async fn sync_kernel_and_proxy_state(
 
     // 2. Identify peers missing in proxy config
     for (&pub_key, wg_stats) in l3_stats {
-        if !sources.contains_key(&pub_key) {
-            sources.insert(pub_key, "kernel".to_string());
+        if let Entry::Vacant(entry) = sources.entry(pub_key) {
+            entry.insert("kernel".to_string());
             peers_to_sync_to_proxy.push((pub_key, wg_stats.clone()));
         }
     }
 
     // 3. Perform synchronization to kernel (wg CLI)
     for peer in peers_to_sync_to_kernel {
-        let pub_key_b64 = encode_base64_32(&peer.public_key);
-        let allowed_ips_str = peer
-            .allowed_ips
-            .iter()
-            .map(|ip| ip.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut args = vec![
-            "set".to_string(),
-            interface_name.to_string(),
-            "peer".to_string(),
-            pub_key_b64,
-            "allowed-ips".to_string(),
-            allowed_ips_str,
-        ];
-        if let Some(endpoint) = peer.endpoint {
-            args.push("endpoint".to_string());
-            args.push(endpoint.to_string());
-        }
-        let _ = std::process::Command::new("wg").args(&args).output();
+        let interface_name = interface_name.to_string();
+        let _ = run_blocking_command(move || {
+            sync_peer_to_kernel(&interface_name, &peer)?;
+            Ok(())
+        })
+        .await;
     }
 
     // 4. Perform synchronization to proxy (GatewayState peers & Trie router & peer_secrets)
@@ -1120,6 +1131,7 @@ async fn main() {
     // 自动配置路由与 iptables
     if let Err(e) = setup_routes_and_iptables(&config, &interface_name) {
         eprintln!("Failed to setup routes and firewall rules: {}", e);
+        cleanup_runtime(&config, &interface_name);
         std::process::exit(1);
     }
 
@@ -1481,7 +1493,7 @@ async fn main() {
                                     let quic_connections =
                                         quic_registry.get(&key).map(|c| c.len()).unwrap_or(0);
                                     lines.push(format!(
-                                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}:{}",
                                         encode_base64_32(&key),
                                         wg.and_then(|s| s.endpoint.clone())
                                             .unwrap_or_else(|| "(none)".to_string()),
@@ -1492,7 +1504,8 @@ async fn main() {
                                         wg.map(|s| s.rx_bytes).unwrap_or(0),
                                         wg.map(|s| s.tx_bytes).unwrap_or(0),
                                         l4_rx + l4_tx,
-                                        format!("{}:{}", quic_connections, active_streams),
+                                        quic_connections,
+                                        active_streams,
                                     ));
                                 }
                                 lines.sort();
@@ -1560,7 +1573,7 @@ async fn main() {
                                 proxy_port,
                             };
 
-                            let (table_off, tproxy_port) = {
+                            let (table_off, tproxy_port, old_peer) = {
                                 let st = state.read().unwrap();
                                 (
                                     st.config
@@ -1570,19 +1583,61 @@ async fn main() {
                                         .map(|t| t.eq_ignore_ascii_case("off"))
                                         .unwrap_or(false),
                                     st.config.interface.tproxy_port,
+                                    st.config
+                                        .peers
+                                        .iter()
+                                        .find(|p| p.public_key == parsed_pub_key)
+                                        .cloned(),
                                 )
                             };
                             if !table_off {
-                                if let Err(e) = setup_peer_routes_and_tproxy(
-                                    &new_peer,
-                                    tproxy_port,
-                                    &interface_name,
-                                ) {
-                                    cleanup_peer_routes_and_tproxy(
-                                        &new_peer,
+                                if let Some(peer) = old_peer.clone() {
+                                    let interface_name = interface_name.clone();
+                                    let _ = run_blocking_command(move || {
+                                        cleanup_peer_routes_and_tproxy(
+                                            &peer,
+                                            tproxy_port,
+                                            &interface_name,
+                                        );
+                                        Ok(())
+                                    })
+                                    .await;
+                                }
+                            }
+                            if !table_off {
+                                let new_peer_for_routes = new_peer.clone();
+                                let interface_name_for_routes = interface_name.clone();
+                                let setup_result = run_blocking_command(move || {
+                                    setup_peer_routes_and_tproxy(
+                                        &new_peer_for_routes,
                                         tproxy_port,
-                                        &interface_name,
-                                    );
+                                        &interface_name_for_routes,
+                                    )
+                                })
+                                .await;
+                                if let Err(e) = setup_result {
+                                    let new_peer_for_cleanup = new_peer.clone();
+                                    let interface_name_for_cleanup = interface_name.clone();
+                                    let _ = run_blocking_command(move || {
+                                        cleanup_peer_routes_and_tproxy(
+                                            &new_peer_for_cleanup,
+                                            tproxy_port,
+                                            &interface_name_for_cleanup,
+                                        );
+                                        Ok(())
+                                    })
+                                    .await;
+                                    if let Some(peer) = old_peer.clone() {
+                                        let interface_name = interface_name.clone();
+                                        let _ = run_blocking_command(move || {
+                                            setup_peer_routes_and_tproxy(
+                                                &peer,
+                                                tproxy_port,
+                                                &interface_name,
+                                            )
+                                        })
+                                        .await;
+                                    }
                                     let resp = ApiResponse {
                                         status: "Error".to_string(),
                                         message: Some(format!(
@@ -1595,13 +1650,39 @@ async fn main() {
                                     return;
                                 }
                             }
-                            if let Err(e) = sync_peer_to_kernel(&interface_name, &new_peer) {
+                            let interface_name_for_kernel = interface_name.clone();
+                            let new_peer_for_kernel = new_peer.clone();
+                            if let Err(e) = run_blocking_command(move || {
+                                sync_peer_to_kernel(
+                                    &interface_name_for_kernel,
+                                    &new_peer_for_kernel,
+                                )
+                            })
+                            .await
+                            {
                                 if !table_off {
-                                    cleanup_peer_routes_and_tproxy(
-                                        &new_peer,
-                                        tproxy_port,
-                                        &interface_name,
-                                    );
+                                    let new_peer_for_cleanup = new_peer.clone();
+                                    let interface_name_for_cleanup = interface_name.clone();
+                                    let _ = run_blocking_command(move || {
+                                        cleanup_peer_routes_and_tproxy(
+                                            &new_peer_for_cleanup,
+                                            tproxy_port,
+                                            &interface_name_for_cleanup,
+                                        );
+                                        Ok(())
+                                    })
+                                    .await;
+                                    if let Some(peer) = old_peer.clone() {
+                                        let interface_name = interface_name.clone();
+                                        let _ = run_blocking_command(move || {
+                                            setup_peer_routes_and_tproxy(
+                                                &peer,
+                                                tproxy_port,
+                                                &interface_name,
+                                            )
+                                        })
+                                        .await;
+                                    }
                                 }
                                 let resp = ApiResponse {
                                     status: "Error".to_string(),
@@ -1673,14 +1754,25 @@ async fn main() {
                             };
                             if let Some(peer) = &removed_peer {
                                 if !table_off {
-                                    cleanup_peer_routes_and_tproxy(
-                                        peer,
-                                        tproxy_port,
-                                        &interface_name,
-                                    );
+                                    let peer = peer.clone();
+                                    let interface_name_for_cleanup = interface_name.clone();
+                                    let _ = run_blocking_command(move || {
+                                        cleanup_peer_routes_and_tproxy(
+                                            &peer,
+                                            tproxy_port,
+                                            &interface_name_for_cleanup,
+                                        );
+                                        Ok(())
+                                    })
+                                    .await;
                                 }
                             }
-                            remove_peer_from_kernel(&interface_name, parsed_pub_key);
+                            let interface_name_for_kernel = interface_name.clone();
+                            let _ = run_blocking_command(move || {
+                                remove_peer_from_kernel(&interface_name_for_kernel, parsed_pub_key);
+                                Ok(())
+                            })
+                            .await;
 
                             // 1. 动态移除 Shared Secret
                             peer_secrets.write().unwrap().remove(&parsed_pub_key);
@@ -1688,6 +1780,13 @@ async fn main() {
                             // 2. 动态移除会话与 Nonce 缓存
                             session_cache.lock().unwrap().remove(&parsed_pub_key);
                             auth_nonce_cache.lock().unwrap().remove(&parsed_pub_key);
+                            if let Some(conns) =
+                                shared_quic_registry.lock().unwrap().remove(&parsed_pub_key)
+                            {
+                                for conn in conns {
+                                    conn.close(b"Peer removed");
+                                }
+                            }
 
                             // 2. 动态移除 AllowedIPs 路由
                             {
@@ -1735,15 +1834,22 @@ async fn main() {
             session_cache.clone(),
         );
 
-        let control_task = tokio::spawn(async move {
-            if let Err(e) = control_server.run().await {
-                log::error!("Control plane server error: {}", e);
+        let control_task = match control_server.start().await {
+            Ok(handle) => handle,
+            Err(e) => {
+                log::error!("Control plane server failed to start: {}", e);
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
             }
-        });
+        };
 
         // 启动用户态多路复用平行 QUIC 物理池接收服务器
-        let quic_server =
-            QuicPoolServer::new(config.quic_pool.listen_ports.clone(), session_cache.clone(), auth_nonce_cache.clone());
+        let quic_server = QuicPoolServer::new(
+            config.quic_pool.listen_ports.clone(),
+            session_cache.clone(),
+            auth_nonce_cache.clone(),
+        );
         // 删除多余的锁操作（shared_quic_registry 与 server 内部 registry 已通过 run_with_registry 共享）
         let telemetry_for_handler = telemetry_registry.clone();
         let shared_reg_for_server = shared_quic_registry.clone();
@@ -1787,8 +1893,13 @@ async fn main() {
                         "Establishing userspace TCP proxy bridge to target destination: {}",
                         target_addr
                     );
-                    match tokio::net::TcpStream::connect(target_addr).await {
-                        Ok(tcp_socket) => {
+                    match timeout(
+                        Duration::from_secs(5),
+                        tokio::net::TcpStream::connect(target_addr),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tcp_socket)) => {
                             if let Err(e) = set_tcp_keepalive(&tcp_socket) {
                                 log::warn!(
                                     "Failed to set TCP Keep-Alive on target TCP stream: {}",
@@ -1802,12 +1913,16 @@ async fn main() {
                                 .await;
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             log::warn!(
                                 "Failed to establish TCP connection to target {}: {}",
                                 target_addr,
                                 e
                             );
+                            let _ = send_mux.write_all(&[0]).await;
+                        }
+                        Err(_) => {
+                            log::warn!("Timed out connecting to target {}", target_addr);
                             let _ = send_mux.write_all(&[0]).await;
                         }
                     }
@@ -1820,6 +1935,9 @@ async fn main() {
             .await
         {
             log::error!("QUIC Pool Server error: {}", e);
+            control_task.abort();
+            let cleanup_config = gateway_state.read().unwrap().config.clone();
+            cleanup_runtime(&cleanup_config, &interface_name);
             std::process::exit(1);
         }
 
@@ -1832,16 +1950,30 @@ async fn main() {
 
         if config.peers.is_empty() {
             eprintln!("Error: Client config must have at least one Peer!");
+            let cleanup_config = gateway_state.read().unwrap().config.clone();
+            cleanup_runtime(&cleanup_config, &interface_name);
             std::process::exit(1);
         }
 
         let peer = &config.peers[0];
-        let endpoint = peer
-            .endpoint
-            .expect("Error: Endpoint required for Client mode");
-        let proxy_port = peer
-            .proxy_port
-            .expect("Error: ProxyPort required for Client mode");
+        let endpoint = match peer.endpoint {
+            Some(endpoint) => endpoint,
+            None => {
+                log::error!("Error: Endpoint required for Client mode");
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+        let proxy_port = match peer.proxy_port {
+            Some(proxy_port) => proxy_port,
+            None => {
+                log::error!("Error: ProxyPort required for Client mode");
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
 
         let control_addr = SocketAddr::new(endpoint.ip(), proxy_port);
         let control_client =
@@ -1855,6 +1987,8 @@ async fn main() {
             Ok(res) => res,
             Err(e) => {
                 log::error!("Control Negotiation FAILED: {}", e);
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
                 std::process::exit(1);
             }
         };
@@ -1877,20 +2011,29 @@ async fn main() {
                 "Failed to establish physical parallel QUIC connection pool: {}",
                 e
             );
+            let cleanup_config = gateway_state.read().unwrap().config.clone();
+            cleanup_runtime(&cleanup_config, &interface_name);
             std::process::exit(1);
         }
 
         quic_pool_client.clone().start_health_checker();
 
-        let tproxy_port = config
-            .interface
-            .tproxy_port
-            .expect("Error: TProxyPort required for Client mode");
+        let tproxy_port = match config.interface.tproxy_port {
+            Some(port) => port,
+            None => {
+                log::error!("Error: TProxyPort required for Client mode");
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
         let tproxy_v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), tproxy_port);
         let tproxy_v4_listener = match tproxy::create_tproxy_listener(tproxy_v4_addr) {
             Ok(l) => l,
             Err(e) => {
                 log::error!("IPv4 TPROXY Listener bind FAILED: {}", e);
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
                 std::process::exit(1);
             }
         };
@@ -1939,12 +2082,8 @@ async fn main() {
     }
 
     // 自动清理路由与 iptables
-    cleanup_routes_and_iptables(&config, &interface_name);
-
-    // 执行 PostScript 脚本
-    if let Some(ref post_script) = config.interface.post_script {
-        run_script(post_script);
-    }
+    let cleanup_config = gateway_state.read().unwrap().config.clone();
+    cleanup_runtime(&cleanup_config, &interface_name);
 }
 
 // CLI 遥测查看实用工具实现
@@ -2494,7 +2633,10 @@ mod tests {
         // 1. Populate caches
         peer_secrets.write().unwrap().insert(pub_key, secret);
         session_cache.lock().unwrap().insert(pub_key, session_psk);
-        auth_nonce_cache.lock().unwrap().insert(pub_key, crate::control::NonceCache::new(10));
+        auth_nonce_cache
+            .lock()
+            .unwrap()
+            .insert(pub_key, crate::control::NonceCache::new(10));
 
         // Verify populated
         assert!(peer_secrets.read().unwrap().contains_key(&pub_key));

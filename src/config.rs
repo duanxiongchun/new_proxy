@@ -162,7 +162,7 @@ impl GatewayConfig {
         // 2. 解析 Peers
         let mut peers = Vec::new();
         for (section_name, section) in ini.iter() {
-            if section_name.as_deref() == Some("Peer") {
+            if section_name == Some("Peer") {
                 let pub_key_str = section
                     .get("PublicKey")
                     .ok_ok_or_else(|| "Missing PublicKey in [Peer]".to_string())?;

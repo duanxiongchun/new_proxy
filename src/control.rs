@@ -270,16 +270,12 @@ impl ControlServer {
         }
     }
 
-    // 运行服务端 UDP 监听循环
-    pub async fn run(self) -> Result<(), String> {
-        // 双栈监听
-        // 双栈监听 (利用 socket2 明确设定 only_v6(false) 强制拉通双栈监听)
+    async fn bind_socket(listen_port: u16) -> Result<UdpSocket, String> {
         let socket = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
             Ok(sock) => {
                 let _ = sock.set_only_v6(false);
                 let _ = sock.set_reuse_address(true);
-                let bind_addr =
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), self.listen_port);
+                let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port);
                 if sock.bind(&bind_addr.into()).is_ok() {
                     let std_sock: StdUdpSocket = sock.into();
                     std_sock
@@ -288,17 +284,35 @@ impl ControlServer {
                     UdpSocket::from_std(std_sock)
                         .map_err(|e| format!("Failed to convert to Tokio UdpSocket: {}", e))?
                 } else {
-                    UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port))
+                    UdpSocket::bind(format!("0.0.0.0:{}", listen_port))
                         .await
                         .map_err(|e| format!("Server failed to bind control UDP port: {}", e))?
                 }
             }
-            Err(_) => UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port))
+            Err(_) => UdpSocket::bind(format!("0.0.0.0:{}", listen_port))
                 .await
                 .map_err(|e| format!("Server failed to bind control UDP port: {}", e))?,
         };
+        Ok(socket)
+    }
 
-        let socket = Arc::new(socket);
+    pub async fn start(self) -> Result<tokio::task::JoinHandle<()>, String> {
+        let socket = Arc::new(Self::bind_socket(self.listen_port).await?);
+        Ok(tokio::spawn(async move {
+            if let Err(e) = self.run_loop(socket).await {
+                log::error!("Control plane server error: {}", e);
+            }
+        }))
+    }
+
+    // 运行服务端 UDP 监听循环
+    #[allow(dead_code)]
+    pub async fn run(self) -> Result<(), String> {
+        let socket = Arc::new(Self::bind_socket(self.listen_port).await?);
+        self.run_loop(socket).await
+    }
+
+    async fn run_loop(self, socket: Arc<UdpSocket>) -> Result<(), String> {
         let worker_limit = Arc::new(Semaphore::new(MAX_CONTROL_WORKERS));
         log::info!(
             "Userspace Control Server listening on UDP port {}",
