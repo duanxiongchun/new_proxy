@@ -118,12 +118,12 @@ touch /tmp/client_proxy_active
 
 # 启动 Server Daemon (PATH 包含 /tmp 以使用 mock wg 命令)
 PATH="/tmp:$PATH" ip netns exec server_ns env PATH="/tmp:$PATH" \
-    ./target/debug/new_proxy -config server.conf > server_daemon.log 2>&1 &
+    ./target/debug/new_proxy -config conf/server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 # 启动 Client Daemon (含 TPROXY 监听)
-ip netns exec client_ns ./target/debug/new_proxy -config client.conf > client_daemon.log 2>&1 &
+ip netns exec client_ns ./target/debug/new_proxy -config conf/client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
 CLIENT_PID=$!
 sleep 2
 

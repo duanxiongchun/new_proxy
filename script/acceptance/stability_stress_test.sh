@@ -138,7 +138,7 @@ ip netns exec client_ns ip route add local 0.0.0.0/0 dev lo table 100
 ip netns exec client_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
 
 echo "=== [2/7] Starting target TCP/UDP server ==="
-ip netns exec server_ns python3 "$ROOT_DIR/scripts/acceptance/stability_server.py" > "$ARTIFACT_DIR/target_server.log" 2>&1 &
+ip netns exec server_ns python3 "$ROOT_DIR/script/acceptance/stability_server.py" > "$ARTIFACT_DIR/target_server.log" 2>&1 &
 TARGET_PID=$!
 sleep 1
 
@@ -254,7 +254,7 @@ ping_loop() {
 
 echo "=== [5/7] Starting background traffic for ${DURATION}s ==="
 START_TS="$(date +%s)"
-ip netns exec router_ns python3 "$ROOT_DIR/scripts/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
+ip netns exec router_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
 LONG_PID=$!
 short_loop &
 SHORT_PID=$!
@@ -277,6 +277,6 @@ wait "$UDP_PID" || true
 wait "$PING_PID" || true
 
 echo "=== [7/7] Generating report ==="
-REPORT_PATH="$(python3 "$ROOT_DIR/scripts/acceptance/stability_report.py" "$ARTIFACT_DIR")"
+REPORT_PATH="$(python3 "$ROOT_DIR/script/acceptance/stability_report.py" "$ARTIFACT_DIR")"
 echo "Artifacts: $ARTIFACT_DIR"
 echo "Report: $REPORT_PATH"

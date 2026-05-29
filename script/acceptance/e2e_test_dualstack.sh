@@ -84,12 +84,12 @@ echo "✓ [SUCCESS] Dual-stack physical network WAN path verified successfully."
 
 echo "=== [7/7] Starting Gateway Daemons and Verifying IPC CLI ==="
 # 7.1 Start Server proxy daemon in server_ns
-ip netns exec server_ns ./target/debug/new_proxy -config server.conf > server_daemon.log 2>&1 &
+ip netns exec server_ns ./target/debug/new_proxy -config conf/server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 # 7.2 Start Client proxy daemon in client_ns
-ip netns exec client_ns ./target/debug/new_proxy -config client.conf > client_daemon.log 2>&1 &
+ip netns exec client_ns ./target/debug/new_proxy -config conf/client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
 CLIENT_PID=$!
 sleep 2
 
