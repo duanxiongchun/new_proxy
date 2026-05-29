@@ -261,6 +261,12 @@ impl QuicPoolClient {
                 return Err("All physical QUIC connections in pool are dead".to_string());
             }
 
+            // 快速本地预检：如果连接已知已关闭，直接跳过，避免 open_bi().await 产生不必要的异步等待与延迟抖动
+            if conn.close_reason().is_some() {
+                log::debug!("Link round-robin matched known closed connection, skipping instantly.");
+                continue;
+            }
+
             match conn.open_bi().await {
                 Ok((send, recv)) => {
                     return Ok((send, recv, conn_stat));
