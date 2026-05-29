@@ -1,7 +1,7 @@
 # Makefile for new_proxy packaging
 
 VERSION = 5.0.0
-ARCH = amd64
+ARCH ?= $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
 DEB_DIR = target/deb-pkg
 DEB_FILE = target/new-proxy_$(VERSION)_$(ARCH).deb
 
