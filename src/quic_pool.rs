@@ -295,7 +295,7 @@ impl QuicPoolClient {
                         let conns = self.connections.lock().unwrap();
                         conns[i].clone()
                     };
-                    let need_reconnect = conn.open_bi().await.is_err();
+                    let need_reconnect = conn.close_reason().is_some();
                     
                     if need_reconnect {
                         let target_addr = endpoints[i];

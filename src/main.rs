@@ -143,6 +143,15 @@ pub fn encode_base64_32(bytes: &[u8; 32]) -> String {
     out
 }
 
+fn set_tcp_keepalive(socket: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let socket_ref = socket2::SockRef::from(socket);
+    let mut keepalive = socket2::TcpKeepalive::new();
+    keepalive = keepalive.with_time(Duration::from_secs(60));
+    keepalive = keepalive.with_interval(Duration::from_secs(10));
+    socket_ref.set_tcp_keepalive(&keepalive)?;
+    Ok(())
+}
+
 // 目标地址代理协议头部编解码辅助函数
 pub async fn write_target_addr<W: AsyncWrite + Unpin>(w: &mut W, addr: SocketAddr) -> std::io::Result<()> {
     match addr.ip() {
@@ -237,12 +246,14 @@ async fn run_tproxy_accept_loop(
     listener: TcpListener,
     quic_pool: Arc<QuicPoolClient>,
     state: Arc<std::sync::RwLock<GatewayState>>,
+    telemetry: Arc<TelemetryRegistry>,
 ) {
     while let Ok((tcp_socket, src_addr)) = listener.accept().await {
         let quic_pool = quic_pool.clone();
         let state = state.clone();
+        let telemetry = telemetry.clone();
         tokio::spawn(async move {
-            handle_tproxy_connection(tcp_socket, src_addr, quic_pool, state).await;
+            handle_tproxy_connection(tcp_socket, src_addr, quic_pool, state, telemetry).await;
         });
     }
 }
@@ -252,7 +263,12 @@ async fn handle_tproxy_connection(
     src_addr: SocketAddr,
     quic_pool: Arc<QuicPoolClient>,
     state: Arc<std::sync::RwLock<GatewayState>>,
+    telemetry: Arc<TelemetryRegistry>,
 ) {
+    if let Err(e) = set_tcp_keepalive(&tcp_socket) {
+        log::warn!("Failed to set TCP Keep-Alive on TPROXY socket: {}", e);
+    }
+
     let original_dst = match tcp_socket.local_addr() {
         Ok(addr) => addr,
         Err(e) => {
@@ -298,12 +314,22 @@ async fn handle_tproxy_connection(
             }
         }
 
-        let dummy_stats = Arc::new(PeerL4Stats::default());
+        let server_pub_key = {
+            let st = state.read().unwrap();
+            st.config.peers.first().map(|p| p.public_key)
+        };
+
+        let stats = if let Some(pub_key) = server_pub_key {
+            telemetry.get_or_create(pub_key)
+        } else {
+            Arc::new(PeerL4Stats::default())
+        };
+
         relay::relay_connections_with_conn_stat(
             tcp_socket,
             quic_send,
             quic_recv,
-            dummy_stats,
+            stats,
             conn_stat,
         ).await;
     } else {
@@ -609,6 +635,12 @@ async fn main() {
         }
     };
 
+    let interface_name = std::path::Path::new(&config_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tun0")
+        .to_string();
+
     // 执行 PreScript 脚本
     if let Some(ref pre_script) = config.interface.pre_script {
         run_script(pre_script);
@@ -674,6 +706,7 @@ async fn main() {
         let peer_secrets_clone = peer_secrets.clone();
         let server_secret_clone = server_secret.clone();
         let shared_quic_registry_uds = shared_quic_registry.clone();
+        let interface_name_clone = interface_name.clone();
         
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = uds.accept().await {
@@ -682,6 +715,7 @@ async fn main() {
                 let peer_secrets = peer_secrets_clone.clone();
                 let server_secret = server_secret_clone.clone();
                 let shared_quic_registry = shared_quic_registry_uds.clone();
+                let interface_name = interface_name_clone.clone();
                 
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
@@ -723,9 +757,9 @@ async fn main() {
 
                     match cmd {
                         CommandInput::Stats => {
-                            let l3_stats = get_wg_dump_stats("tun0").await.unwrap_or_default();
+                            let l3_stats = get_wg_dump_stats(&interface_name).await.unwrap_or_default();
                             let sources = sync_kernel_and_proxy_state(
-                                "tun0",
+                                &interface_name,
                                 &state,
                                 &peer_secrets,
                                 &server_secret,
@@ -883,7 +917,7 @@ async fn main() {
                             let _ = stream.write_all(&serde_json::to_vec(&aggregated).unwrap()).await;
                         }
                         CommandInput::Dump => {
-                            let l3_stats = get_wg_dump_stats("tun0").await.unwrap_or_default();
+                            let l3_stats = get_wg_dump_stats(&interface_name).await.unwrap_or_default();
                             let response = {
                                 let telemetry = telemetry.snapshot();
                                 let quic_registry = shared_quic_registry.lock().unwrap();
@@ -1066,6 +1100,9 @@ async fn main() {
                     log::info!("Establishing userspace TCP proxy bridge to target destination: {}", target_addr);
                     match tokio::net::TcpStream::connect(target_addr).await {
                         Ok(tcp_socket) => {
+                            if let Err(e) = set_tcp_keepalive(&tcp_socket) {
+                                log::warn!("Failed to set TCP Keep-Alive on target TCP stream: {}", e);
+                            }
                             if send_mux.write_all(&[1]).await.is_ok() {
                                 relay::relay_connections_with_conn_stat(
                                     tcp_socket, send_mux, recv_mux, stats, conn_stat
@@ -1166,6 +1203,7 @@ async fn main() {
                 listener,
                 quic_pool_client.clone(),
                 gateway_state.clone(),
+                telemetry_registry.clone(),
             ));
         }
 
@@ -1174,6 +1212,7 @@ async fn main() {
                 tproxy_v4_listener,
                 quic_pool_client.clone(),
                 gateway_state.clone(),
+                telemetry_registry.clone(),
             ) => {}
             _ = wait_for_shutdown() => {}
         }
