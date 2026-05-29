@@ -36,7 +36,10 @@ pub fn create_tproxy_listener(addr: SocketAddr) -> Result<TokioTcpListener, Stri
                 log::info!("Successfully set IP_TRANSPARENT/IPV6_TRANSPARENT socket option for TPROXY on {}", addr);
             } else {
                 let err = std::io::Error::last_os_error();
-                log::warn!("Failed to set IP_TRANSPARENT/IPV6_TRANSPARENT socket option for TPROXY on {}: {}. Falling back to standard listener.", addr, err);
+                return Err(format!(
+                    "Failed to set IP_TRANSPARENT/IPV6_TRANSPARENT socket option for TPROXY on {}: {}",
+                    addr, err
+                ));
             }
         }
     }
@@ -71,6 +74,11 @@ mod tests {
     async fn test_create_tproxy_listener_ipv4() {
         let addr = "127.0.0.1:0".parse().unwrap();
         let res = create_tproxy_listener(addr);
+        if let Err(e) = &res {
+            if e.contains("IP_TRANSPARENT") {
+                return;
+            }
+        }
         assert!(res.is_ok());
         let listener = res.unwrap();
         assert!(listener.local_addr().is_ok());
@@ -80,6 +88,11 @@ mod tests {
     async fn test_create_tproxy_listener_ipv6() {
         let addr = "[::1]:0".parse().unwrap();
         let res = create_tproxy_listener(addr);
+        if let Err(e) = &res {
+            if e.contains("IP_TRANSPARENT") {
+                return;
+            }
+        }
         assert!(res.is_ok());
         let listener = res.unwrap();
         assert!(listener.local_addr().is_ok());

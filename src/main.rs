@@ -369,6 +369,17 @@ fn interface_name_from_config_path(config_path: &str) -> String {
         .to_string()
 }
 
+fn instance_routing_ids(interface_name: &str) -> (u32, u32) {
+    let mut hash = 0x811c9dc5u32;
+    for byte in interface_name.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    let fwmark = 0x1000_0000 | (hash & 0x00ff_ffff);
+    let table = 10_000 + (hash % 50_000);
+    (fwmark, table)
+}
+
 fn run_command_checked(cmd: &str) -> Result<(), String> {
     let output = std::process::Command::new("sh")
         .arg("-c")
@@ -439,8 +450,8 @@ fn setup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) -> Re
         run_command_checked(&cmd)?;
     }
     
-    // Set interface UP
-    run_command_checked(&format!("ip link set {} up", interface_name))?;
+    // Set interface UP and configure the parsed MTU to prevent PMTU fragmentation issues
+    run_command_checked(&format!("ip link set {} up mtu {}", interface_name, config.interface.mtu))?;
 
     // 2. Add routes for AllowedIPs of all peers
     for peer in &config.peers {
@@ -457,30 +468,32 @@ fn setup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) -> Re
     // 3. Configure TPROXY iptables rules if TProxyPort is set
     if let Some(tproxy_port) = config.interface.tproxy_port {
         log::info!("Setting up TPROXY iptables rules on port {}", tproxy_port);
+        let (fwmark, route_table) = instance_routing_ids(interface_name);
+        let mark_spec = format!("{:#x}/0xffffffff", fwmark);
 
         // IPv4 policy routing & local route
-        run_command_best_effort("ip rule del fwmark 1 lookup 100");
-        run_command_checked("ip rule add fwmark 1 lookup 100")?;
-        run_command_checked("ip route replace local 0.0.0.0/0 dev lo table 100")?;
+        run_command_best_effort(&format!("ip rule del fwmark {:#x} lookup {}", fwmark, route_table));
+        run_command_checked(&format!("ip rule add fwmark {:#x} lookup {}", fwmark, route_table))?;
+        run_command_checked(&format!("ip route replace local 0.0.0.0/0 dev lo table {}", route_table))?;
 
         // IPv6 policy routing & local route
-        run_command_best_effort("ip -6 rule del fwmark 1 lookup 100");
-        run_command_checked("ip -6 rule add fwmark 1 lookup 100")?;
-        run_command_checked("ip -6 route replace local ::/0 dev lo table 100")?;
+        run_command_best_effort(&format!("ip -6 rule del fwmark {:#x} lookup {}", fwmark, route_table));
+        run_command_checked(&format!("ip -6 rule add fwmark {:#x} lookup {}", fwmark, route_table))?;
+        run_command_checked(&format!("ip -6 route replace local ::/0 dev lo table {}", route_table))?;
 
         // Add PREROUTING rules for each AllowedIP
         for peer in &config.peers {
             for allowed_ip in &peer.allowed_ips {
                 if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
                     let rule = format!(
-                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1",
-                        allowed_ip, tproxy_port
+                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark {}",
+                        allowed_ip, tproxy_port, mark_spec
                     );
                     ensure_iptables_rule("iptables", &rule)?;
                 } else {
                     let rule = format!(
-                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark 0x1/0x1",
-                        allowed_ip, tproxy_port
+                        "PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark {}",
+                        allowed_ip, tproxy_port, mark_spec
                     );
                     ensure_iptables_rule("ip6tables", &rule)?;
                 }
@@ -502,21 +515,25 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
     // 1. Remove TPROXY iptables rules if TProxyPort is set
     if let Some(tproxy_port) = config.interface.tproxy_port {
         log::info!("Tearing down TPROXY iptables rules on port {}", tproxy_port);
+        let (fwmark, route_table) = instance_routing_ids(interface_name);
+        let mark_spec = format!("{:#x}/0xffffffff", fwmark);
 
         for peer in &config.peers {
             for allowed_ip in &peer.allowed_ips {
                 if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
                     let cmd = format!(
-                        "iptables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1",
+                        "iptables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip 0.0.0.0 --tproxy-mark {}",
                         allowed_ip,
-                        tproxy_port
+                        tproxy_port,
+                        mark_spec
                     );
                     run_command_best_effort(&cmd);
                 } else {
                     let cmd = format!(
-                        "ip6tables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark 0x1/0x1",
+                        "ip6tables -t mangle -D PREROUTING -p tcp -d {} -j TPROXY --on-port {} --on-ip :: --tproxy-mark {}",
                         allowed_ip,
-                        tproxy_port
+                        tproxy_port,
+                        mark_spec
                     );
                     run_command_best_effort(&cmd);
                 }
@@ -524,10 +541,10 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
         }
 
         // Clean up policy routing & local routes
-        run_command_best_effort("ip rule del fwmark 1 lookup 100");
-        run_command_best_effort("ip route del local 0.0.0.0/0 dev lo table 100");
-        run_command_best_effort("ip -6 rule del fwmark 1 lookup 100");
-        run_command_best_effort("ip -6 route del local ::/0 dev lo table 100");
+        run_command_best_effort(&format!("ip rule del fwmark {:#x} lookup {}", fwmark, route_table));
+        run_command_best_effort(&format!("ip route del local 0.0.0.0/0 dev lo table {}", route_table));
+        run_command_best_effort(&format!("ip -6 rule del fwmark {:#x} lookup {}", fwmark, route_table));
+        run_command_best_effort(&format!("ip -6 route del local ::/0 dev lo table {}", route_table));
     }
 
     // 2. Remove routes and addresses injected during setup.
@@ -1115,7 +1132,7 @@ async fn main() {
             session_cache.clone(),
         );
 
-        tokio::spawn(async move {
+        let control_task = tokio::spawn(async move {
             if let Err(e) = control_server.run().await {
                 log::error!("Control plane server error: {}", e);
             }
@@ -1130,58 +1147,56 @@ async fn main() {
         let telemetry_for_handler = telemetry_registry.clone();
         let shared_reg_for_server = shared_quic_registry.clone();
         let stream_handler_limit = Arc::new(tokio::sync::Semaphore::new(MAX_QUIC_STREAM_HANDLERS));
-        let quic_run_task = tokio::spawn(async move {
-            let stream_handler_limit = stream_handler_limit.clone();
-            let handler = Arc::new(move |client_pub: [u8; 32], mut send_mux: quinn::SendStream, mut recv_mux: quinn::RecvStream, conn_stat: Arc<quic_pool::QuicConnStats>| {
-                let permit = match stream_handler_limit.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
+        let handler = Arc::new(move |client_pub: [u8; 32], mut send_mux: quinn::SendStream, mut recv_mux: quinn::RecvStream, conn_stat: Arc<quic_pool::QuicConnStats>| {
+            let permit = match stream_handler_limit.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    log::warn!("QUIC stream handler limit reached; rejecting stream for peer {:?}", client_pub);
+                    return;
+                }
+            };
+            let stats = telemetry_for_handler.get_or_create(client_pub);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let target_addr = match timeout(Duration::from_secs(5), read_target_addr(&mut recv_mux)).await {
+                    Ok(Ok(addr)) => addr,
+                    Ok(Err(e)) => {
+                        log::debug!("Failed to read target proxy address header: {}", e);
+                        return;
+                    }
                     Err(_) => {
-                        log::warn!("QUIC stream handler limit reached; rejecting stream for peer {:?}", client_pub);
+                        log::debug!("Timed out reading target proxy address header");
                         return;
                     }
                 };
-                let stats = telemetry_for_handler.get_or_create(client_pub);
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let target_addr = match timeout(Duration::from_secs(5), read_target_addr(&mut recv_mux)).await {
-                        Ok(Ok(addr)) => addr,
-                        Ok(Err(e)) => {
-                            log::debug!("Failed to read target proxy address header: {}", e);
-                            return;
+                
+                log::info!("Establishing userspace TCP proxy bridge to target destination: {}", target_addr);
+                match tokio::net::TcpStream::connect(target_addr).await {
+                    Ok(tcp_socket) => {
+                        if let Err(e) = set_tcp_keepalive(&tcp_socket) {
+                            log::warn!("Failed to set TCP Keep-Alive on target TCP stream: {}", e);
                         }
-                        Err(_) => {
-                            log::debug!("Timed out reading target proxy address header");
-                            return;
-                        }
-                    };
-                    
-                    log::info!("Establishing userspace TCP proxy bridge to target destination: {}", target_addr);
-                    match tokio::net::TcpStream::connect(target_addr).await {
-                        Ok(tcp_socket) => {
-                            if let Err(e) = set_tcp_keepalive(&tcp_socket) {
-                                log::warn!("Failed to set TCP Keep-Alive on target TCP stream: {}", e);
-                            }
-                            if send_mux.write_all(&[1]).await.is_ok() {
-                                relay::relay_connections_with_conn_stat(
-                                    tcp_socket, send_mux, recv_mux, stats, conn_stat
-                                ).await;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to establish TCP connection to target {}: {}", target_addr, e);
-                            let _ = send_mux.write_all(&[0]).await;
+                        if send_mux.write_all(&[1]).await.is_ok() {
+                            relay::relay_connections_with_conn_stat(
+                                tcp_socket, send_mux, recv_mux, stats, conn_stat
+                            ).await;
                         }
                     }
-                });
+                    Err(e) => {
+                        log::warn!("Failed to establish TCP connection to target {}: {}", target_addr, e);
+                        let _ = send_mux.write_all(&[0]).await;
+                    }
+                }
             });
-
-            if let Err(e) = quic_server.run_with_registry(handler, shared_reg_for_server).await {
-                log::error!("QUIC Pool Server error: {}", e);
-            }
         });
 
-        let _ = quic_run_task.await;
+        if let Err(e) = quic_server.run_with_registry(handler, shared_reg_for_server).await {
+            log::error!("QUIC Pool Server error: {}", e);
+            std::process::exit(1);
+        }
+
         wait_for_shutdown().await;
+        control_task.abort();
 
     } else {
         log::info!("------------------------------------------------------");

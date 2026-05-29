@@ -178,7 +178,7 @@ struct PeerTelemetry {
 接口名与 WireGuard/wg-quick 保持一致：来自配置文件 basename，例如 `tun0.conf` 对应接口 `tun0`，`client.conf` 对应接口 `client`。所有自动路由、`wg show <interface> dump` 与清理逻辑都使用这个接口名。
 
 * **`Table`**（可选，支持 `Table` 或 `table`）：
-  * **`auto` 或未配置 (默认值)**：网关在启动时会自动将 `Address` 绑定到 tun 设备，自动将所有 Peer 的 `AllowedIPs` 注入系统路由表（通过 `ip route`），并配置本地策略路由（`fwmark 1 lookup 100`）和 TPROXY 的 `iptables` / `ip6tables` 拦截规则。在程序退出时，会自动、无损地回滚删除所有注入的路由及防火墙规则。
+  * **`auto` 或未配置 (默认值)**：网关在启动时会自动将 `Address` 绑定到 tun 设备，自动将所有 Peer 的 `AllowedIPs` 注入系统路由表（通过 `ip route`），并配置本地策略路由和 TPROXY 的 `iptables` / `ip6tables` 拦截规则。策略路由使用按接口名稳定派生的 `fwmark` 与 table，避免多实例互相覆盖。在程序退出时，会自动、无损地回滚删除所有注入的路由及防火墙规则。
   * **`off`**：网关不做任何路由和 `iptables` 的修改，完全交由用户或外部脚本接管。
 * **`PreScript` / `pre_script`**（可选）：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
 * **`PostScript` / `post_script`**（可选）：程序优雅停止并清理完所有路由与 iptables 拦截规则后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。

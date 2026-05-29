@@ -1,9 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use quinn::{SendStream, RecvStream};
 use crate::quic_pool::QuicConnStats;
+
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 // 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
 pub struct PeerL4Stats {
@@ -103,19 +106,19 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     let client_to_server = tokio::spawn(async move {
         let mut reader = counting_tcp_read;
         let mut writer = quic_send;
-        if let Err(e) = tokio::io::copy(&mut reader, &mut writer).await {
+        if let Err(e) = relay_copy_with_idle(&mut reader, &mut writer).await {
             log::debug!("Client→Server relay error: {}", e);
         }
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+        let _ = writer.shutdown().await;
     });
 
     let server_to_client = tokio::spawn(async move {
         let mut reader = counting_quic_read;
         let mut writer = tcp_write;
-        if let Err(e) = tokio::io::copy(&mut reader, &mut writer).await {
+        if let Err(e) = relay_copy_with_idle(&mut reader, &mut writer).await {
             log::debug!("Server→Client relay error: {}", e);
         }
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+        let _ = writer.shutdown().await;
     });
 
     // 4. 并发等待双方关闭，配合 10 秒优雅半关闭超时机制，彻底根治死锁/连接悬挂泄露
@@ -145,6 +148,31 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     stats.active_streams.fetch_sub(1, Ordering::Relaxed);
     if let Some(cs) = &conn_stat {
         cs.active_streams.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn relay_copy_with_idle<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 16 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = match tokio::time::timeout(RELAY_IDLE_TIMEOUT, reader.read(&mut buf)).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "relay idle timeout",
+                ));
+            }
+        };
+        if n == 0 {
+            return Ok(copied);
+        }
+        writer.write_all(&buf[..n]).await?;
+        copied += n as u64;
     }
 }
 

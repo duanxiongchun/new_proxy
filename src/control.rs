@@ -21,11 +21,19 @@ pub struct ControlRequest {
     pub client_public_key: [u8; 32],
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct ControlResponse {
     pub server_nonce: [u8; 16],
-    #[serde(skip)]
     pub session_psk: [u8; 32],
+    pub port_pool: Vec<u16>,
+    pub public_ipv4: Option<String>,
+    pub public_ipv6: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ControlResponseWire {
+    pub server_nonce: [u8; 16],
     pub port_pool: Vec<u16>,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
@@ -159,9 +167,15 @@ impl ControlClient {
                     }
 
                     // 反序列化配置
-                    let mut resp: ControlResponse = serde_json::from_slice(&signed_resp.payload)
+                    let wire: ControlResponseWire = serde_json::from_slice(&signed_resp.payload)
                         .map_err(|e| format!("Failed to parse response: {}", e))?;
-                    resp.session_psk = derive_session_psk(&shared_secret, &client_nonce, &resp.server_nonce);
+                    let resp = ControlResponse {
+                        session_psk: derive_session_psk(&shared_secret, &client_nonce, &wire.server_nonce),
+                        server_nonce: wire.server_nonce,
+                        port_pool: wire.port_pool,
+                        public_ipv4: wire.public_ipv4,
+                        public_ipv6: wire.public_ipv6,
+                    };
 
                     log::info!("Successfully negotiated PSK and received QUIC pool configuration!");
                     return Ok((resp, socket));
@@ -278,10 +292,7 @@ impl ControlServer {
                 }
             };
 
-            // 1. 快速轻量级预检 (DDoS 防护)
-            // - 最小包长：有效的 SignedPacket 序列化 JSON 必定大于 120 字节
-            // - 结构验证：JSON 报文首尾必须为 '{' 和 '}'
-            if len < 120 || buf[0] != b'{' || buf[len - 1] != b'}' {
+            if len == 0 || buf[0] != b'{' || buf[len - 1] != b'}' {
                 log::debug!("Fast discard obviously invalid control packet from {}, len={}", client_addr, len);
                 continue;
             }
@@ -352,9 +363,8 @@ impl ControlServer {
                     cache.insert(req.client_public_key, session_psk);
                 }
 
-                let resp = ControlResponse {
+                let resp = ControlResponseWire {
                     server_nonce,
-                    session_psk,
                     port_pool: ports_clone,
                     public_ipv4: v4_clone,
                     public_ipv6: v6_clone,

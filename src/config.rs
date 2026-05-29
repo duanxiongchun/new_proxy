@@ -55,7 +55,8 @@ pub fn decode_base64_32(s: &str) -> Result<[u8; 32], String> {
             b'0'..=b'9' => byte - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            _ => continue, // 忽略空格、换行等干扰字符
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return Err(format!("Invalid base64 character: 0x{:02x}", byte)),
         };
         temp = (temp << 6) | val as u32;
         bits += 6;

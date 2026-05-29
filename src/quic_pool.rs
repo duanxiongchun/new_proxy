@@ -94,12 +94,16 @@ pub struct QuicPoolClient {
     client_public_key: [u8; 32],
     session_psk: [u8; 32],
     endpoints: Vec<SocketAddr>,
-    connections: Arc<Mutex<Vec<Connection>>>,
-    conn_endpoints: Arc<Mutex<Vec<SocketAddr>>>,
-    // 每条物理连接独立的流量统计
-    pub conn_stats: Arc<Mutex<Vec<QuicConnStats>>>,
+    slots: Arc<Mutex<Vec<PoolSlot>>>,
     rr_index: Arc<Mutex<usize>>,
     endpoint: Arc<Mutex<Option<Endpoint>>>,
+}
+
+#[derive(Clone)]
+struct PoolSlot {
+    endpoint: SocketAddr,
+    conn: Connection,
+    stats: QuicConnStats,
 }
 
 impl QuicPoolClient {
@@ -108,9 +112,7 @@ impl QuicPoolClient {
             client_public_key,
             session_psk,
             endpoints,
-            connections: Arc::new(Mutex::new(Vec::new())),
-            conn_endpoints: Arc::new(Mutex::new(Vec::new())),
-            conn_stats: Arc::new(Mutex::new(Vec::new())),
+            slots: Arc::new(Mutex::new(Vec::new())),
             rr_index: Arc::new(Mutex::new(0)),
             endpoint: Arc::new(Mutex::new(None)),
         }
@@ -148,9 +150,7 @@ impl QuicPoolClient {
         endpoint.set_default_client_config(client_config);
         *self.endpoint.lock().unwrap() = Some(endpoint.clone());
 
-        let mut conns = Vec::new();
-        let mut conn_endpoints = Vec::new();
-        let mut stats = Vec::new();
+        let mut slots = Vec::new();
 
         // 并发连向推上来的公网 UDP 端口池
         for &target_addr in &self.endpoints {
@@ -179,19 +179,19 @@ impl QuicPoolClient {
             // 获取本地绑定端口用于统计展示
             let local_port = target_addr.port();
             let remote_addr = conn.remote_address();
-            stats.push(QuicConnStats::new(remote_addr, local_port));
-            conn_endpoints.push(target_addr);
-            conns.push(conn);
+            slots.push(PoolSlot {
+                endpoint: target_addr,
+                conn,
+                stats: QuicConnStats::new(remote_addr, local_port),
+            });
         }
 
-        if conns.is_empty() {
+        if slots.is_empty() {
             return Err("Failed to establish any healthy physical QUIC connection links".to_string());
         }
 
-        log::info!("Successfully initialized QUIC connection pool with {} active links", conns.len());
-        *self.connections.lock().unwrap() = conns;
-        *self.conn_endpoints.lock().unwrap() = conn_endpoints;
-        *self.conn_stats.lock().unwrap() = stats;
+        log::info!("Successfully initialized QUIC connection pool with {} active links", slots.len());
+        *self.slots.lock().unwrap() = slots;
         Ok(())
     }
 
@@ -243,17 +243,16 @@ impl QuicPoolClient {
             attempts += 1;
             
             let (conn, conn_stat, total_conns) = {
-                let conns = self.connections.lock().unwrap();
-                let stats = self.conn_stats.lock().unwrap();
-                if conns.is_empty() {
+                let slots = self.slots.lock().unwrap();
+                if slots.is_empty() {
                     return Err("No active QUIC connections in pool".to_string());
                 }
                 
                 let mut idx = self.rr_index.lock().unwrap();
-                let i = *idx % conns.len();
-                let selected_conn = conns[i].clone();
-                let selected_stat = Arc::new(stats[i].clone());
-                let total = conns.len();
+                let i = *idx % slots.len();
+                let selected_conn = slots[i].conn.clone();
+                let selected_stat = Arc::new(slots[i].stats.clone());
+                let total = slots.len();
                 *idx += 1;
                 (selected_conn, selected_stat, total)
             };
@@ -290,56 +289,51 @@ impl QuicPoolClient {
                     None => continue,
                 };
                 
-                let active_slots = {
-                    let conns = self.connections.lock().unwrap();
-                    let conn_endpoints = self.conn_endpoints.lock().unwrap();
-                    conns.iter()
-                        .cloned()
-                        .zip(conn_endpoints.iter().copied())
-                        .collect::<Vec<_>>()
-                };
+                let active_slots = self.slots.lock().unwrap().clone();
                 
-                for (i, (conn, target_addr)) in active_slots.iter().enumerate() {
-                    let need_reconnect = conn.close_reason().is_some();
+                for (i, slot) in active_slots.iter().enumerate() {
+                    let need_reconnect = slot.conn.close_reason().is_some();
                     
                     if need_reconnect {
-                        log::info!("Connection index {} to {} is dead. Reconnecting...", i, target_addr);
+                        log::info!("Connection index {} to {} is dead. Reconnecting...", i, slot.endpoint);
                         
-                        match endpoint.connect(*target_addr, "localhost") {
+                        match endpoint.connect(slot.endpoint, "localhost") {
                             Ok(connecting) => {
                                 match connecting.await {
                                     Ok(new_conn) => {
                                         // 握手成功后立即发起首个 Stream 的 PSK 应用层认证
                                         if let Err(e) = self.authenticate_connection(&new_conn).await {
-                                            log::warn!("Re-authentication failed on link {}: {}", target_addr, e);
+                                            log::warn!("Re-authentication failed on link {}: {}", slot.endpoint, e);
                                             new_conn.close(0u32.into(), b"Auth failed");
                                         } else {
-                                            log::info!("Successfully re-established dead connection to {}", target_addr);
-                                            let mut conns = self.connections.lock().unwrap();
-                                            let mut stats = self.conn_stats.lock().unwrap();
-                                            if i < conns.len() && i < stats.len() {
-                                                conns[i] = new_conn.clone();
-                                                stats[i] = QuicConnStats::new(new_conn.remote_address(), target_addr.port());
+                                            log::info!("Successfully re-established dead connection to {}", slot.endpoint);
+                                            let mut slots = self.slots.lock().unwrap();
+                                            if i < slots.len() {
+                                                slots[i] = PoolSlot {
+                                                    endpoint: slot.endpoint,
+                                                    stats: QuicConnStats::new(new_conn.remote_address(), slot.endpoint.port()),
+                                                    conn: new_conn.clone(),
+                                                };
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        log::warn!("Reconnection handshake failed to {}: {}", target_addr, e);
+                                        log::warn!("Reconnection handshake failed to {}: {}", slot.endpoint, e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Failed to initiate reconnection to {}: {}", target_addr, e);
+                                log::warn!("Failed to initiate reconnection to {}: {}", slot.endpoint, e);
                             }
                         }
                     }
                 }
 
                 let missing_endpoints = {
-                    let conn_endpoints = self.conn_endpoints.lock().unwrap();
+                    let slots = self.slots.lock().unwrap();
                     endpoints.iter()
                         .copied()
-                        .filter(|endpoint_addr| !conn_endpoints.contains(endpoint_addr))
+                        .filter(|endpoint_addr| !slots.iter().any(|slot| slot.endpoint == *endpoint_addr))
                         .collect::<Vec<_>>()
                 };
 
@@ -353,12 +347,11 @@ impl QuicPoolClient {
                                     new_conn.close(0u32.into(), b"Auth failed");
                                 } else {
                                     log::info!("Successfully added recovered connection to {}", target_addr);
-                                    let mut conns = self.connections.lock().unwrap();
-                                    let mut conn_endpoints = self.conn_endpoints.lock().unwrap();
-                                    let mut stats = self.conn_stats.lock().unwrap();
-                                    conns.push(new_conn.clone());
-                                    conn_endpoints.push(target_addr);
-                                    stats.push(QuicConnStats::new(new_conn.remote_address(), target_addr.port()));
+                                    self.slots.lock().unwrap().push(PoolSlot {
+                                        endpoint: target_addr,
+                                        stats: QuicConnStats::new(new_conn.remote_address(), target_addr.port()),
+                                        conn: new_conn.clone(),
+                                    });
                                 }
                             }
                             Err(e) => {
@@ -674,8 +667,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 9. 关闭客户端连接，验证 Registry 自动清理
-        if let Some(conn) = client_arc.connections.lock().unwrap().first() {
-            conn.close(0u32.into(), b"Test shutdown");
+        if let Some(slot) = client_arc.slots.lock().unwrap().first() {
+            slot.conn.close(0u32.into(), b"Test shutdown");
         }
         
         // 给清理机制一些时间
