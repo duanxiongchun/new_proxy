@@ -53,6 +53,27 @@ target/release/new_proxy
 target/release/new-proxy-cli
 ```
 
+### Debian 打包与安装 (Makefile)
+
+本项目支持通过 `make` 工具快速构建并打包为 Debian 格式的安装包（`.deb`），自动集成二进制文件、systemd 服务模板以及示例配置：
+
+1. **构建并打包**：
+   ```bash
+   make package
+   ```
+   该命令会在 `target/` 目录下生成 `new-proxy_5.0.0_amd64.deb` 安装包。
+
+2. **安装 Debian 包**：
+   ```bash
+   sudo dpkg -i target/new-proxy_5.0.0_amd64.deb
+   ```
+   安装后，程序文件将被放置于 `/usr/bin/`，服务模板将写入 `/lib/systemd/system/`，示例配置复制至 `/etc/new_proxy/`。
+
+3. **清理构建缓存与包**：
+   ```bash
+   make clean
+   ```
+
 ## 配置方式
 
 示例配置位于 `conf/`。支持以下高级配置项：
@@ -131,6 +152,39 @@ sudo iptables -t mangle -A PREROUTING \
 
 实际部署时应按业务网段替换 `10.0.0.1`。
 
+## 系统服务管理 (Systemd)
+
+安装 Debian 包后，可以使用 systemd 来管理和守护 `new_proxy` 实例。服务采用了模块化/模板化设计（`new_proxy@.service`），支持在一台机器上同时管理多个不同配置的网关实例：
+
+### 1. 配置实例
+准备您的配置文件（如 `server.conf` 或 `client.conf`），并移动到配置目录下：
+```bash
+sudo cp conf/server.conf /etc/new_proxy/server.conf
+```
+*注意：服务加载的配置文件路径为 `/etc/new_proxy/<interface_name>.conf`。*
+
+### 2. 启动与自启服务
+以实例名（配置文件名，如 `server`）启动服务：
+```bash
+# 启动 server 实例
+sudo systemctl start new_proxy@server
+
+# 设置开机自启
+sudo systemctl enable new_proxy@server
+```
+
+### 3. 管理服务状态
+```bash
+# 查看服务运行状态
+sudo systemctl status new_proxy@server
+
+# 查看服务实时日志
+sudo journalctl -u new_proxy@server -f
+
+# 停止服务
+sudo systemctl stop new_proxy@server
+```
+
 ## CLI 使用
 
 查看服务端聚合遥测：
@@ -181,6 +235,12 @@ sudo script/acceptance/e2e_test_dualstack.sh
 
 ```bash
 sudo script/acceptance/e2e_scenarios.sh
+```
+
+运行多客户端并发 L3 回退 E2E 测试：
+
+```bash
+sudo script/acceptance/e2e_multi_client.sh
 ```
 
 运行 1 小时稳定性压测：
