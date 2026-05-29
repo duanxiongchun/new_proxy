@@ -204,8 +204,12 @@ CLIENT_PID=$!
 sleep 3
 
 echo "=== [4/7] Verifying initial TCP paths for both clients ==="
+# Direct L3 path (router_ns -> server_ns)
 ip netns exec router_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
+# Standard WG fallback path (client2_ns -> router_ns -> server_ns)
 ip netns exec client2_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
+# QUIC offload path (client1_ns -> TPROXY:1080 -> QUIC pool -> server_ns)
+ip netns exec client1_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
 
 monitor_once() {
   python3 - "$METRICS" "$SERVER_PID" "$CLIENT_PID" "$START_TS" <<'PY'
@@ -263,6 +267,15 @@ PY
 short_loop() {
   end=$((START_TS + DURATION))
   while [ "$(date +%s)" -lt "$end" ]; do
+    # QUIC offload path: client1_ns -> TPROXY:1080 -> QUIC pool -> server_ns (MUST exercise this)
+    for _ in $(seq 1 "$SHORT_PARALLEL"); do
+      if ip netns exec client1_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
+        echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
+      else
+        echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
+      fi &
+    done
+    # Direct L3 path: router_ns -> server_ns (bypasses QUIC, tests standard routing)
     for _ in $(seq 1 "$SHORT_PARALLEL"); do
       if ip netns exec router_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
         echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
@@ -270,6 +283,7 @@ short_loop() {
         echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
       fi &
     done
+    # Standard WG fallback path: client2_ns -> router_ns -> server_ns
     for _ in $(seq 1 "$SHORT_PARALLEL"); do
       if ip netns exec client2_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
         echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
@@ -332,7 +346,9 @@ ping_loop() {
 
 echo "=== [5/7] Starting background traffic for ${DURATION}s ==="
 START_TS="$(date +%s)"
-ip netns exec router_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
+# Long TCP MUST run from client1_ns so connections go through TPROXY -> QUIC pool.
+# router_ns traffic bypasses TPROXY and goes directly to server_ns, defeating the test.
+ip netns exec client1_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
 LONG_PID=$!
 short_loop &
 SHORT_PID=$!

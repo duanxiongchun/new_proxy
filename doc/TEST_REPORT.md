@@ -162,7 +162,7 @@ sudo STABILITY_DURATION=60 STABILITY_SAMPLE_INTERVAL=10 bash script/acceptance/s
 产物目录：
 
 ```text
-/tmp/new_proxy_stability_20260529_114233
+/tmp/new_proxy_stability_20260529_115629
 ```
 
 关键结果：
@@ -170,29 +170,36 @@ sudo STABILITY_DURATION=60 STABILITY_SAMPLE_INTERVAL=10 bash script/acceptance/s
 ```text
 Samples collected: 7
 Proxy crash samples: 0
-Long TCP iterations: 488
+Long TCP iterations: 480
 Long TCP errors: 0
-Short curl OK/FAIL: 464/0
+Short curl OK/FAIL: 708/0
 UDP OK/FAIL: 24/0
 Ping OK/FAIL: 60/0
-QUIC balance CV: unavailable *
-Client RSS MiB: 10.2 -> 10.2 (+0.00%)
-Server RSS MiB: 10.9 -> 11.0 (+0.90%)
+QUIC balance CV: 0.19%
+Client RSS MiB: 11.2 -> 11.7 (+4.54%)
+Server RSS MiB: 11.5 -> 11.9 (+4.15%)
 ```
 
-> **\* QUIC CV 说明**：测试拓扑中 `router_ns` 和 `client2_ns` 流量直接路由至 `server_ns`，不经过 `client1_ns` 的 TPROXY 拦截层，因此 QUIC 连接池虽已建立（4 路物理连接正常握手），但本次 smoke test 中无 QUIC 数据流量经过，导致 CV 指标不可用。QUIC 连接池功能性由端到端多客户端测试（§7）验证确认。
+4 路 QUIC 物理连接流量分布（三路并发：QUIC 卸载 + L3 直连 + WG 回退）：
+
+```text
+Port 40001: tx=127423 rx=203474 total=330897 share=24.97% active_streams=0
+Port 40002: tx=127500 rx=204840 total=332340 share=25.08% active_streams=0
+Port 40003: tx=127423 rx=203474 total=330897 share=24.97% active_streams=0
+Port 40004: tx=127423 rx=203474 total=330897 share=24.97% active_streams=0
+```
 
 通过准则：
 
 ```text
 No proxy crash:       PASS
-Short curl success:   PASS  (464 成功, 0 失败)
-Long TCP success:     PASS  (488 次迭代, 0 错误)
-QUIC CV < 5%:         N/A   (见上述说明)
-RSS growth <= 10%:    PASS  (client +0.00%, server +0.90%)
+Short curl success:   PASS  (708 成功, 0 失败)
+Long TCP success:     PASS  (480 次迭代, 0 错误)
+QUIC CV < 5%:         PASS  (CV = 0.19%, 四路均衡 24.97%/25.08%/24.97%/24.97%)
+RSS growth <= 10%:    PASS  (client +4.54%, server +4.15%)
 ```
 
-结论：**所有可量化标准全部通过。进程 60 秒内无崩溃，内存增长稳定在 1% 以内，短连接和长连接全部成功。**
+结论：**全部 5 项通过准则 PASS。TCP→QUIC 卸载链路经真实流量验证，4 路 QUIC 物理连接完美均衡，内存增长健康，进程 60 秒内无崩溃。**
 
 ---
 
@@ -283,7 +290,7 @@ peer: vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
 
 ## Bug 修复记录（本次测试发现）
 
-本次测试过程中发现并修复了以下两个脚本 bug：
+本次测试过程中发现并修复了以下三个脚本 bug：
 
 ### Bug 1：stability_stress_test.sh 配置文件名超长
 
@@ -295,10 +302,16 @@ peer: vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
 - **现象**：当代理 socket 不可达时，telemetry 字段为 `{"error": "..."}` dict，`latest_connections()` 迭代 dict keys（字符串），触发 `AttributeError: 'str' object has no attribute 'get'`。
 - **修复**：在 `latest_connections()` 和 peer 迭代处各加 `isinstance` 类型守卫，非 list 类型直接跳过。
 
+### Bug 3：stability_stress_test.sh 压力流量未经过 QUIC 卸载路径
+
+- **现象**：`long_tcp` 和 `short_loop` 全部从 `router_ns`/`client2_ns` 发起，流量直接路由至 `server_ns`，完全绕过 `client1_ns` TPROXY。QUIC 连接池虽已建立，但始终无数据通过，CV 显示"不可用"，压力测试无法验证核心 TCP→QUIC 卸载功能。
+- **根本原因**：TPROXY 拦截只在 `client1_ns` 生效（OUTPUT mangle mark → ip rule table 100 → PREROUTING TPROXY）。从 `router_ns` 发起的流量路径是 `router_ns → server_ns` 直连，不经过 `client1_ns`。
+- **修复**：`long_tcp` 改为从 `client1_ns` 执行；`short_loop` 新增 `client1_ns` curl 并发循环；Step 4 新增 `client1_ns` QUIC 路径预验证断言。
+- **验证**：修复后 QUIC CV = **0.19%**，四路均衡 24.97%/25.08%/24.97%/24.97%，全部 5 项 PASS。
+
 ---
 
 ## 当前风险与后续建议
 
-1. **QUIC CV 压力测试覆盖**：当前 60s smoke 压力测试的 traffic 来源（`router_ns`/`client2_ns`）不经过 `client1_ns` TPROXY，QUIC CV 无法量化。建议后续在 `short_loop` 中补充 `client1_ns` 本地发起的 curl，以覆盖完整 QUIC 卸载链路的 CV 验证。
-2. **更长周期稳定性测试**：建议定期执行 4 小时或夜间 24 小时长稳测试，确认服务端 RSS 增长为一次性稳定增长而非持续泄漏。
-3. **CI 集成建议**：将 60s smoke test 固定在 CI 中每次提交自动执行，将多客户端验收测试作为合并门控。
+1. **更长周期稳定性测试**：建议定期执行 4 小时或夜间 24 小时长稳测试，确认服务端 RSS 增长为一次性稳定增长而非持续泄漏。
+2. **CI 集成建议**：将 60s smoke test 固定在 CI 中每次提交自动执行，将多客户端验收测试作为合并门控。
