@@ -29,14 +29,17 @@ pub struct ControlResponse {
     pub port_pool: Vec<u16>,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
+    pub quic_cert_sha256: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ControlResponseWire {
+    pub client_nonce: [u8; 16],
     pub server_nonce: [u8; 16],
     pub port_pool: Vec<u16>,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
+    pub quic_cert_sha256: [u8; 32],
 }
 
 // 封装带 HMAC 签名的 UDP 数据包
@@ -117,24 +120,10 @@ impl ControlClient {
                 .map_err(|e| format!("Failed to bind local IPv4 UDP socket: {}", e))?
         };
 
-        // 3. 构建 Request
-        let mut client_nonce = [0u8; 16];
-        rand::thread_rng().fill(&mut client_nonce);
-
         let client_pub_derived = PublicKey::from(&client_secret).to_bytes();
-        let req = ControlRequest {
-            client_nonce,
-            client_public_key: client_pub_derived,
-        };
 
-        let payload =
-            serde_json::to_vec(&req).map_err(|e| format!("Serialization error: {}", e))?;
-        let mac = calculate_mac(&shared_secret, &payload);
-
-        let signed_packet = SignedPacket { payload, mac };
-        let packet_bytes = serde_json::to_vec(&signed_packet).unwrap();
-
-        // 4. UDP 发送并重试循环 (最多重试 4 次)
+        // 3. UDP 发送并重试循环 (最多重试 4 次)。每次重试都生成新 nonce，
+        // 避免“响应丢包后重发同 nonce 被服务端 replay cache 拒绝”。
         let mut attempts = 0;
         let mut buf = [0u8; 2048];
 
@@ -151,6 +140,19 @@ impl ControlClient {
                 attempts,
                 self.server_control_endpoint
             );
+            let mut client_nonce = [0u8; 16];
+            rand::thread_rng().fill(&mut client_nonce);
+            let req = ControlRequest {
+                client_nonce,
+                client_public_key: client_pub_derived,
+            };
+            let payload =
+                serde_json::to_vec(&req).map_err(|e| format!("Serialization error: {}", e))?;
+            let mac = calculate_mac(&shared_secret, &payload);
+            let signed_packet = SignedPacket { payload, mac };
+            let packet_bytes = serde_json::to_vec(&signed_packet)
+                .map_err(|e| format!("Serialization error: {}", e))?;
+
             if let Err(e) = socket
                 .send_to(&packet_bytes, self.server_control_endpoint)
                 .await
@@ -181,6 +183,10 @@ impl ControlClient {
                     // 反序列化配置
                     let wire: ControlResponseWire = serde_json::from_slice(&signed_resp.payload)
                         .map_err(|e| format!("Failed to parse response: {}", e))?;
+                    if wire.client_nonce != client_nonce {
+                        log::warn!("Received stale control response for a previous nonce");
+                        continue;
+                    }
                     let resp = ControlResponse {
                         session_psk: derive_session_psk(
                             &shared_secret,
@@ -191,6 +197,7 @@ impl ControlClient {
                         port_pool: wire.port_pool,
                         public_ipv4: wire.public_ipv4,
                         public_ipv6: wire.public_ipv6,
+                        quic_cert_sha256: wire.quic_cert_sha256,
                     };
 
                     log::info!("Successfully negotiated PSK and received QUIC pool configuration!");
@@ -246,6 +253,7 @@ pub struct ControlServer {
     quic_ports: Vec<u16>,
     public_ipv4: Option<String>,
     public_ipv6: Option<String>,
+    quic_cert_sha256: [u8; 32],
     session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Session_PSK}
     nonce_cache: Arc<Mutex<NonceCache>>,
 }
@@ -257,6 +265,7 @@ impl ControlServer {
         quic_ports: Vec<u16>,
         public_ipv4: Option<String>,
         public_ipv6: Option<String>,
+        quic_cert_sha256: [u8; 32],
         session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
     ) -> Self {
         Self {
@@ -265,6 +274,7 @@ impl ControlServer {
             quic_ports,
             public_ipv4,
             public_ipv6,
+            quic_cert_sha256,
             session_cache,
             nonce_cache: Arc::new(Mutex::new(NonceCache::new(4096))),
         }
@@ -345,6 +355,7 @@ impl ControlServer {
             let ports_clone = self.quic_ports.clone();
             let v4_clone = self.public_ipv4.clone();
             let v6_clone = self.public_ipv6.clone();
+            let quic_cert_sha256 = self.quic_cert_sha256;
             let permit = match worker_limit.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -415,10 +426,12 @@ impl ControlServer {
                 }
 
                 let resp = ControlResponseWire {
+                    client_nonce: req.client_nonce,
                     server_nonce,
                     port_pool: ports_clone,
                     public_ipv4: v4_clone,
                     public_ipv6: v6_clone,
+                    quic_cert_sha256,
                 };
 
                 let resp_payload = serde_json::to_vec(&resp).unwrap();
@@ -492,6 +505,7 @@ mod tests {
             vec![40001, 40002],
             Some("1.2.3.4".to_string()),
             None,
+            [3u8; 32],
             session_cache.clone(),
         );
 
@@ -515,6 +529,7 @@ mod tests {
         // 5. 校验协商配置结果是否匹配
         assert_eq!(resp.port_pool, vec![40001, 40002]);
         assert_eq!(resp.public_ipv4, Some("1.2.3.4".to_string()));
+        assert_eq!(resp.quic_cert_sha256, [3u8; 32]);
         assert!(resp.session_psk != [0u8; 32]);
 
         // 验证服务端 session cache 里成功缓存了该 session_psk
@@ -522,5 +537,132 @@ mod tests {
         assert_eq!(cache.get(&client_pub.to_bytes()), Some(&resp.session_psk));
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_control_server_rejects_bad_hmac_and_replay() {
+        let client_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let client_pub = PublicKey::from(&client_secret);
+        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let shared_secret = server_secret.diffie_hellman(&client_pub).to_bytes();
+
+        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        peer_secrets
+            .write()
+            .unwrap()
+            .insert(client_pub.to_bytes(), shared_secret);
+        let session_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        let server_port = {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.local_addr().unwrap().port()
+        };
+        let server = ControlServer::new(
+            server_port,
+            peer_secrets,
+            vec![40001],
+            None,
+            None,
+            [9u8; 32],
+            session_cache.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = SocketAddr::new(IpAddr::V4("127.0.0.1".parse().unwrap()), server_port);
+        let req = ControlRequest {
+            client_nonce: [7u8; 16],
+            client_public_key: client_pub.to_bytes(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        let bad_packet = SignedPacket {
+            payload: payload.clone(),
+            mac: [0u8; 32],
+        };
+        socket
+            .send_to(&serde_json::to_vec(&bad_packet).unwrap(), server_addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "bad HMAC request must not receive a response"
+        );
+        assert!(session_cache.lock().unwrap().is_empty());
+
+        let good_packet = SignedPacket {
+            mac: calculate_mac(&shared_secret, &payload),
+            payload,
+        };
+        let good_bytes = serde_json::to_vec(&good_packet).unwrap();
+        socket.send_to(&good_bytes, server_addr).await.unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(serde_json::from_slice::<SignedPacket>(&buf[..len]).is_ok());
+        assert!(session_cache
+            .lock()
+            .unwrap()
+            .contains_key(&client_pub.to_bytes()));
+
+        socket.send_to(&good_bytes, server_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "replayed nonce must not receive a second response"
+        );
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_control_client_rejects_stale_nonce_response() {
+        let client_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let server_pub = PublicKey::from(&server_secret);
+        let shared_secret = client_secret.diffie_hellman(&server_pub).to_bytes();
+
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((len, client_addr)) = server_socket.recv_from(&mut buf).await {
+                let signed_req: SignedPacket = serde_json::from_slice(&buf[..len]).unwrap();
+                assert!(verify_mac(
+                    &shared_secret,
+                    &signed_req.payload,
+                    &signed_req.mac
+                ));
+                let wire = ControlResponseWire {
+                    client_nonce: [0u8; 16],
+                    server_nonce: [1u8; 16],
+                    port_pool: vec![40001],
+                    public_ipv4: None,
+                    public_ipv6: None,
+                    quic_cert_sha256: [2u8; 32],
+                };
+                let payload = serde_json::to_vec(&wire).unwrap();
+                let resp = SignedPacket {
+                    mac: calculate_mac(&shared_secret, &payload),
+                    payload,
+                };
+                let _ = server_socket
+                    .send_to(&serde_json::to_vec(&resp).unwrap(), client_addr)
+                    .await;
+            }
+        });
+
+        let client =
+            ControlClient::new(client_secret.to_bytes(), server_pub.to_bytes(), server_addr);
+        let err = client.negotiate_config().await.unwrap_err();
+        assert!(err.contains("timeout"));
+        responder.abort();
     }
 }

@@ -43,18 +43,19 @@ def cv_percent(values):
     return math.sqrt(variance) / mean * 100.0
 
 
-def latest_connections(metrics):
+def latest_connections_by_peer(metrics):
     for row in reversed(metrics):
         telemetry = row.get("telemetry")
         if not isinstance(telemetry, list):
             continue
-        peers = telemetry
-        conns = []
-        for peer in peers:
+        by_peer = {}
+        for peer in telemetry:
             if not isinstance(peer, dict):
                 continue
-            conns.extend(peer.get("quic_connections") or [])
-        if conns:
+            conns = peer.get("quic_connections") or []
+            if not conns:
+                continue
+            peer_key = peer.get("public_key") or "(unknown)"
             by_port = {}
             for conn in conns:
                 port = str(conn.get("local_port"))
@@ -62,7 +63,9 @@ def latest_connections(metrics):
                 item["rx_bytes"] += int(conn.get("rx_bytes") or 0)
                 item["tx_bytes"] += int(conn.get("tx_bytes") or 0)
                 item["active_streams"] += int(conn.get("active_streams") or 0)
-            return by_port
+            by_peer[peer_key] = by_port
+        if by_peer:
+            return by_peer
     return {}
 
 
@@ -85,6 +88,14 @@ def rss_growth(metrics, side):
     return base_rss / 1024.0, end_rss / 1024.0, growth
 
 
+def rss_pass(rss, max_pct, max_mib):
+    if not rss:
+        return True
+    base_mib, end_mib, growth_pct = rss
+    growth_mib = end_mib - base_mib
+    return growth_pct <= max_pct or growth_mib <= max_mib
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: stability_report.py <artifact_dir>", file=sys.stderr)
@@ -92,6 +103,7 @@ def main():
     artifact_dir = sys.argv[1]
     metrics = read_jsonl(os.path.join(artifact_dir, "stability_metrics.jsonl"))
     long_stats = read_json(os.path.join(artifact_dir, "long_tcp_stats.json"))
+    long2_stats = read_json(os.path.join(artifact_dir, "long_tcp2_stats.json"))
     short_ok = count_lines(os.path.join(artifact_dir, "short_conn.log"), "OK")
     short_fail = count_lines(os.path.join(artifact_dir, "short_conn.log"), "FAIL")
     udp_ok = count_lines(os.path.join(artifact_dir, "udp.log"), "OK")
@@ -99,12 +111,27 @@ def main():
     ping_ok = count_lines(os.path.join(artifact_dir, "ping.log"), "OK")
     ping_fail = count_lines(os.path.join(artifact_dir, "ping.log"), "FAIL")
 
-    conns = latest_connections(metrics)
-    totals = {port: item["rx_bytes"] + item["tx_bytes"] for port, item in conns.items()}
-    cv = cv_percent(list(totals.values()))
+    conns_by_peer = latest_connections_by_peer(metrics)
+    totals_by_peer = {
+        peer: {port: item["rx_bytes"] + item["tx_bytes"] for port, item in conns.items()}
+        for peer, conns in conns_by_peer.items()
+    }
+    cv_by_peer = {
+        peer: cv_percent(list(totals.values()))
+        for peer, totals in totals_by_peer.items()
+    }
     client_rss = rss_growth(metrics, "client")
     server_rss = rss_growth(metrics, "server")
-    crashes = [row for row in metrics if not row.get("client", {}).get("alive") or not row.get("server", {}).get("alive")]
+    client2_rss = rss_growth(metrics, "client2")
+    max_rss_growth_pct = float(os.environ.get("STABILITY_MAX_RSS_GROWTH_PCT", "10.0"))
+    max_rss_growth_mib = float(os.environ.get("STABILITY_MAX_RSS_GROWTH_MIB", "2.0"))
+    crashes = [
+        row
+        for row in metrics
+        if not row.get("client", {}).get("alive")
+        or not row.get("client2", {}).get("alive")
+        or not row.get("server", {}).get("alive")
+    ]
 
     report_path = os.path.join(artifact_dir, "stability_report.md")
     with open(report_path, "w", encoding="utf-8") as f:
@@ -112,42 +139,57 @@ def main():
         f.write(f"- Artifact directory: `{artifact_dir}`\n")
         f.write(f"- Samples collected: {len(metrics)}\n")
         f.write(f"- Proxy crash samples: {len(crashes)}\n")
-        f.write(f"- Long TCP iterations: {long_stats.get('iterations', 0)}\n")
-        f.write(f"- Long TCP errors: {long_stats.get('errors', 0)}\n")
+        long_iterations = long_stats.get("iterations", 0) + long2_stats.get("iterations", 0)
+        long_errors = long_stats.get("errors", 0) + long2_stats.get("errors", 0)
+        f.write(f"- Long TCP iterations: {long_iterations}\n")
+        f.write(f"- Long TCP errors: {long_errors}\n")
         f.write(f"- Short curl OK/FAIL: {short_ok}/{short_fail}\n")
         f.write(f"- UDP OK/FAIL: {udp_ok}/{udp_fail}\n")
         f.write(f"- Ping OK/FAIL: {ping_ok}/{ping_fail}\n")
-        if cv is None:
+        available_cvs = [cv for cv in cv_by_peer.values() if cv is not None]
+        if not available_cvs:
             f.write("- QUIC balance CV: unavailable\n")
         else:
-            f.write(f"- QUIC balance CV: {cv:.2f}%\n")
+            worst_cv = max(available_cvs)
+            f.write(f"- Worst per-peer QUIC balance CV: {worst_cv:.2f}%\n")
         if client_rss:
             f.write(f"- Client RSS MiB: {client_rss[0]:.1f} -> {client_rss[1]:.1f} ({client_rss[2]:+.2f}%)\n")
+        if client2_rss:
+            f.write(f"- Client2 RSS MiB: {client2_rss[0]:.1f} -> {client2_rss[1]:.1f} ({client2_rss[2]:+.2f}%)\n")
         if server_rss:
             f.write(f"- Server RSS MiB: {server_rss[0]:.1f} -> {server_rss[1]:.1f} ({server_rss[2]:+.2f}%)\n")
         f.write("\n## QUIC Physical Connections\n\n")
-        if totals:
-            total_all = sum(totals.values())
-            for port in sorted(totals):
-                item = conns[port]
-                share = 0.0 if total_all == 0 else totals[port] / total_all * 100.0
-                f.write(
-                    f"- Port {port}: tx={item['tx_bytes']} rx={item['rx_bytes']} "
-                    f"total={totals[port]} share={share:.2f}% active_streams={item['active_streams']}\n"
-                )
+        if totals_by_peer:
+            for peer in sorted(totals_by_peer):
+                totals = totals_by_peer[peer]
+                conns = conns_by_peer[peer]
+                total_all = sum(totals.values())
+                cv = cv_by_peer.get(peer)
+                cv_text = "unavailable" if cv is None else f"{cv:.2f}%"
+                f.write(f"- Peer {peer}: CV={cv_text}\n")
+                for port in sorted(totals):
+                    item = conns[port]
+                    share = 0.0 if total_all == 0 else totals[port] / total_all * 100.0
+                    f.write(
+                        f"  - Port {port}: tx={item['tx_bytes']} rx={item['rx_bytes']} "
+                        f"total={totals[port]} share={share:.2f}% active_streams={item['active_streams']}\n"
+                    )
         else:
             f.write("- No per-connection QUIC telemetry was captured.\n")
         f.write("\n## Pass Criteria\n\n")
         f.write(f"- No proxy crash: {'PASS' if not crashes else 'FAIL'}\n")
         f.write(f"- Short curl success: {'PASS' if short_fail == 0 and short_ok > 0 else 'FAIL'}\n")
-        f.write(f"- Long TCP success: {'PASS' if long_stats.get('errors', 0) == 0 and long_stats.get('iterations', 0) > 0 else 'FAIL'}\n")
-        f.write(f"- QUIC CV < 5%: {'PASS' if cv is not None and cv < 5.0 else 'FAIL'}\n")
-        mem_pass = True
-        if client_rss and client_rss[2] > 10.0:
-            mem_pass = False
-        if server_rss and server_rss[2] > 10.0:
-            mem_pass = False
-        f.write(f"- RSS growth <= 10%: {'PASS' if mem_pass else 'FAIL'}\n")
+        f.write(f"- Long TCP success: {'PASS' if long_errors == 0 and long_stats.get('iterations', 0) > 0 and long2_stats.get('iterations', 0) > 0 else 'FAIL'}\n")
+        cv_pass = bool(available_cvs) and all(cv < 5.0 for cv in available_cvs)
+        f.write(f"- Per-peer QUIC CV < 5%: {'PASS' if cv_pass else 'FAIL'}\n")
+        mem_pass = all(
+            rss_pass(rss, max_rss_growth_pct, max_rss_growth_mib)
+            for rss in (client_rss, client2_rss, server_rss)
+        )
+        f.write(
+            f"- RSS growth <= {max_rss_growth_pct:g}% or <= {max_rss_growth_mib:g} MiB: "
+            f"{'PASS' if mem_pass else 'FAIL'}\n"
+        )
     print(report_path)
     return 0
 

@@ -254,21 +254,18 @@ fn print_wg_style(peers: &[UnifiedTelemetry]) {
     }
 }
 
-pub fn run_cli_stats(socket_path: &str) {
-    match send_command(socket_path, &CommandInput::Stats) {
-        Ok(json) => match serde_json::from_str::<Vec<UnifiedTelemetry>>(&json) {
-            Ok(peers) => print_wg_style(&peers),
-            Err(e) => eprintln!("Failed to parse gateway response: {}\nRaw: {}", e, json),
-        },
-        Err(e) => eprintln!("Error: {}", e),
-    }
+pub fn run_cli_stats(socket_path: &str) -> Result<(), String> {
+    let json = send_command(socket_path, &CommandInput::Stats)?;
+    let peers = serde_json::from_str::<Vec<UnifiedTelemetry>>(&json)
+        .map_err(|e| format!("Failed to parse gateway response: {}\nRaw: {}", e, json))?;
+    print_wg_style(&peers);
+    Ok(())
 }
 
-pub fn run_cli_dump(socket_path: &str) {
-    match send_command(socket_path, &CommandInput::Dump) {
-        Ok(json) => println!("{}", json),
-        Err(e) => eprintln!("Error: {}", e),
-    }
+pub fn run_cli_dump(socket_path: &str) -> Result<(), String> {
+    let json = send_command(socket_path, &CommandInput::Dump)?;
+    println!("{}", json);
+    Ok(())
 }
 
 pub fn run_cli_add_peer(
@@ -277,45 +274,46 @@ pub fn run_cli_add_peer(
     allowed_ips: Vec<String>,
     endpoint: Option<String>,
     proxy_port: Option<u16>,
-) {
+) -> Result<(), String> {
     let cmd = CommandInput::AddPeer {
         public_key,
         allowed_ips,
         endpoint,
         proxy_port,
     };
-    match send_command(socket_path, &cmd) {
-        Ok(json) => match serde_json::from_str::<ApiResponse>(&json) {
-            Ok(resp) => {
-                if resp.status.eq_ignore_ascii_case("ok") {
-                    println!("Peer added successfully.");
-                } else {
-                    eprintln!("Failed to add peer: {}", resp.message.unwrap_or_default());
-                }
-            }
-            Err(_) => println!("{}", json),
-        },
-        Err(e) => eprintln!("Error: {}", e),
+    let json = send_command(socket_path, &cmd)?;
+    match serde_json::from_str::<ApiResponse>(&json) {
+        Ok(resp) if resp.status.eq_ignore_ascii_case("ok") => {
+            println!("Peer added successfully.");
+            Ok(())
+        }
+        Ok(resp) => Err(format!(
+            "Failed to add peer: {}",
+            resp.message.unwrap_or_default()
+        )),
+        Err(_) => {
+            println!("{}", json);
+            Ok(())
+        }
     }
 }
 
-pub fn run_cli_remove_peer(socket_path: &str, public_key: String) {
+pub fn run_cli_remove_peer(socket_path: &str, public_key: String) -> Result<(), String> {
     let cmd = CommandInput::RemovePeer { public_key };
-    match send_command(socket_path, &cmd) {
-        Ok(json) => match serde_json::from_str::<ApiResponse>(&json) {
-            Ok(resp) => {
-                if resp.status.eq_ignore_ascii_case("ok") {
-                    println!("Peer removed successfully.");
-                } else {
-                    eprintln!(
-                        "Failed to remove peer: {}",
-                        resp.message.unwrap_or_default()
-                    );
-                }
-            }
-            Err(_) => println!("{}", json),
-        },
-        Err(e) => eprintln!("Error: {}", e),
+    let json = send_command(socket_path, &cmd)?;
+    match serde_json::from_str::<ApiResponse>(&json) {
+        Ok(resp) if resp.status.eq_ignore_ascii_case("ok") => {
+            println!("Peer removed successfully.");
+            Ok(())
+        }
+        Ok(resp) => Err(format!(
+            "Failed to remove peer: {}",
+            resp.message.unwrap_or_default()
+        )),
+        Err(_) => {
+            println!("{}", json);
+            Ok(())
+        }
     }
 }
 
@@ -362,7 +360,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    match args[idx].as_str() {
+    let result = match args[idx].as_str() {
         "show" | "stats" => run_cli_stats(&socket_path),
         "dump" => run_cli_dump(&socket_path),
         "add-peer" => {
@@ -383,19 +381,23 @@ fn main() {
                 allowed_ips,
                 endpoint,
                 proxy_port,
-            );
+            )
         }
         "remove-peer" => {
             if args.len() != idx + 2 {
                 print_usage();
                 std::process::exit(2);
             }
-            run_cli_remove_peer(&socket_path, args[idx + 1].clone());
+            run_cli_remove_peer(&socket_path, args[idx + 1].clone())
         }
         _ => {
             print_usage();
             std::process::exit(2);
         }
+    };
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 }
 
@@ -522,10 +524,10 @@ mod tests {
         thread::sleep(std::time::Duration::from_millis(100));
 
         // 验证 run_cli_stats
-        run_cli_stats(uds_path);
+        run_cli_stats(uds_path).unwrap();
 
         // 验证 run_cli_dump
-        run_cli_dump(uds_path);
+        run_cli_dump(uds_path).unwrap();
 
         // 验证 run_cli_add_peer
         run_cli_add_peer(
@@ -534,13 +536,15 @@ mod tests {
             vec!["10.0.0.99/32".to_string()],
             None,
             None,
-        );
+        )
+        .unwrap();
 
         // 验证 run_cli_remove_peer
         run_cli_remove_peer(
             uds_path,
             "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=".to_string(),
-        );
+        )
+        .unwrap();
 
         let _ = handle.join();
         let _ = std::fs::remove_file(uds_path);

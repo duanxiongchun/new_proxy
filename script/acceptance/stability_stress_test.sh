@@ -14,12 +14,15 @@ ARTIFACT_DIR="${STABILITY_ARTIFACT_DIR:-/tmp/new_proxy_stability_$(date +%Y%m%d_
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 SERVER_CONF="$ARTIFACT_DIR/srv_stab.conf"
 CLIENT_CONF="$ARTIFACT_DIR/cli_stab.conf"
+CLIENT2_CONF="$ARTIFACT_DIR/cli2_stab.conf"
 METRICS="$ARTIFACT_DIR/stability_metrics.jsonl"
 
 SERVER_PID=""
 CLIENT_PID=""
+CLIENT2_PID=""
 TARGET_PID=""
 LONG_PID=""
+LONG2_PID=""
 SHORT_PID=""
 UDP_PID=""
 PING_PID=""
@@ -33,22 +36,26 @@ require_cmd() {
 
 cleanup() {
   set +e
-  for pid in "$SHORT_PID" "$UDP_PID" "$PING_PID" "$LONG_PID" "$CLIENT_PID" "$SERVER_PID" "$TARGET_PID"; do
+  for pid in "$SHORT_PID" "$UDP_PID" "$PING_PID" "$LONG_PID" "$LONG2_PID" "$CLIENT_PID" "$CLIENT2_PID" "$SERVER_PID" "$TARGET_PID"; do
     if [ -n "${pid:-}" ]; then
       kill "$pid" 2>/dev/null
     fi
   done
   sleep 1
-  for pid in "$SHORT_PID" "$UDP_PID" "$PING_PID" "$LONG_PID" "$CLIENT_PID" "$SERVER_PID" "$TARGET_PID"; do
+  for pid in "$SHORT_PID" "$UDP_PID" "$PING_PID" "$LONG_PID" "$LONG2_PID" "$CLIENT_PID" "$CLIENT2_PID" "$SERVER_PID" "$TARGET_PID"; do
     if [ -n "${pid:-}" ]; then
       kill -9 "$pid" 2>/dev/null
     fi
   done
   ip netns delete client1_ns 2>/dev/null || true
+  ip netns delete client1_work_ns 2>/dev/null || true
   ip netns delete client2_ns 2>/dev/null || true
+  ip netns delete client2_work_ns 2>/dev/null || true
+  ip netns delete client3_ns 2>/dev/null || true
+  ip netns delete client4_ns 2>/dev/null || true
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete server_ns 2>/dev/null || true
-  rm -f /run/new_proxy/srv_stab.sock /run/new_proxy/cli_stab.sock /tmp/client_proxy_active /tmp/wg
+  rm -f /run/new_proxy/srv_stab.sock /run/new_proxy/cli_stab.sock /tmp/client_proxy_active /tmp/new_proxy_wg_dump_mock
 }
 trap cleanup EXIT
 
@@ -84,6 +91,20 @@ ListenPorts = 40001, 40002, 40003, 40004
 [Peer]
 PublicKey = 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
 AllowedIPs = 10.0.0.2/32, fd00::2/128
+
+# Client 2: second independent QUIC proxy peer
+[Peer]
+PublicKey = g1WrftphD9z9b0/TX7tGOuqh1C2KpkFgGKC4jB3uz0s=
+AllowedIPs = 10.0.0.4/32
+
+# Client 3/4: WireGuard-only peers; they must not enter any QUIC pool.
+[Peer]
+PublicKey = qv8C4Z9KlAlTjsc73+rRV7ePh6WAD0lr8+gilJwXdiE=
+AllowedIPs = 10.0.0.3/32
+
+[Peer]
+PublicKey = DPvsO0uZuAK43BHWbY9kZvN7ZS2SPL5TcYYpugnXxRw=
+AllowedIPs = 10.0.0.5/32
 EOF_CONF
 
 cat > "$CLIENT_CONF" <<'EOF_CONF'
@@ -101,12 +122,31 @@ ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32, fd00::1/128
 EOF_CONF
 
+cat > "$CLIENT2_CONF" <<'EOF_CONF'
+[Interface]
+PrivateKey = hkUqKGHX5jbtCBUjiAvin8bxzy5JFKviYYJ0coE52Eg=
+Address = 10.0.0.4/24
+TProxyPort = 1080
+MTU = 1400
+Table = off
+
+[Peer]
+PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
+Endpoint = 10.0.2.2:51820
+ProxyPort = 51821
+AllowedIPs = 10.0.0.1/32
+EOF_CONF
+
 echo "=== [1/7] Setting up namespaces ==="
 cleanup
 ip netns add server_ns
 ip netns add router_ns
 ip netns add client1_ns
+ip netns add client1_work_ns
 ip netns add client2_ns
+ip netns add client2_work_ns
+ip netns add client3_ns
+ip netns add client4_ns
 
 # Server <-> Router
 ip link add veth-server type veth peer name veth-router-s
@@ -118,10 +158,28 @@ ip link add veth-client1 type veth peer name veth-router-c1
 ip link set veth-client1 netns client1_ns
 ip link set veth-router-c1 netns router_ns
 
-# Client 2 <-> Router
+# Client 1 workload <-> Client 1 proxy router
+ip link add veth-work type veth peer name veth-client1-w
+ip link set veth-work netns client1_work_ns
+ip link set veth-client1-w netns client1_ns
+
+# Client 2 <-> Router (second QUIC proxy client)
 ip link add veth-client2 type veth peer name veth-router-c2
 ip link set veth-client2 netns client2_ns
 ip link set veth-router-c2 netns router_ns
+
+# Client 2 workload <-> Client 2 proxy router
+ip link add veth-work2 type veth peer name veth-client2-w
+ip link set veth-work2 netns client2_work_ns
+ip link set veth-client2-w netns client2_ns
+
+# Client 3/4 <-> Router (WireGuard-only fallback clients)
+ip link add veth-client3 type veth peer name veth-router-c3
+ip link set veth-client3 netns client3_ns
+ip link set veth-router-c3 netns router_ns
+ip link add veth-client4 type veth peer name veth-router-c4
+ip link set veth-client4 netns client4_ns
+ip link set veth-router-c4 netns router_ns
 
 # Server NS
 ip netns exec server_ns ip addr add 10.0.2.2/24 dev veth-server
@@ -132,45 +190,85 @@ ip netns exec server_ns ip addr add 10.0.0.1/32 dev lo
 # Client 1 NS (Custom Proxy)
 ip netns exec client1_ns ip addr add 10.0.1.2/24 dev veth-client1
 ip netns exec client1_ns ip link set veth-client1 up
+ip netns exec client1_ns ip addr add 10.0.4.1/24 dev veth-client1-w
+ip netns exec client1_ns ip link set veth-client1-w up
 ip netns exec client1_ns ip link set lo up
 ip netns exec client1_ns ip addr add 10.0.0.2/32 dev lo
 
-# Client 2 NS (Standard WG Fallback)
-ip netns exec client2_ns ip addr add 10.0.3.2/24 dev veth-client2
+# Client 1 workload NS. Its TCP traffic enters client1_ns via PREROUTING,
+# so the TPROXY rules below are actually exercised.
+ip netns exec client1_work_ns ip addr add 10.0.4.2/24 dev veth-work
+ip netns exec client1_work_ns ip link set veth-work up
+ip netns exec client1_work_ns ip link set lo up
+ip netns exec client1_work_ns ip route add default via 10.0.4.1
+
+# Client 2 NS (second Custom Proxy)
+ip netns exec client2_ns ip addr add 10.0.5.2/24 dev veth-client2
 ip netns exec client2_ns ip link set veth-client2 up
+ip netns exec client2_ns ip addr add 10.0.8.1/24 dev veth-client2-w
+ip netns exec client2_ns ip link set veth-client2-w up
 ip netns exec client2_ns ip link set lo up
-ip netns exec client2_ns ip addr add 10.0.0.3/32 dev lo
+ip netns exec client2_ns ip addr add 10.0.0.4/32 dev lo
+
+# Client 2 workload NS.
+ip netns exec client2_work_ns ip addr add 10.0.8.2/24 dev veth-work2
+ip netns exec client2_work_ns ip link set veth-work2 up
+ip netns exec client2_work_ns ip link set lo up
+ip netns exec client2_work_ns ip route add default via 10.0.8.1
+
+# Client 3/4 NS (Standard WG-only fallback)
+ip netns exec client3_ns ip addr add 10.0.6.2/24 dev veth-client3
+ip netns exec client3_ns ip link set veth-client3 up
+ip netns exec client3_ns ip link set lo up
+ip netns exec client3_ns ip addr add 10.0.0.3/32 dev lo
+ip netns exec client4_ns ip addr add 10.0.7.2/24 dev veth-client4
+ip netns exec client4_ns ip link set veth-client4 up
+ip netns exec client4_ns ip link set lo up
+ip netns exec client4_ns ip addr add 10.0.0.5/32 dev lo
 
 # Router NS
 ip netns exec router_ns ip addr add 10.0.2.1/24 dev veth-router-s
 ip netns exec router_ns ip link set veth-router-s up
 ip netns exec router_ns ip addr add 10.0.1.1/24 dev veth-router-c1
 ip netns exec router_ns ip link set veth-router-c1 up
-ip netns exec router_ns ip addr add 10.0.3.1/24 dev veth-router-c2
+ip netns exec router_ns ip addr add 10.0.5.1/24 dev veth-router-c2
 ip netns exec router_ns ip link set veth-router-c2 up
+ip netns exec router_ns ip addr add 10.0.6.1/24 dev veth-router-c3
+ip netns exec router_ns ip link set veth-router-c3 up
+ip netns exec router_ns ip addr add 10.0.7.1/24 dev veth-router-c4
+ip netns exec router_ns ip link set veth-router-c4 up
 ip netns exec router_ns ip link set lo up
 
 # Enable IP forwarding
 ip netns exec router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec client1_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
+ip netns exec client2_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # Clients Gateway Routes
 ip netns exec client1_ns ip route add default via 10.0.1.1
 ip netns exec client1_ns ip route add 10.0.0.1/32 via 10.0.1.1
 
-ip netns exec client2_ns ip route add default via 10.0.3.1
-ip netns exec client2_ns ip route add 10.0.0.1/32 via 10.0.3.1
+ip netns exec client2_ns ip route add default via 10.0.5.1
+ip netns exec client2_ns ip route add 10.0.0.1/32 via 10.0.5.1
+ip netns exec client3_ns ip route add default via 10.0.6.1
+ip netns exec client3_ns ip route add 10.0.0.1/32 via 10.0.6.1
+ip netns exec client4_ns ip route add default via 10.0.7.1
+ip netns exec client4_ns ip route add 10.0.0.1/32 via 10.0.7.1
 
 # Server Gateway & Client Routes
 ip netns exec server_ns ip route add default via 10.0.2.1
 ip netns exec server_ns ip route add 10.0.0.2/32 via 10.0.2.1
 ip netns exec server_ns ip route add 10.0.0.3/32 via 10.0.2.1
+ip netns exec server_ns ip route add 10.0.0.4/32 via 10.0.2.1
+ip netns exec server_ns ip route add 10.0.0.5/32 via 10.0.2.1
 ip netns exec server_ns ip route add 10.0.0.1/32 dev lo scope host
 
 # Router Routing Table
 ip netns exec router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec router_ns ip route add 10.0.0.2/32 via 10.0.1.2
-ip netns exec router_ns ip route add 10.0.0.3/32 via 10.0.3.2
+ip netns exec router_ns ip route add 10.0.0.3/32 via 10.0.6.2
+ip netns exec router_ns ip route add 10.0.0.4/32 via 10.0.5.2
+ip netns exec router_ns ip route add 10.0.0.5/32 via 10.0.7.2
 
 # Client 1 TPROXY Interception Setup
 ip netns exec client1_ns ip rule add fwmark 1 lookup 100
@@ -178,41 +276,47 @@ ip netns exec client1_ns ip route add local 0.0.0.0/0 dev lo table 100
 ip netns exec client1_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
 ip netns exec client1_ns iptables -t mangle -A OUTPUT -p tcp -d 10.0.0.1 -j MARK --set-mark 1
 
+# Client 2 TPROXY Interception Setup
+ip netns exec client2_ns ip rule add fwmark 1 lookup 100
+ip netns exec client2_ns ip route add local 0.0.0.0/0 dev lo table 100
+ip netns exec client2_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
+ip netns exec client2_ns iptables -t mangle -A OUTPUT -p tcp -d 10.0.0.1 -j MARK --set-mark 1
+
 echo "=== [2/7] Starting target TCP/UDP server ==="
 ip netns exec server_ns python3 "$ROOT_DIR/script/acceptance/stability_server.py" > "$ARTIFACT_DIR/target_server.log" 2>&1 &
 TARGET_PID=$!
 sleep 1
 
 echo "=== [3/7] Starting server/client proxies with 4 QUIC ports ==="
-# Create Mock wg command to emulate kernel WireGuard dump stats
-cat > /tmp/wg <<'EOF_MOCK_WG'
-#!/usr/bin/env bash
-if [ "$1" = "show" ] && [ "$3" = "dump" ]; then
-    # Client 2 (kernel-only)
-    echo -e "vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=\t(none)\t10.0.3.2:51820\t10.0.0.3/32\t$(date +%s)\t12500\t8400\t(none)"
-    # Client 1 (both / proxy)
-    echo -e "09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=\t(none)\t10.0.1.2:50322\t10.0.0.2/32\t$(date +%s)\t3482\t256\t(none)"
-fi
+now_ts="$(date +%s)"
+cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
+09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
+g1WrftphD9z9b0/TX7tGOuqh1C2KpkFgGKC4jB3uz0s=	(none)	10.0.5.2:50323	10.0.0.4/32	${now_ts}	3482	256	(none)
+qv8C4Z9KlAlTjsc73+rRV7ePh6WAD0lr8+gilJwXdiE=	(none)	10.0.6.2:51820	10.0.0.3/32	${now_ts}	12500	8400	(none)
+DPvsO0uZuAK43BHWbY9kZvN7ZS2SPL5TcYYpugnXxRw=	(none)	10.0.7.2:51820	10.0.0.5/32	${now_ts}	12500	8400	(none)
 EOF_MOCK_WG
-chmod +x /tmp/wg
 
-PATH="/tmp:$PATH" ip netns exec server_ns env PATH="/tmp:$PATH" "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &
+ip netns exec server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 ip netns exec client1_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$ARTIFACT_DIR/client_daemon.log" 2>&1 &
 CLIENT_PID=$!
+ip netns exec client2_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT2_CONF" > "$ARTIFACT_DIR/client2_daemon.log" 2>&1 &
+CLIENT2_PID=$!
 sleep 3
 
 echo "=== [4/7] Verifying initial TCP paths for both clients ==="
 # Direct L3 path (router_ns -> server_ns)
 ip netns exec router_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
-# Standard WG fallback path (client2_ns -> router_ns -> server_ns)
-ip netns exec client2_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
-# QUIC offload path (client1_ns -> TPROXY:1080 -> QUIC pool -> server_ns)
-ip netns exec client1_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
+# Standard WG fallback paths (client3/4_ns -> router_ns -> server_ns)
+ip netns exec client3_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
+ip netns exec client4_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
+# QUIC offload path (client1_work_ns -> client1_ns TPROXY:1080 -> QUIC pool -> server_ns)
+ip netns exec client1_work_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
+ip netns exec client2_work_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
 
 monitor_once() {
-  python3 - "$METRICS" "$SERVER_PID" "$CLIENT_PID" "$START_TS" <<'PY'
+  python3 - "$METRICS" "$SERVER_PID" "$CLIENT_PID" "$CLIENT2_PID" "$START_TS" <<'PY'
 import json
 import os
 import socket
@@ -220,7 +324,7 @@ import subprocess
 import sys
 import time
 
-metrics_path, server_pid, client_pid, start_ts = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+metrics_path, server_pid, client_pid, client2_pid, start_ts = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 
 def proc(pid):
     alive = os.path.exists(f"/proc/{pid}")
@@ -257,6 +361,7 @@ row = {
     "elapsed_seconds": now - start_ts,
     "server": proc(server_pid),
     "client": proc(client_pid),
+    "client2": proc(client2_pid),
     "telemetry": telemetry(),
 }
 with open(metrics_path, "a", encoding="utf-8") as f:
@@ -267,9 +372,16 @@ PY
 short_loop() {
   end=$((START_TS + DURATION))
   while [ "$(date +%s)" -lt "$end" ]; do
-    # QUIC offload path: client1_ns -> TPROXY:1080 -> QUIC pool -> server_ns (MUST exercise this)
+    # QUIC offload paths: two independent proxy peers, each with its own QUIC pool.
     for _ in $(seq 1 "$SHORT_PARALLEL"); do
-      if ip netns exec client1_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
+      if ip netns exec client1_work_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
+        echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
+      else
+        echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
+      fi &
+    done
+    for _ in $(seq 1 "$SHORT_PARALLEL"); do
+      if ip netns exec client2_work_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
         echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
       else
         echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
@@ -283,9 +395,16 @@ short_loop() {
         echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
       fi &
     done
-    # Standard WG fallback path: client2_ns -> router_ns -> server_ns
+    # Standard WG fallback paths: two WG-only peers bypass QUIC entirely.
     for _ in $(seq 1 "$SHORT_PARALLEL"); do
-      if ip netns exec client2_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
+      if ip netns exec client3_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
+        echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
+      else
+        echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
+      fi &
+    done
+    for _ in $(seq 1 "$SHORT_PARALLEL"); do
+      if ip netns exec client4_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
         echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
       else
         echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
@@ -311,7 +430,19 @@ PY
     else
       echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/udp.log"
     fi
-    if ip netns exec client2_ns python3 - <<'PY'
+    if ip netns exec client3_ns python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.sendto(b"stability-udp", ("10.0.2.2", 8081))
+print(s.recvfrom(1024)[0].decode(errors="replace"))
+PY
+    then
+      echo "$(date +%s) OK" >> "$ARTIFACT_DIR/udp.log"
+    else
+      echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/udp.log"
+    fi
+    if ip netns exec client4_ns python3 - <<'PY'
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(2)
@@ -340,16 +471,28 @@ ping_loop() {
     else
       echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/ping.log"
     fi
+    if ip netns exec client3_ns ping -c 1 -W 2 10.0.2.2 >/dev/null; then
+      echo "$(date +%s) OK" >> "$ARTIFACT_DIR/ping.log"
+    else
+      echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/ping.log"
+    fi
+    if ip netns exec client4_ns ping -c 1 -W 2 10.0.2.2 >/dev/null; then
+      echo "$(date +%s) OK" >> "$ARTIFACT_DIR/ping.log"
+    else
+      echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/ping.log"
+    fi
     sleep 2
   done
 }
 
 echo "=== [5/7] Starting background traffic for ${DURATION}s ==="
 START_TS="$(date +%s)"
-# Long TCP MUST run from client1_ns so connections go through TPROXY -> QUIC pool.
+# Long TCP MUST run from client1_work_ns so connections enter client1_ns via PREROUTING and go through TPROXY -> QUIC pool.
 # router_ns traffic bypasses TPROXY and goes directly to server_ns, defeating the test.
-ip netns exec client1_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
+ip netns exec client1_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
 LONG_PID=$!
+ip netns exec client2_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp2_stats.json" > "$ARTIFACT_DIR/long_tcp2.log" 2>&1 &
+LONG2_PID=$!
 short_loop &
 SHORT_PID=$!
 udp_loop > "$ARTIFACT_DIR/udp_loop.log" 2>&1 &
@@ -366,6 +509,7 @@ done
 monitor_once
 
 wait "$LONG_PID" || true
+wait "$LONG2_PID" || true
 wait "$SHORT_PID" || true
 wait "$UDP_PID" || true
 wait "$PING_PID" || true

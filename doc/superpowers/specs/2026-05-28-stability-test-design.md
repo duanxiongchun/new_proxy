@@ -41,7 +41,7 @@
 
 ### 2.1 端口与策略拦截配置
 1. **服务端动态推送**：`server_stability.conf` 配置 `ListenPorts = 40001, 40002, 40003, 40004`。
-2. **控制面交互**：客户端启动后，通过 UDP `51821` 物理控制端口执行 Noise_IK 握手，安全拉取这 4 个端口的清单，并在 20ms 内建立 4 个平行的 QUIC 隧道物理连接。
+2. **控制面交互**：客户端启动后，通过 UDP `51821` 物理控制端口执行 X25519 + HMAC-SHA256 控制面协商，安全拉取这 4 个端口的清单，并建立 4 个平行的 QUIC 隧道物理连接。
 3. **TPROXY 拦截**：在 `client_ns` 中下发 `iptables -t mangle` 拦截目的地址为 `10.0.0.1` (AllowedIP) 的所有 TCP 请求，转发至 `127.0.0.1:1080` (TProxy) 导入 QUIC 连接池分配。
 
 ---
@@ -73,7 +73,7 @@
 
 ## 4. 实时遥测与数据收集
 
-在测试进行期间，由一个轻量级的 `stability_monitor.py` 脚本实现周期性数据采集（每 30 秒一次）：
+在测试进行期间，由 `stability_stress_test.sh` 内置的 `monitor_once` 采样逻辑实现周期性数据采集（默认每 30 秒一次，可通过环境变量调整）：
 
 ### 4.1 核心采集参数
 1. **进程状态**：检查进程是否存在，捕获 Crash 发生时的日志后缀。
@@ -83,7 +83,7 @@
 3. **分层物理遥测**：
    - 使用 `new-proxy-cli dump` 提取服务端与客户端接口统计。
    - 解析出 4 个 QUIC 物理通道各自对应的 `local_port` (`40001` - `40004`)、`rx_bytes`、`tx_bytes` 及 `active_streams`。
-4. **归档路径**：采集到的时间序列数据以 JSON 格式追加记录到 `/tmp/stability_metrics.json` 中。
+4. **归档路径**：采集到的时间序列数据以 JSON Lines 格式追加记录到 artifact 目录的 `stability_metrics.jsonl` 中。
 
 ---
 

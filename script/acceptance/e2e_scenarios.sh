@@ -26,6 +26,8 @@ ip netns delete server_ns 2>/dev/null || true
 rm -f /run/new_proxy/server.sock
 rm -f /run/new_proxy/client.sock
 rm -f /tmp/client_proxy_active
+rm -f /tmp/new_proxy_wg_dump_mock /tmp/scenario_server.conf /tmp/scenario_client.conf
+rm -f /tmp/scenario_server.conf /tmp/scenario_client.conf
 
 # -------------------------------------------------------------------------
 # 1. SETUP NAMESPACES & ROUTING
@@ -113,17 +115,53 @@ echo "  流量路径:"
 echo "  [TCP]      router_ns ──► client_ns:TPROXY:1080 ──► QUIC Pool ──► server_ns:8080"
 echo "  [UDP/ICMP] client_ns ──► router_ns ──► server_ns (L3 native)"
 
-# 激活 mock wg 标志 (供 /tmp/wg 脚本判断 L3 活跃模式)
+# 激活 mock 标志与显式 WireGuard dump fixture
 touch /tmp/client_proxy_active
+now_ts="$(date +%s)"
+cat > /tmp/new_proxy_wg_dump_mock <<EOF_MOCK_WG
+09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=	(none)	10.0.1.2:50322	10.0.0.2/32	${now_ts}	3482	256	(none)
+EOF_MOCK_WG
 
-# 启动 Server Daemon (PATH 包含 /tmp 以使用 mock wg 命令)
-PATH="/tmp:$PATH" ip netns exec server_ns env PATH="/tmp:$PATH" \
-    ./target/debug/new_proxy -config conf/server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
+cat > /tmp/scenario_server.conf <<'EOF_CONF'
+[Interface]
+PrivateKey = 1WL7OPPOABmaRVdjR6JoliATNsjOVFO1bE8gM113POM=
+Address = 10.0.0.1/24
+ListenPort = 51820
+ListenControlPort = 51821
+Table = off
+
+[QUICPool]
+PublicIPv4 = 10.0.2.2
+ListenPorts = 40001, 40002
+
+[Peer]
+PublicKey = 09oeT4J/+NVN39aRL+CNd+N4J8t0vvW2Wc2DLAE5XS4=
+AllowedIPs = 10.0.0.2/32
+EOF_CONF
+
+cat > /tmp/scenario_client.conf <<'EOF_CONF'
+[Interface]
+PrivateKey = etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24=
+Address = 10.0.0.2/24
+TProxyPort = 1080
+MTU = 1400
+Table = off
+
+[Peer]
+PublicKey = vWwaq2WH6+bOvcsFJHRqOhvMoPxBMHkWrug2YfyQ3ho=
+Endpoint = 10.0.2.2:51820
+ProxyPort = 51821
+AllowedIPs = 10.0.0.1/32
+EOF_CONF
+
+# 启动 Server Daemon
+ip netns exec server_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 \
+    ./target/debug/new_proxy -config /tmp/scenario_server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 # 启动 Client Daemon (含 TPROXY 监听)
-ip netns exec client_ns ./target/debug/new_proxy -config conf/client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
+ip netns exec client_ns env NEW_PROXY_WG_MOCK_DUMP=/tmp/new_proxy_wg_dump_mock NEW_PROXY_WG_SKIP_KERNEL_SYNC=1 ./target/debug/new_proxy -config /tmp/scenario_client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
 CLIENT_PID=$!
 sleep 2
 
@@ -152,11 +190,11 @@ sleep 1
 
 echo ""
 echo "  >> 从网关拉取聚合遥测 (L3 WAN + L4 QUIC 分层):"
-ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show
 
 echo ""
 echo "  预期结果:"
-echo "  L3 Transfer: 显示 WireGuard 控制面 UDP 流量 (mock wg 数据)"
+echo "  L3 Transfer: 显示 WireGuard 控制面 UDP 流量 (mock kernel dump 数据)"
 echo "  L4 Transfer: 显示 QUIC 卸载的 TCP 字节 (应 > 0)"
 echo "  Active Strm: TCP 完成后应为 0 (连接已关闭)"
 
@@ -169,16 +207,16 @@ echo "=== [4/5] SCENARIO 2: Dynamic Peer Management (Hot-Add/Remove Peer) ==="
 NEW_PEER_KEY="etewwnbYf1Zk8wnouPD/qbVWQpP9xW61CeNZ4JCXo24="
 
 echo "  A. 动态新增 Peer..."
-ip netns exec server_ns ./target/debug/new-proxy-cli --interface server add-peer "$NEW_PEER_KEY" "10.0.0.99/32"
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server add-peer "$NEW_PEER_KEY" "10.0.0.99/32"
 
 echo "  B. 验证 Peer 添加后遥测表 (应出现新 peer 行):"
-ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show
 
 echo "  C. 动态删除 Peer..."
-ip netns exec server_ns ./target/debug/new-proxy-cli --interface server remove-peer "$NEW_PEER_KEY"
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server remove-peer "$NEW_PEER_KEY"
 
 echo "  D. 验证 Peer 删除后遥测表 (应只剩原始 peer):"
-ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show
 
 # -------------------------------------------------------------------------
 # 5. SCENARIO 3: WIREGUARD L3 FALLBACK (无 QUIC 代理, 纯 L3)
@@ -217,11 +255,11 @@ sleep 1
 
 echo ""
 echo "  >> 从网关拉取回退模式遥测:"
-ip netns exec server_ns ./target/debug/new-proxy-cli --interface server show
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show
 
 echo ""
 echo "  预期结果:"
-echo "  L3 Transfer: 增加 (mock wg 显示全量 L3 流量)"
+echo "  L3 Transfer: 增加 (mock kernel dump 显示全量 L3 流量)"
 echo "  L4 Transfer: 保持 0 B (QUIC 完全未使用)"
 echo "  Active Strm: 0 (无 QUIC 流)"
 

@@ -31,7 +31,6 @@ socket2 = { version = "0.5", features = ["all"] }
 
 # 高性能 CIDR 基数树路由检索
 ipnet = "2.9"
-ip_network_table = "0.2"
 
 # 基础运行期支撑
 rand = "0.8"

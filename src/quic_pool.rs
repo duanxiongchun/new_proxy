@@ -2,9 +2,10 @@ use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
 use rand::Rng;
 use rustls::client::ServerCertVerified;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -117,19 +118,29 @@ pub struct QuicConnSnapshot {
     pub active_streams: u64,
 }
 
-// 自定义 Dummy 证书验证器以支持 TLS 零证书配置
-struct DummyVerifier;
-impl rustls::client::ServerCertVerifier for DummyVerifier {
+// 控制面通过已认证 HMAC 响应下发 QUIC 证书指纹；数据面只接受该证书。
+struct PinnedCertVerifier {
+    expected_sha256: [u8; 32],
+}
+
+impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
+        end_entity: &rustls::Certificate,
         _intermediates: &[rustls::Certificate],
         _server_name: &rustls::ServerName,
         _scts: &mut dyn Iterator<Item = &[u8]>,
         _ocsp_response: &[u8],
         _now: std::time::SystemTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
+        let digest = Sha256::digest(&end_entity.0);
+        if digest.as_slice() == self.expected_sha256 {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "pinned QUIC certificate fingerprint mismatch".to_string(),
+            ))
+        }
     }
 }
 
@@ -143,14 +154,26 @@ pub fn generate_self_signed_cert() -> Result<(Vec<rustls::Certificate>, rustls::
     Ok((vec![cert_der], key))
 }
 
+pub fn cert_sha256(certs: &[rustls::Certificate]) -> Result<[u8; 32], String> {
+    let cert = certs
+        .first()
+        .ok_or_else(|| "QUIC certificate chain is empty".to_string())?;
+    let digest = Sha256::digest(&cert.0);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
 // 2. 客户端 QUIC 物理连接池
 pub struct QuicPoolClient {
     client_public_key: [u8; 32],
     session_psk: [u8; 32],
+    server_cert_sha256: [u8; 32],
     endpoints: Vec<SocketAddr>,
     slots: Arc<Mutex<Vec<PoolSlot>>>,
     rr_index: Arc<Mutex<usize>>,
     endpoint: Arc<Mutex<Option<Endpoint>>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -164,15 +187,31 @@ impl QuicPoolClient {
     pub fn new(
         client_public_key: [u8; 32],
         session_psk: [u8; 32],
+        server_cert_sha256: [u8; 32],
         endpoints: Vec<SocketAddr>,
     ) -> Self {
         Self {
             client_public_key,
             session_psk,
+            server_cert_sha256,
             endpoints,
             slots: Arc::new(Mutex::new(Vec::new())),
             rr_index: Arc::new(Mutex::new(0)),
             endpoint: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn shutdown(&self, reason: &'static [u8]) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        {
+            let slots = self.slots.lock().unwrap();
+            for slot in slots.iter() {
+                slot.conn.close(0u32.into(), reason);
+            }
+        }
+        if let Some(endpoint) = self.endpoint.lock().unwrap().as_ref() {
+            endpoint.close(0u32.into(), reason);
         }
     }
 
@@ -185,7 +224,9 @@ impl QuicPoolClient {
         // 配置 0 证书验证的客户端配置
         let mut rustls_config = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_custom_certificate_verifier(Arc::new(DummyVerifier))
+            .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
+                expected_sha256: self.server_cert_sha256,
+            }))
             .with_no_client_auth();
 
         // 开启 ALPN
@@ -407,6 +448,9 @@ impl QuicPoolClient {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                if self.shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 let (endpoints, endpoint_opt) = {
                     let ep = self.endpoint.lock().unwrap();
@@ -566,11 +610,11 @@ impl QuicPoolServer {
     // 启动服务端 QUIC 引擎（使用外部传入的 registry，用于与 UDS 层共享统计数据）
     pub async fn run_with_registry(
         self,
+        certs: Vec<rustls::Certificate>,
+        key: rustls::PrivateKey,
         handler: StreamHandler,
         external_registry: PeerConnRegistry,
     ) -> Result<(), String> {
-        let (certs, key) = generate_self_signed_cert()?;
-
         let mut rustls_config = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
@@ -690,27 +734,34 @@ impl QuicPoolServer {
                         };
 
                         // 查找临时协商的 PSK 缓存
-                        let authenticated = {
+                        let authenticated_psk = {
                             let cache = session_cache.lock().unwrap();
                             if let Some(psk) = cache.get(&auth_packet.client_public_key) {
-                                crate::control::verify_mac(
+                                if crate::control::verify_mac(
                                     psk,
                                     &auth_packet.nonce,
                                     &auth_packet.mac,
-                                )
+                                ) {
+                                    Some(*psk)
+                                } else {
+                                    None
+                                }
                             } else {
-                                false
+                                None
                             }
                         };
 
-                        if !authenticated {
-                            log::warn!(
-                                "PSK Authentication FAILED for QUIC connection from {}",
-                                remote_addr
-                            );
-                            conn.close(0u32.into(), b"Auth failed");
-                            return;
-                        }
+                        let connection_psk = match authenticated_psk {
+                            Some(psk) => psk,
+                            None => {
+                                log::warn!(
+                                    "PSK Authentication FAILED for QUIC connection from {}",
+                                    remote_addr
+                                );
+                                conn.close(0u32.into(), b"Auth failed");
+                                return;
+                            }
+                        };
 
                         {
                             let mut cache = auth_nonce_cache.lock().unwrap();
@@ -758,14 +809,17 @@ impl QuicPoolServer {
                         while let Ok((send_mux, recv_mux)) = conn.accept_bi().await {
                             let still_authorized = {
                                 let cache = session_cache.lock().unwrap();
-                                cache.contains_key(&client_pub_key)
+                                cache
+                                    .get(&client_pub_key)
+                                    .map(|psk| *psk == connection_psk)
+                                    .unwrap_or(false)
                             };
                             if !still_authorized {
                                 log::warn!(
-                                    "Closing QUIC connection from removed peer {:?}",
+                                    "Closing QUIC connection from removed or rotated peer {:?}",
                                     client_pub_key
                                 );
-                                conn.close(0u32.into(), b"Peer removed");
+                                conn.close(0u32.into(), b"Peer removed or session rotated");
                                 break;
                             }
                             let handler = handler.clone();
@@ -810,6 +864,16 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
+    async fn test_quic_pool_rejects_empty_endpoint_pool() {
+        let client = QuicPoolClient::new([1u8; 32], [2u8; 32], [3u8; 32], Vec::new());
+
+        assert_eq!(
+            client.start_pool().await.unwrap_err(),
+            "Empty endpoints pool"
+        );
+    }
+
+    #[tokio::test]
     async fn test_quic_pool_client_server_integration() {
         // 1. 获取一个闲置的本地 UDP 端口
         let port = {
@@ -830,6 +894,8 @@ mod tests {
 
         let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
         let server = QuicPoolServer::new(vec![port], session_cache.clone(), auth_nonce_cache);
+        let (certs, key) = generate_self_signed_cert().unwrap();
+        let cert_fingerprint = cert_sha256(&certs).unwrap();
 
         // 3. 服务端流处理逻辑 (Echo 服务)
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
@@ -857,13 +923,22 @@ mod tests {
         );
 
         server
-            .run_with_registry(handler, peer_registry.clone())
+            .run_with_registry(certs, key, handler, peer_registry.clone())
             .await
             .unwrap();
 
         // 4. 初始化客户端并连接
         let server_addr = format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap();
-        let client = QuicPoolClient::new(client_pub_key, session_psk, vec![server_addr]);
+        let bad_client =
+            QuicPoolClient::new(client_pub_key, session_psk, [0u8; 32], vec![server_addr]);
+        assert!(bad_client.start_pool().await.is_err());
+
+        let client = QuicPoolClient::new(
+            client_pub_key,
+            session_psk,
+            cert_fingerprint,
+            vec![server_addr],
+        );
         client.start_pool().await.unwrap();
 
         // 5. 验证 open_mux_stream 并进行双向数据交互

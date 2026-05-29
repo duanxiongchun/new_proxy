@@ -1,12 +1,16 @@
 # new_proxy
 
-`new_proxy` 是一个高性能混合多协议安全代理网关。它将 WireGuard 风格的 L3 通道和用户态 QUIC L4 多路复用通道组合起来：UDP、ICMP 等三层流量走内核态 L3 通道，TCP 流量通过 TPROXY 拦截后走用户态 QUIC 连接池，从而规避 TCP-over-VPN 的队头阻塞问题。## 主要功能
+`new_proxy` 是一个高性能混合多协议安全代理网关。它将系统 WireGuard L3 通道和用户态 QUIC L4 多路复用通道组合起来：UDP、ICMP 等三层流量走内核态 L3 通道，TCP 流量通过 TPROXY 拦截后走用户态 QUIC 连接池，从而规避 TCP-over-VPN 的队头阻塞问题。
+
+## 主要功能
 
 - **双轨数据面**：L3 WireGuard 风格通道承载 UDP/ICMP，L4 QUIC 多路复用通道承载 TCP。
 - **TPROXY 透明拦截**：客户端按 `AllowedIPs` 判断 TCP 目的地址，命中后透明导入 QUIC 池。
 - **多物理 QUIC 连接池**：服务端可配置多个 UDP 端口，客户端自动建立并轮询分流。
-- **对等密钥认证**：复用 WireGuard 密钥材料进行用户态控制面协商。
-- **双向自适应互补同步**：当 `new-proxy-cli` 与内核 `wg` 配置不一致时，自动双向补全对等体配置（热重建 AllowedIPs 路由树并生成 Noise_IK 共享密钥对），提供 `"both"`, `"kernel"`, `"proxy"` 预同步前置源诊断标识。
+- **对等密钥认证**：复用 WireGuard 密钥材料，通过 X25519 shared secret 和 HMAC-SHA256 进行用户态控制面协商。
+- **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端只接受该指纹对应证书。
+- **多 Peer 客户端**：客户端可同时配置多个 QUIC proxy peer，也可混合 WireGuard-only peer。
+- **来源诊断**：遥测输出提供 `"both"`, `"kernel"`, `"proxy"` source 标识，用于判断 peer 在用户态配置和内核 WireGuard 状态中的分布关系。
 - **聚合遥测**：通过 `new-proxy-cli` 查看 L3/L4 合并统计、QUIC 物理连接统计和活跃流数量，并直接输出 `source` 同步溯源字段。
 - **动态 Peer 管理**：运行期支持通过 CLI 添加和删除 Peer。
 
@@ -115,7 +119,7 @@ sudo target/release/new_proxy -config conf/server.conf
 
 ### 客户端配置
 
-客户端需要配置本地 TPROXY 端口、服务端 endpoint、控制面端口和目标 `AllowedIPs`：
+客户端的 QUIC proxy peer 需要配置本地 TPROXY 端口、服务端 endpoint、控制面端口和目标 `AllowedIPs`：
 
 ```ini
 [Interface]
@@ -141,6 +145,8 @@ sudo target/release/new_proxy -config conf/client.conf
 ```
 
 同样，`conf/client.conf` 会使用接口名 `client`；需要兼容现有 `tun0` 路由/脚本时，请使用 `tun0.conf`。
+
+客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint` 和 `ProxyPort`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，`Endpoint` 和 `ProxyPort` 必须同时存在。
 
 ### TPROXY 路由规则
 

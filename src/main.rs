@@ -4,6 +4,7 @@ mod quic_pool;
 mod relay;
 mod routing;
 mod tproxy;
+mod wireguard;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -18,9 +19,14 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use config::{decode_base64_32, GatewayConfig};
 use control::{ControlClient, ControlServer};
-use quic_pool::{QuicConnSnapshot, QuicPoolClient, QuicPoolServer};
+use quic_pool::{
+    cert_sha256, generate_self_signed_cert, QuicConnSnapshot, QuicPoolClient, QuicPoolServer,
+};
 use relay::PeerL4Stats;
 use routing::AllowedIPsRouter;
+use wireguard::{get_wg_dump_stats, remove_peer_from_kernel, sync_peer_to_kernel, WgPeerStats};
+
+type PeerQuicPools = Arc<std::sync::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
 
 // 统一的 L3/L4 遥测聚合数据结构 (用于 CLI 输出与 UDS JSON 传递)
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -39,15 +45,6 @@ pub struct UnifiedTelemetry {
     // 每条物理 QUIC 连接的独立统计（无代理时为空）
     pub quic_connections: Vec<QuicConnSnapshot>,
     pub source: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct WgPeerStats {
-    pub allowed_ips: Vec<String>,
-    pub endpoint: Option<String>,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
-    pub last_handshake: u64,
 }
 
 // Unix Domain Socket API 请求指令结构 (支持 CLI 动态管理)
@@ -207,68 +204,9 @@ pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Resul
     Ok(SocketAddr::new(ip, port))
 }
 
-// 通过内核 WireGuard 命令行工具按需拉取 L3 流量统计
-pub async fn get_wg_dump_stats(interface: &str) -> Result<HashMap<[u8; 32], WgPeerStats>, String> {
-    let interface = interface.to_string();
-    tokio::task::spawn_blocking(move || get_wg_dump_stats_blocking(&interface))
-        .await
-        .map_err(|e| format!("Failed to join wg dump worker: {}", e))?
-}
-
-fn get_wg_dump_stats_blocking(interface: &str) -> Result<HashMap<[u8; 32], WgPeerStats>, String> {
-    let output = match std::process::Command::new("wg")
-        .args(["show", interface, "dump"])
-        .output()
-    {
-        Ok(out) => out,
-        Err(_) => return Ok(HashMap::new()), // 优雅降级：若系统未安装 wg CLI，则返回空指标
-    };
-
-    if !output.status.success() {
-        return Ok(HashMap::new());
-    }
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let mut stats = HashMap::new();
-
-    for line in stdout_str.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 8 {
-            let peer_pub_b64 = parts[0];
-            let endpoint = if parts[2] == "(none)" || parts[2].is_empty() {
-                None
-            } else {
-                Some(parts[2].to_string())
-            };
-            let allowed_ips = if parts[3] == "(none)" || parts[3].is_empty() {
-                Vec::new()
-            } else {
-                parts[3].split(',').map(|s| s.trim().to_string()).collect()
-            };
-            let latest_handshake: u64 = parts[4].parse().unwrap_or(0);
-            let rx_bytes: u64 = parts[5].parse().unwrap_or(0);
-            let tx_bytes: u64 = parts[6].parse().unwrap_or(0);
-
-            if let Ok(pub_key) = decode_base64_32(peer_pub_b64) {
-                stats.insert(
-                    pub_key,
-                    WgPeerStats {
-                        allowed_ips,
-                        endpoint,
-                        rx_bytes,
-                        tx_bytes,
-                        last_handshake: latest_handshake,
-                    },
-                );
-            }
-        }
-    }
-    Ok(stats)
-}
-
 async fn run_tproxy_accept_loop(
     listener: TcpListener,
-    quic_pool: Arc<QuicPoolClient>,
+    quic_pools: PeerQuicPools,
     state: Arc<std::sync::RwLock<GatewayState>>,
     telemetry: Arc<TelemetryRegistry>,
     connection_limit: Arc<tokio::sync::Semaphore>,
@@ -281,12 +219,12 @@ async fn run_tproxy_accept_loop(
                 continue;
             }
         };
-        let quic_pool = quic_pool.clone();
+        let quic_pools = quic_pools.clone();
         let state = state.clone();
         let telemetry = telemetry.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            handle_tproxy_connection(tcp_socket, src_addr, quic_pool, state, telemetry).await;
+            handle_tproxy_connection(tcp_socket, src_addr, quic_pools, state, telemetry).await;
         });
     }
 }
@@ -294,7 +232,7 @@ async fn run_tproxy_accept_loop(
 async fn handle_tproxy_connection(
     tcp_socket: TcpStream,
     src_addr: SocketAddr,
-    quic_pool: Arc<QuicPoolClient>,
+    quic_pools: PeerQuicPools,
     state: Arc<std::sync::RwLock<GatewayState>>,
     telemetry: Arc<TelemetryRegistry>,
 ) {
@@ -319,6 +257,20 @@ async fn handle_tproxy_connection(
     };
 
     if let Some(peer_pub_key) = matched_peer {
+        let quic_pool = {
+            let pools = quic_pools.read().unwrap();
+            pools.get(&peer_pub_key).cloned()
+        };
+        let Some(quic_pool) = quic_pool else {
+            log::warn!(
+                "AllowedIPs matched peer {}, but no QUIC pool exists; dropping {} -> {}",
+                encode_base64_32(&peer_pub_key),
+                src_addr,
+                original_dst
+            );
+            return;
+        };
+
         log::info!(
             "Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.",
             src_addr,
@@ -399,8 +351,8 @@ async fn wait_for_shutdown() {
     log::info!("Received CTRL+C, shutting down...");
 }
 
-const MAX_TPROXY_CONNECTIONS: usize = 8192;
-const MAX_QUIC_STREAM_HANDLERS: usize = 65536;
+const MAX_TPROXY_CONNECTIONS: usize = 4096;
+const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
 const MAX_UDS_CLIENTS: usize = 1024;
 
 fn interface_name_from_config_path(config_path: &str) -> Result<String, String> {
@@ -458,15 +410,21 @@ fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, String>
     if config.peers.is_empty() {
         return Err("Invalid client config: at least one [Peer] is required".to_string());
     }
-    let peer = &config.peers[0];
-    if peer.endpoint.is_none() {
-        return Err("Invalid client config: first peer must define Endpoint".to_string());
+    let mut proxy_peer_count = 0;
+    for peer in &config.peers {
+        match (peer.endpoint, peer.proxy_port) {
+            (Some(_), Some(_)) => proxy_peer_count += 1,
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "Invalid client config: peer {} must define both Endpoint and ProxyPort for QUIC offload, or neither for WireGuard-only mode",
+                    encode_base64_32(&peer.public_key)
+                ));
+            }
+        }
     }
-    if peer.proxy_port.is_none() {
-        return Err("Invalid client config: first peer must define ProxyPort".to_string());
-    }
-    if config.interface.tproxy_port.is_none() {
-        return Err("Invalid client config: TProxyPort is required".to_string());
+    if proxy_peer_count > 0 && config.interface.tproxy_port.is_none() {
+        return Err("Invalid client config: TProxyPort is required when any peer defines Endpoint/ProxyPort".to_string());
     }
     Ok(RuntimeMode::Client)
 }
@@ -495,6 +453,20 @@ fn validate_gateway_config(config: &GatewayConfig) -> Result<RuntimeMode, String
         }
     }
     determine_runtime_mode(config)
+}
+
+fn peer_has_l4_proxy(peer: &config::PeerConfig) -> bool {
+    peer.endpoint.is_some() && peer.proxy_port.is_some()
+}
+
+fn rebuild_l4_router(peers: &[config::PeerConfig]) -> AllowedIPsRouter<[u8; 32]> {
+    let mut router = AllowedIPsRouter::new();
+    for peer in peers.iter().filter(|peer| peer_has_l4_proxy(peer)) {
+        for &allowed_ip in &peer.allowed_ips {
+            router.insert(allowed_ip, peer.public_key);
+        }
+    }
+    router
 }
 
 fn telemetry_sources(
@@ -535,6 +507,43 @@ fn select_quic_endpoint_ip(
             .map_err(|e| format!("Invalid server PublicIPv4 '{}': {}", public_ipv4, e));
     }
     Ok(fallback_endpoint.ip())
+}
+
+async fn build_peer_quic_pool(
+    private_key: [u8; 32],
+    peer: &config::PeerConfig,
+) -> Result<Arc<QuicPoolClient>, String> {
+    let endpoint = peer
+        .endpoint
+        .ok_or_else(|| "proxy peer is missing Endpoint".to_string())?;
+    let proxy_port = peer
+        .proxy_port
+        .ok_or_else(|| "proxy peer is missing ProxyPort".to_string())?;
+    let control_addr = SocketAddr::new(endpoint.ip(), proxy_port);
+    let control_client = ControlClient::new(private_key, peer.public_key, control_addr);
+
+    log::info!(
+        "Initiating userspace ECDH + HMAC-SHA256 control handshake for peer {} to {}",
+        encode_base64_32(&peer.public_key),
+        control_addr
+    );
+    let (control_response, _control_socket) = control_client.negotiate_config().await?;
+    let quic_endpoint_ip = select_quic_endpoint_ip(&control_response, endpoint)?;
+    let quic_endpoints = control_response
+        .port_pool
+        .iter()
+        .map(|&port| SocketAddr::new(quic_endpoint_ip, port))
+        .collect::<Vec<_>>();
+    let client_pub_derived = PublicKey::from(&StaticSecret::from(private_key)).to_bytes();
+    let quic_pool_client = Arc::new(QuicPoolClient::new(
+        client_pub_derived,
+        control_response.session_psk,
+        control_response.quic_cert_sha256,
+        quic_endpoints,
+    ));
+    quic_pool_client.start_pool().await?;
+    quic_pool_client.clone().start_health_checker();
+    Ok(quic_pool_client)
 }
 
 fn instance_routing_ids(interface_name: &str) -> (u32, u32) {
@@ -866,7 +875,7 @@ fn setup_peer_routes_and_tproxy(
                 ],
             )?;
         }
-        if let Some(port) = tproxy_port {
+        if let Some(port) = tproxy_port.filter(|_| peer_has_l4_proxy(peer)) {
             ensure_tproxy_rule(*allowed_ip, port, &mark_spec)?;
             let _ = ensure_mss_clamp_rule(*allowed_ip);
         }
@@ -1113,7 +1122,7 @@ fn cleanup_peer_routes_and_tproxy(
     let mark_spec = format!("{:#x}/0xffffffff", fwmark);
     let mut errors = Vec::new();
     for allowed_ip in &peer.allowed_ips {
-        if let Some(port) = tproxy_port {
+        if let Some(port) = tproxy_port.filter(|_| peer_has_l4_proxy(peer)) {
             let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
                 ("iptables", "0.0.0.0")
             } else {
@@ -1201,42 +1210,6 @@ fn cleanup_peer_routes_and_tproxy(
     }
 }
 
-fn sync_peer_to_kernel(interface_name: &str, peer: &config::PeerConfig) -> Result<(), String> {
-    let pub_key_b64 = encode_base64_32(&peer.public_key);
-    let allowed_ips_str = peer
-        .allowed_ips
-        .iter()
-        .map(|ip| ip.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut args = vec![
-        "set".to_string(),
-        interface_name.to_string(),
-        "peer".to_string(),
-        pub_key_b64,
-        "allowed-ips".to_string(),
-        allowed_ips_str,
-    ];
-    if let Some(endpoint) = peer.endpoint {
-        args.push("endpoint".to_string());
-        args.push(endpoint.to_string());
-    }
-    run_command_checked("wg", &args)
-}
-
-fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) -> Result<(), String> {
-    run_command_checked(
-        "wg",
-        &[
-            "set".to_string(),
-            interface_name.to_string(),
-            "peer".to_string(),
-            encode_base64_32(&pub_key),
-            "remove".to_string(),
-        ],
-    )
-}
-
 #[cfg(test)]
 async fn sync_kernel_and_proxy_state(
     interface_name: &str,
@@ -1305,16 +1278,9 @@ async fn sync_kernel_and_proxy_state(
                 public_key: pub_key,
                 allowed_ips: parsed_allowed_ips,
                 endpoint: parsed_endpoint,
-                proxy_port: Some(51821),
+                proxy_port: None,
             });
-            // Hot-rebuild allowed IPs Trie router
-            let mut new_router = AllowedIPsRouter::new();
-            for p in &st.config.peers {
-                for &allowed_ip in &p.allowed_ips {
-                    new_router.insert(allowed_ip, p.public_key);
-                }
-            }
-            st.router = new_router;
+            st.router = rebuild_l4_router(&st.config.peers);
         }
     }
 
@@ -1391,12 +1357,7 @@ async fn main() {
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
 
-    let mut initial_router = AllowedIPsRouter::new();
-    for peer in &config.peers {
-        for &allowed_ip in &peer.allowed_ips {
-            initial_router.insert(allowed_ip, peer.public_key);
-        }
-    }
+    let initial_router = rebuild_l4_router(&config.peers);
 
     let gateway_state = Arc::new(std::sync::RwLock::new(GatewayState {
         config: config.clone(),
@@ -1473,6 +1434,7 @@ async fn main() {
     // - client 模式下不使用，始终为空
     let shared_quic_registry: quic_pool::PeerConnRegistry =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let client_quic_pools: PeerQuicPools = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
     if let Some(uds) = uds_listener {
         let telemetry_clone = telemetry_registry.clone();
@@ -1483,6 +1445,9 @@ async fn main() {
         let interface_name_clone = interface_name.clone();
         let session_cache_clone = session_cache.clone();
         let auth_nonce_cache_clone = auth_nonce_cache.clone();
+        let client_quic_pools_clone = client_quic_pools.clone();
+        let client_private_key = config.interface.private_key;
+        let uds_runtime_mode = runtime_mode;
 
         tokio::spawn(async move {
             let uds_client_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UDS_CLIENTS));
@@ -1507,6 +1472,7 @@ async fn main() {
                 let interface_name = interface_name_clone.clone();
                 let session_cache = session_cache_clone.clone();
                 let auth_nonce_cache = auth_nonce_cache_clone.clone();
+                let client_quic_pools = client_quic_pools_clone.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -1598,7 +1564,7 @@ async fn main() {
                                     seen.insert(pub_key);
                                 }
 
-                                // 标准 WireGuard 客户端可能只存在于内核 wg dump 中，没有 QUIC 代理运行态。
+                                // 标准 WireGuard 客户端可能只存在于内核 WireGuard 状态中，没有 QUIC 代理运行态。
                                 for (pub_key, wg_stats) in &l3_stats {
                                     if seen.contains(pub_key) {
                                         continue;
@@ -1640,7 +1606,7 @@ async fn main() {
                                     seen.insert(*pub_key);
                                 }
 
-                                // 极端情况下 QUIC registry 里存在已认证连接，但该 peer 不在配置或 wg dump 中，也要展示。
+                                // 极端情况下 QUIC registry 里存在已认证连接，但该 peer 不在配置或内核状态中，也要展示。
                                 for pub_key in quic_registry.keys() {
                                     if seen.contains(pub_key) {
                                         continue;
@@ -1817,6 +1783,58 @@ async fn main() {
                                         .cloned(),
                                 )
                             };
+                            if uds_runtime_mode == RuntimeMode::Client {
+                                match (new_peer.endpoint, new_peer.proxy_port) {
+                                    (Some(_), Some(_)) => {}
+                                    (None, None) => {}
+                                    _ => {
+                                        let resp = ApiResponse {
+                                            status: "Error".to_string(),
+                                            message: Some(
+                                                "Endpoint and ProxyPort must be provided together for client QUIC offload"
+                                                    .to_string(),
+                                            ),
+                                        };
+                                        let _ = write_uds_json(&mut stream, &resp, framed_response)
+                                            .await;
+                                        return;
+                                    }
+                                }
+                                if peer_has_l4_proxy(&new_peer) && tproxy_port.is_none() {
+                                    let resp = ApiResponse {
+                                        status: "Error".to_string(),
+                                        message: Some(
+                                            "TProxyPort is required before adding a QUIC proxy peer"
+                                                .to_string(),
+                                        ),
+                                    };
+                                    let _ =
+                                        write_uds_json(&mut stream, &resp, framed_response).await;
+                                    return;
+                                }
+                            }
+
+                            let prepared_client_pool = if uds_runtime_mode == RuntimeMode::Client
+                                && peer_has_l4_proxy(&new_peer)
+                            {
+                                match build_peer_quic_pool(client_private_key, &new_peer).await {
+                                    Ok(pool) => Some(pool),
+                                    Err(e) => {
+                                        let resp = ApiResponse {
+                                            status: "Error".to_string(),
+                                            message: Some(format!(
+                                                "Failed to establish QUIC pool for peer: {}",
+                                                e
+                                            )),
+                                        };
+                                        let _ = write_uds_json(&mut stream, &resp, framed_response)
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             if !table_off {
                                 if let Some(peer) = old_peer.clone() {
                                     let interface_name = interface_name.clone();
@@ -1843,6 +1861,9 @@ async fn main() {
                                 })
                                 .await;
                                 if let Err(e) = setup_result {
+                                    if let Some(pool) = prepared_client_pool.as_ref() {
+                                        pool.shutdown(b"Peer route setup failed");
+                                    }
                                     let new_peer_for_cleanup = new_peer.clone();
                                     let interface_name_for_cleanup = interface_name.clone();
                                     let _ = run_blocking_command(move || {
@@ -1887,6 +1908,9 @@ async fn main() {
                             })
                             .await
                             {
+                                if let Some(pool) = prepared_client_pool.as_ref() {
+                                    pool.shutdown(b"Peer kernel sync failed");
+                                }
                                 if !table_off {
                                     let new_peer_for_cleanup = new_peer.clone();
                                     let interface_name_for_cleanup = interface_name.clone();
@@ -1932,14 +1956,20 @@ async fn main() {
                                 let mut st = state.write().unwrap();
                                 st.config.peers.retain(|p| p.public_key != parsed_pub_key);
                                 st.config.peers.push(new_peer);
-                                // 热重构 Trie
-                                let mut new_router = AllowedIPsRouter::new();
-                                for p in &st.config.peers {
-                                    for &allowed_ip in &p.allowed_ips {
-                                        new_router.insert(allowed_ip, p.public_key);
+                                st.router = rebuild_l4_router(&st.config.peers);
+                            }
+                            if uds_runtime_mode == RuntimeMode::Client {
+                                let old_pool = {
+                                    let mut pools = client_quic_pools.write().unwrap();
+                                    if let Some(pool) = prepared_client_pool {
+                                        pools.insert(parsed_pub_key, pool)
+                                    } else {
+                                        pools.remove(&parsed_pub_key)
                                     }
+                                };
+                                if let Some(pool) = old_pool {
+                                    pool.shutdown(b"Peer replaced");
                                 }
-                                st.router = new_router;
                             }
 
                             let resp = ApiResponse {
@@ -1983,6 +2013,13 @@ async fn main() {
                             peer_secrets.write().unwrap().remove(&parsed_pub_key);
                             session_cache.lock().unwrap().remove(&parsed_pub_key);
                             auth_nonce_cache.lock().unwrap().remove(&parsed_pub_key);
+                            if uds_runtime_mode == RuntimeMode::Client {
+                                if let Some(pool) =
+                                    client_quic_pools.write().unwrap().remove(&parsed_pub_key)
+                                {
+                                    pool.shutdown(b"Peer removed");
+                                }
+                            }
                             if let Some(conns) =
                                 shared_quic_registry.lock().unwrap().remove(&parsed_pub_key)
                             {
@@ -1994,13 +2031,7 @@ async fn main() {
                             {
                                 let mut st = state.write().unwrap();
                                 st.config.peers.retain(|p| p.public_key != parsed_pub_key);
-                                let mut new_router = AllowedIPsRouter::new();
-                                for p in &st.config.peers {
-                                    for &allowed_ip in &p.allowed_ips {
-                                        new_router.insert(allowed_ip, p.public_key);
-                                    }
-                                }
-                                st.router = new_router;
+                                st.router = rebuild_l4_router(&st.config.peers);
                             }
 
                             let mut remove_errors = Vec::new();
@@ -2062,6 +2093,25 @@ async fn main() {
             std::process::exit(1);
         };
 
+        let (quic_certs, quic_key) = match generate_self_signed_cert() {
+            Ok(cert) => cert,
+            Err(e) => {
+                log::error!("Failed to generate QUIC certificate: {}", e);
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+        let quic_cert_sha256 = match cert_sha256(&quic_certs) {
+            Ok(fingerprint) => fingerprint,
+            Err(e) => {
+                log::error!("Failed to fingerprint QUIC certificate: {}", e);
+                let cleanup_config = gateway_state.read().unwrap().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+
         // 启动用户态独立公网控制通道协商服务器 (传递动态 peer_secrets 哈希表)
         let control_server = ControlServer::new(
             listen_control_port,
@@ -2069,6 +2119,7 @@ async fn main() {
             config.quic_pool.listen_ports.clone(),
             config.quic_pool.public_ipv4.clone(),
             config.quic_pool.public_ipv6.clone(),
+            quic_cert_sha256,
             session_cache.clone(),
         );
 
@@ -2169,7 +2220,7 @@ async fn main() {
         );
 
         if let Err(e) = quic_server
-            .run_with_registry(handler, shared_reg_for_server)
+            .run_with_registry(quic_certs, quic_key, handler, shared_reg_for_server)
             .await
         {
             log::error!("QUIC Pool Server error: {}", e);
@@ -2186,146 +2237,102 @@ async fn main() {
         log::info!("         STARTING GATEWAY IN [ CLIENT MODE ]         ");
         log::info!("------------------------------------------------------");
 
-        if config.peers.is_empty() {
-            eprintln!("Error: Client config must have at least one Peer!");
-            let cleanup_config = gateway_state.read().unwrap().config.clone();
-            cleanup_runtime(&cleanup_config, &interface_name);
-            std::process::exit(1);
+        let proxy_peers = config
+            .peers
+            .iter()
+            .filter(|peer| peer_has_l4_proxy(peer))
+            .cloned()
+            .collect::<Vec<_>>();
+        if proxy_peers.is_empty() {
+            log::warn!("No QUIC proxy peers configured; TPROXY offload remains inactive.");
         }
 
-        let peer = &config.peers[0];
-        let endpoint = match peer.endpoint {
-            Some(endpoint) => endpoint,
-            None => {
-                log::error!("Error: Endpoint required for Client mode");
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
+        for peer in &proxy_peers {
+            match build_peer_quic_pool(config.interface.private_key, peer).await {
+                Ok(pool) => {
+                    client_quic_pools
+                        .write()
+                        .unwrap()
+                        .insert(peer.public_key, pool);
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to establish QUIC pool for peer {}: {}",
+                        encode_base64_32(&peer.public_key),
+                        e
+                    );
+                    let cleanup_config = gateway_state.read().unwrap().config.clone();
+                    cleanup_runtime(&cleanup_config, &interface_name);
+                    std::process::exit(1);
+                }
             }
-        };
-        let proxy_port = match peer.proxy_port {
-            Some(proxy_port) => proxy_port,
-            None => {
-                log::error!("Error: ProxyPort required for Client mode");
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        let control_addr = SocketAddr::new(endpoint.ip(), proxy_port);
-        let control_client =
-            ControlClient::new(config.interface.private_key, peer.public_key, control_addr);
-
-        log::info!(
-            "Initiating userspace ECDH + HMAC-SHA256 control handshake to {}",
-            control_addr
-        );
-        let (control_response, _control_socket) = match control_client.negotiate_config().await {
-            Ok(res) => res,
-            Err(e) => {
-                log::error!("Control Negotiation FAILED: {}", e);
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        let quic_endpoint_ip = match select_quic_endpoint_ip(&control_response, endpoint) {
-            Ok(ip) => ip,
-            Err(e) => {
-                log::error!("{}", e);
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        let mut quic_endpoints = Vec::new();
-        for &port in &control_response.port_pool {
-            quic_endpoints.push(SocketAddr::new(quic_endpoint_ip, port));
         }
 
-        let client_pub_derived =
-            PublicKey::from(&StaticSecret::from(config.interface.private_key)).to_bytes();
-        let quic_pool_client = Arc::new(QuicPoolClient::new(
-            client_pub_derived,
-            control_response.session_psk,
-            quic_endpoints,
-        ));
+        if proxy_peers.is_empty() && config.interface.tproxy_port.is_none() {
+            wait_for_shutdown().await;
+        } else {
+            let tproxy_port = match config.interface.tproxy_port {
+                Some(port) => port,
+                None => {
+                    log::error!("Error: TProxyPort required for Client mode");
+                    let cleanup_config = gateway_state.read().unwrap().config.clone();
+                    cleanup_runtime(&cleanup_config, &interface_name);
+                    std::process::exit(1);
+                }
+            };
+            let tproxy_v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), tproxy_port);
+            let tproxy_v4_listener = match tproxy::create_tproxy_listener(tproxy_v4_addr) {
+                Ok(l) => l,
+                Err(e) => {
+                    log::error!("IPv4 TPROXY Listener bind FAILED: {}", e);
+                    let cleanup_config = gateway_state.read().unwrap().config.clone();
+                    cleanup_runtime(&cleanup_config, &interface_name);
+                    std::process::exit(1);
+                }
+            };
+            let tproxy_v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tproxy_port);
+            let tproxy_v6_listener = match tproxy::create_tproxy_listener(tproxy_v6_addr) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    log::warn!(
+                        "IPv6 TPROXY Listener bind FAILED: {}. IPv4 interception remains active.",
+                        e
+                    );
+                    None
+                }
+            };
 
-        if let Err(e) = quic_pool_client.start_pool().await {
-            log::error!(
-                "Failed to establish physical parallel QUIC connection pool: {}",
-                e
+            log::info!("------------------------------------------------------");
+            log::info!(
+                "  TPROXY TCP transparent intercept running on port {} ",
+                tproxy_port
             );
-            let cleanup_config = gateway_state.read().unwrap().config.clone();
-            cleanup_runtime(&cleanup_config, &interface_name);
-            std::process::exit(1);
-        }
+            log::info!("  All TCP streams routed to AllowedIPs will offload to ");
+            log::info!("  Parallel Userspace QUIC Connection Pool bypass L3 !  ");
+            log::info!("------------------------------------------------------");
 
-        quic_pool_client.clone().start_health_checker();
-
-        let tproxy_port = match config.interface.tproxy_port {
-            Some(port) => port,
-            None => {
-                log::error!("Error: TProxyPort required for Client mode");
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
+            let tproxy_connection_limit =
+                Arc::new(tokio::sync::Semaphore::new(MAX_TPROXY_CONNECTIONS));
+            if let Some(listener) = tproxy_v6_listener {
+                tokio::spawn(run_tproxy_accept_loop(
+                    listener,
+                    client_quic_pools.clone(),
+                    gateway_state.clone(),
+                    telemetry_registry.clone(),
+                    tproxy_connection_limit.clone(),
+                ));
             }
-        };
-        let tproxy_v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), tproxy_port);
-        let tproxy_v4_listener = match tproxy::create_tproxy_listener(tproxy_v4_addr) {
-            Ok(l) => l,
-            Err(e) => {
-                log::error!("IPv4 TPROXY Listener bind FAILED: {}", e);
-                let cleanup_config = gateway_state.read().unwrap().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
+
+            tokio::select! {
+                _ = run_tproxy_accept_loop(
+                    tproxy_v4_listener,
+                    client_quic_pools.clone(),
+                    gateway_state.clone(),
+                    telemetry_registry.clone(),
+                    tproxy_connection_limit.clone(),
+                ) => {}
+                _ = wait_for_shutdown() => {}
             }
-        };
-        let tproxy_v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tproxy_port);
-        let tproxy_v6_listener = match tproxy::create_tproxy_listener(tproxy_v6_addr) {
-            Ok(l) => Some(l),
-            Err(e) => {
-                log::warn!(
-                    "IPv6 TPROXY Listener bind FAILED: {}. IPv4 interception remains active.",
-                    e
-                );
-                None
-            }
-        };
-
-        log::info!("------------------------------------------------------");
-        log::info!(
-            "  TPROXY TCP transparent intercept running on port {} ",
-            tproxy_port
-        );
-        log::info!("  All TCP streams routed to AllowedIPs will offload to ");
-        log::info!("  Parallel Userspace QUIC Connection Pool bypass L3 !  ");
-        log::info!("------------------------------------------------------");
-
-        let tproxy_connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_TPROXY_CONNECTIONS));
-        if let Some(listener) = tproxy_v6_listener {
-            tokio::spawn(run_tproxy_accept_loop(
-                listener,
-                quic_pool_client.clone(),
-                gateway_state.clone(),
-                telemetry_registry.clone(),
-                tproxy_connection_limit.clone(),
-            ));
-        }
-
-        tokio::select! {
-            _ = run_tproxy_accept_loop(
-                tproxy_v4_listener,
-                quic_pool_client.clone(),
-                gateway_state.clone(),
-                telemetry_registry.clone(),
-                tproxy_connection_limit.clone(),
-            ) => {}
-            _ = wait_for_shutdown() => {}
         }
     }
 
@@ -2470,6 +2477,101 @@ mod tests {
         assert_eq!(snap[&key1].rx_bytes.load(Ordering::Relaxed), 100);
         assert_eq!(snap[&key1].tx_bytes.load(Ordering::Relaxed), 200);
         assert_eq!(snap[&key1].active_streams.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn test_l4_router_only_contains_proxy_peers() {
+        let proxy_peer = config::PeerConfig {
+            public_key: [1u8; 32],
+            allowed_ips: vec!["10.10.0.0/16".parse().unwrap()],
+            endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            proxy_port: Some(51821),
+        };
+        let wg_only_peer = config::PeerConfig {
+            public_key: [2u8; 32],
+            allowed_ips: vec!["10.20.0.0/16".parse().unwrap()],
+            endpoint: None,
+            proxy_port: None,
+        };
+
+        let router = rebuild_l4_router(&[proxy_peer, wg_only_peer]);
+
+        assert_eq!(
+            router.longest_match("10.10.1.1".parse().unwrap()),
+            Some([1u8; 32])
+        );
+        assert_eq!(router.longest_match("10.20.1.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn test_client_mode_peer_proxy_fields_must_be_paired() {
+        let mut config = GatewayConfig {
+            interface: config::InterfaceConfig {
+                private_key: [1u8; 32],
+                addresses: vec!["10.0.0.2/24".parse().unwrap()],
+                listen_port: None,
+                listen_control_port: None,
+                tproxy_port: Some(1080),
+                mtu: 1400,
+                table: None,
+                pre_script: None,
+                post_script: None,
+            },
+            peers: vec![config::PeerConfig {
+                public_key: [2u8; 32],
+                allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
+                endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+                proxy_port: Some(51821),
+            }],
+            quic_pool: config::QUICPoolConfig {
+                public_ipv4: None,
+                public_ipv6: None,
+                listen_ports: vec![],
+            },
+        };
+
+        assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
+        config.interface.tproxy_port = None;
+        assert!(determine_runtime_mode(&config)
+            .unwrap_err()
+            .contains("TProxyPort is required"));
+        config.interface.tproxy_port = Some(1080);
+        config.peers[0].proxy_port = None;
+        assert!(determine_runtime_mode(&config)
+            .unwrap_err()
+            .contains("must define both Endpoint and ProxyPort"));
+        config.peers[0].endpoint = None;
+        assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
+    }
+
+    #[test]
+    fn test_select_quic_endpoint_ip_rejects_invalid_advertised_public_ips() {
+        let fallback_v4 = "10.0.2.2:51820".parse::<SocketAddr>().unwrap();
+        let fallback_v6 = "[fd00:2::2]:51820".parse::<SocketAddr>().unwrap();
+
+        let mut resp = control::ControlResponse {
+            session_psk: [1u8; 32],
+            server_nonce: [4u8; 16],
+            port_pool: vec![40001],
+            public_ipv4: Some("not-an-ipv4".to_string()),
+            public_ipv6: None,
+            quic_cert_sha256: [2u8; 32],
+        };
+        assert!(select_quic_endpoint_ip(&resp, fallback_v4)
+            .unwrap_err()
+            .contains("Invalid server PublicIPv4"));
+
+        resp.public_ipv4 = None;
+        resp.public_ipv6 = Some("not-an-ipv6".to_string());
+        assert!(select_quic_endpoint_ip(&resp, fallback_v6)
+            .unwrap_err()
+            .contains("Invalid server PublicIPv6"));
+
+        resp.public_ipv6 = None;
+        assert_eq!(
+            select_quic_endpoint_ip(&resp, fallback_v6).unwrap(),
+            fallback_v6.ip()
+        );
     }
 
     #[tokio::test]
@@ -2963,9 +3065,8 @@ mod tests {
             .router
             .longest_match(std::net::IpAddr::V4("10.0.3.5".parse().unwrap()));
         assert_eq!(
-            lookup_res,
-            Some([3u8; 32]),
-            "Router should be able to resolve IP to [3u8; 32]"
+            lookup_res, None,
+            "Kernel-synced peers are WireGuard-only unless they explicitly define ProxyPort"
         );
 
         let secrets = peer_secrets.read().unwrap();
