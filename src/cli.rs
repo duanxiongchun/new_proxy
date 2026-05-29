@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+mod api;
+
+use api::{ApiResponse, CommandInput};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::io::{BufWriter, Read};
@@ -28,28 +32,6 @@ pub struct UnifiedTelemetry {
     pub active_streams: u64,
     pub quic_connections: Vec<QuicConnSnapshot>,
     pub source: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "type")]
-pub enum CommandInput {
-    Stats,
-    Dump,
-    AddPeer {
-        public_key: String,
-        allowed_ips: Vec<String>,
-        endpoint: Option<String>,
-        proxy_port: Option<u16>,
-    },
-    RemovePeer {
-        public_key: String,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ApiResponse {
-    pub status: String,
-    pub message: Option<String>,
 }
 
 const DEFAULT_SERVER_UDS_PATH: &str = "/run/new_proxy/tun0.sock";

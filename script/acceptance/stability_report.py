@@ -69,14 +69,14 @@ def latest_connections_by_peer(metrics):
     return {}
 
 
-def rss_growth(metrics, side):
+def rss_growth(metrics, side, warmup_seconds):
     samples = [row for row in metrics if row.get(side, {}).get("rss_kib")]
     if not samples:
         return None
     base = None
     started = samples[0]["elapsed_seconds"]
     for row in samples:
-        if row["elapsed_seconds"] - started >= 300:
+        if row["elapsed_seconds"] - started >= warmup_seconds:
             base = row
             break
     if base is None:
@@ -120,11 +120,12 @@ def main():
         peer: cv_percent(list(totals.values()))
         for peer, totals in totals_by_peer.items()
     }
-    client_rss = rss_growth(metrics, "client")
-    server_rss = rss_growth(metrics, "server")
-    client2_rss = rss_growth(metrics, "client2")
     max_rss_growth_pct = float(os.environ.get("STABILITY_MAX_RSS_GROWTH_PCT", "10.0"))
     max_rss_growth_mib = float(os.environ.get("STABILITY_MAX_RSS_GROWTH_MIB", "2.0"))
+    rss_warmup_seconds = float(os.environ.get("STABILITY_RSS_WARMUP_SECONDS", "10.0"))
+    client_rss = rss_growth(metrics, "client", rss_warmup_seconds)
+    server_rss = rss_growth(metrics, "server", rss_warmup_seconds)
+    client2_rss = rss_growth(metrics, "client2", rss_warmup_seconds)
     crashes = [
         row
         for row in metrics
@@ -190,6 +191,7 @@ def main():
             f"- RSS growth <= {max_rss_growth_pct:g}% or <= {max_rss_growth_mib:g} MiB: "
             f"{'PASS' if mem_pass else 'FAIL'}\n"
         )
+        f.write(f"- RSS warmup baseline: {rss_warmup_seconds:g}s\n")
     print(report_path)
     return 0
 

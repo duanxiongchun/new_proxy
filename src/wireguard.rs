@@ -565,4 +565,11 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
         assert_eq!(parse_sockaddr(&sockaddr_bytes(addr)), Some(addr));
     }
+
+    #[tokio::test]
+    async fn test_get_wg_dump_stats_missing_interface_returns_empty() {
+        let res = get_wg_dump_stats("nonexistent_interface").await;
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_empty());
+    }
 }

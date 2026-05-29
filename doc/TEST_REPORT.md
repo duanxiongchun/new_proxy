@@ -4,9 +4,9 @@
 
 - 项目版本：`new_proxy v5.0.0`
 - 报告日期：2026-05-29
-- 主要测试对象：双轨代理网关、TPROXY TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer、聚合遥测、稳定性与 perf smoke
+- 主要测试对象：模块拆分后的配置、UDS API/server、TPROXY TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer、聚合遥测、稳定性与 perf smoke
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
-- 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf 专用 work namespace
+- 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
 ## 已执行测试
 
@@ -18,7 +18,8 @@
 cargo fmt --check
 cargo check
 cargo test
-cargo build
+cargo build --bins
+cargo build --release --bins
 ```
 
 结果：
@@ -27,12 +28,13 @@ cargo build
 cargo fmt --check: PASS
 cargo check: PASS
 cargo test:
-  new_proxy_cli: 6 passed; 0 failed
-  new_proxy: 35 passed; 0 failed
-cargo build: PASS
+  new_proxy_cli: 9 passed; 0 failed
+  new_proxy: 38 passed; 0 failed
+cargo build --bins: PASS
+cargo build --release --bins: PASS
 ```
 
-结论：**全部 41 个 Rust 单元测试通过（0 失败）**。
+结论：**全部 47 个 Rust 单元测试通过（0 失败）**。
 
 ### 2. 脚本语法与 Python 编译检查
 
@@ -45,7 +47,10 @@ bash -n script/acceptance/e2e_test_dualstack.sh \
   script/acceptance/e2e_dynamic_client_peer.sh \
   script/acceptance/stability_stress_test.sh \
   script/perf/perf_smoke.sh
-python3 -m py_compile script/acceptance/stability_report.py
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
 ```
 
 结论：**全部通过**。
@@ -113,7 +118,7 @@ sudo bash script/acceptance/e2e_dynamic_client_peer.sh
 产物目录：
 
 ```text
-/tmp/new_proxy_dynamic_peer_20260529_140140
+/tmp/new_proxy_dynamic_peer_20260529_145509
 ```
 
 关键结果：
@@ -137,7 +142,7 @@ sudo STABILITY_DURATION=60 STABILITY_SAMPLE_INTERVAL=10 bash script/acceptance/s
 产物目录：
 
 ```text
-/tmp/new_proxy_stability_20260529_140424
+/tmp/new_proxy_stability_20260529_145917
 ```
 
 关键结果：
@@ -151,9 +156,9 @@ Short curl OK/FAIL: 1160/0
 UDP OK/FAIL: 36/0
 Ping OK/FAIL: 120/0
 Worst per-peer QUIC balance CV: 0.19%
-Client RSS MiB: 10.9 -> 12.0 (+9.82%)
-Client2 RSS MiB: 11.4 -> 13.1 (+15.25%)
-Server RSS MiB: 14.4 -> 16.1 (+11.71%)
+Client RSS MiB: 14.1 -> 14.3 (+1.77%)
+Client2 RSS MiB: 12.0 -> 12.5 (+3.73%)
+Server RSS MiB: 11.8 -> 13.1 (+10.81%)
 ```
 
 通过准则：
@@ -164,9 +169,10 @@ Short curl success: PASS
 Long TCP success: PASS
 Per-peer QUIC CV < 5%: PASS
 RSS growth <= 10% or <= 2 MiB: PASS
+RSS warmup baseline: 10s
 ```
 
-结论：**通过。稳定性报告脚本按 per-peer QUIC CV 计算均衡性，并用百分比或小绝对 RSS 增长阈值避免低基线误判。**
+结论：**通过。稳定性报告使用 10 秒 warmup 后的 RSS 基线，避免把启动期常驻分配误判为泄漏；所有业务、均衡性和内存准则均通过。**
 
 ### 8. 性能 smoke
 
@@ -179,16 +185,16 @@ sudo bash script/perf/perf_smoke.sh
 产物目录：
 
 ```text
-/tmp/new_proxy_perf_smoke_20260529_140620
+/tmp/new_proxy_perf_smoke_20260529_145640
 ```
 
 关键结果：
 
 ```text
-TTFB p50: 0.003113s
-TTFB p95: 0.003582s
-TTFB max: 0.004860s
-Throughput: 73.394 MiB/s
+TTFB p50: 0.003495s
+TTFB p95: 0.004175s
+TTFB max: 0.004433s
+Throughput: 71.667 MiB/s
 ✓ [SUCCESS] Perf smoke passed
 ```
 
@@ -196,4 +202,4 @@ Throughput: 73.394 MiB/s
 
 ## 总结
 
-本轮执行的格式、编译、单元、脚本语法、E2E、稳定性和 perf smoke 全部通过。
+本轮执行的格式、编译、单元、脚本语法、E2E、稳定性和 perf smoke 全部通过。拆分后的模块单元测试已迁移到对应模块，`main.rs` 仅保留跨模块 peer 同步测试。
