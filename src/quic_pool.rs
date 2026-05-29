@@ -488,11 +488,12 @@ impl QuicPoolServer {
     pub fn new(
         listen_ports: Vec<u16>,
         session_cache: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+        auth_nonce_cache: Arc<Mutex<HashMap<[u8; 32], crate::control::NonceCache>>>,
     ) -> Self {
         Self {
             listen_ports,
             session_cache,
-            auth_nonce_cache: Arc::new(Mutex::new(HashMap::new())),
+            auth_nonce_cache,
         }
     }
 
@@ -757,7 +758,8 @@ mod tests {
             .unwrap()
             .insert(client_pub_key, session_psk);
 
-        let server = QuicPoolServer::new(vec![port], session_cache.clone());
+        let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+        let server = QuicPoolServer::new(vec![port], session_cache.clone(), auth_nonce_cache);
 
         // 3. 服务端流处理逻辑 (Echo 服务)
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(10);

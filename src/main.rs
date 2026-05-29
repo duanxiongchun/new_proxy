@@ -660,9 +660,35 @@ fn setup_peer_routes_and_tproxy(
         }
         if let Some(port) = tproxy_port {
             ensure_tproxy_rule(*allowed_ip, port, &mark_spec)?;
+            let _ = ensure_mss_clamp_rule(*allowed_ip);
         }
     }
     Ok(())
+}
+
+fn ensure_mss_clamp_rule(allowed_ip: ipnet::IpNet) -> Result<(), String> {
+    let tool = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+        "iptables"
+    } else {
+        "ip6tables"
+    };
+    let rule = vec![
+        "PREROUTING".to_string(),
+        "-p".to_string(),
+        "tcp".to_string(),
+        "--tcp-flags".to_string(),
+        "SYN,RST".to_string(),
+        "SYN".to_string(),
+        "-d".to_string(),
+        allowed_ip.to_string(),
+        "-j".to_string(),
+        "TCPMSS".to_string(),
+        "--clamp-mss-to-pmtud".to_string(),
+    ];
+    ensure_iptables_rule(tool, &rule).map_err(|e| {
+        log::warn!("Failed to set TCPMSS clamping rule (might be unsupported in this environment): {}", e);
+        e
+    })
 }
 
 fn ensure_tproxy_rule(
@@ -714,6 +740,7 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
         for peer in &config.peers {
             for allowed_ip in &peer.allowed_ips {
                 cleanup_tproxy_rule(*allowed_ip, tproxy_port, &mark_spec);
+                cleanup_mss_clamp_rule(*allowed_ip);
             }
         }
 
@@ -841,6 +868,31 @@ fn cleanup_tproxy_rule(allowed_ip: ipnet::IpNet, tproxy_port: u16, mark_spec: &s
     run_command_best_effort(tool, &args);
 }
 
+fn cleanup_mss_clamp_rule(allowed_ip: ipnet::IpNet) {
+    let tool = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+        "iptables"
+    } else {
+        "ip6tables"
+    };
+    let args = vec![
+        "-t".to_string(),
+        "mangle".to_string(),
+        "-D".to_string(),
+        "PREROUTING".to_string(),
+        "-p".to_string(),
+        "tcp".to_string(),
+        "--tcp-flags".to_string(),
+        "SYN,RST".to_string(),
+        "SYN".to_string(),
+        "-d".to_string(),
+        allowed_ip.to_string(),
+        "-j".to_string(),
+        "TCPMSS".to_string(),
+        "--clamp-mss-to-pmtud".to_string(),
+    ];
+    run_command_best_effort(tool, &args);
+}
+
 fn cleanup_peer_routes_and_tproxy(
     peer: &config::PeerConfig,
     tproxy_port: Option<u16>,
@@ -851,6 +903,7 @@ fn cleanup_peer_routes_and_tproxy(
     for allowed_ip in &peer.allowed_ips {
         if let Some(port) = tproxy_port {
             cleanup_tproxy_rule(*allowed_ip, port, &mark_spec);
+            cleanup_mss_clamp_rule(*allowed_ip);
         }
         if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
             run_command_best_effort(
@@ -918,7 +971,7 @@ fn remove_peer_from_kernel(interface_name: &str, pub_key: [u8; 32]) {
 async fn sync_kernel_and_proxy_state(
     interface_name: &str,
     state: &Arc<std::sync::RwLock<GatewayState>>,
-    peer_secrets: &Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    peer_secrets: &Arc<std::sync::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     server_secret: &StaticSecret,
     l3_stats: &HashMap<[u8; 32], WgPeerStats>,
 ) -> HashMap<[u8; 32], String> {
@@ -976,7 +1029,7 @@ async fn sync_kernel_and_proxy_state(
         // Generates and caches the DH shared secret
         let peer_pub = PublicKey::from(pub_key);
         let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
-        peer_secrets.lock().unwrap().insert(pub_key, shared_secret);
+        peer_secrets.write().unwrap().insert(pub_key, shared_secret);
 
         let mut parsed_allowed_ips = Vec::new();
         for ip_str in &wg_stats.allowed_ips {
@@ -1086,16 +1139,20 @@ async fn main() {
     }));
 
     // 初始化控制面 Peer Secrets 动态共享哈希表
-    let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
+    let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let server_secret = StaticSecret::from(config.interface.private_key);
     {
-        let mut secrets_guard = peer_secrets.lock().unwrap();
+        let mut secrets_guard = peer_secrets.write().unwrap();
         for peer in &config.peers {
             let peer_pub = PublicKey::from(peer.public_key);
             let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
             secrets_guard.insert(peer.public_key, shared_secret);
         }
     }
+
+    // 初始化会话与 Nonce 动态共享缓存（用于 UDS 动态清理）
+    let session_cache = Arc::new(Mutex::new(HashMap::new()));
+    let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
 
     // 智能自适应识别网关运行模式 (Server vs. Client)
     let is_server =
@@ -1163,6 +1220,8 @@ async fn main() {
         let server_secret_clone = server_secret.clone();
         let shared_quic_registry_uds = shared_quic_registry.clone();
         let interface_name_clone = interface_name.clone();
+        let session_cache_clone = session_cache.clone();
+        let auth_nonce_cache_clone = auth_nonce_cache.clone();
 
         tokio::spawn(async move {
             let uds_client_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UDS_CLIENTS));
@@ -1178,12 +1237,15 @@ async fn main() {
                         continue;
                     }
                 };
+
                 let telemetry = telemetry_clone.clone();
                 let state = state_clone.clone();
                 let peer_secrets = peer_secrets_clone.clone();
                 let server_secret = server_secret_clone.clone();
                 let shared_quic_registry = shared_quic_registry_uds.clone();
                 let interface_name = interface_name_clone.clone();
+                let session_cache = session_cache_clone.clone();
+                let auth_nonce_cache = auth_nonce_cache_clone.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -1553,7 +1615,7 @@ async fn main() {
                             let peer_pub = PublicKey::from(parsed_pub_key);
                             let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
                             peer_secrets
-                                .lock()
+                                .write()
                                 .unwrap()
                                 .insert(parsed_pub_key, shared_secret);
 
@@ -1621,7 +1683,11 @@ async fn main() {
                             remove_peer_from_kernel(&interface_name, parsed_pub_key);
 
                             // 1. 动态移除 Shared Secret
-                            peer_secrets.lock().unwrap().remove(&parsed_pub_key);
+                            peer_secrets.write().unwrap().remove(&parsed_pub_key);
+
+                            // 2. 动态移除会话与 Nonce 缓存
+                            session_cache.lock().unwrap().remove(&parsed_pub_key);
+                            auth_nonce_cache.lock().unwrap().remove(&parsed_pub_key);
 
                             // 2. 动态移除 AllowedIPs 路由
                             {
@@ -1658,7 +1724,6 @@ async fn main() {
             .interface
             .listen_control_port
             .expect("Missing ListenControlPort for Server mode");
-        let session_cache = Arc::new(Mutex::new(HashMap::new()));
 
         // 启动用户态独立公网控制通道协商服务器 (传递动态 peer_secrets 哈希表)
         let control_server = ControlServer::new(
@@ -1678,7 +1743,7 @@ async fn main() {
 
         // 启动用户态多路复用平行 QUIC 物理池接收服务器
         let quic_server =
-            QuicPoolServer::new(config.quic_pool.listen_ports.clone(), session_cache.clone());
+            QuicPoolServer::new(config.quic_pool.listen_ports.clone(), session_cache.clone(), auth_nonce_cache.clone());
         // 删除多余的锁操作（shared_quic_registry 与 server 内部 registry 已通过 run_with_registry 共享）
         let telemetry_for_handler = telemetry_registry.clone();
         let shared_reg_for_server = shared_quic_registry.clone();
@@ -2090,7 +2155,7 @@ mod tests {
             config: config.clone(),
             router: initial_router,
         }));
-        let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
+        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let server_secret = StaticSecret::from(config.interface.private_key);
         let shared_quic_registry: quic_pool::PeerConnRegistry =
             Arc::new(Mutex::new(HashMap::new()));
@@ -2151,7 +2216,7 @@ mod tests {
                         let shared_secret =
                             server_secret_clone.diffie_hellman(&peer_pub).to_bytes();
                         peer_secrets_clone
-                            .lock()
+                            .write()
                             .unwrap()
                             .insert(parsed_pub_key, shared_secret);
 
@@ -2209,7 +2274,7 @@ mod tests {
 
         let private_key = [1u8; 32];
         let server_secret = StaticSecret::from(private_key);
-        let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
+        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let server_handle = tokio::spawn(async move {
             for _ in 0..2 {
@@ -2238,7 +2303,7 @@ mod tests {
                             let peer_pub = PublicKey::from(parsed_pub_key);
                             let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
                             peer_secrets
-                                .lock()
+                                .write()
                                 .unwrap()
                                 .insert(parsed_pub_key, shared_secret);
 
@@ -2250,7 +2315,7 @@ mod tests {
                         }
                         CommandInput::RemovePeer { public_key } => {
                             let parsed_pub_key = decode_base64_32(&public_key).unwrap();
-                            peer_secrets.lock().unwrap().remove(&parsed_pub_key);
+                            peer_secrets.write().unwrap().remove(&parsed_pub_key);
 
                             let resp = ApiResponse {
                                 status: "ok".to_string(),
@@ -2312,7 +2377,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_synchronization() {
         let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
-        let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
+        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let config = GatewayConfig {
             interface: config::InterfaceConfig {
@@ -2409,10 +2474,41 @@ mod tests {
             "Router should be able to resolve IP to [3u8; 32]"
         );
 
-        let secrets = peer_secrets.lock().unwrap();
+        let secrets = peer_secrets.read().unwrap();
         assert!(
             secrets.contains_key(&[3u8; 32]),
             "Peer [3u8; 32] secret should be computed"
         );
+    }
+
+    #[test]
+    fn test_dynamic_peer_removal_caches_cleanup() {
+        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let session_cache = Arc::new(Mutex::new(HashMap::new()));
+        let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        let pub_key = [5u8; 32];
+        let secret = [10u8; 32];
+        let session_psk = [15u8; 32];
+
+        // 1. Populate caches
+        peer_secrets.write().unwrap().insert(pub_key, secret);
+        session_cache.lock().unwrap().insert(pub_key, session_psk);
+        auth_nonce_cache.lock().unwrap().insert(pub_key, crate::control::NonceCache::new(10));
+
+        // Verify populated
+        assert!(peer_secrets.read().unwrap().contains_key(&pub_key));
+        assert!(session_cache.lock().unwrap().contains_key(&pub_key));
+        assert!(auth_nonce_cache.lock().unwrap().contains_key(&pub_key));
+
+        // 2. Perform dynamic peer removal (mirroring CommandInput::RemovePeer block)
+        peer_secrets.write().unwrap().remove(&pub_key);
+        session_cache.lock().unwrap().remove(&pub_key);
+        auth_nonce_cache.lock().unwrap().remove(&pub_key);
+
+        // 3. Verify completely cleared
+        assert!(!peer_secrets.read().unwrap().contains_key(&pub_key));
+        assert!(!session_cache.lock().unwrap().contains_key(&pub_key));
+        assert!(!auth_nonce_cache.lock().unwrap().contains_key(&pub_key));
     }
 }

@@ -242,7 +242,7 @@ impl NonceCache {
 // 3. 服务端控制面协商服务
 pub struct ControlServer {
     listen_port: u16,
-    pub peer_secrets: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Derived_Shared_Secret}
+    pub peer_secrets: Arc<std::sync::RwLock<HashMap<[u8; 32], [u8; 32]>>>, // {Client_PublicKey -> Derived_Shared_Secret}
     quic_ports: Vec<u16>,
     public_ipv4: Option<String>,
     public_ipv6: Option<String>,
@@ -253,7 +253,7 @@ pub struct ControlServer {
 impl ControlServer {
     pub fn new(
         listen_port: u16,
-        peer_secrets: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+        peer_secrets: Arc<std::sync::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
         quic_ports: Vec<u16>,
         public_ipv4: Option<String>,
         public_ipv6: Option<String>,
@@ -356,7 +356,7 @@ impl ControlServer {
 
                 // 1. 查找客户端共享密钥
                 let shared_secret = {
-                    let guard = peer_secrets_clone.lock().unwrap();
+                    let guard = peer_secrets_clone.read().unwrap();
                     guard.get(&req.client_public_key).cloned()
                 };
                 let shared_secret = match shared_secret {
@@ -458,9 +458,9 @@ mod tests {
         // 2. 预计算 Diffie-Hellman 共享密钥
         let server_shared = server_secret.diffie_hellman(&client_pub).to_bytes();
 
-        let peer_secrets = Arc::new(Mutex::new(HashMap::new()));
+        let peer_secrets = Arc::new(std::sync::RwLock::new(HashMap::new()));
         peer_secrets
-            .lock()
+            .write()
             .unwrap()
             .insert(client_pub.to_bytes(), server_shared);
 
