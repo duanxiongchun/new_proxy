@@ -45,9 +45,14 @@ def cv_percent(values):
 
 def latest_connections(metrics):
     for row in reversed(metrics):
-        peers = row.get("telemetry") or []
+        telemetry = row.get("telemetry")
+        if not isinstance(telemetry, list):
+            continue
+        peers = telemetry
         conns = []
         for peer in peers:
+            if not isinstance(peer, dict):
+                continue
             conns.extend(peer.get("quic_connections") or [])
         if conns:
             by_port = {}

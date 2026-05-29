@@ -12,8 +12,8 @@ LONG_THREADS="${STABILITY_LONG_THREADS:-8}"
 SHORT_PARALLEL="${STABILITY_SHORT_PARALLEL:-4}"
 ARTIFACT_DIR="${STABILITY_ARTIFACT_DIR:-/tmp/new_proxy_stability_$(date +%Y%m%d_%H%M%S)}"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-SERVER_CONF="$ARTIFACT_DIR/server_stability.conf"
-CLIENT_CONF="$ARTIFACT_DIR/client_stability.conf"
+SERVER_CONF="$ARTIFACT_DIR/srv_stab.conf"
+CLIENT_CONF="$ARTIFACT_DIR/cli_stab.conf"
 METRICS="$ARTIFACT_DIR/stability_metrics.jsonl"
 
 SERVER_PID=""
@@ -48,7 +48,7 @@ cleanup() {
   ip netns delete client2_ns 2>/dev/null || true
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete server_ns 2>/dev/null || true
-  rm -f /run/new_proxy/server_stability.sock /run/new_proxy/client_stability.sock /tmp/client_proxy_active /tmp/wg
+  rm -f /run/new_proxy/srv_stab.sock /run/new_proxy/cli_stab.sock /tmp/client_proxy_active /tmp/wg
 }
 trap cleanup EXIT
 
@@ -233,7 +233,7 @@ def telemetry():
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(2)
-        sock.connect("/run/new_proxy/server_stability.sock")
+        sock.connect("/run/new_proxy/srv_stab.sock")
         sock.sendall(json.dumps({"type": "Stats"}).encode())
         sock.shutdown(socket.SHUT_WR)
         chunks = []
