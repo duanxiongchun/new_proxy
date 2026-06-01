@@ -1,7 +1,7 @@
 # Makefile for new_proxy packaging
 
 VERSION = 5.0.0
-ARCH = amd64
+ARCH ?= $(shell if command -v dpkg >/dev/null 2>&1; then dpkg --print-architecture; else machine=$$(uname -m); if [ "$$machine" = x86_64 ]; then echo amd64; elif [ "$$machine" = aarch64 ] || [ "$$machine" = arm64 ]; then echo arm64; elif [ "$${machine#armv7}" != "$$machine" ]; then echo armhf; else echo "$$machine"; fi; fi)
 DEB_DIR = target/deb-pkg
 DEB_FILE = target/new-proxy_$(VERSION)_$(ARCH).deb
 
