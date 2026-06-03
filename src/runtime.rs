@@ -215,6 +215,40 @@ pub fn setup_peer_routes_and_tproxy(
     Ok(())
 }
 
+pub fn setup_proxy_tproxy_rules(
+    config: &GatewayConfig,
+    interface_name: &str,
+) -> Result<(), String> {
+    let Some(tproxy_port) = config.interface.tproxy_port else {
+        return Ok(());
+    };
+    let (fwmark, _) = instance_routing_ids(interface_name);
+    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
+
+    for peer in config.peers.iter().filter(|peer| peer_has_l4_proxy(peer)) {
+        for allowed_ip in &peer.allowed_ips {
+            ensure_tproxy_rule(*allowed_ip, tproxy_port, &mark_spec)?;
+            let _ = ensure_mss_clamp_rule(*allowed_ip);
+        }
+    }
+    Ok(())
+}
+
+pub fn cleanup_proxy_tproxy_rules(config: &GatewayConfig, interface_name: &str) {
+    let Some(tproxy_port) = config.interface.tproxy_port else {
+        return;
+    };
+    let (fwmark, _) = instance_routing_ids(interface_name);
+    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
+
+    for peer in config.peers.iter().filter(|peer| peer_has_l4_proxy(peer)) {
+        for allowed_ip in &peer.allowed_ips {
+            cleanup_tproxy_rule(*allowed_ip, tproxy_port, &mark_spec);
+            cleanup_mss_clamp_rule(*allowed_ip);
+        }
+    }
+}
+
 pub fn cleanup_peer_routes_and_tproxy(
     peer: &PeerConfig,
     tproxy_port: Option<u16>,

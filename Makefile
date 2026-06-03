@@ -47,7 +47,7 @@ package: build
 	echo "Description: Hybrid Secure Proxy Gateway (WireGuard L3 + QUIC L4 Mux)" >> $(DEB_DIR)/DEBIAN/control
 
 	# Build deb package
-	dpkg-deb --build $(DEB_DIR) $(DEB_FILE)
+	dpkg-deb --root-owner-group --build $(DEB_DIR) $(DEB_FILE)
 	@echo "Debian package created successfully: $(DEB_FILE)"
 
 clean:

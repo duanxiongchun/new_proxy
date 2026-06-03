@@ -130,12 +130,17 @@ fn configure_kernel_device(
     };
 
     if !creation_success {
-        log::warn!("Kernel WireGuard interface creation failed. Attempting userspace wireguard fallback.");
+        log::warn!(
+            "Kernel WireGuard interface creation failed. Attempting userspace wireguard fallback."
+        );
         return configure_userspace_device(interface_name, private_key, listen_port);
     }
 
     if let Err(e) = configure_kernel_device_key(interface_name, private_key, listen_port) {
-        log::warn!("Kernel Netlink key configuration failed: {}. Falling back to userspace wireguard.", e);
+        log::warn!(
+            "Kernel Netlink key configuration failed: {}. Falling back to userspace wireguard.",
+            e
+        );
         // Clean up the partially created device before switching to userspace
         let _ = Command::new("ip")
             .args(["link", "del", "dev", interface_name])

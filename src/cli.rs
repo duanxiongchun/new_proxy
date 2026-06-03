@@ -3,8 +3,8 @@ mod api;
 
 use api::{ApiResponse, CommandInput};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::io::Read;
+use std::io::Write;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 

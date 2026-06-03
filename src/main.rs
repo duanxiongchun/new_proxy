@@ -29,11 +29,16 @@ use app_config::{
 };
 use config::GatewayConfig;
 use control::ControlServer;
-use quic_pool::{cert_sha256, generate_self_signed_cert, QuicPoolClient, QuicPoolServer};
+use quic_pool::{
+    cert_sha256, generate_self_signed_cert, PoolState, QuicPoolClient, QuicPoolServer,
+};
 use routing::AllowedIPsRouter;
 #[cfg(test)]
 use runtime::run_blocking_command;
-use runtime::{cleanup_runtime, run_script, setup_routes_and_iptables};
+use runtime::{
+    cleanup_proxy_tproxy_rules, cleanup_runtime, run_script, setup_proxy_tproxy_rules,
+    setup_routes_and_iptables,
+};
 use server_proxy::build_stream_handler;
 use stats_cli::run_cli_stats;
 use telemetry::TelemetryRegistry;
@@ -46,6 +51,142 @@ type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClien
 pub struct GatewayState {
     pub config: GatewayConfig,
     pub router: AllowedIPsRouter<[u8; 32]>,
+    pub tproxy_offload_enabled: bool,
+}
+
+const TPROXY_FAILOVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn should_enable_tproxy_for_pool_states(
+    expected_proxy_peer_count: usize,
+    states: &[PoolState],
+) -> bool {
+    expected_proxy_peer_count > 0
+        && states.len() == expected_proxy_peer_count
+        && states
+            .iter()
+            .all(|state| matches!(state, PoolState::Active))
+}
+
+fn start_tproxy_failover_manager(
+    state: Arc<parking_lot::RwLock<GatewayState>>,
+    pools: PeerQuicPools,
+    interface_name: String,
+    client_private_key: [u8; 32],
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TPROXY_FAILOVER_POLL_INTERVAL).await;
+
+            let (table_off, tproxy_port, current_enabled, proxy_peers) = {
+                let st = state.read();
+                (
+                    st.config
+                        .interface
+                        .table
+                        .as_deref()
+                        .map(|table| table.eq_ignore_ascii_case("off"))
+                        .unwrap_or(false),
+                    st.config.interface.tproxy_port,
+                    st.tproxy_offload_enabled,
+                    st.config
+                        .peers
+                        .iter()
+                        .filter(|peer| peer_has_l4_proxy(peer))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            };
+            if table_off || tproxy_port.is_none() {
+                continue;
+            }
+            if proxy_peers.is_empty() {
+                continue;
+            }
+
+            let missing_peers = {
+                let pools_guard = pools.read();
+                proxy_peers
+                    .iter()
+                    .filter(|peer| !pools_guard.contains_key(&peer.public_key))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+
+            for peer in missing_peers {
+                log::info!(
+                    "Attempting to establish missing QUIC pool for peer {}",
+                    encode_base64_32(&peer.public_key)
+                );
+                match build_peer_quic_pool(client_private_key, &peer).await {
+                    Ok(pool) => {
+                        let still_configured = {
+                            let st = state.read();
+                            st.config.peers.iter().any(|configured| {
+                                configured.public_key == peer.public_key
+                                    && peer_has_l4_proxy(configured)
+                            })
+                        };
+                        if !still_configured {
+                            pool.shutdown(b"Peer removed before pool recovery completed");
+                            continue;
+                        }
+                        let mut pools_guard = pools.write();
+                        if pools_guard.contains_key(&peer.public_key) {
+                            pool.shutdown(b"Peer pool already recovered");
+                        } else {
+                            pools_guard.insert(peer.public_key, pool);
+                            log::info!(
+                                "Recovered missing QUIC pool for peer {}",
+                                encode_base64_32(&peer.public_key)
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to recover missing QUIC pool for peer {}: {}",
+                            encode_base64_32(&peer.public_key),
+                            e
+                        );
+                    }
+                }
+            }
+
+            let pool_states = {
+                let pools = pools.read();
+                pools
+                    .values()
+                    .map(|pool| pool.get_state())
+                    .collect::<Vec<_>>()
+            };
+            let desired_enabled =
+                should_enable_tproxy_for_pool_states(proxy_peers.len(), &pool_states);
+            if desired_enabled == current_enabled {
+                continue;
+            }
+
+            let config = state.read().config.clone();
+            if desired_enabled {
+                match setup_proxy_tproxy_rules(&config, &interface_name) {
+                    Ok(()) => {
+                        state.write().tproxy_offload_enabled = true;
+                        log::info!(
+                            "QUIC pools recovered after cooldown; restored TPROXY rules for proxy peers"
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to restore TPROXY rules after QUIC recovery: {}", e);
+                        cleanup_proxy_tproxy_rules(&config, &interface_name);
+                    }
+                }
+            } else {
+                cleanup_proxy_tproxy_rules(&config, &interface_name);
+                state.write().tproxy_offload_enabled = false;
+                log::warn!(
+                    "At least one QUIC pool is in fallback/recovering; removed all proxy TPROXY rules so new connections use WireGuard L3"
+                );
+            }
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -244,6 +385,7 @@ async fn main() {
     let gateway_state = Arc::new(parking_lot::RwLock::new(GatewayState {
         config: config.clone(),
         router: initial_router,
+        tproxy_offload_enabled: true,
     }));
 
     // 初始化控制面 Peer Secrets 动态共享哈希表
@@ -380,30 +522,43 @@ async fn main() {
             log::warn!("No QUIC proxy peers configured; TPROXY offload remains inactive.");
         }
 
+        let mut initial_pool_failures = 0usize;
         for peer in &proxy_peers {
-            match build_peer_quic_pool(
-                config.interface.private_key,
-                peer,
-                &interface_name,
-                config.interface.tproxy_port,
-            )
-            .await
-            {
+            match build_peer_quic_pool(config.interface.private_key, peer).await {
                 Ok(pool) => {
                     client_quic_pools.write().insert(peer.public_key, pool);
                 }
                 Err(e) => {
-                    log::error!(
-                        "Failed to establish QUIC pool for peer {}: {}",
+                    initial_pool_failures += 1;
+                    log::warn!(
+                        "Failed to establish initial QUIC pool for peer {}; starting in WireGuard L3 fallback and retrying in background: {}",
                         encode_base64_32(&peer.public_key),
                         e
                     );
-                    let cleanup_config = gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &interface_name);
-                    std::process::exit(1);
                 }
             }
         }
+        if initial_pool_failures > 0
+            && !config
+                .interface
+                .table
+                .as_deref()
+                .map(|table| table.eq_ignore_ascii_case("off"))
+                .unwrap_or(false)
+        {
+            cleanup_proxy_tproxy_rules(&config, &interface_name);
+            gateway_state.write().tproxy_offload_enabled = false;
+            log::warn!(
+                "Removed proxy TPROXY rules because {} initial QUIC pool(s) failed; traffic will use WireGuard L3 until QUIC recovers",
+                initial_pool_failures
+            );
+        }
+        let tproxy_failover_task = start_tproxy_failover_manager(
+            gateway_state.clone(),
+            client_quic_pools.clone(),
+            interface_name.clone(),
+            config.interface.private_key,
+        );
 
         if proxy_peers.is_empty() && config.interface.tproxy_port.is_none() {
             wait_for_shutdown().await;
@@ -471,6 +626,7 @@ async fn main() {
                 _ = wait_for_shutdown() => {}
             }
         }
+        tproxy_failover_task.abort();
     }
 
     // 自动清理路由与 iptables
@@ -482,6 +638,29 @@ async fn main() {
 mod tests {
     use super::*;
     use wireguard::WgPeerStats;
+
+    #[test]
+    fn test_tproxy_failover_policy_requires_all_pools_active() {
+        assert!(!should_enable_tproxy_for_pool_states(1, &[]));
+        assert!(!should_enable_tproxy_for_pool_states(
+            2,
+            &[PoolState::Active]
+        ));
+        assert!(should_enable_tproxy_for_pool_states(
+            1,
+            &[PoolState::Active]
+        ));
+        assert!(!should_enable_tproxy_for_pool_states(
+            2,
+            &[PoolState::Active, PoolState::Fallback,]
+        ));
+        assert!(!should_enable_tproxy_for_pool_states(
+            1,
+            &[PoolState::Recovering {
+                recovery_start: std::time::Instant::now(),
+            },]
+        ));
+    }
 
     #[tokio::test]
     async fn test_peer_synchronization() {
@@ -525,6 +704,7 @@ mod tests {
         let gateway_state = Arc::new(parking_lot::RwLock::new(GatewayState {
             config,
             router: initial_router,
+            tproxy_offload_enabled: true,
         }));
 
         let mut l3_stats = HashMap::new();

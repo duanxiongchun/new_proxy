@@ -27,7 +27,8 @@ cargo test
 - `src/stats_cli.rs`：`new_proxy stats` 内置 telemetry table 输出、byte formatter。
 - `src/tcp_util.rs`：TCP keepalive socket option helper。
 - `src/telemetry.rs`：统一 telemetry DTO 和 sharded L4 telemetry registry。
-- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复。
+- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、QUIC pool fallback/recovering/active 状态。
+- `src/main.rs`：TPROXY failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TPROXY，所有 pool active 后才允许回切。
 - `src/relay.rs`：双向 relay、计数 reader。
 - `src/routing.rs`：AllowedIPs longest-prefix matching。
 - `src/tproxy.rs`：IPv4/IPv6 transparent listener 创建。
@@ -63,7 +64,7 @@ python3 -m py_compile script/acceptance/stability_report.py
 
 | 层级 | 已覆盖 | 主要缺口 |
 | --- | --- | --- |
-| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry | `setup_peer_routes_and_tproxy()`/`cleanup_peer_routes_and_tproxy()` 的命令级断言仍主要依赖 E2E |
+| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、TPROXY fallback 回切策略 | `setup_peer_routes_and_tproxy()`/`cleanup_peer_routes_and_tproxy()` 的命令级断言仍主要依赖 E2E |
 | E2E | 双栈 WAN、IPv6 HTTP over TPROXY/QUIC、TPROXY->QUIC、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy+WireGuard-only fallback、动态 client proxy peer add/remove 生命周期 | 服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、WireGuard-only fallback、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
 | 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测 |
@@ -139,6 +140,23 @@ Rust 单元测试覆盖：
 3. 健康检查按旧配置重连失败后重新走控制面协商。
 4. 客户端获得新的 `session_psk`、QUIC 证书指纹和端口池，替换本地 runtime config 与连接池。
 5. 新业务 stream 在新 QUIC 服务端上成功 echo。
+
+### 3.7 QUIC 故障后的 WireGuard fallback 与延迟回切
+
+当前代码路径：
+
+1. QUIC stream 打开失败、目标地址写入失败、或 server proxy 状态读取失败时，client 将对应 pool 标记为 `Fallback`。
+2. `Table != off` 的 client mode TPROXY failover manager 观察所有 proxy pool 状态。
+3. 任意 pool 为 `Fallback` 或 `Recovering` 时，manager 删除当前配置中所有 proxy peer 的 TPROXY/TCPMSS 规则，保留 WireGuard route。
+4. 后续新 TCP 连接不再进入用户态 TPROXY，自然走 WireGuard/wireguard-go L3。
+5. 启动时缺失 QUIC pool 不再导致 client 退出；manager 周期性重建缺失 pool。
+6. QUIC 连接恢复后先进入 `Recovering` cooldown，cooldown 结束并回到 `Active` 后，manager 按当前配置重建所有 proxy peer 的 TPROXY 规则。
+
+`Table = off` 不由 daemon 管理 iptables；这类拓扑只验证 QUIC 重连、动态 peer 生命周期和手工规则路径，不验证自动删除/恢复 TPROXY。
+
+Rust 单元测试覆盖：
+
+- `src/main.rs::test_tproxy_failover_policy_requires_all_pools_active`：确认只有所有 pool 都是 `Active` 时才允许恢复 TPROXY；`Fallback` 和 `Recovering` 都保持 WireGuard fallback。
 
 ## 4. Backlog
 

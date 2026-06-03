@@ -197,7 +197,6 @@ pub struct QuicPoolClient {
     rr_index: Arc<AtomicUsize>,
     endpoint: Arc<Mutex<Option<Endpoint>>>,
     shutdown: Arc<AtomicBool>,
-    interface_name: String,
     pool_state: Arc<RwLock<PoolState>>,
 }
 
@@ -222,7 +221,6 @@ impl QuicPoolClient {
             server_cert_sha256,
             endpoints,
             None,
-            String::new(),
         )
     }
 
@@ -235,7 +233,6 @@ impl QuicPoolClient {
         server_public_key: [u8; 32],
         control_endpoint: SocketAddr,
         fallback_endpoint: SocketAddr,
-        interface_name: String,
     ) -> Self {
         Self::new_internal(
             client_public_key,
@@ -248,7 +245,6 @@ impl QuicPoolClient {
                 control_endpoint,
                 fallback_endpoint,
             }),
-            interface_name,
         )
     }
 
@@ -258,7 +254,6 @@ impl QuicPoolClient {
         server_cert_sha256: [u8; 32],
         endpoints: Vec<SocketAddr>,
         refresh_config: Option<ControlRefreshConfig>,
-        interface_name: String,
     ) -> Self {
         Self {
             client_public_key,
@@ -272,7 +267,6 @@ impl QuicPoolClient {
             rr_index: Arc::new(AtomicUsize::new(0)),
             endpoint: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            interface_name,
             pool_state: Arc::new(RwLock::new(PoolState::Active)),
         }
     }
@@ -285,8 +279,12 @@ impl QuicPoolClient {
         matches!(self.get_state(), PoolState::Active)
     }
 
-    pub fn interface_name(&self) -> &str {
-        &self.interface_name
+    pub fn enter_fallback(&self, reason: &str) {
+        let mut state = self.pool_state.write();
+        if !matches!(*state, PoolState::Fallback) {
+            log::warn!("Entering QUIC fallback state: {}", reason);
+            *state = PoolState::Fallback;
+        }
     }
 
     pub fn shutdown(&self, reason: &'static [u8]) {
@@ -701,8 +699,12 @@ impl QuicPoolClient {
                             log::warn!("QUIC pool is completely down; entering Fallback state");
                             new_pool_state = PoolState::Fallback;
                         } else if let PoolState::Recovering { recovery_start } = pool_state {
-                            if std::time::Instant::now().duration_since(recovery_start) >= Duration::from_secs(30) {
-                                log::info!("QUIC pool cooldown period expired; entering Active state.");
+                            if std::time::Instant::now().duration_since(recovery_start)
+                                >= Duration::from_secs(30)
+                            {
+                                log::info!(
+                                    "QUIC pool cooldown period expired; entering Active state."
+                                );
                                 new_pool_state = PoolState::Active;
                             }
                         }
@@ -710,7 +712,9 @@ impl QuicPoolClient {
                     PoolState::Fallback => {
                         if has_live_connection {
                             log::info!("QUIC pool has recovered. Entering Recovery (cooldown) period before switching back to QUIC.");
-                            new_pool_state = PoolState::Recovering { recovery_start: std::time::Instant::now() };
+                            new_pool_state = PoolState::Recovering {
+                                recovery_start: std::time::Instant::now(),
+                            };
                         }
                     }
                 }
@@ -1063,8 +1067,8 @@ impl Drop for TelemetryRegistryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
     use std::net::UdpSocket;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::Ordering;
     use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -1286,7 +1290,6 @@ mod tests {
             server_pub,
             control_addr,
             control_addr,
-            "testwg0".to_string(),
         ));
         client.start_pool().await.unwrap();
 

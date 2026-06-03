@@ -74,6 +74,10 @@ Client mode 支持两类 peer：
 
 - 已关闭连接会按原 endpoint 重连。
 - 缺失 endpoint 会补建连接。
+- pool 状态分为 `Active`、`Fallback`、`Recovering`：
+  - `Active`：新 TCP 连接被 TPROXY 劫持到用户态并走 QUIC。
+  - `Fallback`：QUIC pool 不可用，新 TCP 连接不再被 TPROXY 劫持，按内核路由走 WireGuard L3。
+  - `Recovering`：QUIC 物理连接已经恢复，但仍处于延迟回切窗口，新 TCP 连接继续走 WireGuard L3，避免链路抖动时频繁切换。
 - 如果所有重连尝试都因 QUIC 握手、证书 pinning 或 PSK 认证失败，且该 pool 带有控制面刷新配置，客户端会重新发起控制面协商，获取新的 `session_psk`、QUIC 证书指纹和端口池，然后替换本地 QUIC endpoint 与连接池。这个路径用于服务端进程重启后自签证书和 session cache 重建的恢复。
 - 刷新成功后，旧 QUIC endpoint 和旧物理连接会被显式关闭，后续新 stream 使用刷新后的连接池。
 - pool 被运行期删除或替换时调用 `shutdown()`，关闭连接并停止健康检查循环。
@@ -97,6 +101,15 @@ Client mode 支持两类 peer：
 `Table = off` 时程序不改系统路由和 iptables，测试脚本或外部系统需要自行配置。
 
 L4 内存路由器只包含 proxy peer 的 `AllowedIPs`。WireGuard-only peer 不会被 TPROXY 命中后丢进 QUIC。
+
+`Table != off` 的 client mode 还有一个全局 TPROXY failover manager：
+
+- 正常 `Active` 时，配置中的所有 proxy peer 都保持 TPROXY 规则，新连接走 QUIC。
+- 任意 proxy pool 进入 `Fallback` 或 `Recovering` 时，manager 删除当前配置里所有 proxy peer 的 TPROXY 规则和 TCPMSS clamp 规则，但保留 WireGuard route 和 peer 配置；后续新连接自然按内核路由走 WireGuard/wireguard-go L3。
+- client 启动时如果某个 proxy peer 的 QUIC pool 建立失败，daemon 不退出；它会先删除 proxy TPROXY 规则进入 WireGuard L3 fallback，并由 failover manager 后台周期性重建缺失的 QUIC pool。
+- 所有 proxy pool 回到 `Active` 后，manager 按当前配置全量重建所有 proxy peer 的 TPROXY 规则。
+- UDS `AddPeer`/`RemovePeer` 仍负责动态 peer 的 route 与 TPROXY 生命周期；如果 AddPeer 发生在全局 fallback 期间，只添加 WireGuard route，不立即添加 TPROXY，等待恢复后统一重建。
+- `Table = off` 时 daemon 不拥有 route/iptables，failover manager 不修改 TPROXY 规则；外部测试脚本或编排系统需要自行处理故障切换规则。
 
 ## 6. 遥测与 API
 
