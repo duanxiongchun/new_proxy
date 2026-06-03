@@ -4,7 +4,7 @@ mod api;
 use api::{ApiResponse, CommandInput};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::io::{BufWriter, Read};
+use std::io::Read;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
@@ -142,8 +142,11 @@ fn fmt_handshake_ago(ts: u64) -> String {
 /// WireGuard 风格的 show 展示（每个 peer 独立块，缩进文本）
 fn print_wg_style(peers: &[UnifiedTelemetry]) {
     let out = std::io::stdout();
-    let mut w = BufWriter::new(out.lock());
+    let mut w = std::io::BufWriter::new(out.lock());
+    print_wg_style_to(&mut w, peers);
+}
 
+fn print_wg_style_to<W: std::io::Write>(w: &mut W, peers: &[UnifiedTelemetry]) {
     writeln!(w, "interface: new-proxy").unwrap();
     writeln!(
         w,
@@ -196,8 +199,19 @@ fn print_wg_style(peers: &[UnifiedTelemetry]) {
         )
         .unwrap();
 
-        if peer.quic_connections.is_empty() && peer.l4_rx_bytes == 0 && peer.l4_tx_bytes == 0 {
-            writeln!(w, "  quic: inactive").unwrap();
+        if peer.quic_connections.is_empty() {
+            if peer.l4_rx_bytes > 0 || peer.l4_tx_bytes > 0 {
+                writeln!(w, "  quic: inactive (disconnected)").unwrap();
+                writeln!(
+                    w,
+                    "  quic transfer: {} received, {} sent",
+                    fmt_bytes(peer.l4_rx_bytes),
+                    fmt_bytes(peer.l4_tx_bytes)
+                )
+                .unwrap();
+            } else {
+                writeln!(w, "  quic: inactive").unwrap();
+            }
         } else {
             let conn_count = peer.quic_connections.len();
             writeln!(
@@ -558,5 +572,27 @@ mod tests {
 
         let _ = handle.join();
         let _ = std::fs::remove_file(uds_path);
+    }
+
+    #[test]
+    fn test_print_wg_style_peer_disconnected_with_history() {
+        let peer = UnifiedTelemetry {
+            public_key: "CCCC==".to_string(),
+            allowed_ips: vec!["10.0.0.3/32".to_string()],
+            endpoint: None,
+            l3_rx_bytes: 100,
+            l3_tx_bytes: 200,
+            last_handshake: 0,
+            l4_rx_bytes: 3500,
+            l4_tx_bytes: 231,
+            active_streams: 0,
+            quic_connections: vec![],
+            source: "both".to_string(),
+        };
+        let mut buf = Vec::new();
+        print_wg_style_to(&mut buf, &[peer]);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("quic: inactive (disconnected)"));
+        assert!(out.contains("quic transfer: 3.42 KiB received, 231 B sent"));
     }
 }
