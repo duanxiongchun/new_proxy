@@ -477,7 +477,16 @@ async fn handle_add_peer(
 
     let prepared_client_pool =
         if context.runtime_mode == RuntimeMode::Client && peer_has_l4_proxy(&new_peer) {
-            match build_peer_quic_pool(context.client_private_key, &new_peer).await {
+            let interface_name = context.interface_name.clone();
+            let tproxy_port = context.state.read().config.interface.tproxy_port;
+            match build_peer_quic_pool(
+                context.client_private_key,
+                &new_peer,
+                &interface_name,
+                tproxy_port,
+            )
+            .await
+            {
                 Ok(pool) => Some(pool),
                 Err(e) => {
                     write_error(

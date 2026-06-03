@@ -232,6 +232,74 @@ fi
 echo "  ✓ 客户端重连成功！"
 
 # -------------------------------------------------------------------------
+# 4b. SCENARIO 2B: DYNAMIC FALLBACK TO WIREGUARD ON QUIC FAILURE
+# -------------------------------------------------------------------------
+echo ""
+echo "=== [4b/6] SCENARIO 2B: Dynamic Fallback to WireGuard on QUIC Failure ==="
+if ! ip netns exec client_ns ip link show scenario_client >/dev/null 2>&1; then
+  echo "  >> SKIP: WireGuard device scenario_client is not present in client_ns; dynamic L3 fallback requires a real WireGuard netdev."
+else
+echo "  >> 模拟 QUIC 物理链路网络故障（丢弃服务器端 QUIC 端口的 UDP 包）..."
+ip netns exec server_ns iptables -A INPUT -p udp --match multiport --dports 40001,40002 -j DROP
+
+echo "  >> 等待客户端连接空闲超时（35秒）以触发降级逻辑..."
+sleep 35
+
+# 此时，客户端应该已经检测到连接全部断开，并将流量降级为 WireGuard 传输
+echo "  >> 发送新的 TCP 流量，验证在 QUIC 故障下，流量是否可以无缝降级并成功通过 WireGuard 传输..."
+ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
+if [ $? -ne 0 ]; then
+  echo "❌ [ERROR] TCP traffic failed under QUIC fallback state!"
+  exit 1
+fi
+echo "  ✓ 降级模式流量传输成功！"
+
+# -------------------------------------------------------------------------
+# 4c. SCENARIO 2C: COOLDOWN-BASED SWITCH-BACK TO QUIC
+# -------------------------------------------------------------------------
+echo ""
+echo "=== [4c/6] SCENARIO 2C: Cooldown-Based Switch-Back to QUIC ==="
+echo "  >> 恢复服务器端 QUIC 端口（清空 iptables 阻断规则）..."
+ip netns exec server_ns iptables -F INPUT
+
+echo "  >> 等待客户端健康检查器重新建立物理 QUIC 连接并进入 Recovering (cooldown) 状态..."
+# 健康检查间隔为 5 秒，加 2 秒缓冲
+sleep 7
+
+# 此时客户端应该重建了 QUIC 连接，但处于 Recovering 状态，新的 TCP 流量应该继续走 WireGuard 降级通道
+echo "  >> 在 30 秒冷却时间内发送 TCP 流量，验证流量依然走 WireGuard 降级通道（防止频繁切换抖动）..."
+# 记录发送流量前的 QUIC 字节数
+PRE_QUIC_STATS=$(ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show)
+PRE_QUIC_LINE=$(echo "$PRE_QUIC_STATS" | grep -A 7 "$NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY" | grep "quic transfer:")
+
+ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
+
+POST_QUIC_STATS=$(ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show)
+POST_QUIC_LINE=$(echo "$POST_QUIC_STATS" | grep -A 7 "$NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY" | grep "quic transfer:")
+
+if [ "$PRE_QUIC_LINE" != "$POST_QUIC_LINE" ]; then
+  echo "❌ [ERROR] Traffic was sent over QUIC during the cooldown window!"
+  exit 1
+fi
+echo "  ✓ 验证成功：冷却时间内流量未切换回 QUIC！"
+
+echo "  >> 等待冷却时间结束（再等待 25 秒，总计超过 30 秒）..."
+sleep 25
+
+echo "  >> 发送新的 TCP 流量，验证冷却期结束后流量成功切换回 QUIC 通道..."
+ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
+
+FINAL_QUIC_STATS=$(ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show)
+FINAL_QUIC_LINE=$(echo "$FINAL_QUIC_STATS" | grep -A 7 "$NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY" | grep "quic transfer:")
+
+if [ "$FINAL_QUIC_LINE" = "$POST_QUIC_LINE" ]; then
+  echo "❌ [ERROR] Traffic failed to switch back to QUIC after cooldown expired!"
+  exit 1
+fi
+echo "  ✓ 验证成功：冷却期结束后流量成功切回 QUIC 隧道！"
+fi
+
+# -------------------------------------------------------------------------
 # 5. SCENARIO 3: DYNAMIC PEER MANAGEMENT (hot-adding/removing peers)
 # -------------------------------------------------------------------------
 echo ""

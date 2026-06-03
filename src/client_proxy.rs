@@ -13,9 +13,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+
+
 pub async fn build_peer_quic_pool(
     private_key: [u8; 32],
     peer: &config::PeerConfig,
+    interface_name: &str,
+    _tproxy_port: Option<u16>,
 ) -> Result<Arc<QuicPoolClient>, String> {
     let endpoint = peer
         .endpoint
@@ -48,6 +52,7 @@ pub async fn build_peer_quic_pool(
         peer.public_key,
         control_addr,
         endpoint,
+        interface_name.to_string(),
     ));
     quic_pool_client.start_pool().await?;
     quic_pool_client.clone().start_health_checker();
@@ -121,55 +126,139 @@ async fn handle_tproxy_connection(
             return;
         };
 
+        let is_pool_active = quic_pool.is_active();
+
+        let quic_stream_res = if !is_pool_active {
+            Err("QUIC pool is unhealthy".to_string())
+        } else {
+            quic_pool.open_mux_stream().await
+        };
+
+        match quic_stream_res {
+            Ok((mut quic_send, mut quic_recv, conn_stat)) => {
+                log::info!(
+                    "Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.",
+                    src_addr,
+                    original_dst
+                );
+
+                if write_target_addr(&mut quic_send, original_dst)
+                    .await
+                    .is_ok()
+                {
+                    let mut status = [0u8; 1];
+                    match timeout(Duration::from_secs(5), quic_recv.read_exact(&mut status)).await {
+                        Ok(Ok(_)) if status[0] == 1 => {
+                            let stats = telemetry.get_or_create(peer_pub_key);
+                            relay::relay_connections_with_conn_stat(
+                                tcp_socket,
+                                quic_send,
+                                quic_recv,
+                                stats,
+                                conn_stat,
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(Ok(_)) => {
+                            log::warn!("Server side rejected proxy endpoint {}", original_dst);
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!(
+                                "Failed to read server proxy status for {}: {}",
+                                original_dst,
+                                e
+                            );
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Timed out waiting for server proxy status for {}",
+                                original_dst
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "QUIC pool unhealthy or failed to open stream: {}. Falling back to WireGuard (L3) tunnel.",
+                    e
+                );
+            }
+        }
+
+        // --- WIREGUARD FALLBACK PATH ---
         log::info!(
-            "Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.",
+            "QUIC pool unavailable; falling back connection {} -> {} to WireGuard L3 relay",
             src_addr,
             original_dst
         );
 
-        let (mut quic_send, mut quic_recv, conn_stat) = match quic_pool.open_mux_stream().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                log::warn!("Failed to open parallel multiplexed QUIC stream: {}", e);
-                return;
+        let local_bind_ip = {
+            let st = state.read();
+            st.config.interface.addresses.iter()
+                .find(|ipnet| matches!(ipnet, ipnet::IpNet::V4(_)) == original_dst.is_ipv4())
+                .map(|ipnet| ipnet.addr())
+        };
+
+        let outbound_socket = if original_dst.is_ipv6() {
+            tokio::net::TcpSocket::new_v6()
+        } else {
+            tokio::net::TcpSocket::new_v4()
+        };
+
+        let outbound_stream = match outbound_socket {
+            Ok(socket) => {
+                if let Some(ip) = local_bind_ip {
+                    let _ = socket.bind(SocketAddr::new(ip, 0));
+                }
+
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = socket.as_raw_fd();
+                    if let Ok(iface_cstring) = std::ffi::CString::new(quic_pool.interface_name()) {
+                        let iface_bytes = iface_cstring.as_bytes_with_nul();
+                        let ret = unsafe {
+                            libc::setsockopt(
+                                fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_BINDTODEVICE,
+                                iface_bytes.as_ptr() as *const libc::c_void,
+                                iface_bytes.len() as libc::socklen_t,
+                            )
+                        };
+                        if ret != 0 {
+                            log::warn!(
+                                "WireGuard fallback: failed to set SO_BINDTODEVICE on interface {}: {}",
+                                quic_pool.interface_name(),
+                                std::io::Error::last_os_error()
+                            );
+                        }
+                    }
+                }
+
+                match timeout(Duration::from_secs(5), socket.connect(original_dst)).await {
+                    Ok(Ok(stream)) => Some(stream),
+                    Ok(Err(err)) => {
+                        log::error!("WireGuard fallback: connection to {} failed: {}", original_dst, err);
+                        None
+                    }
+                    Err(_) => {
+                        log::error!("WireGuard fallback: connection to {} timed out", original_dst);
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                log::error!("WireGuard fallback: failed to create TCP socket: {}", err);
+                None
             }
         };
 
-        if write_target_addr(&mut quic_send, original_dst)
-            .await
-            .is_err()
-        {
-            return;
+        if let Some(outbound_stream) = outbound_stream {
+            relay::relay_fallback_connections(tcp_socket, outbound_stream).await;
         }
-
-        let mut status = [0u8; 1];
-        match timeout(Duration::from_secs(5), quic_recv.read_exact(&mut status)).await {
-            Ok(Ok(_)) if status[0] == 1 => {}
-            Ok(Ok(_)) => {
-                log::warn!("Server side rejected proxy endpoint {}", original_dst);
-                return;
-            }
-            Ok(Err(e)) => {
-                log::warn!(
-                    "Failed to read server proxy status for {}: {}",
-                    original_dst,
-                    e
-                );
-                return;
-            }
-            Err(_) => {
-                log::warn!(
-                    "Timed out waiting for server proxy status for {}",
-                    original_dst
-                );
-                return;
-            }
-        }
-
-        let stats = telemetry.get_or_create(peer_pub_key);
-
-        relay::relay_connections_with_conn_stat(tcp_socket, quic_send, quic_recv, stats, conn_stat)
-            .await;
     } else {
         log::debug!(
             "Intercepted connection to {} does not match AllowedIPs. Dropped.",

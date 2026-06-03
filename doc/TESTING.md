@@ -27,7 +27,7 @@ cargo test
 - `src/stats_cli.rs`：`new_proxy stats` 内置 telemetry table 输出、byte formatter。
 - `src/tcp_util.rs`：TCP keepalive socket option helper。
 - `src/telemetry.rs`：统一 telemetry DTO 和 sharded L4 telemetry registry。
-- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝。
+- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复。
 - `src/relay.rs`：双向 relay、计数 reader。
 - `src/routing.rs`：AllowedIPs longest-prefix matching。
 - `src/tproxy.rs`：IPv4/IPv6 transparent listener 创建。
@@ -64,7 +64,7 @@ python3 -m py_compile script/acceptance/stability_report.py
 | 层级 | 已覆盖 | 主要缺口 |
 | --- | --- | --- |
 | 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry | `setup_peer_routes_and_tproxy()`/`cleanup_peer_routes_and_tproxy()` 的命令级断言仍主要依赖 E2E |
-| E2E | 双栈 WAN、IPv6 HTTP over TPROXY/QUIC、TPROXY->QUIC、动态 server peer add/remove、多客户端 proxy+WireGuard-only fallback、动态 client proxy peer add/remove 生命周期 | 服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
+| E2E | 双栈 WAN、IPv6 HTTP over TPROXY/QUIC、TPROXY->QUIC、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy+WireGuard-only fallback、动态 client proxy peer add/remove 生命周期 | 服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、WireGuard-only fallback、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
 | 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测 |
 | 弱网/混沌 | 无正式脚本 | 缺丢包、端口阻断、服务端重启、session rotation、控制面丢包场景 |
@@ -122,10 +122,28 @@ Rust 单元测试覆盖：
 - router namespace 使用 `curl -g http://[fd00::1]:8080/` 发起真实 TCP。
 - server telemetry 中出现 QUIC L4 字节。
 
+### 3.6 服务端重启后的客户端自动恢复
+
+`script/acceptance/e2e_scenarios.sh` 覆盖 namespace 级真实进程恢复：
+
+1. client/server daemon 先完成 TPROXY -> QUIC 业务流量。
+2. 测试 kill server daemon 并重新启动 server daemon，触发新自签证书和新 session cache。
+3. 等待 client health checker 自愈。
+4. 从 router namespace 发起新 TCP 请求，验证业务恢复。
+5. 通过 server UDS stats 检查 `quic: active`。
+
+`src/quic_pool.rs::test_health_checker_refreshes_control_config_after_server_restart` 额外覆盖 pool 层控制面刷新细节：
+
+1. 客户端先使用旧 `session_psk`、旧 QUIC 证书指纹和旧端口建立连接。
+2. 测试模拟服务端重启后旧 session 失效，并关闭旧物理连接。
+3. 健康检查按旧配置重连失败后重新走控制面协商。
+4. 客户端获得新的 `session_psk`、QUIC 证书指纹和端口池，替换本地 runtime config 与连接池。
+5. 新业务 stream 在新 QUIC 服务端上成功 echo。
+
 ## 4. Backlog
 
 - 服务端 session rotation / peer removal E2E：建立长 TCP 流，server `remove-peer`，验证旧 QUIC 连接关闭、新 stream 失败，重新 `add-peer` 后新 TCP 成功。
-- 弱网脚本：对单个 QUIC UDP port 下发 `DROP`，验证新 stream 继续使用其他健康 port；控制面 UDP 丢第一包后重试新 nonce 成功；服务端重启后 health checker 恢复。
+- 弱网脚本：对单个 QUIC UDP port 下发 `DROP`，验证新 stream 继续使用其他健康 port；控制面 UDP 丢第一包后重试新 nonce 成功。
 - 性能脚本：正式 throughput、TTFB、CPU/RSS、连接建立耗时、并发 1k/4k/8k 阶梯压测。
 - 稳定性脚本：1 小时 nightly/profile、FD 数、CPU 累计时间、失败日志自动打包、机器可读 pass/fail 总结。
 - 安全负向：恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E。

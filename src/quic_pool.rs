@@ -19,6 +19,13 @@ const MAX_AUTH_PACKET_LEN: usize = 2048;
 const MAX_INCOMING_QUIC_CONNECTIONS: usize = 4096;
 static NEXT_QUIC_CONN_RECORD_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolState {
+    Active,
+    Fallback,
+    Recovering { recovery_start: std::time::Instant },
+}
+
 #[derive(Clone)]
 struct PoolRuntimeConfig {
     session_psk: [u8; 32],
@@ -190,6 +197,8 @@ pub struct QuicPoolClient {
     rr_index: Arc<AtomicUsize>,
     endpoint: Arc<Mutex<Option<Endpoint>>>,
     shutdown: Arc<AtomicBool>,
+    interface_name: String,
+    pool_state: Arc<RwLock<PoolState>>,
 }
 
 #[derive(Clone)]
@@ -213,6 +222,7 @@ impl QuicPoolClient {
             server_cert_sha256,
             endpoints,
             None,
+            String::new(),
         )
     }
 
@@ -225,6 +235,7 @@ impl QuicPoolClient {
         server_public_key: [u8; 32],
         control_endpoint: SocketAddr,
         fallback_endpoint: SocketAddr,
+        interface_name: String,
     ) -> Self {
         Self::new_internal(
             client_public_key,
@@ -237,6 +248,7 @@ impl QuicPoolClient {
                 control_endpoint,
                 fallback_endpoint,
             }),
+            interface_name,
         )
     }
 
@@ -246,6 +258,7 @@ impl QuicPoolClient {
         server_cert_sha256: [u8; 32],
         endpoints: Vec<SocketAddr>,
         refresh_config: Option<ControlRefreshConfig>,
+        interface_name: String,
     ) -> Self {
         Self {
             client_public_key,
@@ -259,7 +272,21 @@ impl QuicPoolClient {
             rr_index: Arc::new(AtomicUsize::new(0)),
             endpoint: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            interface_name,
+            pool_state: Arc::new(RwLock::new(PoolState::Active)),
         }
+    }
+
+    pub fn get_state(&self) -> PoolState {
+        *self.pool_state.read()
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self.get_state(), PoolState::Active)
+    }
+
+    pub fn interface_name(&self) -> &str {
+        &self.interface_name
     }
 
     pub fn shutdown(&self, reason: &'static [u8]) {
@@ -532,6 +559,8 @@ impl QuicPoolClient {
                     break;
                 }
 
+                let pool_state = { *self.pool_state.read() };
+
                 let runtime_config = self.runtime_config.read().clone();
                 let (endpoints, session_psk, endpoint_opt) = {
                     let ep = self.endpoint.lock();
@@ -658,6 +687,36 @@ impl QuicPoolClient {
                     if let Err(e) = self.refresh_control_config().await {
                         log::warn!("Failed to refresh QUIC session after auth failures: {}", e);
                     }
+                }
+
+                let has_live_connection = {
+                    let slots = self.slots.read();
+                    slots.iter().any(|slot| slot.conn.close_reason().is_none())
+                };
+
+                let mut new_pool_state = pool_state;
+                match pool_state {
+                    PoolState::Active | PoolState::Recovering { .. } => {
+                        if !has_live_connection {
+                            log::warn!("QUIC pool is completely down; entering Fallback state");
+                            new_pool_state = PoolState::Fallback;
+                        } else if let PoolState::Recovering { recovery_start } = pool_state {
+                            if std::time::Instant::now().duration_since(recovery_start) >= Duration::from_secs(30) {
+                                log::info!("QUIC pool cooldown period expired; entering Active state.");
+                                new_pool_state = PoolState::Active;
+                            }
+                        }
+                    }
+                    PoolState::Fallback => {
+                        if has_live_connection {
+                            log::info!("QUIC pool has recovered. Entering Recovery (cooldown) period before switching back to QUIC.");
+                            new_pool_state = PoolState::Recovering { recovery_start: std::time::Instant::now() };
+                        }
+                    }
+                }
+
+                if new_pool_state != pool_state {
+                    *self.pool_state.write() = new_pool_state;
                 }
             }
         });
@@ -1004,8 +1063,59 @@ impl Drop for TelemetryRegistryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::net::UdpSocket;
     use std::sync::atomic::Ordering;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn unused_udp_port() -> u16 {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().port()
+    }
+
+    async fn start_echo_quic_server(
+        port: u16,
+        session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
+    ) -> (
+        [u8; 32],
+        PeerConnRegistry,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let peer_registry = Arc::new(Mutex::new(HashMap::new()));
+        let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+        let server = QuicPoolServer::new(vec![port], session_cache, auth_nonce_cache);
+        let (certs, key) = generate_self_signed_cert().unwrap();
+        let cert_fingerprint = cert_sha256(&certs).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+
+        let handler = Arc::new(
+            move |_pub_key: [u8; 32],
+                  mut send: quinn::SendStream,
+                  mut recv: quinn::RecvStream,
+                  stat: Arc<QuicConnStats>| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    if let Ok(Some(n)) = recv.read(&mut buf).await {
+                        buf.truncate(n);
+                        stat.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        if send.write_all(&buf).await.is_ok() {
+                            stat.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        let _ = send.finish().await;
+                        let _ = tx.send(buf).await;
+                    }
+                });
+            },
+        );
+
+        server
+            .run_with_registry(certs, key, handler, peer_registry.clone())
+            .await
+            .unwrap();
+
+        (cert_fingerprint, peer_registry, rx)
+    }
 
     #[tokio::test]
     async fn test_quic_pool_rejects_empty_endpoint_pool() {
@@ -1020,10 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn test_quic_pool_client_server_integration() {
         // 1. 获取一个闲置的本地 UDP 端口
-        let port = {
-            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            socket.local_addr().unwrap().port()
-        };
+        let port = unused_udp_port();
 
         // 2. 初始化服务端
         let session_cache = Arc::new(RwLock::new(HashMap::new()));
@@ -1128,6 +1235,101 @@ mod tests {
             let registry = peer_registry.lock();
             assert!(registry.is_empty() || !registry.contains_key(&client_pub_key));
         }
+    }
+
+    #[tokio::test]
+    async fn test_health_checker_refreshes_control_config_after_server_restart() {
+        let old_port = unused_udp_port();
+        let new_port = unused_udp_port();
+        let control_port = unused_udp_port();
+
+        let client_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let client_pub = PublicKey::from(&client_secret).to_bytes();
+        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let server_pub = PublicKey::from(&server_secret).to_bytes();
+        let server_shared = server_secret
+            .diffie_hellman(&PublicKey::from(client_pub))
+            .to_bytes();
+
+        let old_psk = [9u8; 32];
+        let old_session_cache = Arc::new(RwLock::new(HashMap::new()));
+        old_session_cache.write().insert(client_pub, old_psk);
+        let (old_cert_fingerprint, _old_registry, _old_rx) =
+            start_echo_quic_server(old_port, old_session_cache.clone()).await;
+
+        let new_session_cache = Arc::new(RwLock::new(HashMap::new()));
+        let (new_cert_fingerprint, _new_registry, mut new_rx) =
+            start_echo_quic_server(new_port, new_session_cache.clone()).await;
+
+        let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
+        peer_secrets.write().insert(client_pub, server_shared);
+        let control_server = crate::control::ControlServer::new(
+            control_port,
+            peer_secrets,
+            vec![new_port],
+            None,
+            None,
+            new_cert_fingerprint,
+            new_session_cache.clone(),
+        );
+        let control_task = control_server.start().await.unwrap();
+
+        let old_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), old_port);
+        let new_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), new_port);
+        let control_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), control_port);
+        let client = Arc::new(QuicPoolClient::new_with_refresh(
+            client_pub,
+            old_psk,
+            old_cert_fingerprint,
+            vec![old_addr],
+            client_secret.to_bytes(),
+            server_pub,
+            control_addr,
+            control_addr,
+            "testwg0".to_string(),
+        ));
+        client.start_pool().await.unwrap();
+
+        old_session_cache.write().insert(client_pub, [8u8; 32]);
+        {
+            let slots = client.slots.read();
+            for slot in slots.iter() {
+                slot.conn.close(0u32.into(), b"simulated server restart");
+            }
+        }
+
+        client.clone().start_health_checker();
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            let refreshed =
+                client.runtime_config.read().endpoints == vec![new_addr]
+                    && client.slots.read().iter().any(|slot| {
+                        slot.endpoint == new_addr && slot.conn.close_reason().is_none()
+                    });
+            if refreshed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health checker did not refresh control config and reconnect to restarted server"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(new_session_cache.read().contains_key(&client_pub));
+        let (mut send, mut recv, conn_stat) = client.open_mux_stream().await.unwrap();
+        assert_eq!(conn_stat.local_port, new_port);
+        send.write_all(b"after restart").await.unwrap();
+        send.finish().await.unwrap();
+
+        let mut resp = vec![0u8; 1024];
+        let n = recv.read(&mut resp).await.unwrap().unwrap();
+        resp.truncate(n);
+        assert_eq!(&resp, b"after restart");
+        assert_eq!(new_rx.recv().await.unwrap(), b"after restart");
+
+        client.shutdown(b"test complete");
+        control_task.abort();
     }
 
     #[test]

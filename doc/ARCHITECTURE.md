@@ -74,7 +74,15 @@ Client mode 支持两类 peer：
 
 - 已关闭连接会按原 endpoint 重连。
 - 缺失 endpoint 会补建连接。
+- 如果所有重连尝试都因 QUIC 握手、证书 pinning 或 PSK 认证失败，且该 pool 带有控制面刷新配置，客户端会重新发起控制面协商，获取新的 `session_psk`、QUIC 证书指纹和端口池，然后替换本地 QUIC endpoint 与连接池。这个路径用于服务端进程重启后自签证书和 session cache 重建的恢复。
+- 刷新成功后，旧 QUIC endpoint 和旧物理连接会被显式关闭，后续新 stream 使用刷新后的连接池。
 - pool 被运行期删除或替换时调用 `shutdown()`，关闭连接并停止健康检查循环。
+
+服务端重启恢复边界：
+
+- 已经建立在旧 QUIC 连接上的业务 stream 不迁移，失败后由上层 TCP 应用重新建连。
+- 客户端恢复依赖健康检查周期、QUIC 关闭/超时或新 stream 打开失败暴露出的连接失效；恢复目标是后续新 stream 自动连回服务端。
+- 控制面地址仍来自 peer 的 `Endpoint.ip()` 和 `ProxyPort`。如果服务端重启后控制面地址也变化，需要通过配置或 UDS 动态 peer 更新完成。
 
 ## 5. TPROXY 与路由
 

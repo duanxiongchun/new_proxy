@@ -381,7 +381,14 @@ async fn main() {
         }
 
         for peer in &proxy_peers {
-            match build_peer_quic_pool(config.interface.private_key, peer).await {
+            match build_peer_quic_pool(
+                config.interface.private_key,
+                peer,
+                &interface_name,
+                config.interface.tproxy_port,
+            )
+            .await
+            {
                 Ok(pool) => {
                     client_quic_pools.write().insert(peer.public_key, pool);
                 }

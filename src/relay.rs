@@ -235,6 +235,68 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     }
 }
 
+pub async fn relay_fallback_connections(
+    tcp_client: TcpStream,
+    tcp_target: TcpStream,
+) {
+    let (client_read, client_write) = tcp_client.into_split();
+    let (target_read, target_write) = tcp_target.into_split();
+
+    let client_to_target = tokio::spawn(async move {
+        let mut reader = client_read;
+        let mut writer = target_write;
+        if let Err(e) = relay_copy_with_idle(&mut reader, &mut writer).await {
+            log::debug!("Client→Target fallback relay error: {}", e);
+        }
+        let _ = writer.shutdown().await;
+    });
+
+    let target_to_client = tokio::spawn(async move {
+        let mut reader = target_read;
+        let mut writer = client_write;
+        if let Err(e) = relay_copy_with_idle(&mut reader, &mut writer).await {
+            log::debug!("Target→Client fallback relay error: {}", e);
+        }
+        let _ = writer.shutdown().await;
+    });
+
+    let mut c2t = client_to_target;
+    let mut t2c = target_to_client;
+
+    tokio::select! {
+        res = &mut c2t => {
+            if let Err(e) = res {
+                log::error!("Client→Target fallback relay task panicked: {:?}", e);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    t2c.abort();
+                }
+                res2 = &mut t2c => {
+                    if let Err(e) = res2 {
+                        log::error!("Target→Client fallback relay task panicked: {:?}", e);
+                    }
+                }
+            }
+        }
+        res = &mut t2c => {
+            if let Err(e) = res {
+                log::error!("Target→Client fallback relay task panicked: {:?}", e);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    c2t.abort();
+                }
+                res2 = &mut c2t => {
+                    if let Err(e) = res2 {
+                        log::error!("Client→Target fallback relay task panicked: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn relay_copy_with_idle<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
