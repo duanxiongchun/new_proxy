@@ -51,6 +51,11 @@ impl TelemetryRegistry {
         snapshot
     }
 
+    pub fn remove(&self, pub_key: &[u8; 32]) {
+        let mut map = self.stats[self.shard_index(pub_key)].lock();
+        map.remove(pub_key);
+    }
+
     fn shard_index(&self, pub_key: &[u8; 32]) -> usize {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&pub_key[..8]);
@@ -89,5 +94,17 @@ mod tests {
         assert_eq!(snap[&key1].rx_bytes.load(Ordering::Relaxed), 100);
         assert_eq!(snap[&key1].tx_bytes.load(Ordering::Relaxed), 200);
         assert_eq!(snap[&key1].active_streams.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn test_telemetry_registry_remove() {
+        let registry = TelemetryRegistry::new();
+        let key = [9u8; 32];
+        let stats = registry.get_or_create(key);
+        stats.rx_bytes.store(500, Ordering::Relaxed);
+
+        registry.remove(&key);
+        let snap = registry.snapshot();
+        assert!(!snap.contains_key(&key));
     }
 }

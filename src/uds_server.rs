@@ -679,6 +679,7 @@ async fn handle_remove_peer(
     context.peer_secrets.write().remove(&parsed_pub_key);
     context.session_cache.write().remove(&parsed_pub_key);
     context.auth_nonce_cache.lock().remove(&parsed_pub_key);
+    context.telemetry.remove(&parsed_pub_key);
 
     if context.runtime_mode == RuntimeMode::Client {
         if let Some(pool) = context.client_quic_pools.write().remove(&parsed_pub_key) {
@@ -955,6 +956,7 @@ mod tests {
         let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
         let session_cache = Arc::new(RwLock::new(HashMap::new()));
         let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+        let telemetry = crate::telemetry::TelemetryRegistry::new();
 
         let pub_key = [5u8; 32];
         peer_secrets.write().insert(pub_key, [10u8; 32]);
@@ -962,14 +964,18 @@ mod tests {
         auth_nonce_cache
             .lock()
             .insert(pub_key, crate::control::NonceCache::new(10));
+        let stats = telemetry.get_or_create(pub_key);
+        stats.rx_bytes.store(500, std::sync::atomic::Ordering::Relaxed);
 
         peer_secrets.write().remove(&pub_key);
         session_cache.write().remove(&pub_key);
         auth_nonce_cache.lock().remove(&pub_key);
+        telemetry.remove(&pub_key);
 
         assert!(!peer_secrets.read().contains_key(&pub_key));
         assert!(!session_cache.read().contains_key(&pub_key));
         assert!(!auth_nonce_cache.lock().contains_key(&pub_key));
+        assert!(!telemetry.snapshot().contains_key(&pub_key));
     }
 
     #[test]
