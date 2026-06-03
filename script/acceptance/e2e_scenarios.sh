@@ -199,10 +199,43 @@ echo "  L4 Transfer: 显示 QUIC 卸载的 TCP 字节 (应 > 0)"
 echo "  Active Strm: TCP 完成后应为 0 (连接已关闭)"
 
 # -------------------------------------------------------------------------
-# 4. SCENARIO 2: DYNAMIC PEER MANAGEMENT (hot-adding/removing peers)
+# 4. SCENARIO 2: SERVER RESTART & AUTO-RECONNECTION
 # -------------------------------------------------------------------------
 echo ""
-echo "=== [4/5] SCENARIO 2: Dynamic Peer Management (Hot-Add/Remove Peer) ==="
+echo "=== [4/6] SCENARIO 2: Server Restart & Client Auto-Reconnection ==="
+echo "  >> 重启服务端以更改自签名证书..."
+kill $SERVER_PID
+sleep 1
+
+# 启动 Server Daemon (这会生成全新的自签名证书)
+ip netns exec server_ns ./target/debug/new_proxy -config /tmp/scenario_server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
+SERVER_PID=$!
+sleep 2
+
+echo "  >> 等待客户端健康检查器检测到连接断开并进行自愈重连..."
+# 客户端的健康检查周期是 5 秒，空闲超时时间是 30 秒，我们睡眠 35 秒以确保连接彻底超时并完成自愈重连
+sleep 35
+
+echo "  >> 发送新的 TCP 流量以验证连接已恢复且走了 QUIC 隧道..."
+ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
+
+echo ""
+echo "  >> 从网关拉取重启后的遥测数据:"
+ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show
+
+# 验证当前 quic 连接是否为 active，以确保重连成功
+CLIENT_STATS=$(ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show)
+if ! echo "$CLIENT_STATS" | grep -q "quic: active"; then
+  echo "❌ [ERROR] Client failed to reconnect automatically after server restart!"
+  exit 1
+fi
+echo "  ✓ 客户端重连成功！"
+
+# -------------------------------------------------------------------------
+# 5. SCENARIO 3: DYNAMIC PEER MANAGEMENT (hot-adding/removing peers)
+# -------------------------------------------------------------------------
+echo ""
+echo "=== [5/6] SCENARIO 3: Dynamic Peer Management (Hot-Add/Remove Peer) ==="
 
 NEW_PEER_KEY="${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}"
 
@@ -219,10 +252,10 @@ echo "  D. 验证 Peer 删除后遥测表 (应只剩原始 peer):"
 ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show
 
 # -------------------------------------------------------------------------
-# 5. SCENARIO 3: WIREGUARD L3 FALLBACK (无 QUIC 代理, 纯 L3)
+# 6. SCENARIO 4: WIREGUARD L3 FALLBACK (无 QUIC 代理, 纯 L3)
 # -------------------------------------------------------------------------
 echo ""
-echo "=== [5/5] SCENARIO 3: Standard WireGuard L3 Fallback Mode (No QUIC) ==="
+echo "=== [6/6] SCENARIO 4: Standard WireGuard L3 Fallback Mode (No QUIC) ==="
 echo "  流量路径 (回退):"
 echo "  [ALL]  client_ns ──► router_ns ──► server_ns:8080 (native L3, no QUIC)"
 
