@@ -645,6 +645,7 @@ impl QuicPoolClient {
                         Err(e) => {
                             if e.contains("PSK Authentication failed")
                                 || e.contains("PSK Authentication timed out")
+                                || e.contains("QUIC connection failed")
                             {
                                 auth_failures += 1;
                             }
