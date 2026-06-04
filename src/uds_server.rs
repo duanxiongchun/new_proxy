@@ -151,6 +151,26 @@ pub fn start(listener: UnixListener, context: UdsServerContext) {
     });
 }
 
+fn quic_connection_snapshots(
+    quic_registry: &HashMap<[u8; 32], Vec<quic_pool::QuicConnRecord>>,
+    client_quic_pools: &PeerQuicPools,
+    pub_key: &[u8; 32],
+) -> Vec<quic_pool::QuicConnSnapshot> {
+    let server_side = quic_registry
+        .get(pub_key)
+        .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !server_side.is_empty() {
+        return server_side;
+    }
+
+    client_quic_pools
+        .read()
+        .get(pub_key)
+        .map(|pool| pool.connection_snapshots())
+        .unwrap_or_default()
+}
+
 async fn handle_stats(
     context: &UdsServerContext,
     stream: &mut tokio::net::UnixStream,
@@ -183,10 +203,8 @@ async fn handle_stats(
                     )
                 })
                 .unwrap_or((0, 0, 0));
-            let quic_connections = quic_registry
-                .get(&pub_key)
-                .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect())
-                .unwrap_or_default();
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, &pub_key);
             let endpoint = peer
                 .endpoint
                 .map(|addr| addr.to_string())
@@ -233,10 +251,8 @@ async fn handle_stats(
                     )
                 })
                 .unwrap_or((0, 0, 0));
-            let quic_connections = quic_registry
-                .get(pub_key)
-                .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect())
-                .unwrap_or_default();
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, pub_key);
             let source = sources
                 .get(pub_key)
                 .cloned()
@@ -272,10 +288,8 @@ async fn handle_stats(
                     )
                 })
                 .unwrap_or((0, 0, 0));
-            let quic_connections = quic_registry
-                .get(pub_key)
-                .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect())
-                .unwrap_or_default();
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, pub_key);
             let source = sources
                 .get(pub_key)
                 .cloned()
@@ -326,6 +340,7 @@ async fn handle_dump(
         keys.extend(l3_stats.keys().copied());
         keys.extend(telemetry.keys().copied());
         keys.extend(quic_registry.keys().copied());
+        keys.extend(context.client_quic_pools.read().keys().copied());
 
         let mut lines = Vec::new();
         for key in keys {
@@ -341,10 +356,8 @@ async fn handle_dump(
             let active_streams = l4
                 .map(|stats| stats.active_streams.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            let quic_connections = quic_registry
-                .get(&key)
-                .map(|conns| conns.len())
-                .unwrap_or(0);
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, &key).len();
             let endpoint = configured
                 .and_then(|peer| peer.endpoint.map(|addr| addr.to_string()))
                 .or_else(|| wg.and_then(|stats| stats.endpoint.clone()))

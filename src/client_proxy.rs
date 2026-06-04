@@ -2,7 +2,7 @@ use crate::app_config::select_quic_endpoint_ip;
 use crate::config;
 use crate::control::ControlClient;
 use crate::proxy_proto::write_target_addr;
-use crate::quic_pool::QuicPoolClient;
+use crate::quic_pool::{PoolState, QuicPoolClient};
 use crate::tcp_util::set_tcp_keepalive;
 use crate::telemetry::TelemetryRegistry;
 use crate::{encode_base64_32, relay, GatewayState, PeerQuicPools};
@@ -79,6 +79,14 @@ pub async fn run_tproxy_accept_loop(
     }
 }
 
+fn should_enter_fallback_after_mux_error(pool_state: PoolState) -> bool {
+    matches!(pool_state, PoolState::Active)
+}
+
+fn should_enter_fallback_after_proxy_status_error(_pool_state: PoolState) -> bool {
+    false
+}
+
 async fn handle_tproxy_connection(
     tcp_socket: TcpStream,
     src_addr: SocketAddr,
@@ -121,9 +129,9 @@ async fn handle_tproxy_connection(
             return;
         };
 
-        let is_pool_active = quic_pool.is_active();
+        let pool_state = quic_pool.get_state();
 
-        let quic_stream_res = if !is_pool_active {
+        let quic_stream_res = if !matches!(pool_state, PoolState::Active) {
             Err("QUIC pool is unhealthy".to_string())
         } else {
             quic_pool.open_mux_stream().await
@@ -160,18 +168,25 @@ async fn handle_tproxy_connection(
                                 original_dst,
                                 e
                             );
-                            quic_pool.enter_fallback("failed to read server proxy status");
+                            if should_enter_fallback_after_proxy_status_error(pool_state) {
+                                quic_pool.enter_fallback("failed to read server proxy status");
+                            }
                         }
                         Err(_) => {
                             log::warn!(
                                 "Timed out waiting for server proxy status for {}",
                                 original_dst
                             );
-                            quic_pool.enter_fallback("timed out waiting for server proxy status");
+                            if should_enter_fallback_after_proxy_status_error(pool_state) {
+                                quic_pool
+                                    .enter_fallback("timed out waiting for server proxy status");
+                            }
                         }
                     }
                 } else {
-                    quic_pool.enter_fallback("failed to write proxy target address");
+                    if should_enter_fallback_after_proxy_status_error(pool_state) {
+                        quic_pool.enter_fallback("failed to write proxy target address");
+                    }
                 }
             }
             Err(e) => {
@@ -179,7 +194,9 @@ async fn handle_tproxy_connection(
                     "QUIC pool unhealthy or failed to open stream: {}. Falling back to WireGuard (L3) tunnel.",
                     e
                 );
-                quic_pool.enter_fallback("failed to open QUIC mux stream");
+                if should_enter_fallback_after_mux_error(pool_state) {
+                    quic_pool.enter_fallback("failed to open QUIC mux stream");
+                }
             }
         }
 
@@ -196,5 +213,36 @@ async fn handle_tproxy_connection(
             "Intercepted connection to {} does not match AllowedIPs. Dropped.",
             original_dst
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mux_error_only_marks_fallback_from_active_pool() {
+        assert!(should_enter_fallback_after_mux_error(PoolState::Active));
+        assert!(!should_enter_fallback_after_mux_error(PoolState::Fallback));
+        assert!(!should_enter_fallback_after_mux_error(
+            PoolState::Recovering {
+                recovery_start: std::time::Instant::now(),
+            }
+        ));
+    }
+
+    #[test]
+    fn proxy_status_error_does_not_mark_physical_pool_fallback() {
+        assert!(!should_enter_fallback_after_proxy_status_error(
+            PoolState::Active
+        ));
+        assert!(!should_enter_fallback_after_proxy_status_error(
+            PoolState::Fallback
+        ));
+        assert!(!should_enter_fallback_after_proxy_status_error(
+            PoolState::Recovering {
+                recovery_start: std::time::Instant::now(),
+            }
+        ));
     }
 }

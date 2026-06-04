@@ -279,8 +279,13 @@ impl QuicPoolClient {
         *self.pool_state.read()
     }
 
-    pub fn is_active(&self) -> bool {
-        matches!(self.get_state(), PoolState::Active)
+    pub fn connection_snapshots(&self) -> Vec<QuicConnSnapshot> {
+        self.slots
+            .read()
+            .iter()
+            .filter(|slot| slot.conn.close_reason().is_none())
+            .map(|slot| slot.stats.snapshot())
+            .collect()
     }
 
     pub fn enter_fallback(&self, reason: &str) {
