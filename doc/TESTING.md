@@ -160,6 +160,44 @@ Rust 单元测试覆盖：
 
 - `src/main.rs::test_tproxy_failover_policy_requires_all_pools_active`：确认只有所有 pool 都是 `Active` 时才允许恢复 TPROXY；`Fallback` 和 `Recovering` 都保持 WireGuard fallback。
 
+### 3.8 稳定性与负载均衡测试设计
+
+`script/acceptance/stability_stress_test.sh` 是长稳测试入口，目标覆盖物理 QUIC 连接池、TPROXY 拦截、用户态并发转发和双轨聚合遥测。
+
+核心成功标准：
+
+- 测试期间 client/server daemon 无 panic、无意外退出、无 crash。
+- 长连接 TCP 与短连接 `curl` 业务请求应持续成功。
+- 多物理 QUIC 连接的流量分布应接近均匀；稳定性报告按各连接总流量计算变异系数 CV。
+- warmup 后 RSS 不应持续线性增长，避免 OOM 或明显泄漏。
+
+流量模型：
+
+- 多线程长 TCP：后台线程持续建立到目标 HTTP 服务的 TCP 连接并发送数据，断线后自动重连。
+- 高频短 TCP：周期性发起 `curl` 短连接，压测 QUIC stream 分配和回收。
+- 背景 UDP/ICMP：通过非 proxy 路径保持 L3 活跃，辅助观察 WireGuard 与 QUIC 分层遥测。
+
+采样与报告：
+
+- 脚本周期性采集 daemon 存活、CPU、RSS、UDS/CLI dump、QUIC connection 本地端口、rx/tx bytes 和 active streams。
+- 采样数据写入 artifact 目录的 JSON Lines 文件。
+- `stability_report.py` 汇总资源趋势、流量成功率和 QUIC 物理连接分布。
+
+### 3.9 部署验证
+
+部署包验证分三层：
+
+- 构建层：`make package` 生成本机架构包；交叉包使用 `ARCH=<deb_arch> CARGO_TARGET=<rust_target>`，并用 `file`/`dpkg-deb -f` 确认二进制架构和 Debian `Architecture` 匹配。
+- 安装层：远端 `dpkg -i` 后确认 `dpkg -s new-proxy` 为 `install ok installed`，二进制和 systemd unit 属主为 `root:root`。
+- 运行层：`systemctl restart new_proxy@<instance>` 后检查服务为 `active (running)`，再通过 `new-proxy-cli --interface <instance> show` 验证 UDS 可连接、peer source/handshake/QUIC 状态符合预期。
+
+客户端隧道自举机器部署必须使用本机 rollback 机制：
+
+1. 在客户端本地把当前安装内容打成 rollback deb。
+2. 安装新 deb 前启动 watchdog。
+3. 新包安装并重启服务后，在限定时间内确认 systemd active、UDS CLI 可查询、peer 非 `latest handshake: Never`。
+4. 若健康确认未写入，watchdog 自动 `dpkg -i` rollback deb 并重启原服务。
+
 ## 4. Backlog
 
 - 服务端 session rotation / peer removal E2E：建立长 TCP 流，server `remove-peer`，验证旧 QUIC 连接关闭、新 stream 失败，重新 `add-peer` 后新 TCP 成功。
