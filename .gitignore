@@ -3,3 +3,6 @@
 __pycache__/
 *.py[cod]
 /conf/server_11024.conf
+/conf/client.conf.production
+/conf/pre.sh
+/conf/post.sh
