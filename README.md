@@ -65,11 +65,11 @@ target/release/new-proxy-cli
    ```bash
    make package
    ```
-   该命令会在 `target/` 目录下生成 `new-proxy_5.0.0_amd64.deb` 安装包。
+   该命令会在 `target/` 目录下生成匹配当前 Debian 架构的安装包，例如 `new-proxy_5.0.0_amd64.deb` 或 `new-proxy_5.0.0_arm64.deb`。也可以显式覆盖架构：`make package ARCH=arm64`。
 
 2. **安装 Debian 包**：
    ```bash
-   sudo dpkg -i target/new-proxy_5.0.0_amd64.deb
+   sudo dpkg -i target/new-proxy_5.0.0_$(dpkg --print-architecture).deb
    ```
    安装后，程序文件将被放置于 `/usr/bin/`，服务模板将写入 `/lib/systemd/system/`，示例配置复制至 `/etc/new_proxy/`。
 

@@ -34,7 +34,18 @@ Client mode 支持两类 peer：
 
 `Endpoint` 和 `ProxyPort` 必须成对出现。只配置其中一个会被视为非法 client 配置。
 
-## 3. 控制面
+## 3. WireGuard 后端
+
+L3 数据面由系统 WireGuard 设备承载，程序负责创建/配置接口、同步 peer、读取统计：
+
+- 启动时先尝试 `modprobe wireguard`，然后执行 `ip link add dev <interface> type wireguard`。
+- 如果接口已经存在，程序会继续复用该 kernel WireGuard 设备并通过 generic netlink 写入密钥、listen port、peer 与 AllowedIPs；这保证 systemd restart 时不会因为 `File exists` 误切到 userspace fallback。
+- 如果 kernel 设备创建失败且接口不存在，或者 generic netlink 写配置失败，程序会尝试 userspace WireGuard fallback。
+- userspace fallback 默认执行 `wireguard-go <interface>`，也可通过 `NEW_PROXY_WG_USERSPACE_BIN` 或 `NEW_PROXY_WG_USERSPACE_CMD` 指定命令，通过 `NEW_PROXY_WG_USERSPACE_SOCKET_DIR` 指定 UAPI socket 目录。
+- 设置 `NEW_PROXY_WG_USERSPACE=1` 时会直接使用 userspace WireGuard，不先尝试 kernel backend。
+- 清理时会删除 WireGuard 接口；userspace 模式还会清理对应的 userspace 进程。
+
+## 4. 控制面
 
 控制面位于服务端 `ListenControlPort`，客户端从 peer 的 `Endpoint.ip()` 与 `ProxyPort` 拼出控制面地址。
 
@@ -49,7 +60,7 @@ Client mode 支持两类 peer：
 
 控制面重试每次生成新的 `client_nonce`，避免响应丢包后旧 nonce 被服务端 replay cache 拒绝。
 
-## 4. QUIC 数据面
+## 5. QUIC 数据面
 
 服务端启动时生成一组自签证书和私钥：
 
@@ -74,9 +85,21 @@ Client mode 支持两类 peer：
 
 - 已关闭连接会按原 endpoint 重连。
 - 缺失 endpoint 会补建连接。
+- pool 状态分为 `Active`、`Fallback`、`Recovering`：
+  - `Active`：新 TCP 连接被 TPROXY 劫持到用户态并走 QUIC。
+  - `Fallback`：QUIC pool 不可用，新 TCP 连接不再被 TPROXY 劫持，按内核路由走 WireGuard L3。
+  - `Recovering`：QUIC 物理连接已经恢复，但仍处于延迟回切窗口，新 TCP 连接继续走 WireGuard L3，避免链路抖动时频繁切换。
+- 如果所有重连尝试都因 QUIC 握手、证书 pinning 或 PSK 认证失败，且该 pool 带有控制面刷新配置，客户端会重新发起控制面协商，获取新的 `session_psk`、QUIC 证书指纹和端口池，然后替换本地 QUIC endpoint 与连接池。这个路径用于服务端进程重启后自签证书和 session cache 重建的恢复。
+- 刷新成功后，旧 QUIC endpoint 和旧物理连接会被显式关闭，后续新 stream 使用刷新后的连接池。
 - pool 被运行期删除或替换时调用 `shutdown()`，关闭连接并停止健康检查循环。
 
-## 5. TPROXY 与路由
+服务端重启恢复边界：
+
+- 已经建立在旧 QUIC 连接上的业务 stream 不迁移，失败后由上层 TCP 应用重新建连。
+- 客户端恢复依赖健康检查周期、QUIC 关闭/超时或新 stream 打开失败暴露出的连接失效；恢复目标是后续新 stream 自动连回服务端。
+- 控制面地址仍来自 peer 的 `Endpoint.ip()` 和 `ProxyPort`。如果服务端重启后控制面地址也变化，需要通过配置或 UDS 动态 peer 更新完成。
+
+## 6. TPROXY 与路由
 
 `Table = auto` 时程序自动配置：
 
@@ -88,9 +111,25 @@ Client mode 支持两类 peer：
 
 `Table = off` 时程序不改系统路由和 iptables，测试脚本或外部系统需要自行配置。
 
+TPROXY 规则只接管客户端侧主动发起的新 TCP 连接：
+
+- 自动规则对 proxy peer `AllowedIPs` 下发 `-p tcp --syn -d <allowed_ip> -j TPROXY ...`，只匹配初始 SYN。
+- 同时下发 `-m socket --transparent` 的实例级 DIVERT chain，将已由透明 socket 接管的连接后续包重新标记并 `ACCEPT`，避免只匹配 SYN 后断流。
+- server 主动访问 client 后端时，回程 SYN-ACK 即使经过 client gateway，也不会命中 TPROXY 规则，因此不会被错误导入 QUIC proxy。
+- 启动或恢复 TPROXY 规则时会 best-effort 清理旧版“不带 `--syn` 的全 TCP TPROXY 规则”，避免升级后遗留规则继续误拦截回程包。
+
 L4 内存路由器只包含 proxy peer 的 `AllowedIPs`。WireGuard-only peer 不会被 TPROXY 命中后丢进 QUIC。
 
-## 6. 遥测与 API
+`Table != off` 的 client mode 还有一个全局 TPROXY failover manager：
+
+- 正常 `Active` 时，配置中的所有 proxy peer 都保持 TPROXY 规则，新连接走 QUIC。
+- 任意 proxy pool 进入 `Fallback` 或 `Recovering` 时，manager 删除当前配置里所有 proxy peer 的 TPROXY 规则和 TCPMSS clamp 规则，但保留 WireGuard route 和 peer 配置；后续新连接自然按内核路由走 WireGuard/wireguard-go L3。
+- client 启动时如果某个 proxy peer 的 QUIC pool 建立失败，daemon 不退出；它会先删除 proxy TPROXY 规则进入 WireGuard L3 fallback，并由 failover manager 后台周期性重建缺失的 QUIC pool。
+- 所有 proxy pool 回到 `Active` 后，manager 按当前配置全量重建所有 proxy peer 的 TPROXY 规则。
+- UDS `AddPeer`/`RemovePeer` 仍负责动态 peer 的 route 与 TPROXY 生命周期；如果 AddPeer 发生在全局 fallback 期间，只添加 WireGuard route，不立即添加 TPROXY，等待恢复后统一重建。
+- `Table = off` 时 daemon 不拥有 route/iptables，failover manager 不修改 TPROXY 规则；外部测试脚本或编排系统需要自行处理故障切换规则。
+
+## 7. 遥测与 API
 
 UDS 路径：
 
@@ -116,9 +155,17 @@ UDS 路径：
 - `proxy`：只在用户态配置中存在。
 - `kernel`：只在内核 WireGuard 状态中存在。
 
+QUIC 状态展示语义：
+
+- `quic: active` 表示当前有物理 QUIC 连接快照。
+- `quic: inactive` 表示没有物理连接且没有历史 L4 字节。
+- `quic: inactive (disconnected)` 表示当前没有物理连接，但保留了历史 L4 字节，用于区分“从未连接”和“曾有流量但已断开”。
+
 当前生产代码不会在 `Stats` 查询时自动把 kernel-only peer 持久写入用户态配置，也不会自动把 proxy-only peer 写回内核。动态写回内核只发生在 UDS `AddPeer`，删除内核 peer 只发生在 UDS `RemovePeer`。
 
-## 7. 动态 Peer 管理
+`RemovePeer` 会同步删除控制面 shared secret、session cache、auth nonce cache、client QUIC pool、server-side QUIC registry 和 L4 telemetry registry，避免动态 peer 生命周期导致内存无限增长。
+
+## 8. 动态 Peer 管理
 
 Server mode：
 
@@ -131,7 +178,23 @@ Client mode：
 - `AddPeer` 如果添加 WireGuard-only peer，只更新配置和内核，不进入 L4 router。
 - `RemovePeer` 会移除本地 QUIC pool 并 shutdown。
 
-## 8. 已知架构边界
+## 9. 打包与部署约束
+
+Debian 包由 `Makefile` 生成：
+
+- 默认使用本机 release 产物：`make package`。
+- 交叉打包可指定 Debian 架构和 Rust target，例如 `make package ARCH=arm64 CARGO_TARGET=aarch64-unknown-linux-gnu`。
+- `CARGO_TARGET` 非空时，包内二进制来自 `target/<target>/release/`，避免把本机架构二进制误打进目标架构包。
+- `dpkg-deb --root-owner-group` 确保包内文件安装为 `root:root`。
+
+系统 UDP socket buffer 上限不是程序内配置项。高吞吐部署可由运维侧通过 sysctl 持久化调大，例如：
+
+```ini
+net.core.rmem_max = 2621440
+net.core.wmem_max = 2621440
+```
+
+## 10. 已知架构边界
 
 - 没有内置 WireGuard 数据面实现，L3 连通性依赖系统内核 WireGuard/路由环境；当前 namespace 测试通过显式 mock dump fixture 模拟内核统计。
 - 没有跨 QUIC 物理连接迁移已有 stream；连接池重连只影响后续新 stream。

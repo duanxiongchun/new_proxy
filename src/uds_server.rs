@@ -424,7 +424,7 @@ async fn handle_add_peer(
 
     let _mutation_guard = context.peer_mutation_lock.lock().await;
 
-    let (table_off, tproxy_port, old_peer, conflict) = {
+    let (table_off, tproxy_port, tproxy_offload_enabled, old_peer, conflict) = {
         let state = context.state.read();
         let conflict = find_allowed_ip_conflict(&state.config.peers, &new_peer);
         (
@@ -436,6 +436,7 @@ async fn handle_add_peer(
                 .map(|table| table.eq_ignore_ascii_case("off"))
                 .unwrap_or(false),
             state.config.interface.tproxy_port,
+            state.tproxy_offload_enabled,
             state
                 .config
                 .peers
@@ -495,7 +496,12 @@ async fn handle_add_peer(
 
     if !table_off {
         if let Some(peer) = old_peer.clone() {
-            if let Err(e) = cleanup_peer_routes(context, peer, tproxy_port).await {
+            let cleanup_tproxy_port = if tproxy_offload_enabled {
+                tproxy_port
+            } else {
+                None
+            };
+            if let Err(e) = cleanup_peer_routes(context, peer, cleanup_tproxy_port).await {
                 if let Some(pool) = prepared_client_pool.as_ref() {
                     pool.shutdown(b"Peer route cleanup failed");
                 }
@@ -510,14 +516,20 @@ async fn handle_add_peer(
         }
     }
 
+    let setup_tproxy_port = if tproxy_offload_enabled {
+        tproxy_port
+    } else {
+        None
+    };
+
     if !table_off {
-        let setup_result = setup_peer_routes(context, new_peer.clone(), tproxy_port).await;
+        let setup_result = setup_peer_routes(context, new_peer.clone(), setup_tproxy_port).await;
         if let Err(e) = setup_result {
             if let Some(pool) = prepared_client_pool.as_ref() {
                 pool.shutdown(b"Peer route setup failed");
             }
             let rollback_error =
-                rollback_peer_routes(context, &new_peer, old_peer.clone(), tproxy_port).await;
+                rollback_peer_routes(context, &new_peer, old_peer.clone(), setup_tproxy_port).await;
             let message = match rollback_error {
                 Ok(()) => format!("Failed to sync peer routes/tproxy: {}", e),
                 Err(rollback) => format!(
@@ -542,7 +554,7 @@ async fn handle_add_peer(
         }
         if !table_off {
             let rollback_error =
-                rollback_peer_routes(context, &new_peer, old_peer.clone(), tproxy_port).await;
+                rollback_peer_routes(context, &new_peer, old_peer.clone(), setup_tproxy_port).await;
             let message = match rollback_error {
                 Ok(()) => format!("Failed to sync peer to WireGuard: {}", e),
                 Err(rollback) => format!(
@@ -617,7 +629,7 @@ async fn handle_remove_peer(
 
     let _mutation_guard = context.peer_mutation_lock.lock().await;
 
-    let (removed_peer, table_off, tproxy_port) = {
+    let (removed_peer, table_off, tproxy_port, tproxy_offload_enabled) = {
         let state = context.state.read();
         (
             state
@@ -634,13 +646,19 @@ async fn handle_remove_peer(
                 .map(|table| table.eq_ignore_ascii_case("off"))
                 .unwrap_or(false),
             state.config.interface.tproxy_port,
+            state.tproxy_offload_enabled,
         )
     };
 
     let mut routes_cleaned = false;
     if let Some(peer) = &removed_peer {
         if !table_off {
-            if let Err(e) = cleanup_peer_routes(context, peer.clone(), tproxy_port).await {
+            let cleanup_tproxy_port = if tproxy_offload_enabled {
+                tproxy_port
+            } else {
+                None
+            };
+            if let Err(e) = cleanup_peer_routes(context, peer.clone(), cleanup_tproxy_port).await {
                 write_error(
                     stream,
                     framed_response,
@@ -659,7 +677,16 @@ async fn handle_remove_peer(
     {
         let restore_error = if routes_cleaned {
             match removed_peer.clone() {
-                Some(peer) => setup_peer_routes(context, peer, tproxy_port).await.err(),
+                Some(peer) => {
+                    let restore_tproxy_port = if tproxy_offload_enabled {
+                        tproxy_port
+                    } else {
+                        None
+                    };
+                    setup_peer_routes(context, peer, restore_tproxy_port)
+                        .await
+                        .err()
+                }
                 None => None,
             }
         } else {
@@ -679,6 +706,7 @@ async fn handle_remove_peer(
     context.peer_secrets.write().remove(&parsed_pub_key);
     context.session_cache.write().remove(&parsed_pub_key);
     context.auth_nonce_cache.lock().remove(&parsed_pub_key);
+    context.telemetry.remove(&parsed_pub_key);
 
     if context.runtime_mode == RuntimeMode::Client {
         if let Some(pool) = context.client_quic_pools.write().remove(&parsed_pub_key) {
@@ -858,6 +886,7 @@ mod tests {
             state: Arc::new(RwLock::new(GatewayState {
                 config,
                 router: AllowedIPsRouter::new(),
+                tproxy_offload_enabled: true,
             })),
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             server_secret: StaticSecret::from([1u8; 32]),
@@ -955,6 +984,7 @@ mod tests {
         let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
         let session_cache = Arc::new(RwLock::new(HashMap::new()));
         let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+        let telemetry = crate::telemetry::TelemetryRegistry::new();
 
         let pub_key = [5u8; 32];
         peer_secrets.write().insert(pub_key, [10u8; 32]);
@@ -962,14 +992,20 @@ mod tests {
         auth_nonce_cache
             .lock()
             .insert(pub_key, crate::control::NonceCache::new(10));
+        let stats = telemetry.get_or_create(pub_key);
+        stats
+            .rx_bytes
+            .store(500, std::sync::atomic::Ordering::Relaxed);
 
         peer_secrets.write().remove(&pub_key);
         session_cache.write().remove(&pub_key);
         auth_nonce_cache.lock().remove(&pub_key);
+        telemetry.remove(&pub_key);
 
         assert!(!peer_secrets.read().contains_key(&pub_key));
         assert!(!session_cache.read().contains_key(&pub_key));
         assert!(!auth_nonce_cache.lock().contains_key(&pub_key));
+        assert!(!telemetry.snapshot().contains_key(&pub_key));
     }
 
     #[test]

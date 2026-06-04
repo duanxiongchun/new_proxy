@@ -113,14 +113,52 @@ fn configure_kernel_device(
     private_key: &[u8; 32],
     listen_port: Option<u16>,
 ) -> Result<(), String> {
+    log::info!("Attempting to load wireguard kernel module via modprobe");
+    let _ = Command::new("modprobe").arg("wireguard").output();
+
     log::info!(
         "Creating WireGuard interface '{}' if it does not exist",
         interface_name
     );
-    let _ = Command::new("ip")
+    let output = Command::new("ip")
         .args(["link", "add", "dev", interface_name, "type", "wireguard"])
         .output();
-    configure_kernel_device_key(interface_name, private_key, listen_port)
+
+    let creation_success = match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    };
+
+    let device_exists = if creation_success {
+        true
+    } else {
+        Command::new("ip")
+            .args(["link", "show", "dev", interface_name])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    };
+
+    if !device_exists {
+        log::warn!(
+            "Kernel WireGuard interface creation failed. Attempting userspace wireguard fallback."
+        );
+        return configure_userspace_device(interface_name, private_key, listen_port);
+    }
+
+    if let Err(e) = configure_kernel_device_key(interface_name, private_key, listen_port) {
+        log::warn!(
+            "Kernel Netlink key configuration failed: {}. Falling back to userspace wireguard.",
+            e
+        );
+        // Clean up the partially created device before switching to userspace
+        let _ = Command::new("ip")
+            .args(["link", "del", "dev", interface_name])
+            .output();
+        return configure_userspace_device(interface_name, private_key, listen_port);
+    }
+
+    Ok(())
 }
 
 fn configure_userspace_device(

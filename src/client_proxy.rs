@@ -121,55 +121,76 @@ async fn handle_tproxy_connection(
             return;
         };
 
+        let is_pool_active = quic_pool.is_active();
+
+        let quic_stream_res = if !is_pool_active {
+            Err("QUIC pool is unhealthy".to_string())
+        } else {
+            quic_pool.open_mux_stream().await
+        };
+
+        match quic_stream_res {
+            Ok((mut quic_send, mut quic_recv, conn_stat)) => {
+                log::info!(
+                    "Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.",
+                    src_addr,
+                    original_dst
+                );
+
+                if write_target_addr(&mut quic_send, original_dst)
+                    .await
+                    .is_ok()
+                {
+                    let mut status = [0u8; 1];
+                    match timeout(Duration::from_secs(5), quic_recv.read_exact(&mut status)).await {
+                        Ok(Ok(_)) if status[0] == 1 => {
+                            let stats = telemetry.get_or_create(peer_pub_key);
+                            relay::relay_connections_with_conn_stat(
+                                tcp_socket, quic_send, quic_recv, stats, conn_stat,
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(Ok(_)) => {
+                            log::warn!("Server side rejected proxy endpoint {}", original_dst);
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!(
+                                "Failed to read server proxy status for {}: {}",
+                                original_dst,
+                                e
+                            );
+                            quic_pool.enter_fallback("failed to read server proxy status");
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Timed out waiting for server proxy status for {}",
+                                original_dst
+                            );
+                            quic_pool.enter_fallback("timed out waiting for server proxy status");
+                        }
+                    }
+                } else {
+                    quic_pool.enter_fallback("failed to write proxy target address");
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "QUIC pool unhealthy or failed to open stream: {}. Falling back to WireGuard (L3) tunnel.",
+                    e
+                );
+                quic_pool.enter_fallback("failed to open QUIC mux stream");
+            }
+        }
+
+        // The fallback path is implemented by disabling TPROXY rules for all
+        // proxy peers. This intercepted connection may fail, but subsequent
+        // connections will bypass userspace and follow the WireGuard L3 route.
         log::info!(
-            "Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.",
+            "QUIC pool unavailable for {} -> {}; future connections will bypass TPROXY and use WireGuard L3 routing",
             src_addr,
             original_dst
         );
-
-        let (mut quic_send, mut quic_recv, conn_stat) = match quic_pool.open_mux_stream().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                log::warn!("Failed to open parallel multiplexed QUIC stream: {}", e);
-                return;
-            }
-        };
-
-        if write_target_addr(&mut quic_send, original_dst)
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        let mut status = [0u8; 1];
-        match timeout(Duration::from_secs(5), quic_recv.read_exact(&mut status)).await {
-            Ok(Ok(_)) if status[0] == 1 => {}
-            Ok(Ok(_)) => {
-                log::warn!("Server side rejected proxy endpoint {}", original_dst);
-                return;
-            }
-            Ok(Err(e)) => {
-                log::warn!(
-                    "Failed to read server proxy status for {}: {}",
-                    original_dst,
-                    e
-                );
-                return;
-            }
-            Err(_) => {
-                log::warn!(
-                    "Timed out waiting for server proxy status for {}",
-                    original_dst
-                );
-                return;
-            }
-        }
-
-        let stats = telemetry.get_or_create(peer_pub_key);
-
-        relay::relay_connections_with_conn_stat(tcp_socket, quic_send, quic_recv, stats, conn_stat)
-            .await;
     } else {
         log::debug!(
             "Intercepted connection to {} does not match AllowedIPs. Dropped.",

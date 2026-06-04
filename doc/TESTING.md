@@ -27,7 +27,8 @@ cargo test
 - `src/stats_cli.rs`：`new_proxy stats` 内置 telemetry table 输出、byte formatter。
 - `src/tcp_util.rs`：TCP keepalive socket option helper。
 - `src/telemetry.rs`：统一 telemetry DTO 和 sharded L4 telemetry registry。
-- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝。
+- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、QUIC pool fallback/recovering/active 状态。
+- `src/main.rs`：TPROXY failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TPROXY，所有 pool active 后才允许回切。
 - `src/relay.rs`：双向 relay、计数 reader。
 - `src/routing.rs`：AllowedIPs longest-prefix matching。
 - `src/tproxy.rs`：IPv4/IPv6 transparent listener 创建。
@@ -63,8 +64,8 @@ python3 -m py_compile script/acceptance/stability_report.py
 
 | 层级 | 已覆盖 | 主要缺口 |
 | --- | --- | --- |
-| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry | `setup_peer_routes_and_tproxy()`/`cleanup_peer_routes_and_tproxy()` 的命令级断言仍主要依赖 E2E |
-| E2E | 双栈 WAN、IPv6 HTTP over TPROXY/QUIC、TPROXY->QUIC、动态 server peer add/remove、多客户端 proxy+WireGuard-only fallback、动态 client proxy peer add/remove 生命周期 | 服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
+| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、TPROXY fallback 回切策略 | `setup_peer_routes_and_tproxy()`/`cleanup_peer_routes_and_tproxy()` 的命令级断言仍主要依赖 E2E |
+| E2E | 双栈 WAN、IPv6 HTTP over TPROXY/QUIC、TPROXY->QUIC、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy+WireGuard-only fallback、动态 client proxy peer add/remove 生命周期、server 主动访问 client 后端时回程不被 TPROXY 拦截 | 服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、WireGuard-only fallback、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
 | 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测 |
 | 弱网/混沌 | 无正式脚本 | 缺丢包、端口阻断、服务端重启、session rotation、控制面丢包场景 |
@@ -80,8 +81,9 @@ python3 -m py_compile script/acceptance/stability_report.py
 2. 添加前 workload namespace 访问目标 TCP 失败。
 3. 调用 client UDS `add-peer <server_pub> <allowed_ips> <endpoint> <proxy_port>`。
 4. 验证 client 创建 QUIC pool，workload TCP 被 TPROXY 后成功走 QUIC。
-5. 调用 client UDS `remove-peer`。
-6. 验证后续 TCP 不再进入 QUIC。
+5. server namespace 绑定 `10.0.0.1` 源地址主动访问 client 后端 workload 服务，验证 SYN-ACK 回程穿过 client gateway 时不会命中 TPROXY 规则。
+6. 调用 client UDS `remove-peer`。
+7. 验证后续 TCP 不再进入 QUIC。
 
 ### 3.2 控制面负向与重试
 
@@ -101,6 +103,7 @@ Rust 单元测试覆盖：
 - 同一 client 配置中同时存在 proxy peer 和 WireGuard-only peer。
 - 访问 proxy peer `AllowedIPs` 走 QUIC。
 - 访问 WireGuard-only peer `AllowedIPs` 不走 QUIC。
+- client gateway 的 TPROXY 规则只匹配客户端侧主动发起的初始 SYN；server 主动访问 client 后端时，回程 SYN-ACK 不进入代理。
 
 ### 3.4 UDS server 模块拆分
 
@@ -122,10 +125,83 @@ Rust 单元测试覆盖：
 - router namespace 使用 `curl -g http://[fd00::1]:8080/` 发起真实 TCP。
 - server telemetry 中出现 QUIC L4 字节。
 
+### 3.6 服务端重启后的客户端自动恢复
+
+`script/acceptance/e2e_scenarios.sh` 覆盖 namespace 级真实进程恢复：
+
+1. client/server daemon 先完成 TPROXY -> QUIC 业务流量。
+2. 测试 kill server daemon 并重新启动 server daemon，触发新自签证书和新 session cache。
+3. 等待 client health checker 自愈。
+4. 从 router namespace 发起新 TCP 请求，验证业务恢复。
+5. 通过 server UDS stats 检查 `quic: active`。
+
+`src/quic_pool.rs::test_health_checker_refreshes_control_config_after_server_restart` 额外覆盖 pool 层控制面刷新细节：
+
+1. 客户端先使用旧 `session_psk`、旧 QUIC 证书指纹和旧端口建立连接。
+2. 测试模拟服务端重启后旧 session 失效，并关闭旧物理连接。
+3. 健康检查按旧配置重连失败后重新走控制面协商。
+4. 客户端获得新的 `session_psk`、QUIC 证书指纹和端口池，替换本地 runtime config 与连接池。
+5. 新业务 stream 在新 QUIC 服务端上成功 echo。
+
+### 3.7 QUIC 故障后的 WireGuard fallback 与延迟回切
+
+当前代码路径：
+
+1. QUIC stream 打开失败、目标地址写入失败、或 server proxy 状态读取失败时，client 将对应 pool 标记为 `Fallback`。
+2. `Table != off` 的 client mode TPROXY failover manager 观察所有 proxy pool 状态。
+3. 任意 pool 为 `Fallback` 或 `Recovering` 时，manager 删除当前配置中所有 proxy peer 的 TPROXY/TCPMSS 规则，保留 WireGuard route。
+4. 后续新 TCP 连接不再进入用户态 TPROXY，自然走 WireGuard/wireguard-go L3。
+5. 启动时缺失 QUIC pool 不再导致 client 退出；manager 周期性重建缺失 pool。
+6. QUIC 连接恢复后先进入 `Recovering` cooldown，cooldown 结束并回到 `Active` 后，manager 按当前配置重建所有 proxy peer 的 TPROXY 规则。
+
+`Table = off` 不由 daemon 管理 iptables；这类拓扑只验证 QUIC 重连、动态 peer 生命周期和手工规则路径，不验证自动删除/恢复 TPROXY。
+
+Rust 单元测试覆盖：
+
+- `src/main.rs::test_tproxy_failover_policy_requires_all_pools_active`：确认只有所有 pool 都是 `Active` 时才允许恢复 TPROXY；`Fallback` 和 `Recovering` 都保持 WireGuard fallback。
+
+### 3.8 稳定性与负载均衡测试设计
+
+`script/acceptance/stability_stress_test.sh` 是长稳测试入口，目标覆盖物理 QUIC 连接池、TPROXY 拦截、用户态并发转发和双轨聚合遥测。
+
+核心成功标准：
+
+- 测试期间 client/server daemon 无 panic、无意外退出、无 crash。
+- 长连接 TCP 与短连接 `curl` 业务请求应持续成功。
+- 多物理 QUIC 连接的流量分布应接近均匀；稳定性报告按各连接总流量计算变异系数 CV。
+- warmup 后 RSS 不应持续线性增长，避免 OOM 或明显泄漏。
+
+流量模型：
+
+- 多线程长 TCP：后台线程持续建立到目标 HTTP 服务的 TCP 连接并发送数据，断线后自动重连。
+- 高频短 TCP：周期性发起 `curl` 短连接，压测 QUIC stream 分配和回收。
+- 背景 UDP/ICMP：通过非 proxy 路径保持 L3 活跃，辅助观察 WireGuard 与 QUIC 分层遥测。
+
+采样与报告：
+
+- 脚本周期性采集 daemon 存活、CPU、RSS、UDS/CLI dump、QUIC connection 本地端口、rx/tx bytes 和 active streams。
+- 采样数据写入 artifact 目录的 JSON Lines 文件。
+- `stability_report.py` 汇总资源趋势、流量成功率和 QUIC 物理连接分布。
+
+### 3.9 部署验证
+
+部署包验证分三层：
+
+- 构建层：`make package` 生成本机架构包；交叉包使用 `ARCH=<deb_arch> CARGO_TARGET=<rust_target>`，并用 `file`/`dpkg-deb -f` 确认二进制架构和 Debian `Architecture` 匹配。
+- 安装层：远端 `dpkg -i` 后确认 `dpkg -s new-proxy` 为 `install ok installed`，二进制和 systemd unit 属主为 `root:root`。
+- 运行层：`systemctl restart new_proxy@<instance>` 后检查服务为 `active (running)`，再通过 `new-proxy-cli --interface <instance> show` 验证 UDS 可连接、peer source/handshake/QUIC 状态符合预期。
+
+客户端隧道自举机器部署必须使用本机 rollback 机制：
+
+1. 在客户端本地把当前安装内容打成 rollback deb。
+2. 安装新 deb 前启动 watchdog。
+3. 新包安装并重启服务后，在限定时间内确认 systemd active、UDS CLI 可查询、peer 非 `latest handshake: Never`。
+4. 若健康确认未写入，watchdog 自动 `dpkg -i` rollback deb 并重启原服务。
+
 ## 4. Backlog
 
 - 服务端 session rotation / peer removal E2E：建立长 TCP 流，server `remove-peer`，验证旧 QUIC 连接关闭、新 stream 失败，重新 `add-peer` 后新 TCP 成功。
-- 弱网脚本：对单个 QUIC UDP port 下发 `DROP`，验证新 stream 继续使用其他健康 port；控制面 UDP 丢第一包后重试新 nonce 成功；服务端重启后 health checker 恢复。
+- 弱网脚本：对单个 QUIC UDP port 下发 `DROP`，验证新 stream 继续使用其他健康 port；控制面 UDP 丢第一包后重试新 nonce 成功。
 - 性能脚本：正式 throughput、TTFB、CPU/RSS、连接建立耗时、并发 1k/4k/8k 阶梯压测。
 - 稳定性脚本：1 小时 nightly/profile、FD 数、CPU 累计时间、失败日志自动打包、机器可读 pass/fail 总结。
 - 安全负向：恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E。
