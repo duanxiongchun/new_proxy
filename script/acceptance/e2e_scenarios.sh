@@ -89,9 +89,17 @@ ip netns exec client_ns ip route add 10.0.0.1/32 via 10.0.1.1
 ip netns exec client_ns ip rule add fwmark 1 lookup 100
 ip netns exec client_ns ip route add local 0.0.0.0/0 dev lo table 100
 
-# TPROXY 拦截规则: 用单条规则同时 mark + 重定向 (正确语法)
+# TPROXY 拦截规则:
+# - socket/DIVERT 负责把已被透明 socket 接管的连接后续包继续送回本地
+# - TPROXY 只接管客户端主动发起的初始 SYN，避免服务端主动连接的 SYN-ACK 回程被误拦截
+ip netns exec client_ns iptables -t mangle -N NEW_PROXY_E2E_DIVERT 2>/dev/null || true
+ip netns exec client_ns iptables -t mangle -A NEW_PROXY_E2E_DIVERT -j MARK --set-mark 0x1
+ip netns exec client_ns iptables -t mangle -A NEW_PROXY_E2E_DIVERT -j ACCEPT
 ip netns exec client_ns iptables -t mangle -A PREROUTING \
-    -p tcp -d 10.0.0.1 \
+    -p tcp -m socket --transparent \
+    -j NEW_PROXY_E2E_DIVERT
+ip netns exec client_ns iptables -t mangle -A PREROUTING \
+    -p tcp --syn -d 10.0.0.1 \
     -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
 
 echo "  ✓ 命名空间配置完成"

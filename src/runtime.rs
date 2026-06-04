@@ -88,13 +88,14 @@ pub fn setup_routes_and_iptables(
         ],
     )?;
 
-    for peer in &config.peers {
-        setup_peer_routes_and_tproxy(peer, config.interface.tproxy_port, interface_name)?;
-    }
-
     if let Some(tproxy_port) = config.interface.tproxy_port {
         log::info!("Setting up TPROXY iptables rules on port {}", tproxy_port);
         let (fwmark, route_table) = instance_routing_ids(interface_name);
+        ensure_tproxy_divert_rules(fwmark)?;
+
+        for peer in &config.peers {
+            setup_peer_routes_and_tproxy(peer, config.interface.tproxy_port, interface_name)?;
+        }
 
         run_command_best_effort(
             "ip",
@@ -170,6 +171,10 @@ pub fn setup_routes_and_iptables(
                 route_table.to_string(),
             ],
         )?;
+    } else {
+        for peer in &config.peers {
+            setup_peer_routes_and_tproxy(peer, config.interface.tproxy_port, interface_name)?;
+        }
     }
     Ok(())
 }
@@ -259,32 +264,13 @@ pub fn cleanup_peer_routes_and_tproxy(
     let mut errors = Vec::new();
     for allowed_ip in &peer.allowed_ips {
         if let Some(port) = tproxy_port.filter(|_| peer_has_l4_proxy(peer)) {
-            let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                ("iptables", "0.0.0.0")
-            } else {
-                ("ip6tables", "::")
-            };
-            let tproxy_args = vec![
-                "-t".to_string(),
-                "mangle".to_string(),
-                "-D".to_string(),
-                "PREROUTING".to_string(),
-                "-p".to_string(),
-                "tcp".to_string(),
-                "-d".to_string(),
-                allowed_ip.to_string(),
-                "-j".to_string(),
-                "TPROXY".to_string(),
-                "--on-port".to_string(),
-                port.to_string(),
-                "--on-ip".to_string(),
-                on_ip.to_string(),
-                "--tproxy-mark".to_string(),
-                mark_spec.clone(),
-            ];
+            let (tool, rule) = tproxy_rule_spec(*allowed_ip, port, &mark_spec, true);
+            let mut tproxy_args = vec!["-t".to_string(), "mangle".to_string(), "-D".to_string()];
+            tproxy_args.extend(rule);
             if let Err(e) = run_command_checked(tool, &tproxy_args) {
                 errors.push(e);
             }
+            cleanup_legacy_tproxy_rule(*allowed_ip, port, &mark_spec);
 
             let mss_tool = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
                 "iptables"
@@ -419,6 +405,7 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
                 route_table.to_string(),
             ],
         );
+        cleanup_tproxy_divert_rules(fwmark);
     }
 
     for peer in &config.peers {
@@ -515,42 +502,46 @@ fn ensure_tproxy_rule(
     tproxy_port: u16,
     mark_spec: &str,
 ) -> Result<(), String> {
-    let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-        ("iptables", "0.0.0.0")
-    } else {
-        ("ip6tables", "::")
-    };
-    let rule = vec![
-        "PREROUTING".to_string(),
-        "-p".to_string(),
-        "tcp".to_string(),
-        "-d".to_string(),
-        allowed_ip.to_string(),
-        "-j".to_string(),
-        "TPROXY".to_string(),
-        "--on-port".to_string(),
-        tproxy_port.to_string(),
-        "--on-ip".to_string(),
-        on_ip.to_string(),
-        "--tproxy-mark".to_string(),
-        mark_spec.to_string(),
-    ];
+    let (tool, rule) = tproxy_rule_spec(allowed_ip, tproxy_port, mark_spec, true);
+    cleanup_legacy_tproxy_rule(allowed_ip, tproxy_port, mark_spec);
     ensure_iptables_rule(tool, &rule)
 }
 
 fn cleanup_tproxy_rule(allowed_ip: ipnet::IpNet, tproxy_port: u16, mark_spec: &str) {
+    let (tool, rule) = tproxy_rule_spec(allowed_ip, tproxy_port, mark_spec, true);
+    let mut args = vec!["-t".to_string(), "mangle".to_string(), "-D".to_string()];
+    args.extend(rule);
+    run_command_best_effort(tool, &args);
+    cleanup_legacy_tproxy_rule(allowed_ip, tproxy_port, mark_spec);
+}
+
+fn cleanup_legacy_tproxy_rule(allowed_ip: ipnet::IpNet, tproxy_port: u16, mark_spec: &str) {
+    let (tool, rule) = tproxy_rule_spec(allowed_ip, tproxy_port, mark_spec, false);
+    let mut args = vec!["-t".to_string(), "mangle".to_string(), "-D".to_string()];
+    args.extend(rule);
+    run_command_best_effort(tool, &args);
+}
+
+fn tproxy_rule_spec(
+    allowed_ip: ipnet::IpNet,
+    tproxy_port: u16,
+    mark_spec: &str,
+    client_initiated_only: bool,
+) -> (&'static str, Vec<String>) {
     let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
         ("iptables", "0.0.0.0")
     } else {
         ("ip6tables", "::")
     };
-    let args = vec![
-        "-t".to_string(),
-        "mangle".to_string(),
-        "-D".to_string(),
+    let mut rule = vec![
         "PREROUTING".to_string(),
         "-p".to_string(),
         "tcp".to_string(),
+    ];
+    if client_initiated_only {
+        rule.push("--syn".to_string());
+    }
+    rule.extend([
         "-d".to_string(),
         allowed_ip.to_string(),
         "-j".to_string(),
@@ -561,8 +552,91 @@ fn cleanup_tproxy_rule(allowed_ip: ipnet::IpNet, tproxy_port: u16, mark_spec: &s
         on_ip.to_string(),
         "--tproxy-mark".to_string(),
         mark_spec.to_string(),
-    ];
-    run_command_best_effort(tool, &args);
+    ]);
+    (tool, rule)
+}
+
+fn ensure_tproxy_divert_rules(fwmark: u32) -> Result<(), String> {
+    let mark = format!("{:#x}", fwmark);
+    let chain = tproxy_divert_chain(fwmark);
+    for tool in ["iptables", "ip6tables"] {
+        run_command_best_effort(
+            tool,
+            &["-t".into(), "mangle".into(), "-N".into(), chain.clone()],
+        );
+        ensure_iptables_rule(
+            tool,
+            &[
+                "PREROUTING".to_string(),
+                "-p".to_string(),
+                "tcp".to_string(),
+                "-m".to_string(),
+                "socket".to_string(),
+                "--transparent".to_string(),
+                "-j".to_string(),
+                chain.clone(),
+            ],
+        )?;
+        ensure_iptables_rule(
+            tool,
+            &[
+                chain.clone(),
+                "-j".to_string(),
+                "MARK".to_string(),
+                "--set-mark".to_string(),
+                mark.clone(),
+            ],
+        )?;
+        ensure_iptables_rule(
+            tool,
+            &[chain.clone(), "-j".to_string(), "ACCEPT".to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn cleanup_tproxy_divert_rules(fwmark: u32) {
+    let chain = tproxy_divert_chain(fwmark);
+    for tool in ["iptables", "ip6tables"] {
+        run_command_best_effort(
+            tool,
+            &[
+                "-t".to_string(),
+                "mangle".to_string(),
+                "-D".to_string(),
+                "PREROUTING".to_string(),
+                "-p".to_string(),
+                "tcp".to_string(),
+                "-m".to_string(),
+                "socket".to_string(),
+                "--transparent".to_string(),
+                "-j".to_string(),
+                chain.clone(),
+            ],
+        );
+        run_command_best_effort(
+            tool,
+            &[
+                "-t".to_string(),
+                "mangle".to_string(),
+                "-F".to_string(),
+                chain.clone(),
+            ],
+        );
+        run_command_best_effort(
+            tool,
+            &[
+                "-t".to_string(),
+                "mangle".to_string(),
+                "-X".to_string(),
+                chain.clone(),
+            ],
+        );
+    }
+}
+
+fn tproxy_divert_chain(fwmark: u32) -> String {
+    format!("NEW_PROXY_DIVERT_{:08x}", fwmark)
 }
 
 fn cleanup_mss_clamp_rule(allowed_ip: ipnet::IpNet) {
@@ -622,5 +696,46 @@ fn run_command_checked(program: &str, args: &[String]) -> Result<(), String> {
 fn run_command_best_effort(program: &str, args: &[String]) {
     if let Err(e) = run_command_checked(program, args) {
         log::debug!("{}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tproxy_rule_only_matches_client_initiated_syn() {
+        let allowed_ip = "10.0.0.1/32".parse().unwrap();
+        let (tool, rule) = tproxy_rule_spec(allowed_ip, 1080, "0x1/0xffffffff", true);
+
+        assert_eq!(tool, "iptables");
+        assert!(has_pair(&rule, "-p", "tcp"));
+        assert!(rule.iter().any(|part| part == "--syn"));
+        assert!(has_pair(&rule, "-d", "10.0.0.1/32"));
+        assert!(has_pair(&rule, "-j", "TPROXY"));
+    }
+
+    #[test]
+    fn legacy_tproxy_rule_shape_remains_available_for_cleanup() {
+        let allowed_ip = "fd00::1/128".parse().unwrap();
+        let (tool, rule) = tproxy_rule_spec(allowed_ip, 1080, "0x1/0xffffffff", false);
+
+        assert_eq!(tool, "ip6tables");
+        assert!(!rule.iter().any(|part| part == "--syn"));
+        assert!(has_pair(&rule, "-d", "fd00::1/128"));
+    }
+
+    #[test]
+    fn divert_chain_is_instance_scoped() {
+        assert_eq!(
+            tproxy_divert_chain(0x1234_abcd),
+            "NEW_PROXY_DIVERT_1234abcd"
+        );
+        assert!(tproxy_divert_chain(0x1234_abcd).len() < 29);
+    }
+
+    fn has_pair(rule: &[String], key: &str, value: &str) -> bool {
+        rule.windows(2)
+            .any(|parts| parts[0] == key && parts[1] == value)
     }
 }
