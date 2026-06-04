@@ -2,6 +2,14 @@
 
 VERSION = 5.0.0
 ARCH ?= $(shell if command -v dpkg >/dev/null 2>&1; then dpkg --print-architecture; else machine=$$(uname -m); if [ "$$machine" = x86_64 ]; then echo amd64; elif [ "$$machine" = aarch64 ] || [ "$$machine" = arm64 ]; then echo arm64; elif [ "$${machine#armv7}" != "$$machine" ]; then echo armhf; else echo "$$machine"; fi; fi)
+CARGO_TARGET ?=
+CARGO_BUILD_FLAGS := --release --bins
+ifdef CARGO_TARGET
+CARGO_BUILD_FLAGS += --target $(CARGO_TARGET)
+BIN_DIR = target/$(CARGO_TARGET)/release
+else
+BIN_DIR = target/release
+endif
 DEB_DIR = target/deb-pkg
 DEB_FILE = target/new-proxy_$(VERSION)_$(ARCH).deb
 
@@ -10,7 +18,7 @@ DEB_FILE = target/new-proxy_$(VERSION)_$(ARCH).deb
 all: build
 
 build:
-	cargo build --release --bins
+	cargo build $(CARGO_BUILD_FLAGS)
 
 package: build
 	@echo "Building Debian package structure..."
@@ -21,8 +29,8 @@ package: build
 	mkdir -p $(DEB_DIR)/etc/new_proxy
 
 	# Copy binaries
-	cp target/release/new_proxy $(DEB_DIR)/usr/bin/new_proxy
-	cp target/release/new-proxy-cli $(DEB_DIR)/usr/bin/new-proxy-cli
+	cp $(BIN_DIR)/new_proxy $(DEB_DIR)/usr/bin/new_proxy
+	cp $(BIN_DIR)/new-proxy-cli $(DEB_DIR)/usr/bin/new-proxy-cli
 	chmod 755 $(DEB_DIR)/usr/bin/new_proxy
 	chmod 755 $(DEB_DIR)/usr/bin/new-proxy-cli
 

@@ -16,16 +16,17 @@ mkdir -p "$ARTIFACT_DIR"
 SERVER_PID=""
 CLIENT_PID=""
 HTTP_PID=""
+WORK_HTTP_PID=""
 
 cleanup() {
   set +e
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$HTTP_PID"; do
+  for pid in "$CLIENT_PID" "$SERVER_PID" "$HTTP_PID" "$WORK_HTTP_PID"; do
     if [ -n "${pid:-}" ]; then
       kill "$pid" 2>/dev/null || true
     fi
   done
   sleep 1
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$HTTP_PID"; do
+  for pid in "$CLIENT_PID" "$SERVER_PID" "$HTTP_PID" "$WORK_HTTP_PID"; do
     if [ -n "${pid:-}" ]; then
       kill -9 "$pid" 2>/dev/null || true
     fi
@@ -69,7 +70,7 @@ PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 AllowedIPs = 10.0.0.1/32
 EOF_CONF
 
-echo "=== [1/6] Creating namespaces ==="
+echo "=== [1/7] Creating namespaces ==="
 ip netns add dyn_server_ns
 ip netns add dyn_router_ns
 ip netns add dyn_client_ns
@@ -87,7 +88,7 @@ ip link add vd-w type veth peer name vd-c-w
 ip link set vd-w netns dyn_work_ns
 ip link set vd-c-w netns dyn_client_ns
 
-echo "=== [2/6] Configuring routes ==="
+echo "=== [2/7] Configuring routes ==="
 ip netns exec dyn_server_ns ip addr add 10.0.2.2/24 dev vd-s
 ip netns exec dyn_server_ns ip addr add 10.0.0.1/32 dev lo
 ip netns exec dyn_server_ns ip link set vd-s up
@@ -95,6 +96,7 @@ ip netns exec dyn_server_ns ip link set lo up
 ip netns exec dyn_server_ns ip route add default via 10.0.2.1
 ip netns exec dyn_server_ns ip route add 10.0.0.1/32 dev lo scope host
 ip netns exec dyn_server_ns ip route add 10.0.0.2/32 via 10.0.2.1
+ip netns exec dyn_server_ns ip route add 10.0.4.0/24 via 10.0.2.1
 
 ip netns exec dyn_client_ns ip addr add 10.0.1.2/24 dev vd-c
 ip netns exec dyn_client_ns ip addr add 10.0.4.1/24 dev vd-c-w
@@ -119,14 +121,30 @@ ip netns exec dyn_router_ns ip link set lo up
 ip netns exec dyn_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec dyn_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec dyn_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
+ip netns exec dyn_router_ns ip route add 10.0.4.0/24 via 10.0.1.2
 
 ip netns exec dyn_client_ns ip rule add fwmark 1 lookup 100
 ip netns exec dyn_client_ns ip route add local 0.0.0.0/0 dev lo table 100
-ip netns exec dyn_client_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
+ip netns exec dyn_client_ns iptables -t mangle -N NEW_PROXY_DYN_DIVERT 2>/dev/null || true
+ip netns exec dyn_client_ns iptables -t mangle -A NEW_PROXY_DYN_DIVERT -j MARK --set-mark 0x1
+ip netns exec dyn_client_ns iptables -t mangle -A NEW_PROXY_DYN_DIVERT -j ACCEPT
+ip netns exec dyn_client_ns iptables -t mangle -A PREROUTING \
+  -p tcp -m socket --transparent \
+  -j NEW_PROXY_DYN_DIVERT
+ip netns exec dyn_client_ns iptables -t mangle -A PREROUTING \
+  -p tcp --syn -d 10.0.0.1 \
+  -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
 
-echo "=== [3/6] Starting daemons ==="
+tproxy_packet_count() {
+  ip netns exec dyn_client_ns iptables -t mangle -L PREROUTING -v -x -n \
+    | awk '/TPROXY/ { print $1; exit }'
+}
+
+echo "=== [3/7] Starting daemons ==="
 ip netns exec dyn_server_ns python3 -m http.server 8080 --bind 10.0.0.1 > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
+ip netns exec dyn_work_ns python3 -m http.server 8082 --bind 10.0.4.2 > "$ARTIFACT_DIR/work_http.log" 2>&1 &
+WORK_HTTP_PID=$!
 ip netns exec dyn_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
@@ -134,13 +152,13 @@ ip netns exec dyn_client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFAC
 CLIENT_PID=$!
 sleep 2
 
-echo "=== [4/6] Verifying traffic is blocked before dynamic proxy add-peer ==="
+echo "=== [4/7] Verifying traffic is blocked before dynamic proxy add-peer ==="
 if ip netns exec dyn_work_ns curl -fsS --connect-timeout 2 --max-time 4 http://10.0.0.1:8080/ >/dev/null 2>&1; then
   echo "Expected pre-add curl to fail because no QUIC pool exists"
   exit 1
 fi
 
-echo "=== [5/6] Dynamically adding proxy peer on client ==="
+echo "=== [5/7] Dynamically adding proxy peer on client ==="
 add_output="$(ip netns exec dyn_client_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface client_dyn add-peer \
   "${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}" \
   "10.0.0.1/32" \
@@ -154,7 +172,16 @@ fi
 sleep 2
 ip netns exec dyn_work_ns curl -fsS --connect-timeout 5 --max-time 10 http://10.0.0.1:8080/ >/dev/null
 
-echo "=== [6/6] Removing proxy peer and verifying interception stops ==="
+echo "=== [6/7] Verifying server-initiated client-side traffic bypasses TPROXY ==="
+before_tproxy_packets="$(tproxy_packet_count)"
+ip netns exec dyn_server_ns curl -fsS --interface 10.0.0.1 --connect-timeout 5 --max-time 10 http://10.0.4.2:8082/ >/dev/null
+after_tproxy_packets="$(tproxy_packet_count)"
+if [ "$before_tproxy_packets" != "$after_tproxy_packets" ]; then
+  echo "Expected server-initiated return traffic to bypass client TPROXY, but TPROXY packet counter changed: $before_tproxy_packets -> $after_tproxy_packets"
+  exit 1
+fi
+
+echo "=== [7/7] Removing proxy peer and verifying interception stops ==="
 ip netns exec dyn_client_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface client_dyn remove-peer \
   "${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}"
 sleep 1

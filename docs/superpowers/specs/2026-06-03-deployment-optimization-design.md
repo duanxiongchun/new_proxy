@@ -90,7 +90,7 @@ fn configure_kernel_device(
 
 ### 2.4 Persistent UDP Buffer Tuning (Remote Server Configuration)
 
-We will apply the tuning directly on the remote server `2604:a880:4:1d0::3a41:2000`:
+We will apply the tuning directly on the remote server `<server-ipv6>`:
 1. Create a configuration file `/etc/sysctl.d/99-new-proxy.conf`.
 2. Populate it with:
    ```ini

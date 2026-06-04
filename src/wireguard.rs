@@ -129,7 +129,17 @@ fn configure_kernel_device(
         Err(_) => false,
     };
 
-    if !creation_success {
+    let device_exists = if creation_success {
+        true
+    } else {
+        Command::new("ip")
+            .args(["link", "show", "dev", interface_name])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    };
+
+    if !device_exists {
         log::warn!(
             "Kernel WireGuard interface creation failed. Attempting userspace wireguard fallback."
         );

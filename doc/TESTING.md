@@ -65,7 +65,7 @@ python3 -m py_compile script/acceptance/stability_report.py
 | 层级 | 已覆盖 | 主要缺口 |
 | --- | --- | --- |
 | 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、TPROXY fallback 回切策略 | `setup_peer_routes_and_tproxy()`/`cleanup_peer_routes_and_tproxy()` 的命令级断言仍主要依赖 E2E |
-| E2E | 双栈 WAN、IPv6 HTTP over TPROXY/QUIC、TPROXY->QUIC、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy+WireGuard-only fallback、动态 client proxy peer add/remove 生命周期 | 服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
+| E2E | 双栈 WAN、IPv6 HTTP over TPROXY/QUIC、TPROXY->QUIC、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy+WireGuard-only fallback、动态 client proxy peer add/remove 生命周期、server 主动访问 client 后端时回程不被 TPROXY 拦截 | 服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、WireGuard-only fallback、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
 | 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测 |
 | 弱网/混沌 | 无正式脚本 | 缺丢包、端口阻断、服务端重启、session rotation、控制面丢包场景 |
@@ -81,8 +81,9 @@ python3 -m py_compile script/acceptance/stability_report.py
 2. 添加前 workload namespace 访问目标 TCP 失败。
 3. 调用 client UDS `add-peer <server_pub> <allowed_ips> <endpoint> <proxy_port>`。
 4. 验证 client 创建 QUIC pool，workload TCP 被 TPROXY 后成功走 QUIC。
-5. 调用 client UDS `remove-peer`。
-6. 验证后续 TCP 不再进入 QUIC。
+5. server namespace 绑定 `10.0.0.1` 源地址主动访问 client 后端 workload 服务，验证 SYN-ACK 回程穿过 client gateway 时不会命中 TPROXY 规则。
+6. 调用 client UDS `remove-peer`。
+7. 验证后续 TCP 不再进入 QUIC。
 
 ### 3.2 控制面负向与重试
 
@@ -102,6 +103,7 @@ Rust 单元测试覆盖：
 - 同一 client 配置中同时存在 proxy peer 和 WireGuard-only peer。
 - 访问 proxy peer `AllowedIPs` 走 QUIC。
 - 访问 WireGuard-only peer `AllowedIPs` 不走 QUIC。
+- client gateway 的 TPROXY 规则只匹配客户端侧主动发起的初始 SYN；server 主动访问 client 后端时，回程 SYN-ACK 不进入代理。
 
 ### 3.4 UDS server 模块拆分
 

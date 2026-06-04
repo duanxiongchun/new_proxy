@@ -259,13 +259,13 @@
   Run SSH command to write tuning variables:
   Run:
   ```bash
-  ssh root@2604:a880:4:1d0::3a41:2000 "echo -e 'net.core.rmem_max = 2621440\nnet.core.wmem_max = 2621440' > /etc/sysctl.d/99-new-proxy.conf"
+  ssh root@<server-host> "echo -e 'net.core.rmem_max = 2621440\nnet.core.wmem_max = 2621440' > /etc/sysctl.d/99-new-proxy.conf"
   ```
 
 - [ ] **Step 2: Apply sysctl values**
   Run:
   ```bash
-  ssh root@2604:a880:4:1d0::3a41:2000 "sysctl -p /etc/sysctl.d/99-new-proxy.conf"
+  ssh root@<server-host> "sysctl -p /etc/sysctl.d/99-new-proxy.conf"
   ```
   Expected:
   `net.core.rmem_max = 2621440`
@@ -274,7 +274,7 @@
 - [ ] **Step 3: Verify parameters persistently loaded**
   Run:
   ```bash
-  ssh root@2604:a880:4:1d0::3a41:2000 "sysctl net.core.rmem_max net.core.wmem_max"
+  ssh root@<server-host> "sysctl net.core.rmem_max net.core.wmem_max"
   ```
   Expected:
   `net.core.rmem_max = 2621440`
@@ -286,7 +286,7 @@
 
 **Files:**
 - Create: `/target/new-proxy_5.0.0_amd64.deb`
-- Deploy: `root@2604:a880:4:1d0::3a41:2000`
+- Deploy: `root@<server-host>`
 
 - [ ] **Step 1: Clean build and compile Debian package locally**
   Run:
@@ -299,25 +299,25 @@
 - [ ] **Step 2: Copy package to remote server**
   Run:
   ```bash
-  scp target/new-proxy_5.0.0_amd64.deb root@[2604:a880:4:1d0::3a41:2000]:/tmp/
+  scp target/new-proxy_5.0.0_amd64.deb root@[<server-host>]:/tmp/
   ```
 
 - [ ] **Step 3: Install the package on the remote server**
   Run:
   ```bash
-  ssh root@2604:a880:4:1d0::3a41:2000 "dpkg -i /tmp/new-proxy_5.0.0_amd64.deb"
+  ssh root@<server-host> "dpkg -i /tmp/new-proxy_5.0.0_amd64.deb"
   ```
 
 - [ ] **Step 4: Restart the systemd service on the server**
   Run:
   ```bash
-  ssh root@2604:a880:4:1d0::3a41:2000 "systemctl restart new_proxy@server"
+  ssh root@<server-host> "systemctl restart new_proxy@server"
   ```
 
 - [ ] **Step 5: Verify server startup logs**
   Run:
   ```bash
-  ssh root@2604:a880:4:1d0::3a41:2000 "systemctl status new_proxy@server"
+  ssh root@<server-host> "systemctl status new_proxy@server"
   ```
   Expected: `active (running)` status and no startup crash loops.
 
@@ -325,6 +325,6 @@
   Verify that idle peers are formatted correctly as disconnected.
   Run:
   ```bash
-  ssh root@2604:a880:4:1d0::3a41:2000 "new-proxy-cli show"
+  ssh root@<server-host> "new-proxy-cli show"
   ```
   Expected: Disconnected peers print `quic: inactive (disconnected)` if they have historical traffic.
