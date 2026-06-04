@@ -264,36 +264,8 @@ pub fn cleanup_peer_routes_and_tproxy(
     let mut errors = Vec::new();
     for allowed_ip in &peer.allowed_ips {
         if let Some(port) = tproxy_port.filter(|_| peer_has_l4_proxy(peer)) {
-            let (tool, rule) = tproxy_rule_spec(*allowed_ip, port, &mark_spec, true);
-            let mut tproxy_args = vec!["-t".to_string(), "mangle".to_string(), "-D".to_string()];
-            tproxy_args.extend(rule);
-            if let Err(e) = run_command_checked(tool, &tproxy_args) {
-                errors.push(e);
-            }
-            cleanup_legacy_tproxy_rule(*allowed_ip, port, &mark_spec);
-
-            let mss_tool = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                "iptables"
-            } else {
-                "ip6tables"
-            };
-            let mss_args = vec![
-                "-t".to_string(),
-                "mangle".to_string(),
-                "-D".to_string(),
-                "PREROUTING".to_string(),
-                "-p".to_string(),
-                "tcp".to_string(),
-                "--tcp-flags".to_string(),
-                "SYN,RST".to_string(),
-                "SYN".to_string(),
-                "-d".to_string(),
-                allowed_ip.to_string(),
-                "-j".to_string(),
-                "TCPMSS".to_string(),
-                "--clamp-mss-to-pmtud".to_string(),
-            ];
-            run_command_best_effort(mss_tool, &mss_args);
+            cleanup_tproxy_rule(*allowed_ip, port, &mark_spec);
+            cleanup_mss_clamp_rule(*allowed_ip);
         }
         let route_result = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
             run_command_checked(

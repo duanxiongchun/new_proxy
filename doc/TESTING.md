@@ -57,7 +57,10 @@ bash -n script/acceptance/e2e_test_dualstack.sh \
   script/acceptance/e2e_dynamic_client_peer.sh \
   script/acceptance/stability_stress_test.sh \
   script/perf/perf_smoke.sh
-python3 -m py_compile script/acceptance/stability_report.py
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
 ```
 
 ## 2. 当前覆盖情况

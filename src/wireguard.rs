@@ -598,7 +598,7 @@ impl NetlinkSocket {
                             }
                             return Err(io::Error::from_raw_os_error(-error));
                         }
-                        return Err(io::Error::new(io::ErrorKind::Other, "netlink error"));
+                        return Err(io::Error::other("netlink error"));
                     }
                     _ => responses.push(payload.to_vec()),
                 }

@@ -151,6 +151,26 @@ pub fn start(listener: UnixListener, context: UdsServerContext) {
     });
 }
 
+fn quic_connection_snapshots(
+    quic_registry: &HashMap<[u8; 32], Vec<quic_pool::QuicConnRecord>>,
+    client_quic_pools: &PeerQuicPools,
+    pub_key: &[u8; 32],
+) -> Vec<quic_pool::QuicConnSnapshot> {
+    let server_side = quic_registry
+        .get(pub_key)
+        .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !server_side.is_empty() {
+        return server_side;
+    }
+
+    client_quic_pools
+        .read()
+        .get(pub_key)
+        .map(|pool| pool.connection_snapshots())
+        .unwrap_or_default()
+}
+
 async fn handle_stats(
     context: &UdsServerContext,
     stream: &mut tokio::net::UnixStream,
@@ -183,10 +203,8 @@ async fn handle_stats(
                     )
                 })
                 .unwrap_or((0, 0, 0));
-            let quic_connections = quic_registry
-                .get(&pub_key)
-                .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect())
-                .unwrap_or_default();
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, &pub_key);
             let endpoint = peer
                 .endpoint
                 .map(|addr| addr.to_string())
@@ -233,10 +251,8 @@ async fn handle_stats(
                     )
                 })
                 .unwrap_or((0, 0, 0));
-            let quic_connections = quic_registry
-                .get(pub_key)
-                .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect())
-                .unwrap_or_default();
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, pub_key);
             let source = sources
                 .get(pub_key)
                 .cloned()
@@ -272,10 +288,8 @@ async fn handle_stats(
                     )
                 })
                 .unwrap_or((0, 0, 0));
-            let quic_connections = quic_registry
-                .get(pub_key)
-                .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect())
-                .unwrap_or_default();
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, pub_key);
             let source = sources
                 .get(pub_key)
                 .cloned()
@@ -313,13 +327,24 @@ async fn handle_dump(
     let response = {
         let telemetry = context.telemetry.snapshot();
         let quic_registry = context.shared_quic_registry.lock();
+        let peers = {
+            let state = context.state.read();
+            state.config.peers.clone()
+        };
+        let peer_map = peers
+            .iter()
+            .map(|peer| (peer.public_key, peer))
+            .collect::<HashMap<_, _>>();
         let mut keys = HashSet::new();
+        keys.extend(peers.iter().map(|peer| peer.public_key));
         keys.extend(l3_stats.keys().copied());
         keys.extend(telemetry.keys().copied());
         keys.extend(quic_registry.keys().copied());
+        keys.extend(context.client_quic_pools.read().keys().copied());
 
         let mut lines = Vec::new();
         for key in keys {
+            let configured = peer_map.get(&key).copied();
             let wg = l3_stats.get(&key);
             let l4 = telemetry.get(&key);
             let l4_rx = l4
@@ -331,18 +356,31 @@ async fn handle_dump(
             let active_streams = l4
                 .map(|stats| stats.active_streams.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            let quic_connections = quic_registry
-                .get(&key)
-                .map(|conns| conns.len())
-                .unwrap_or(0);
+            let quic_connections =
+                quic_connection_snapshots(&quic_registry, &context.client_quic_pools, &key).len();
+            let endpoint = configured
+                .and_then(|peer| peer.endpoint.map(|addr| addr.to_string()))
+                .or_else(|| wg.and_then(|stats| stats.endpoint.clone()))
+                .unwrap_or_else(|| "(none)".to_string());
+            let allowed_ips = configured
+                .map(|peer| {
+                    peer.allowed_ips
+                        .iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .filter(|allowed_ips| !allowed_ips.is_empty())
+                .or_else(|| {
+                    wg.map(|stats| stats.allowed_ips.join(","))
+                        .filter(|allowed_ips| !allowed_ips.is_empty())
+                })
+                .unwrap_or_else(|| "(none)".to_string());
             lines.push(format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}:{}",
                 encode_base64_32(&key),
-                wg.and_then(|stats| stats.endpoint.clone())
-                    .unwrap_or_else(|| "(none)".to_string()),
-                wg.map(|stats| stats.allowed_ips.join(","))
-                    .filter(|allowed_ips| !allowed_ips.is_empty())
-                    .unwrap_or_else(|| "(none)".to_string()),
+                endpoint,
+                allowed_ips,
                 wg.map(|stats| stats.last_handshake).unwrap_or(0),
                 wg.map(|stats| stats.rx_bytes).unwrap_or(0),
                 wg.map(|stats| stats.tx_bytes).unwrap_or(0),
@@ -939,7 +977,17 @@ mod tests {
         let path = "/tmp/test_real_uds_dump.sock";
         let _ = fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
-        start(listener, test_context());
+        let context = test_context();
+        {
+            let mut state = context.state.write();
+            state.config.peers.push(PeerConfig {
+                public_key: [9u8; 32],
+                allowed_ips: vec!["10.0.9.0/24".parse().unwrap()],
+                endpoint: None,
+                proxy_port: None,
+            });
+        }
+        start(listener, context);
 
         let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
         let payload = serde_json::to_vec(&CommandInput::Dump).unwrap();
@@ -950,6 +998,8 @@ mod tests {
         stream.read_to_end(&mut response).await.unwrap();
         let dump = String::from_utf8(response).unwrap();
         assert!(dump.contains(&encode_base64_32(&[2u8; 32])));
+        assert!(dump.contains(&encode_base64_32(&[9u8; 32])));
+        assert!(dump.contains("10.0.9.0/24"));
         assert!(dump.contains("150"));
 
         let _ = fs::remove_file(path);
@@ -1024,7 +1074,7 @@ mod tests {
         };
 
         assert!(
-            find_allowed_ip_conflict(&[existing_peer.clone()], &new_peer)
+            find_allowed_ip_conflict(std::slice::from_ref(&existing_peer), &new_peer)
                 .unwrap()
                 .contains("Overlapping AllowedIPs")
         );
@@ -1034,7 +1084,7 @@ mod tests {
             "10.1.0.0/24".parse().unwrap(),
         ];
         assert!(
-            find_allowed_ip_conflict(&[existing_peer.clone()], &new_peer)
+            find_allowed_ip_conflict(std::slice::from_ref(&existing_peer), &new_peer)
                 .unwrap()
                 .contains("Duplicate AllowedIPs")
         );
