@@ -149,11 +149,17 @@ UDS 路径：
 - L3：通过 WireGuard generic netlink 查询内核 peer 统计。
 - L4：进程内 `TelemetryRegistry` 和 server-side `PeerConnRegistry`。
 
+统计方向：
+
+- `rx` / `received`：本 daemon 从该 peer 收到的字节。
+- `tx` / `sent`：本 daemon 发给该 peer 的字节。
+- L3 WireGuard 和 L4 QUIC 统计使用同一方向语义；L4 relay 中 `QUIC -> TCP` 计为 `rx`，`TCP -> QUIC` 计为 `tx`。
+
 `source` 字段表示本次查询前的来源关系：
 
 - `both`：配置中存在，且内核 WireGuard 状态中也存在。
 - `proxy`：只在用户态配置中存在。
-- `kernel`：只在内核 WireGuard 状态中存在。
+- `wireguard`：只在 WireGuard 设备状态中存在。
 
 QUIC 状态展示语义：
 

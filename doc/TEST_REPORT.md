@@ -3,10 +3,76 @@
 ## 测试概览
 
 - 项目版本：`new_proxy v5.0.0`
-- 报告日期：2026-05-29
+- 报告日期：2026-06-04
 - 主要测试对象：配置冲突校验、UDS API/server、TPROXY TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer 并发/冲突防护、聚合遥测、稳定性与 perf smoke
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
+
+## 2026-06-04 增量复查
+
+本次复查执行了无需 root 的静态、单元与脚本语法检查：
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 47 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+```
+
+结论：**本次增量复查的格式、编译、Clippy、单元测试和脚本语法检查全部通过；未重新执行需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
+## 2026-06-04 E2E 与场景复查
+
+本次复查执行了需要 root/network namespace 的端到端与场景脚本：
+
+```bash
+sudo bash script/acceptance/e2e_test_dualstack.sh
+sudo bash script/acceptance/e2e_scenarios.sh
+sudo bash script/acceptance/e2e_multi_client.sh
+sudo bash script/acceptance/e2e_dynamic_client_peer.sh
+```
+
+结果：
+
+```text
+e2e_test_dualstack.sh: PASS
+e2e_scenarios.sh: PASS
+  - SCENARIO 2B dynamic L3 fallback: SKIP
+  - skip reason: userspace WireGuard backend does not expose a real scenario_client netdev in client_ns
+e2e_multi_client.sh: PASS
+e2e_dynamic_client_peer.sh: PASS
+```
+
+动态 client peer E2E 产物目录：
+
+```text
+/tmp/new_proxy_dynamic_peer_20260604_142626
+```
+
+结论：**本轮端到端与场景测试全部通过；`e2e_scenarios.sh` 中依赖真实 WireGuard netdev 的 2B 子场景在 userspace WireGuard 后端下按脚本逻辑跳过。**
 
 ## 已执行测试
 

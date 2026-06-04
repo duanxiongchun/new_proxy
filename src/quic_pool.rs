@@ -174,7 +174,10 @@ pub fn generate_self_signed_cert() -> Result<(Vec<rustls::Certificate>, rustls::
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(|e| format!("Failed to generate cert: {}", e))?;
     let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    let cert_der = rustls::Certificate(cert.serialize_der().unwrap());
+    let cert_der = rustls::Certificate(
+        cert.serialize_der()
+            .map_err(|e| format!("Failed to serialize cert: {}", e))?,
+    );
     Ok((vec![cert_der], key))
 }
 
@@ -224,6 +227,7 @@ impl QuicPoolClient {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_refresh(
         client_public_key: [u8; 32],
         session_psk: [u8; 32],

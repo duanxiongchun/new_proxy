@@ -161,7 +161,8 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
         cs.active_streams.fetch_add(1, Ordering::Relaxed);
     }
 
-    // 构建计数器列表：聚合级 + 可选的单连接级
+    // Keep L4 rx/tx aligned with WireGuard peer semantics:
+    // rx = bytes received from the remote peer over QUIC, tx = bytes sent to it.
     let mut rx_counters = vec![stats.rx_bytes.clone()];
     let mut tx_counters = vec![stats.tx_bytes.clone()];
     if let Some(cs) = &conn_stat {
@@ -169,8 +170,8 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
         tx_counters.push(cs.tx_bytes.clone());
     }
 
-    let counting_tcp_read = CountingReader::new(tcp_read, rx_counters);
-    let counting_quic_read = CountingReader::new(quic_recv, tx_counters);
+    let counting_tcp_read = CountingReader::new(tcp_read, tx_counters);
+    let counting_quic_read = CountingReader::new(quic_recv, rx_counters);
 
     // 3. 并发双向流复制，流结束时传播半关闭 (FIN)
     let client_to_server = tokio::spawn(async move {
@@ -345,10 +346,10 @@ mod tests {
         relay_task.await.unwrap();
 
         // 验证流量计数器更新正确
-        assert_eq!(stats.rx_bytes.load(Ordering::Relaxed), 9);
-        assert_eq!(stats.tx_bytes.load(Ordering::Relaxed), 10);
-        assert_eq!(conn_stat.rx_bytes.load(Ordering::Relaxed), 9);
-        assert_eq!(conn_stat.tx_bytes.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.rx_bytes.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.tx_bytes.load(Ordering::Relaxed), 9);
+        assert_eq!(conn_stat.rx_bytes.load(Ordering::Relaxed), 10);
+        assert_eq!(conn_stat.tx_bytes.load(Ordering::Relaxed), 9);
         assert_eq!(stats.active_streams.load(Ordering::Relaxed), 0);
     }
 }

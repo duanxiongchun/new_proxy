@@ -131,14 +131,17 @@ fn start_tproxy_failover_manager(
                             continue;
                         }
                         let mut pools_guard = pools.write();
-                        if pools_guard.contains_key(&peer.public_key) {
-                            pool.shutdown(b"Peer pool already recovered");
-                        } else {
-                            pools_guard.insert(peer.public_key, pool);
-                            log::info!(
-                                "Recovered missing QUIC pool for peer {}",
-                                encode_base64_32(&peer.public_key)
-                            );
+                        match pools_guard.entry(peer.public_key) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(pool);
+                                log::info!(
+                                    "Recovered missing QUIC pool for peer {}",
+                                    encode_base64_32(&peer.public_key)
+                                );
+                            }
+                            std::collections::hash_map::Entry::Occupied(_) => {
+                                pool.shutdown(b"Peer pool already recovered");
+                            }
                         }
                     }
                     Err(e) => {
