@@ -52,6 +52,7 @@ sudo bash script/acceptance/e2e_dynamic_client_peer.sh
 sudo bash script/acceptance/e2e_userspace_wg_fallback.sh
 sudo bash script/acceptance/e2e_full_tunnel_bypass.sh
 sudo STABILITY_DURATION=60 STABILITY_SAMPLE_INTERVAL=10 bash script/acceptance/stability_stress_test.sh
+cargo build --release --bins
 sudo bash script/perf/perf_smoke.sh
 sudo bash script/perf/perf_cores_scalability.sh
 ```
@@ -81,7 +82,7 @@ python3 -m py_compile \
 | 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限 | QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
 | E2E | 双栈 WAN、IPv6 HTTP over TUN/smoltcp/QUIC、TUN/smoltcp->QUIC、QUIC 被阻断时新 TCP 经 userspace WireGuard fallback、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy + direct L3 baseline、动态 client proxy peer add/remove 生命周期、full-tunnel endpoint bypass 与动态 full-tunnel peer replacement、server 主动访问 client 后端的物理路径保持可达 | UDP/ICMP 经 userspace boringtun 的 namespace 闭环、服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、direct L3 baseline、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV；crash、短/长 TCP、UDP、ping、QUIC CV 为硬门禁，RSS 默认 WARN、`STABILITY_ENFORCE_RSS=1` 时为硬门禁 | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
-| 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 `--threads 1..4` 和 `taskset` 约束 client CPU，输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator；L3 userspace WireGuard 仍是 per-peer shared state，需单独评估 UDP/ICMP/fallback 扩展性 |
+| 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 `--threads 1..4` 同步重启 server/client，并用 `taskset` 约束 client CPU，默认 32 并发输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator；L3 userspace WireGuard 仍是 per-peer shared state，需单独评估 UDP/ICMP/fallback 扩展性 |
 | 弱网/混沌 | 无正式脚本 | 缺丢包、端口阻断、服务端重启、session rotation、控制面丢包场景 |
 | 安全负向 | 控制面坏 HMAC/重放/stale nonce、QUIC 证书 pinning、空 endpoint pool | 缺恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E |
 
