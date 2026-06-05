@@ -5,4 +5,5 @@ pub struct WgPeerStats {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub last_handshake: u64,
+    pub unknown_handshake_drops: u64,
 }

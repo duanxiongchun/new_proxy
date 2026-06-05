@@ -8,6 +8,61 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-05 严格 Review 问题修复验证
+
+本次修复覆盖：
+
+- full-tunnel endpoint bypass 改为 WireGuard 风格 `SO_MARK` + policy routing：外层 QUIC/control/userspace WireGuard UDP socket 自动带 mark，业务流量走专用 table，主表直连/更具体路由通过 `suppress_prefixlength 0` 保留。
+- `e2e_full_tunnel_bypass.sh` 增加 SO_MARK policy rule、marked endpoint route 和动态 full-tunnel proxy peer replacement 验证。
+- userspace WireGuard 未知 endpoint 握手/控制类入站包增加 per-IP token bucket，成功握手不消耗 token，失败 unknown 包才消耗 token；drop 计数进入 telemetry，降低多 peer 下恶意首包触发 O(N) 扫描的 CPU 风险，同时减少 NAT/reconnect storm 误伤。
+- 稳定性报告区分硬失败与 RSS 风险：业务失败、crash、UDP、ping、QUIC CV 失败会返回非零；RSS 默认记录为 `WARN`，设置 `STABILITY_ENFORCE_RSS=1` 后作为硬门禁。
+- 文档同步 full-tunnel SO_MARK 路由、IPv6 extension-header TCP fallback、WireGuard 未知握手限速和完整 E2E 入口。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+cargo build --bins
+bash -n script/acceptance/e2e_full_tunnel_bypass.sh \
+  script/acceptance/stability_stress_test.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+python3 script/acceptance/stability_report.py /tmp/stability_report_check
+STABILITY_ENFORCE_RSS=1 python3 script/acceptance/stability_report.py /tmp/stability_report_check
+sudo bash script/acceptance/e2e_full_tunnel_bypass.sh
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check --quiet: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test --quiet:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 97 passed; 0 failed
+cargo build --bins: PASS
+bash -n modified scripts: PASS
+python3 -m py_compile stability helpers: PASS
+stability_report.py default RSS mode:
+  RSS growth <= 10% or <= 2 MiB: WARN
+  RSS hard gate enabled: no
+  exit code: 0
+stability_report.py strict RSS mode:
+  exit code: 1
+sudo bash script/acceptance/e2e_full_tunnel_bypass.sh: PASS
+  - dynamic full-tunnel add-peer replacement: PASS
+  - endpoint route after replacement: 10.20.2.2 via 10.20.1.1 dev vf-c
+  - artifact: /tmp/new_proxy_full_tunnel_20260605_221703
+```
+
+结论：**严格 Review 中发现的问题已修复并验证；full-tunnel 动态 replacement 真实 E2E 通过，稳定性报告门禁语义已收敛为业务硬失败 + RSS 可配置硬门禁。**
+
 ## 2026-06-05 全量 E2E、稳定性、性能与门禁验证
 
 本轮按要求重新执行全部本地门禁、端到端场景、稳定性压测、性能冒烟和核心数扩展性能测试。

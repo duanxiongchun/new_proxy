@@ -61,6 +61,7 @@ fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoi
             .bind(&v6_addr.into())
             .map_err(|e| format!("bind [::]:{} failed: {}", port, e))?;
         let udp_socket: std::net::UdpSocket = socket.into();
+        crate::socket_mark::set_outer_mark(&udp_socket)?;
         Endpoint::new(
             EndpointConfig::default(),
             Some(server_config.clone()),
@@ -359,11 +360,16 @@ impl QuicPoolClient {
         }
         let client_config = Self::build_client_config(runtime_config.server_cert_sha256);
         let bind_addr = if runtime_config.endpoints[0].is_ipv6() {
-            "[::]:0"
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         } else {
-            "0.0.0.0:0"
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         };
-        let mut endpoint = Endpoint::client(bind_addr.parse().unwrap())
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| "No async runtime found for QUIC".to_string())?;
+        let udp_socket = std::net::UdpSocket::bind(bind_addr)
+            .map_err(|e| format!("Failed to bind QUIC client UDP socket: {}", e))?;
+        crate::socket_mark::set_outer_mark(&udp_socket)?;
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), None, udp_socket, runtime)
             .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
         endpoint.set_default_client_config(client_config);
         Ok(endpoint)

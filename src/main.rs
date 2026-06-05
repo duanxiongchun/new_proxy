@@ -10,6 +10,7 @@ mod routing;
 pub mod rtc_loop;
 mod runtime;
 mod server_proxy;
+mod socket_mark;
 mod stats_cli;
 mod tcp_util;
 mod telemetry;
@@ -330,6 +331,7 @@ fn bind_l3_udp_socket(port: u16, require_ipv6: bool) -> Result<std::net::UdpSock
                     port, e
                 )
             })?;
+        socket_mark::set_socket2_outer_mark(&socket)?;
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;
@@ -337,6 +339,7 @@ fn bind_l3_udp_socket(port: u16, require_ipv6: bool) -> Result<std::net::UdpSock
     } else {
         let socket = std::net::UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("failed to bind IPv4 UDP socket on port {}: {}", port, e))?;
+        socket_mark::set_outer_mark(&socket)?;
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;

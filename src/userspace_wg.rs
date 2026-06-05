@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::PeerConfig;
 use crate::routing::AllowedIPsRouter;
@@ -14,6 +14,10 @@ use crate::wireguard::WgPeerStats;
 const RECEIVER_INDEX_TTL_SECS: u64 = 180;
 const RECEIVER_INDEX_CLEANUP_INTERVAL_SECS: u64 = 60;
 const RECEIVER_INDEX_MAX_ENTRIES: usize = 65536;
+const UNKNOWN_HANDSHAKE_BURST: f64 = 20.0;
+const UNKNOWN_HANDSHAKE_REFILL_PER_SEC: f64 = 10.0;
+const UNKNOWN_HANDSHAKE_BURST_ENV: &str = "NEW_PROXY_UNKNOWN_HANDSHAKE_BURST";
+const UNKNOWN_HANDSHAKE_REFILL_ENV: &str = "NEW_PROXY_UNKNOWN_HANDSHAKE_REFILL_PER_SEC";
 
 pub struct UserspaceWg {
     tunn: Tunn,
@@ -66,6 +70,70 @@ pub struct UserspaceWgRegistry {
     endpoint_index: Arc<parking_lot::RwLock<HashMap<SocketAddr, [u8; 32]>>>,
     receiver_index: Arc<parking_lot::RwLock<HashMap<u32, ReceiverIndexEntry>>>,
     receiver_index_last_cleanup: Arc<AtomicU64>,
+    unknown_handshake_limiter: Arc<IpTokenBucket>,
+}
+
+struct IpTokenBucket {
+    history: parking_lot::Mutex<HashMap<IpAddr, (Instant, f64)>>,
+    burst: f64,
+    refill_per_sec: f64,
+    dropped: AtomicU64,
+}
+
+impl IpTokenBucket {
+    fn new() -> Self {
+        Self::new_with_limits(
+            env_f64(UNKNOWN_HANDSHAKE_BURST_ENV, UNKNOWN_HANDSHAKE_BURST),
+            env_f64(
+                UNKNOWN_HANDSHAKE_REFILL_ENV,
+                UNKNOWN_HANDSHAKE_REFILL_PER_SEC,
+            ),
+        )
+    }
+
+    fn new_with_limits(burst: f64, refill_per_sec: f64) -> Self {
+        Self {
+            history: parking_lot::Mutex::new(HashMap::new()),
+            burst: burst.max(1.0),
+            refill_per_sec: refill_per_sec.max(0.1),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    fn allow_scan(&self, ip: IpAddr) -> bool {
+        let mut history = self.history.lock();
+        if history.len() > 10000 {
+            let now = Instant::now();
+            history.retain(|_, (last_seen, _)| now.duration_since(*last_seen).as_secs() < 60);
+        }
+        let now = Instant::now();
+        let (last_seen, tokens) = history.entry(ip).or_insert((now, self.burst));
+        let elapsed = now.duration_since(*last_seen).as_secs_f64();
+        *last_seen = now;
+        *tokens = (*tokens + elapsed * self.refill_per_sec).min(self.burst);
+        if *tokens >= 1.0 {
+            true
+        } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    fn penalize_failed_scan(&self, ip: IpAddr) {
+        let mut history = self.history.lock();
+        let now = Instant::now();
+        let (last_seen, tokens) = history.entry(ip).or_insert((now, self.burst));
+        let elapsed = now.duration_since(*last_seen).as_secs_f64();
+        *last_seen = now;
+        *tokens = (*tokens + elapsed * self.refill_per_sec).min(self.burst);
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+        }
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl UserspaceWgRegistry {
@@ -77,6 +145,7 @@ impl UserspaceWgRegistry {
             endpoint_index: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             receiver_index: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             receiver_index_last_cleanup: Arc::new(AtomicU64::new(0)),
+            unknown_handshake_limiter: Arc::new(IpTokenBucket::new()),
         };
         for peer in peers {
             registry.add_or_replace_peer(peer.clone())?;
@@ -139,6 +208,7 @@ impl UserspaceWgRegistry {
                         rx_bytes: peer.rx_bytes.load(Ordering::Relaxed),
                         tx_bytes: peer.tx_bytes.load(Ordering::Relaxed),
                         last_handshake: peer.last_handshake.load(Ordering::Relaxed),
+                        unknown_handshake_drops: self.unknown_handshake_limiter.dropped(),
                     },
                 )
             })
@@ -278,6 +348,14 @@ impl UserspaceWgRegistry {
             return None;
         }
 
+        if !self.unknown_handshake_limiter.allow_scan(endpoint.ip()) {
+            log::debug!(
+                "Rate limit exceeded for unknown userspace WireGuard packet from {}",
+                endpoint
+            );
+            return None;
+        }
+
         for (public_key, peer) in self
             .peers
             .read()
@@ -294,6 +372,8 @@ impl UserspaceWgRegistry {
                 return Some((endpoint, action));
             }
         }
+        self.unknown_handshake_limiter
+            .penalize_failed_scan(endpoint.ip());
         None
     }
 
@@ -396,6 +476,14 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(default)
 }
 
 #[cfg(not(tarpaulin))]
@@ -559,6 +647,30 @@ mod tests {
         let index = registry.receiver_index.read();
         assert!(!index.contains_key(&7));
         assert!(index.contains_key(&8));
+    }
+
+    #[test]
+    fn unknown_handshake_limiter_rejects_after_burst() {
+        let limiter = IpTokenBucket::new_with_limits(UNKNOWN_HANDSHAKE_BURST, 0.1);
+        let ip = "192.0.2.10".parse().unwrap();
+
+        for _ in 0..(UNKNOWN_HANDSHAKE_BURST as usize) {
+            assert!(limiter.allow_scan(ip));
+            limiter.penalize_failed_scan(ip);
+        }
+        assert!(!limiter.allow_scan(ip));
+        assert_eq!(limiter.dropped(), 1);
+    }
+
+    #[test]
+    fn unknown_handshake_limiter_does_not_penalize_successful_scans() {
+        let limiter = IpTokenBucket::new_with_limits(2.0, 0.1);
+        let ip = "192.0.2.10".parse().unwrap();
+
+        assert!(limiter.allow_scan(ip));
+        assert!(limiter.allow_scan(ip));
+        assert!(limiter.allow_scan(ip));
+        assert_eq!(limiter.dropped(), 0);
     }
 
     #[test]

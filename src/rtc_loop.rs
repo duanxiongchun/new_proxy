@@ -1103,6 +1103,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_ipv6_tcp_with_extension_header_falls_back_to_l3() {
+        let mut packet = ipv6_tcp_packet(
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            12345,
+            443,
+        );
+        packet[6] = 0;
+
+        assert_eq!(get_ip_protocol(&packet), Some(0));
+        assert_eq!(parse_tcp_packet(&packet), None);
+    }
+
+    #[test]
     fn parse_tcp_packet_handles_ipv4_options_and_ipv6_syn() {
         let mut ipv4 = vec![0u8; 44];
         ipv4[0] = 0x46;
