@@ -216,6 +216,64 @@ async fn handle_tproxy_connection(
     }
 }
 
+pub async fn bridge_userspace_stream_to_quic(
+    target_addr: SocketAddr,
+    quic_pool: Arc<QuicPoolClient>,
+    mut tx_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    rx_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let pool_state = quic_pool.get_state();
+    if !matches!(pool_state, PoolState::Active) {
+        log::warn!("QUIC pool is not active, dropping userspace stream to {}", target_addr);
+        return;
+    }
+
+    match quic_pool.open_mux_stream().await {
+        Ok((mut quic_send, mut quic_recv, _conn_stat)) => {
+            if write_target_addr(&mut quic_send, target_addr).await.is_ok() {
+                let mut status = [0u8; 1];
+                match timeout(Duration::from_secs(5), quic_recv.read_exact(&mut status)).await {
+                    Ok(Ok(_)) if status[0] == 1 => {
+                        // Bridge data
+                        let send_loop = async {
+                            while let Some(data) = tx_receiver.recv().await {
+                                if quic_send.write_all(&data).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = quic_send.finish();
+                        };
+                        let recv_loop = async {
+                            let mut buf = vec![0u8; 1500];
+                            while let Ok(n) = quic_recv.read(&mut buf).await {
+                                if let Some(bytes) = n {
+                                    if bytes > 0 {
+                                        if rx_sender.send(buf[..bytes].to_vec()).await.is_err() {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        };
+                        tokio::join!(send_loop, recv_loop);
+                    }
+                    _ => {
+                        log::warn!("Failed or rejected userspace target {}", target_addr);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to open stream for userspace bridge: {}", e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
