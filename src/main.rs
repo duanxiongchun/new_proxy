@@ -202,12 +202,8 @@ fn start_userspace_tcp_failover_manager(
     })
 }
 
-fn effective_client_tun_queues(requested: usize, has_l4_proxy: bool) -> usize {
-    if has_l4_proxy && requested > 1 {
-        1
-    } else {
-        requested
-    }
+fn effective_client_tun_queues(requested: usize) -> usize {
+    requested.max(1)
 }
 
 fn build_initial_gateway_state(config: GatewayConfig) -> GatewayState {
@@ -396,11 +392,15 @@ async fn main() {
 
     // 执行 PreScript 脚本
     if let Some(ref pre_script) = config.interface.pre_script {
-        run_script(pre_script);
+        if let Err(e) = run_script(pre_script) {
+            eprintln!("PreScript failed: {}", e);
+            std::process::exit(1);
+        }
     }
 
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
+    let worker_telemetry_registry = Arc::new(telemetry::WorkerTelemetryRegistry::new());
 
     let gateway_state = Arc::new(parking_lot::RwLock::new(build_initial_gateway_state(
         config.clone(),
@@ -435,6 +435,7 @@ async fn main() {
             listener,
             uds_server::UdsServerContext {
                 telemetry: telemetry_registry.clone(),
+                worker_telemetry: worker_telemetry_registry.clone(),
                 state: gateway_state.clone(),
                 peer_secrets: peer_secrets.clone(),
                 server_secret: server_secret.clone(),
@@ -628,14 +629,7 @@ async fn main() {
             config.interface.private_key,
         );
 
-        let effective_num_threads =
-            effective_client_tun_queues(startup_args.num_threads, !proxy_peers.is_empty());
-        if effective_num_threads != startup_args.num_threads {
-            log::warn!(
-                "Userspace TCP offload is configured; forcing TUN queues from {} to 1 to keep TCP flow state on one smoltcp worker",
-                startup_args.num_threads
-            );
-        }
+        let effective_num_threads = effective_client_tun_queues(startup_args.num_threads);
 
         log::info!(
             "Opening userspace multiqueue TUN device: {} with {} queues",
@@ -741,7 +735,7 @@ async fn main() {
         let (local_ipv4, local_ipv6) = local_stack_ips(&config);
 
         let mut worker_tasks = Vec::new();
-        for fd in tun_fds {
+        for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
                 Ok(io) => io,
                 Err(e) => {
@@ -771,6 +765,7 @@ async fn main() {
                 config.interface.mtu as usize,
             );
             worker.active_conn_handler = Some(active_conn_handler.clone());
+            worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
 
             let gateway_state_for_worker = gateway_state.clone();
             let client_quic_pools_for_worker = client_quic_pools.clone();
@@ -866,10 +861,10 @@ mod tests {
     }
 
     #[test]
-    fn test_l4_proxy_forces_single_tun_queue() {
-        assert_eq!(effective_client_tun_queues(4, true), 1);
-        assert_eq!(effective_client_tun_queues(4, false), 4);
-        assert_eq!(effective_client_tun_queues(1, true), 1);
+    fn client_tun_queues_follow_requested_thread_count() {
+        assert_eq!(effective_client_tun_queues(4), 4);
+        assert_eq!(effective_client_tun_queues(1), 1);
+        assert_eq!(effective_client_tun_queues(0), 1);
     }
 
     #[test]

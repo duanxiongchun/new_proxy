@@ -6,6 +6,7 @@ use smoltcp::socket::tcp;
 use smoltcp::socket::AnySocket;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -63,6 +64,13 @@ pub fn parse_tcp_packet(packet: &[u8]) -> Option<(IpAddr, u16, IpAddr, u16, bool
                 return None;
             }
             let ihl = (packet[0] & 0x0f) as usize * 4;
+            if ihl < 20 {
+                return None;
+            }
+            let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+            if total_len < ihl + 20 || packet.len() < total_len {
+                return None;
+            }
             if packet.len() < ihl + 20 {
                 return None;
             }
@@ -266,6 +274,7 @@ pub struct RtcWorker {
     mtu: usize,
     last_housekeeping: Instant,
     bridge_notify: Arc<Notify>,
+    worker_stats: Option<Arc<crate::telemetry::WorkerTelemetry>>,
 }
 
 impl RtcWorker {
@@ -293,6 +302,50 @@ impl RtcWorker {
             mtu,
             last_housekeeping: Instant::now(),
             bridge_notify: Arc::new(Notify::new()),
+            worker_stats: None,
+        }
+    }
+
+    pub fn set_worker_stats(&mut self, worker_stats: Arc<crate::telemetry::WorkerTelemetry>) {
+        self.worker_stats = Some(worker_stats);
+    }
+
+    fn record_tun_rx(&self, bytes: usize) {
+        if let Some(stats) = &self.worker_stats {
+            stats.tun_rx_packets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .tun_rx_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_tcp_offload(&self, bytes: usize) {
+        if let Some(stats) = &self.worker_stats {
+            stats.tcp_offload_packets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .tcp_offload_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_l3_packet(&self, bytes: usize) {
+        if let Some(stats) = &self.worker_stats {
+            stats.l3_packets.fetch_add(1, Ordering::Relaxed);
+            stats.l3_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_new_tcp_flow(&self) {
+        if let Some(stats) = &self.worker_stats {
+            stats.new_tcp_flows.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_current_tcp_flows(&self) {
+        if let Some(stats) = &self.worker_stats {
+            stats
+                .current_tcp_flows
+                .store(self.flow_map.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -386,6 +439,7 @@ impl RtcWorker {
 
         loop {
             self.cleanup_stale_flows();
+            self.record_current_tcp_flows();
             let now = smoltcp::time::Instant::now();
             self.tcp_stack
                 .iface
@@ -419,6 +473,7 @@ impl RtcWorker {
                 read_res = self.tun_io.read(&mut tun_buf) => {
                     match read_res {
                         Ok(n) if n > 0 => {
+                            self.record_tun_rx(n);
                             let packet = &mut tun_buf[..n];
                             if let Some((src_ip, src_port, dst_ip, dst_port, is_syn)) = parse_tcp_packet(packet) {
                                 let flow_key = (src_ip, src_port, dst_ip, dst_port);
@@ -454,6 +509,7 @@ impl RtcWorker {
                                         if let Some((endpoint, enc_pkt)) =
                                             self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                         {
+                                            self.record_l3_packet(n);
                                             if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                 log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                             }
@@ -470,6 +526,7 @@ impl RtcWorker {
                                         if let Some((endpoint, enc_pkt)) =
                                             self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                         {
+                                            self.record_l3_packet(n);
                                             if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                 log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                             }
@@ -483,6 +540,7 @@ impl RtcWorker {
                                             None => match self.allocate_local_port() {
                                                 Some(port) => {
                                                     self.flow_map.insert(flow_key, port);
+                                                    self.record_new_tcp_flow();
                                                     port
                                                 }
                                                 None => {
@@ -490,6 +548,7 @@ impl RtcWorker {
                                                     if let Some((endpoint, enc_pkt)) =
                                                         self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                                     {
+                                                        self.record_l3_packet(n);
                                                         if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                             log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                                         }
@@ -505,6 +564,7 @@ impl RtcWorker {
                                         if let Some((endpoint, enc_pkt)) =
                                             self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                         {
+                                            self.record_l3_packet(n);
                                             if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                 log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                             }
@@ -542,11 +602,13 @@ impl RtcWorker {
                                     rewrite_destination_ip(packet, local_ip);
                                     rewrite_destination_port(packet, local_port);
 
+                                    self.record_tcp_offload(n);
                                     self.tcp_stack.process_input_packet(packet.to_vec());
                                 } else {
                                     if let Some((endpoint, enc_pkt)) =
                                         self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                     {
+                                        self.record_l3_packet(n);
                                         if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                             log::warn!("Failed to send userspace WireGuard packet to {}: {}", endpoint, e);
                                         }
@@ -556,6 +618,7 @@ impl RtcWorker {
                                 if let Some((endpoint, enc_pkt)) =
                                     self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                 {
+                                    self.record_l3_packet(n);
                                     if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                         log::warn!("Failed to send userspace WireGuard packet to {}: {}", endpoint, e);
                                     }
@@ -964,6 +1027,21 @@ mod tests {
                 true,
             ))
         );
+    }
+
+    #[test]
+    fn parse_tcp_packet_rejects_malformed_ipv4_lengths() {
+        let mut bad_ihl = ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 12345, 443);
+        bad_ihl[0] = 0x44;
+        assert_eq!(parse_tcp_packet(&bad_ihl), None);
+
+        let mut bad_total_len = ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 12345, 443);
+        bad_total_len[2..4].copy_from_slice(&(30u16).to_be_bytes());
+        assert_eq!(parse_tcp_packet(&bad_total_len), None);
+
+        let mut truncated = ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 12345, 443);
+        truncated[2..4].copy_from_slice(&(60u16).to_be_bytes());
+        assert_eq!(parse_tcp_packet(&truncated), None);
     }
 
     #[test]

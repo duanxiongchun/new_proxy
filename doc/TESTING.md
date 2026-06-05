@@ -79,7 +79,7 @@ python3 -m py_compile \
 | 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算 | 桥接通道背压、QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
 | E2E | 双栈 WAN、IPv6 HTTP over TUN/smoltcp/QUIC、TUN/smoltcp->QUIC、QUIC 被阻断时新 TCP 经 userspace WireGuard fallback、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy + direct L3 baseline、动态 client proxy peer add/remove 生命周期、server 主动访问 client 后端的物理路径保持可达 | UDP/ICMP 经 userspace boringtun 的 namespace 闭环、服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、direct L3 baseline、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
-| 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 覆盖 `--threads` 多队列扩展 smoke | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测 |
+| 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 `--threads 1..4` 和 `taskset` 约束 client CPU，输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator |
 | 弱网/混沌 | 无正式脚本 | 缺丢包、端口阻断、服务端重启、session rotation、控制面丢包场景 |
 | 安全负向 | 控制面坏 HMAC/重放/stale nonce、QUIC 证书 pinning、空 endpoint pool | 缺恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E |
 
@@ -241,16 +241,16 @@ Rust 单元测试覆盖：
 - NAT 重写：TUN 入站 TCP 目标 IP 改写为 smoltcp 虚拟 IP，smoltcp 出站响应源 IP 改写回原始目标 IP，IPv4/IPv6 都需要覆盖；同时必须覆盖 IPv4 header checksum 和 TCP pseudo-header checksum 重算。
 - 桥接通道：smoltcp socket payload 经 `BridgeChannels` 发往 QUIC handler，QUIC 返回 payload 能写回 smoltcp socket；通道断开时 socket abort 并清理 bridge。
 - WireGuard timer/UDP 入站：`update_timers()` 产生网络包时写入物理 UDP socket；`decapsulate()` 返回 tunnel 包时写回 TUN。
-- 多队列启动：`--threads <count>` 打开同数量 TUN FD，并为每个 FD 启动独立 `RtcWorker`；失败时清理 runtime。
+- 多队列启动：`--threads <count>` 打开同数量 TUN FD，并为每个 FD 启动独立 `RtcWorker`/userspace WireGuard loop；L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。
 - 多 peer userspace WireGuard：每个 proxy peer 拥有独立 `boringtun` 状态和 UDP endpoint，并按 `AllowedIPs` 选择 L3 fallback 目标。
 - E2E：补齐 UDP/ICMP 经 TUN -> boringtun -> server TUN 闭环。
-- 性能：`script/perf/perf_cores_scalability.sh` 在具备 root、release binary、`iperf3`、`jq` 的环境下运行真实多线程吞吐；工具缺失时的模拟输出只能作为脚本 smoke，不能写入正式性能结论。
+- 性能：`script/perf/perf_cores_scalability.sh` 在具备 root、release binary、`ip`、`python3`、`curl`、`taskset`、`awk` 和可用 CPU cpuset 的环境下运行真实 HTTP 吞吐；工具、CPU 或拓扑缺失时必须失败，不能生成模拟性能数据。脚本还必须强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 `--threads`。
 
 ## 4. Backlog
 
 - 服务端 session rotation / peer removal E2E：建立长 TCP 流，server `remove-peer`，验证旧 QUIC 连接关闭、新 stream 失败，重新 `add-peer` 后新 TCP 成功。
 - 弱网脚本：对单个 QUIC UDP port 下发 `DROP`，验证新 stream 继续使用其他健康 port；控制面 UDP 丢第一包后重试新 nonce 成功。
-- 性能脚本：正式 throughput、TTFB、CPU/RSS、连接建立耗时、并发 1k/4k/8k 阶梯压测，并把 `perf_cores_scalability.sh` 从 smoke/模拟 fallback 升级为稳定的 namespace benchmark。
+- 性能脚本：正式 throughput、TTFB、CPU/RSS、连接建立耗时、并发 1k/4k/8k 阶梯压测，并将 `perf_cores_scalability.sh` 的 curl/Python HTTP 负载替换为 iperf3 或专用 Rust traffic generator。
 - 稳定性脚本：1 小时 nightly/profile、FD 数、CPU 累计时间、失败日志自动打包、机器可读 pass/fail 总结。
 - 安全负向：恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E。
 

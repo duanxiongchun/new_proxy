@@ -132,7 +132,7 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   cat "$ARTIFACT_DIR/server.log"
   exit 1
 fi
-ip netns exec perf_client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
+ip netns exec perf_client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" --threads 4 > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
 if ! kill -0 "$CLIENT_PID" 2>/dev/null; then

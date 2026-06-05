@@ -153,7 +153,7 @@ SERVER_PID=$!
 sleep 2
 
 # D. Start Client 1 (Custom Proxy) Daemon
-ip netns exec client1_ns "$ROOT_DIR/target/debug/new_proxy" -config /tmp/client1.conf > /tmp/new_proxy_client1.log 2>&1 &
+ip netns exec client1_ns "$ROOT_DIR/target/debug/new_proxy" -config /tmp/client1.conf --threads 4 > /tmp/new_proxy_client1.log 2>&1 &
 CLIENT1_PID=$!
 sleep 2
 

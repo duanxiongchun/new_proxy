@@ -8,6 +8,103 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-05 Review 修复验证
+
+本次修复覆盖：
+
+- `PreScript` 执行失败时启动立即失败，不再只记录 warning 后继续启动；`PostScript` 仍保持 cleanup best-effort。
+- `RtcWorker` IPv4 TCP parser 拒绝非法 IHL、过短 total length 和截断 packet，避免 malformed TUN packet 被误分类。
+- `script/perf/perf_cores_scalability.sh` 删除模拟吞吐 fallback，缺 root、release binary、必需系统工具、可用 CPU 或 benchmark 拓扑时失败，不再生成可误读的性能数据；脚本强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 `--threads`。
+- 架构和测试文档同步当前真实语义：client 按 `--threads` 使用多队列；L4 proxy 多 worker 正确性依赖 Linux TUN multiqueue 的 flow queue affinity。
+- 取消 L4 proxy client 强制单 TUN 队列，已有 proxy E2E/perf smoke 入口改为使用 `--threads 4` 启动 client。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+bash -n script/perf/perf_cores_scalability.sh \
+  script/perf/perf_smoke.sh \
+  script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/stability_stress_test.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+sudo script/acceptance/e2e_dynamic_client_peer.sh
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 93 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+sudo script/acceptance/e2e_dynamic_client_peer.sh: PASS
+  - client daemon uses --threads 4
+  - artifact: /tmp/new_proxy_dynamic_peer_20260605_200459
+```
+
+结论：**Review 修复后的格式、编译、Clippy、单元测试、脚本语法检查和 `--threads 4` 动态 client proxy peer E2E 通过；本轮未重新执行其他需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
+## 2026-06-05 L4 Proxy 多队列扩展实测
+
+测试目标：确认取消 L4 proxy 单队列限制后，`--threads 1..4` 是否真实开启对应 TUN queue，观察 TCP over QUIC 吞吐扩展，并通过 per-worker telemetry 判断 flow 是否分散到多个 `RtcWorker`。
+
+测试方法：
+
+- 使用 release binary：`cargo build --release --bins`
+- 使用 Linux network namespace 搭建 `scale_work_ns -> scale_client_ns -> scale_router_ns -> scale_server_ns`
+- server 运行 4 个 QUIC data ports：`40001..40004`
+- client 分别以 `--threads 1`、`--threads 2`、`--threads 3`、`--threads 4` 启动
+- 每组 client 使用当前允许 cpuset 的前 N 个 CPU 运行，支持 `PERF_CPU_LIST` 覆盖，`--threads=N`
+- 每组先 warmup 一次 64 MiB HTTP 下载，再运行并发 HTTP 下载同一 64 MiB 对象
+- 统计来自 client UDS dump 的 `worker:` 行：`new_flows` 表示每个 worker 新建 TCP flow 数
+
+16 并发、2 轮、总传输量 2048 MiB：
+
+```text
+artifact: /tmp/new_proxy_cores_scalability_20260605_202207
+threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,16,2,2048,10.534491,194.409,1.000,33
+2,16,2,2048,6.294708,325.353,1.674,15|18
+3,16,2,2048,4.682595,437.364,2.250,13|10|10
+4,16,2,2048,3.575260,572.825,2.946,7|7|11|8
+```
+
+64 并发、1 轮、总传输量 4096 MiB：
+
+```text
+artifact: /tmp/new_proxy_cores_scalability_20260605_202329
+threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,64,1,4096,49.274695,83.126,1.000,65
+2,64,1,4096,20.422916,200.559,2.413,37|28
+3,64,1,4096,14.139338,289.688,3.485,22|22|21
+4,64,1,4096,11.392930,359.521,4.325,17|16|19|13
+```
+
+worker dump 示例显示 4 threads 下流量进入全部 worker，且没有 L3 fallback：
+
+```text
+worker:0 tun_rx=103907:4157015 tcp_offload=103907:4157015 l3=0:0 new_flows=7 current_flows=0
+worker:1 tun_rx=110968:4439455 tcp_offload=110968:4439455 l3=0:0 new_flows=7 current_flows=0
+worker:2 tun_rx=183794:7352931 tcp_offload=183792:7352835 l3=0:0 new_flows=11 current_flows=0
+worker:3 tun_rx=122252:4890920 tcp_offload=122252:4890920 l3=0:0 new_flows=8 current_flows=0
+```
+
+结论：**L4 proxy 多队列改动已生效，flow 确实分散到多个 worker。16 并发下 4 threads 为 2.946x，不是严格线性；64 并发下相对扩展达到 4.325x，但绝对吞吐下降，说明 curl/Python HTTP/连接调度引入了额外测试瓶颈。本测试能证明多 worker 参与转发和吞吐随 worker 增长，但还不能作为最终性能基准。正式结论仍需要 iperf3 或专用 Rust traffic generator、多轮 median、CPU/RSS/worker 分布联合报告。**
+
 ## 2026-06-05 文档与用户态 client 路径复查
 
 本次复查执行了格式、编译、Clippy、单元测试、脚本语法检查，并复跑了需要 root/network namespace 的场景脚本：
