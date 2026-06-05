@@ -16,6 +16,8 @@ mod tproxy;
 mod uds_server;
 mod wireguard;
 pub mod tun_device;
+pub mod tun_io;
+
 
 
 use client_proxy::{build_peer_quic_pool, run_tproxy_accept_loop};
