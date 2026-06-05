@@ -8,6 +8,52 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-05 严格 Review 修复验证
+
+本次修复覆盖：
+
+- `RtcWorker` bridge pending 队列增加按字节上限，client bridge 全局并发上限从 4096 收紧到 1024，降低慢读/慢写场景 RSS 放大风险。
+- QUIC pool 在 `open_bi()` 失败或超时时主动关闭该物理连接，避免后续 health checker 将无法开 stream 的连接继续视为健康。
+- 架构文档修正 L3 userspace WireGuard 语义：当前是 shared per-peer `boringtun` 状态，不是 per-worker 独立状态。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+git diff --check
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check --quiet: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test --quiet:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 94 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+git diff --check: PASS
+```
+
+结论：**严格 Review 后的稳定性修复通过格式、编译、Clippy、单元测试和脚本语法检查；本轮未重新执行需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
 ## 2026-06-05 Review 修复验证
 
 本次修复覆盖：

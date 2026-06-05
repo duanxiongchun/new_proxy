@@ -548,10 +548,12 @@ impl QuicPoolClient {
                 }
                 Ok(Err(e)) => {
                     log::warn!("Failed to open stream, link might be dead: {}", e);
+                    conn.close(0u32.into(), b"open stream failed");
                     continue;
                 }
                 Err(_) => {
                     log::warn!("Timed out opening mux stream on a QUIC link; trying another link");
+                    conn.close(0u32.into(), b"open stream timeout");
                     continue;
                 }
             }

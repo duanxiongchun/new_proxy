@@ -296,7 +296,7 @@ async fn wait_for_shutdown() {
 }
 
 const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
-const MAX_CLIENT_USERSPACE_TCP_BRIDGES: usize = 4096;
+const MAX_CLIENT_USERSPACE_TCP_BRIDGES: usize = 1024;
 
 fn needs_ipv6_l3_socket(config: &GatewayConfig) -> bool {
     config
