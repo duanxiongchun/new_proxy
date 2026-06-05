@@ -155,4 +155,37 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn default_routes_match_when_no_more_specific_route_exists() {
+        let mut router = AllowedIPsRouter::new();
+        router.insert(IpNet::from_str("0.0.0.0/0").unwrap(), "PeerV4Default");
+        router.insert(IpNet::from_str("::/0").unwrap(), "PeerV6Default");
+        router.insert(IpNet::from_str("10.0.0.0/8").unwrap(), "PeerV4Private");
+
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("8.8.8.8").unwrap()),
+            Some("PeerV4Default")
+        );
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("10.1.2.3").unwrap()),
+            Some("PeerV4Private")
+        );
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("2001:db8::1").unwrap()),
+            Some("PeerV6Default")
+        );
+    }
+
+    #[test]
+    fn inserting_same_prefix_replaces_previous_value() {
+        let mut router = AllowedIPsRouter::new();
+        router.insert(IpNet::from_str("192.0.2.0/24").unwrap(), "old");
+        router.insert(IpNet::from_str("192.0.2.0/24").unwrap(), "new");
+
+        assert_eq!(
+            router.longest_match(IpAddr::from_str("192.0.2.42").unwrap()),
+            Some("new")
+        );
+    }
 }

@@ -7,18 +7,22 @@ mod proxy_proto;
 mod quic_pool;
 mod relay;
 mod routing;
+pub mod rtc_loop;
 mod runtime;
 mod server_proxy;
 mod stats_cli;
 mod tcp_util;
 mod telemetry;
-mod tproxy;
+pub mod tun_device;
+pub mod tun_io;
 mod uds_server;
+pub mod userspace_tcp;
+pub mod userspace_wg;
 mod wireguard;
 
-use client_proxy::{build_peer_quic_pool, run_tproxy_accept_loop};
+use client_proxy::build_peer_quic_pool;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -33,17 +37,11 @@ use quic_pool::{
     cert_sha256, generate_self_signed_cert, PoolState, QuicPoolClient, QuicPoolServer,
 };
 use routing::AllowedIPsRouter;
-#[cfg(test)]
-use runtime::run_blocking_command;
-use runtime::{
-    cleanup_proxy_tproxy_rules, cleanup_runtime, run_script, setup_proxy_tproxy_rules,
-    setup_routes_and_iptables,
-};
+use runtime::{cleanup_runtime, run_script, setup_routes};
+#[cfg(not(tarpaulin))]
 use server_proxy::build_stream_handler;
 use stats_cli::run_cli_stats;
 use telemetry::TelemetryRegistry;
-#[cfg(test)]
-use wireguard::sync_peer_to_wireguard;
 
 type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
 
@@ -51,12 +49,49 @@ type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClien
 pub struct GatewayState {
     pub config: GatewayConfig,
     pub router: AllowedIPsRouter<[u8; 32]>,
-    pub tproxy_offload_enabled: bool,
+    pub userspace_tcp_offload_enabled: bool,
 }
 
-const TPROXY_FAILOVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const USERSPACE_TCP_FAILOVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn should_enable_tproxy_for_pool_states(
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct StartupArgs {
+    config_path: String,
+    num_threads: usize,
+    stats: bool,
+}
+
+fn parse_startup_args(args: &[String]) -> StartupArgs {
+    let mut parsed = StartupArgs {
+        config_path: "proxy.conf".to_string(),
+        num_threads: 1,
+        stats: false,
+    };
+
+    if args.len() > 1 && args[1] == "stats" {
+        parsed.stats = true;
+        return parsed;
+    }
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "-config" && i + 1 < args.len() {
+            parsed.config_path = args[i + 1].clone();
+            i += 2;
+        } else if args[i] == "--threads" && i + 1 < args.len() {
+            if let Ok(threads) = args[i + 1].parse::<usize>() {
+                parsed.num_threads = threads.max(1);
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    parsed
+}
+
+fn should_enable_userspace_tcp_for_pool_states(
     expected_proxy_peer_count: usize,
     states: &[PoolState],
 ) -> bool {
@@ -67,27 +102,20 @@ fn should_enable_tproxy_for_pool_states(
             .all(|state| matches!(state, PoolState::Active))
 }
 
-fn start_tproxy_failover_manager(
+#[cfg(not(tarpaulin))]
+fn start_userspace_tcp_failover_manager(
     state: Arc<parking_lot::RwLock<GatewayState>>,
     pools: PeerQuicPools,
-    interface_name: String,
     client_private_key: [u8; 32],
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(TPROXY_FAILOVER_POLL_INTERVAL).await;
+            tokio::time::sleep(USERSPACE_TCP_FAILOVER_POLL_INTERVAL).await;
 
-            let (table_off, tproxy_port, current_enabled, proxy_peers) = {
+            let (current_enabled, proxy_peers) = {
                 let st = state.read();
                 (
-                    st.config
-                        .interface
-                        .table
-                        .as_deref()
-                        .map(|table| table.eq_ignore_ascii_case("off"))
-                        .unwrap_or(false),
-                    st.config.interface.tproxy_port,
-                    st.tproxy_offload_enabled,
+                    st.userspace_tcp_offload_enabled,
                     st.config
                         .peers
                         .iter()
@@ -96,9 +124,6 @@ fn start_tproxy_failover_manager(
                         .collect::<Vec<_>>(),
                 )
             };
-            if table_off || tproxy_port.is_none() {
-                continue;
-            }
             if proxy_peers.is_empty() {
                 continue;
             }
@@ -162,37 +187,96 @@ fn start_tproxy_failover_manager(
                     .collect::<Vec<_>>()
             };
             let desired_enabled =
-                should_enable_tproxy_for_pool_states(proxy_peers.len(), &pool_states);
+                should_enable_userspace_tcp_for_pool_states(proxy_peers.len(), &pool_states);
             if desired_enabled == current_enabled {
                 continue;
             }
 
-            let config = state.read().config.clone();
+            state.write().userspace_tcp_offload_enabled = desired_enabled;
             if desired_enabled {
-                match setup_proxy_tproxy_rules(&config, &interface_name) {
-                    Ok(()) => {
-                        state.write().tproxy_offload_enabled = true;
-                        log::info!(
-                            "QUIC pools recovered after cooldown; restored TPROXY rules for proxy peers"
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to restore TPROXY rules after QUIC recovery: {}", e);
-                        cleanup_proxy_tproxy_rules(&config, &interface_name);
-                    }
-                }
+                log::info!("QUIC pools recovered after cooldown; userspace offload active");
             } else {
-                cleanup_proxy_tproxy_rules(&config, &interface_name);
-                state.write().tproxy_offload_enabled = false;
-                log::warn!(
-                    "At least one QUIC pool is in fallback/recovering; removed all proxy TPROXY rules so new connections use WireGuard L3"
-                );
+                log::warn!("At least one QUIC pool is in fallback/recovering; userspace offload disabled, using userspace WireGuard L3 fallback");
             }
         }
     })
 }
 
-#[cfg(unix)]
+fn effective_client_tun_queues(requested: usize, has_l4_proxy: bool) -> usize {
+    if has_l4_proxy && requested > 1 {
+        1
+    } else {
+        requested
+    }
+}
+
+fn build_initial_gateway_state(config: GatewayConfig) -> GatewayState {
+    let router = rebuild_l4_router(&config.peers);
+    GatewayState {
+        config,
+        router,
+        userspace_tcp_offload_enabled: true,
+    }
+}
+
+fn derive_peer_secrets(config: &GatewayConfig) -> HashMap<[u8; 32], [u8; 32]> {
+    let server_secret = StaticSecret::from(config.interface.private_key);
+    config
+        .peers
+        .iter()
+        .map(|peer| {
+            let peer_pub = PublicKey::from(peer.public_key);
+            (
+                peer.public_key,
+                server_secret.diffie_hellman(&peer_pub).to_bytes(),
+            )
+        })
+        .collect()
+}
+
+fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
+    config
+        .peers
+        .iter()
+        .filter(|peer| peer_has_l4_proxy(peer))
+        .cloned()
+        .collect()
+}
+
+fn smoltcp_ip_cidrs(config: &GatewayConfig) -> Result<Vec<smoltcp::wire::IpCidr>, String> {
+    config
+        .interface
+        .addresses
+        .iter()
+        .map(|addr| {
+            addr.to_string()
+                .parse::<smoltcp::wire::IpCidr>()
+                .map_err(|e| format!("Invalid smoltcp interface address {}: {:?}", addr, e))
+        })
+        .collect()
+}
+
+fn local_stack_ips(config: &GatewayConfig) -> (Option<IpAddr>, Option<IpAddr>) {
+    let local_ipv4 = config
+        .interface
+        .addresses
+        .iter()
+        .find_map(|addr| match addr {
+            ipnet::IpNet::V4(net) => Some(IpAddr::V4(net.addr())),
+            _ => None,
+        });
+    let local_ipv6 = config
+        .interface
+        .addresses
+        .iter()
+        .find_map(|addr| match addr {
+            ipnet::IpNet::V6(net) => Some(IpAddr::V6(net.addr())),
+            _ => None,
+        });
+    (local_ipv4, local_ipv6)
+}
+
+#[cfg(all(unix, not(tarpaulin)))]
 async fn wait_for_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
@@ -207,7 +291,7 @@ async fn wait_for_shutdown() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(tarpaulin)))]
 async fn wait_for_shutdown() {
     tokio::signal::ctrl_c()
         .await
@@ -215,95 +299,66 @@ async fn wait_for_shutdown() {
     log::info!("Received CTRL+C, shutting down...");
 }
 
-const MAX_TPROXY_CONNECTIONS: usize = 4096;
 const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
+const MAX_CLIENT_USERSPACE_TCP_BRIDGES: usize = 4096;
 
-#[cfg(test)]
-async fn sync_wireguard_and_proxy_state(
-    interface_name: &str,
-    state: &Arc<parking_lot::RwLock<GatewayState>>,
-    peer_secrets: &Arc<parking_lot::RwLock<HashMap<[u8; 32], [u8; 32]>>>,
-    server_secret: &StaticSecret,
-    l3_stats: &HashMap<[u8; 32], wireguard::WgPeerStats>,
-) -> HashMap<[u8; 32], String> {
-    let mut sources = HashMap::new();
-    let mut peers_to_sync_to_wireguard = Vec::new();
-    let mut peers_to_sync_to_proxy = Vec::new();
+fn needs_ipv6_l3_socket(config: &GatewayConfig) -> bool {
+    config
+        .peers
+        .iter()
+        .any(|peer| peer.endpoint.map(|addr| addr.is_ipv6()).unwrap_or(false))
+        || config
+            .interface
+            .addresses
+            .iter()
+            .any(|addr| matches!(addr, ipnet::IpNet::V6(_)))
+}
 
-    // 1. Identify sources and find peers missing in WireGuard
-    {
-        let st = state.read();
-        for peer in &st.config.peers {
-            if l3_stats.contains_key(&peer.public_key) {
-                sources.insert(peer.public_key, "both".to_string());
-            } else {
-                sources.insert(peer.public_key, "proxy".to_string());
-                peers_to_sync_to_wireguard.push(peer.clone());
-            }
-        }
+#[cfg(not(tarpaulin))]
+fn bind_l3_udp_socket(port: u16, require_ipv6: bool) -> Result<std::net::UdpSocket, String> {
+    if require_ipv6 {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|e| format!("failed to create IPv6 UDP socket: {}", e))?;
+        socket
+            .set_only_v6(false)
+            .map_err(|e| format!("failed to enable dual-stack UDP socket: {}", e))?;
+        socket
+            .bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())
+            .map_err(|e| {
+                format!(
+                    "failed to bind dual-stack UDP socket on port {}: {}",
+                    port, e
+                )
+            })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;
+        Ok(socket.into())
+    } else {
+        let socket = std::net::UdpSocket::bind(("0.0.0.0", port))
+            .map_err(|e| format!("failed to bind IPv4 UDP socket on port {}: {}", port, e))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;
+        Ok(socket)
     }
-
-    // 2. Identify peers missing in proxy config
-    for (&pub_key, wg_stats) in l3_stats {
-        if let std::collections::hash_map::Entry::Vacant(entry) = sources.entry(pub_key) {
-            entry.insert("wireguard".to_string());
-            peers_to_sync_to_proxy.push((pub_key, wg_stats.clone()));
-        }
-    }
-
-    // 3. Perform synchronization to WireGuard.
-    for peer in peers_to_sync_to_wireguard {
-        let interface_name = interface_name.to_string();
-        let _ = run_blocking_command(move || {
-            sync_peer_to_wireguard(&interface_name, &peer)?;
-            Ok(())
-        })
-        .await;
-    }
-
-    // 4. Perform synchronization to proxy (GatewayState peers & Trie router & peer_secrets)
-    for (pub_key, wg_stats) in peers_to_sync_to_proxy {
-        // Generates and caches the DH shared secret
-        let peer_pub = PublicKey::from(pub_key);
-        let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
-        peer_secrets.write().insert(pub_key, shared_secret);
-
-        let mut parsed_allowed_ips = Vec::new();
-        for ip_str in &wg_stats.allowed_ips {
-            if let Ok(ipnet) = std::str::FromStr::from_str(ip_str) {
-                parsed_allowed_ips.push(ipnet);
-            }
-        }
-        let parsed_endpoint = wg_stats
-            .endpoint
-            .as_ref()
-            .and_then(|s| std::str::FromStr::from_str(s).ok());
-
-        {
-            let mut st = state.write();
-            st.config.peers.retain(|p| p.public_key != pub_key);
-            st.config.peers.push(config::PeerConfig {
-                public_key: pub_key,
-                allowed_ips: parsed_allowed_ips,
-                endpoint: parsed_endpoint,
-                proxy_port: None,
-            });
-            st.router = rebuild_l4_router(&st.config.peers);
-        }
-    }
-
-    sources
 }
 
 #[tokio::main]
+#[cfg(not(tarpaulin))]
 async fn main() {
     // 初始化日志系统
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
+    let startup_args = parse_startup_args(&args);
 
     // CLI 遥测展示
-    if args.len() > 1 && args[1] == "stats" {
+    if startup_args.stats {
         if let Err(e) = run_cli_stats().await {
             eprintln!("Error query stats: {}", e);
             std::process::exit(1);
@@ -311,30 +366,19 @@ async fn main() {
         return;
     }
 
-    let mut config_path = "proxy.conf".to_string();
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "-config" && i + 1 < args.len() {
-            config_path = args[i + 1].clone();
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-
     log::info!(
         "Loading hybrid secure proxy gateway configuration: {}",
-        config_path
+        startup_args.config_path
     );
-    let config = match GatewayConfig::load_from_file(&config_path) {
+    let config = match GatewayConfig::load_from_file(&startup_args.config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("Failed to parse config {}: {}", config_path, e);
+            eprintln!("Failed to parse config {}: {}", startup_args.config_path, e);
             std::process::exit(1);
         }
     };
 
-    let interface_name = match interface_name_from_config_path(&config_path) {
+    let interface_name = match interface_name_from_config_path(&startup_args.config_path) {
         Ok(name) => name,
         Err(e) => {
             eprintln!("{}", e);
@@ -355,53 +399,16 @@ async fn main() {
         run_script(pre_script);
     }
 
-    // 自动配置路由与 iptables
-    if let Err(e) = setup_routes_and_iptables(&config, &interface_name) {
-        eprintln!("Failed to setup routes and firewall rules: {}", e);
-        cleanup_runtime(&config, &interface_name);
-        std::process::exit(1);
-    }
-
-    // 将配置文件中所有静态声明的对等体 (Peers) 下发同步到 WireGuard 设备
-    for peer in &config.peers {
-        if let Err(e) = wireguard::sync_peer_to_wireguard(&interface_name, peer) {
-            log::error!(
-                "Failed to sync peer {} to WireGuard on boot: {}",
-                encode_base64_32(&peer.public_key),
-                e
-            );
-            cleanup_runtime(&config, &interface_name);
-            std::process::exit(1);
-        } else {
-            log::info!(
-                "Successfully synced peer {} to WireGuard on startup",
-                encode_base64_32(&peer.public_key)
-            );
-        }
-    }
-
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
 
-    let initial_router = rebuild_l4_router(&config.peers);
-
-    let gateway_state = Arc::new(parking_lot::RwLock::new(GatewayState {
-        config: config.clone(),
-        router: initial_router,
-        tproxy_offload_enabled: true,
-    }));
+    let gateway_state = Arc::new(parking_lot::RwLock::new(build_initial_gateway_state(
+        config.clone(),
+    )));
 
     // 初始化控制面 Peer Secrets 动态共享哈希表
-    let peer_secrets = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let peer_secrets = Arc::new(parking_lot::RwLock::new(derive_peer_secrets(&config)));
     let server_secret = StaticSecret::from(config.interface.private_key);
-    {
-        let mut secrets_guard = peer_secrets.write();
-        for peer in &config.peers {
-            let peer_pub = PublicKey::from(peer.public_key);
-            let shared_secret = server_secret.diffie_hellman(&peer_pub).to_bytes();
-            secrets_guard.insert(peer.public_key, shared_secret);
-        }
-    }
 
     // 初始化会话与 Nonce 动态共享缓存（用于 UDS 动态清理）
     let session_cache = Arc::new(parking_lot::RwLock::new(HashMap::new()));
@@ -414,6 +421,14 @@ async fn main() {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     let client_quic_pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let l3_registry =
+        match userspace_wg::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
+            Ok(registry) => registry,
+            Err(e) => {
+                eprintln!("Failed to initialize userspace WireGuard registry: {}", e);
+                std::process::exit(1);
+            }
+        };
 
     if let Some(listener) = uds_server::bind_listener(&interface_name) {
         uds_server::start(
@@ -431,6 +446,7 @@ async fn main() {
                 client_private_key: config.interface.private_key,
                 runtime_mode,
                 peer_mutation_lock: peer_mutation_lock.clone(),
+                l3_registry: l3_registry.clone(),
             },
         );
     }
@@ -439,6 +455,65 @@ async fn main() {
         log::info!("------------------------------------------------------");
         log::info!("         STARTING GATEWAY IN [ SERVER MODE ]         ");
         log::info!("------------------------------------------------------");
+
+        let listen_port = match config.interface.listen_port {
+            Some(port) => port,
+            None => {
+                log::error!("Server userspace WireGuard L3 requires Interface.ListenPort");
+                cleanup_runtime(&config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+
+        let tun_fds = match tun_device::open_tun(&interface_name, startup_args.num_threads) {
+            Ok(fds) => fds,
+            Err(e) => {
+                log::error!("Failed to open server TUN device: {}", e);
+                cleanup_runtime(&config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = setup_routes(&config, &interface_name) {
+            eprintln!("Failed to setup userspace routes: {}", e);
+            cleanup_runtime(&config, &interface_name);
+            std::process::exit(1);
+        }
+
+        let server_udp = match bind_l3_udp_socket(listen_port, needs_ipv6_l3_socket(&config)) {
+            Ok(socket) => socket,
+            Err(e) => {
+                log::error!(
+                    "Failed to bind userspace WireGuard UDP port {}: {}",
+                    listen_port,
+                    e
+                );
+                cleanup_runtime(&config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+        let server_udp = Arc::new(tokio::net::UdpSocket::from_std(server_udp).unwrap());
+        let mut l3_tasks = Vec::new();
+        for fd in tun_fds {
+            let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
+                Ok(io) => io,
+                Err(e) => {
+                    log::error!("Failed to wrap server TUN FD in AsyncTunIo: {}", e);
+                    cleanup_runtime(&config, &interface_name);
+                    std::process::exit(1);
+                }
+            });
+            let task = tokio::spawn(userspace_wg::run_userspace_wg_loop(
+                tun_io,
+                server_udp.clone(),
+                l3_registry.clone(),
+            ));
+            l3_tasks.push(task);
+        }
+        let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
+            server_udp.clone(),
+            l3_registry.clone(),
+        ));
 
         let Some(listen_control_port) = config.interface.listen_control_port else {
             log::error!("Server config validation failed to enforce ListenControlPort");
@@ -510,19 +585,18 @@ async fn main() {
 
         wait_for_shutdown().await;
         control_task.abort();
+        l3_timer_task.abort();
+        for task in l3_tasks {
+            task.abort();
+        }
     } else {
         log::info!("------------------------------------------------------");
         log::info!("         STARTING GATEWAY IN [ CLIENT MODE ]         ");
         log::info!("------------------------------------------------------");
 
-        let proxy_peers = config
-            .peers
-            .iter()
-            .filter(|peer| peer_has_l4_proxy(peer))
-            .cloned()
-            .collect::<Vec<_>>();
+        let proxy_peers = proxy_peers(&config);
         if proxy_peers.is_empty() {
-            log::warn!("No QUIC proxy peers configured; TPROXY offload remains inactive.");
+            log::warn!("No QUIC proxy peers configured; userspace TCP offload remains inactive.");
         }
 
         let mut initial_pool_failures = 0usize;
@@ -541,98 +615,191 @@ async fn main() {
                 }
             }
         }
-        if initial_pool_failures > 0
-            && !config
-                .interface
-                .table
-                .as_deref()
-                .map(|table| table.eq_ignore_ascii_case("off"))
-                .unwrap_or(false)
-        {
-            cleanup_proxy_tproxy_rules(&config, &interface_name);
-            gateway_state.write().tproxy_offload_enabled = false;
+        if initial_pool_failures > 0 {
+            gateway_state.write().userspace_tcp_offload_enabled = false;
             log::warn!(
-                "Removed proxy TPROXY rules because {} initial QUIC pool(s) failed; traffic will use WireGuard L3 until QUIC recovers",
+                "Disabled userspace TCP offload because {} initial QUIC pool(s) failed; traffic will use userspace WireGuard L3 until QUIC recovers",
                 initial_pool_failures
             );
         }
-        let tproxy_failover_task = start_tproxy_failover_manager(
+        let userspace_tcp_failover_task = start_userspace_tcp_failover_manager(
             gateway_state.clone(),
             client_quic_pools.clone(),
-            interface_name.clone(),
             config.interface.private_key,
         );
 
-        if proxy_peers.is_empty() && config.interface.tproxy_port.is_none() {
-            wait_for_shutdown().await;
-        } else {
-            let tproxy_port = match config.interface.tproxy_port {
-                Some(port) => port,
-                None => {
-                    log::error!("Error: TProxyPort required for Client mode");
-                    let cleanup_config = gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &interface_name);
-                    std::process::exit(1);
-                }
-            };
-            let tproxy_v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), tproxy_port);
-            let tproxy_v4_listener = match tproxy::create_tproxy_listener(tproxy_v4_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    log::error!("IPv4 TPROXY Listener bind FAILED: {}", e);
-                    let cleanup_config = gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &interface_name);
-                    std::process::exit(1);
-                }
-            };
-            let tproxy_v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tproxy_port);
-            let tproxy_v6_listener = match tproxy::create_tproxy_listener(tproxy_v6_addr) {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    log::warn!(
-                        "IPv6 TPROXY Listener bind FAILED: {}. IPv4 interception remains active.",
-                        e
-                    );
-                    None
-                }
-            };
-
-            log::info!("------------------------------------------------------");
-            log::info!(
-                "  TPROXY TCP transparent intercept running on port {} ",
-                tproxy_port
+        let effective_num_threads =
+            effective_client_tun_queues(startup_args.num_threads, !proxy_peers.is_empty());
+        if effective_num_threads != startup_args.num_threads {
+            log::warn!(
+                "Userspace TCP offload is configured; forcing TUN queues from {} to 1 to keep TCP flow state on one smoltcp worker",
+                startup_args.num_threads
             );
-            log::info!("  All TCP streams routed to AllowedIPs will offload to ");
-            log::info!("  Parallel Userspace QUIC Connection Pool bypass L3 !  ");
-            log::info!("------------------------------------------------------");
-
-            let tproxy_connection_limit =
-                Arc::new(tokio::sync::Semaphore::new(MAX_TPROXY_CONNECTIONS));
-            if let Some(listener) = tproxy_v6_listener {
-                tokio::spawn(run_tproxy_accept_loop(
-                    listener,
-                    client_quic_pools.clone(),
-                    gateway_state.clone(),
-                    telemetry_registry.clone(),
-                    tproxy_connection_limit.clone(),
-                ));
-            }
-
-            tokio::select! {
-                _ = run_tproxy_accept_loop(
-                    tproxy_v4_listener,
-                    client_quic_pools.clone(),
-                    gateway_state.clone(),
-                    telemetry_registry.clone(),
-                    tproxy_connection_limit.clone(),
-                ) => {}
-                _ = wait_for_shutdown() => {}
-            }
         }
-        tproxy_failover_task.abort();
+
+        log::info!(
+            "Opening userspace multiqueue TUN device: {} with {} queues",
+            interface_name,
+            effective_num_threads
+        );
+        let tun_fds = match tun_device::open_tun(&interface_name, effective_num_threads) {
+            Ok(fds) => fds,
+            Err(e) => {
+                log::error!("Failed to open TUN device: {}", e);
+                let cleanup_config = gateway_state.read().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = setup_routes(&config, &interface_name) {
+            log::error!("Failed to setup userspace routes: {}", e);
+            for fd in tun_fds {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+            let cleanup_config = gateway_state.read().config.clone();
+            cleanup_runtime(&cleanup_config, &interface_name);
+            std::process::exit(1);
+        }
+
+        // Set up active connection handler
+        let gateway_state_clone = gateway_state.clone();
+        let client_quic_pools_clone = client_quic_pools.clone();
+        let telemetry_for_client_bridge = telemetry_registry.clone();
+        let client_bridge_limit = Arc::new(tokio::sync::Semaphore::new(
+            MAX_CLIENT_USERSPACE_TCP_BRIDGES,
+        ));
+        let client_bridge_limit_for_handler = client_bridge_limit.clone();
+        let active_conn_handler = Arc::new(
+            move |original_dest: SocketAddr, tx_receiver, rx_sender, worker_notify| {
+                let peer_pub_key = {
+                    let st = gateway_state_clone.read();
+                    st.router.longest_match(original_dest.ip())
+                };
+                if let Some(peer_pub_key) = peer_pub_key {
+                    let permit = match client_bridge_limit_for_handler.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            log::warn!(
+                                "Client userspace TCP bridge limit reached; dropping {}",
+                                original_dest
+                            );
+                            return;
+                        }
+                    };
+                    let quic_pool = {
+                        let pools = client_quic_pools_clone.read();
+                        pools.get(&peer_pub_key).cloned()
+                    };
+                    if let Some(quic_pool) = quic_pool {
+                        let stats = telemetry_for_client_bridge.get_or_create(peer_pub_key);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            crate::client_proxy::bridge_userspace_stream_to_quic(
+                                original_dest,
+                                quic_pool,
+                                stats,
+                                tx_receiver,
+                                rx_sender,
+                                worker_notify,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            },
+        );
+
+        let client_udp = match bind_l3_udp_socket(0, needs_ipv6_l3_socket(&config)) {
+            Ok(socket) => Arc::new(tokio::net::UdpSocket::from_std(socket).unwrap()),
+            Err(e) => {
+                log::error!(
+                    "Failed to bind client userspace WireGuard UDP socket: {}",
+                    e
+                );
+                let cleanup_config = gateway_state.read().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+        let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
+            client_udp.clone(),
+            l3_registry.clone(),
+        ));
+
+        let smoltcp_ip_cidrs = match smoltcp_ip_cidrs(&config) {
+            Ok(addrs) => addrs,
+            Err(e) => {
+                log::error!("{}", e);
+                let cleanup_config = gateway_state.read().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+        let (local_ipv4, local_ipv6) = local_stack_ips(&config);
+
+        let mut worker_tasks = Vec::new();
+        for fd in tun_fds {
+            let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
+                Ok(io) => io,
+                Err(e) => {
+                    log::error!("Failed to wrap TUN FD in AsyncTunIo: {}", e);
+                    std::process::exit(1);
+                }
+            });
+
+            let tcp_stack = match userspace_tcp::UserspaceTcpStack::new(
+                smoltcp_ip_cidrs.clone(),
+                config.interface.mtu as usize,
+            ) {
+                Ok(stack) => stack,
+                Err(e) => {
+                    log::error!("Failed to initialize userspace TCP stack: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let mut worker = rtc_loop::RtcWorker::new(
+                tun_io,
+                client_udp.clone(),
+                l3_registry.clone(),
+                tcp_stack,
+                local_ipv4,
+                local_ipv6,
+                config.interface.mtu as usize,
+            );
+            worker.active_conn_handler = Some(active_conn_handler.clone());
+
+            let gateway_state_for_worker = gateway_state.clone();
+            let client_quic_pools_for_worker = client_quic_pools.clone();
+
+            let handle = tokio::spawn(async move {
+                if let Err(e) = worker
+                    .run_loop(gateway_state_for_worker, client_quic_pools_for_worker)
+                    .await
+                {
+                    log::error!("RtcWorker loop failed: {}", e);
+                }
+            });
+            worker_tasks.push(handle);
+        }
+
+        log::info!("------------------------------------------------------");
+        log::info!("  Userspace multiqueue TUN transparent proxy running  ");
+        log::info!("  All L3 and L4 traffic processed in userspace.       ");
+        log::info!("------------------------------------------------------");
+
+        wait_for_shutdown().await;
+        for t in worker_tasks {
+            t.abort();
+        }
+        l3_timer_task.abort();
+        userspace_tcp_failover_task.abort();
     }
 
-    // 自动清理路由与 iptables
+    // 自动清理 userspace TUN 路由
     let cleanup_config = gateway_state.read().config.clone();
     cleanup_runtime(&cleanup_config, &interface_name);
 }
@@ -640,24 +807,57 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wireguard::WgPeerStats;
+    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig};
+
+    fn peer(public_key: [u8; 32], endpoint: Option<&str>, proxy_port: Option<u16>) -> PeerConfig {
+        PeerConfig {
+            public_key,
+            allowed_ips: vec!["10.10.0.0/16".parse().unwrap()],
+            endpoint: endpoint.map(|addr| addr.parse().unwrap()),
+            proxy_port,
+        }
+    }
+
+    fn config_with_peers(peers: Vec<PeerConfig>) -> GatewayConfig {
+        GatewayConfig {
+            interface: InterfaceConfig {
+                private_key: [1u8; 32],
+                addresses: vec![
+                    "10.0.0.2/24".parse().unwrap(),
+                    "fd00::2/64".parse().unwrap(),
+                ],
+                listen_port: None,
+                listen_control_port: None,
+                mtu: 1400,
+                table: None,
+                pre_script: None,
+                post_script: None,
+            },
+            peers,
+            quic_pool: QUICPoolConfig {
+                public_ipv4: None,
+                public_ipv6: None,
+                listen_ports: Vec::new(),
+            },
+        }
+    }
 
     #[test]
-    fn test_tproxy_failover_policy_requires_all_pools_active() {
-        assert!(!should_enable_tproxy_for_pool_states(1, &[]));
-        assert!(!should_enable_tproxy_for_pool_states(
+    fn test_userspace_tcp_failover_policy_requires_all_pools_active() {
+        assert!(!should_enable_userspace_tcp_for_pool_states(1, &[]));
+        assert!(!should_enable_userspace_tcp_for_pool_states(
             2,
             &[PoolState::Active]
         ));
-        assert!(should_enable_tproxy_for_pool_states(
+        assert!(should_enable_userspace_tcp_for_pool_states(
             1,
             &[PoolState::Active]
         ));
-        assert!(!should_enable_tproxy_for_pool_states(
+        assert!(!should_enable_userspace_tcp_for_pool_states(
             2,
             &[PoolState::Active, PoolState::Fallback,]
         ));
-        assert!(!should_enable_tproxy_for_pool_states(
+        assert!(!should_enable_userspace_tcp_for_pool_states(
             1,
             &[PoolState::Recovering {
                 recovery_start: std::time::Instant::now(),
@@ -665,110 +865,136 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_peer_synchronization() {
-        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
-        let peer_secrets = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    #[test]
+    fn test_l4_proxy_forces_single_tun_queue() {
+        assert_eq!(effective_client_tun_queues(4, true), 1);
+        assert_eq!(effective_client_tun_queues(4, false), 4);
+        assert_eq!(effective_client_tun_queues(1, true), 1);
+    }
 
-        let config = GatewayConfig {
-            interface: config::InterfaceConfig {
-                private_key: server_secret.to_bytes(),
-                addresses: vec![],
-                listen_port: Some(51820),
-                listen_control_port: None,
-                tproxy_port: None,
-                mtu: 1420,
-                table: None,
-                pre_script: None,
-                post_script: None,
-            },
-            peers: vec![
-                config::PeerConfig {
-                    public_key: [1u8; 32],
-                    allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
-                    endpoint: Some("127.0.0.1:12345".parse().unwrap()),
-                    proxy_port: None,
-                },
-                config::PeerConfig {
-                    public_key: [2u8; 32],
-                    allowed_ips: vec!["10.0.2.0/24".parse().unwrap()],
-                    endpoint: Some("127.0.0.1:12346".parse().unwrap()),
-                    proxy_port: None,
-                },
-            ],
-            quic_pool: config::QUICPoolConfig {
-                public_ipv4: None,
-                public_ipv6: None,
-                listen_ports: vec![],
-            },
-        };
-
-        let initial_router = AllowedIPsRouter::new();
-        let gateway_state = Arc::new(parking_lot::RwLock::new(GatewayState {
-            config,
-            router: initial_router,
-            tproxy_offload_enabled: true,
-        }));
-
-        let mut l3_stats = HashMap::new();
-        l3_stats.insert(
-            [1u8; 32],
-            WgPeerStats {
-                allowed_ips: vec!["10.0.1.0/24".to_string()],
-                endpoint: Some("127.0.0.1:12345".to_string()),
-                rx_bytes: 100,
-                tx_bytes: 200,
-                last_handshake: 0,
-            },
-        );
-        l3_stats.insert(
-            [3u8; 32],
-            WgPeerStats {
-                allowed_ips: vec!["10.0.3.0/24".to_string()],
-                endpoint: Some("127.0.0.1:12347".to_string()),
-                rx_bytes: 300,
-                tx_bytes: 400,
-                last_handshake: 0,
-            },
-        );
-
-        let sources = sync_wireguard_and_proxy_state(
-            "tun_test_sync",
-            &gateway_state,
-            &peer_secrets,
-            &server_secret,
-            &l3_stats,
-        )
-        .await;
-
-        assert_eq!(sources.get(&[1u8; 32]).unwrap(), "both");
-        assert_eq!(sources.get(&[2u8; 32]).unwrap(), "proxy");
-        assert_eq!(sources.get(&[3u8; 32]).unwrap(), "wireguard");
-
-        let st = gateway_state.read();
-        let peer3 = st.config.peers.iter().find(|p| p.public_key == [3u8; 32]);
-        assert!(
-            peer3.is_some(),
-            "Peer [3u8; 32] should be synced to proxy config"
-        );
-        let peer3_config = peer3.unwrap();
+    #[test]
+    fn parse_startup_args_defaults_and_overrides() {
         assert_eq!(
-            peer3_config.allowed_ips[0],
-            "10.0.3.0/24".parse::<ipnet::IpNet>().unwrap()
+            parse_startup_args(&["new_proxy".to_string()]),
+            StartupArgs {
+                config_path: "proxy.conf".to_string(),
+                num_threads: 1,
+                stats: false,
+            }
         );
-
-        let lookup_res = st
-            .router
-            .longest_match(std::net::IpAddr::V4("10.0.3.5".parse().unwrap()));
         assert_eq!(
-            lookup_res, None,
-            "WireGuard-synced peers are WireGuard-only unless they explicitly define ProxyPort"
+            parse_startup_args(&[
+                "new_proxy".to_string(),
+                "-config".to_string(),
+                "conf/client.conf".to_string(),
+                "--threads".to_string(),
+                "4".to_string(),
+            ]),
+            StartupArgs {
+                config_path: "conf/client.conf".to_string(),
+                num_threads: 4,
+                stats: false,
+            }
         );
+        assert_eq!(
+            parse_startup_args(&[
+                "new_proxy".to_string(),
+                "--threads".to_string(),
+                "bad".to_string(),
+            ])
+            .num_threads,
+            1
+        );
+        assert_eq!(
+            parse_startup_args(&[
+                "new_proxy".to_string(),
+                "--threads".to_string(),
+                "0".to_string(),
+            ])
+            .num_threads,
+            1
+        );
+    }
 
-        let secrets = peer_secrets.read();
-        assert!(
-            secrets.contains_key(&[3u8; 32]),
-            "Peer [3u8; 32] secret should be computed"
+    #[test]
+    fn parse_startup_args_stats_short_circuits_gateway_args() {
+        assert_eq!(
+            parse_startup_args(&[
+                "new_proxy".to_string(),
+                "stats".to_string(),
+                "-config".to_string(),
+                "ignored.conf".to_string(),
+            ]),
+            StartupArgs {
+                config_path: "proxy.conf".to_string(),
+                num_threads: 1,
+                stats: true,
+            }
         );
+    }
+
+    #[test]
+    fn build_initial_gateway_state_only_routes_l4_proxy_peers() {
+        let l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
+        let wg_only_peer = peer([3u8; 32], None, None);
+        let config = config_with_peers(vec![l4_peer.clone(), wg_only_peer]);
+
+        let state = build_initial_gateway_state(config);
+
+        assert!(state.userspace_tcp_offload_enabled);
+        assert_eq!(
+            state.router.longest_match("10.10.1.2".parse().unwrap()),
+            Some(l4_peer.public_key)
+        );
+    }
+
+    #[test]
+    fn derive_peer_secrets_matches_x25519_shared_secret() {
+        let server_secret = StaticSecret::from([1u8; 32]);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let peer_public = PublicKey::from(&peer_secret).to_bytes();
+        let config = config_with_peers(vec![peer(peer_public, None, None)]);
+
+        let secrets = derive_peer_secrets(&config);
+
+        assert_eq!(
+            secrets[&peer_public],
+            server_secret
+                .diffie_hellman(&PublicKey::from(peer_public))
+                .to_bytes()
+        );
+    }
+
+    #[test]
+    fn proxy_peers_filters_wireguard_only_peers() {
+        let l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
+        let config = config_with_peers(vec![l4_peer.clone(), peer([3u8; 32], None, None)]);
+
+        assert_eq!(proxy_peers(&config).len(), 1);
+        assert_eq!(proxy_peers(&config)[0].public_key, l4_peer.public_key);
+    }
+
+    #[test]
+    fn smoltcp_ip_cidrs_and_local_stack_ips_follow_interface_addresses() {
+        let config = config_with_peers(Vec::new());
+
+        let cidrs = smoltcp_ip_cidrs(&config).unwrap();
+        let (local_ipv4, local_ipv6) = local_stack_ips(&config);
+
+        assert_eq!(cidrs.len(), 2);
+        assert_eq!(local_ipv4, Some("10.0.0.2".parse().unwrap()));
+        assert_eq!(local_ipv6, Some("fd00::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn needs_ipv6_l3_socket_when_interface_or_peer_uses_ipv6() {
+        let mut config = config_with_peers(Vec::new());
+        assert!(needs_ipv6_l3_socket(&config));
+
+        config.interface.addresses = vec!["10.0.0.2/24".parse().unwrap()];
+        assert!(!needs_ipv6_l3_socket(&config));
+
+        config.peers = vec![peer([2u8; 32], Some("[::1]:51820"), Some(4433))];
+        assert!(needs_ipv6_l3_socket(&config));
     }
 }

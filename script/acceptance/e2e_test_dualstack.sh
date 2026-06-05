@@ -11,8 +11,6 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
-source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
-new_proxy_select_wireguard_backend
 
 SERVER_PID=""
 CLIENT_PID=""
@@ -136,9 +134,8 @@ cat > /tmp/e2e_client.conf <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24, fd00::2/64
-TProxyPort = 1080
 MTU = 1400
-Table = off
+Table = auto
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
@@ -157,13 +154,8 @@ ip netns exec client_ns ./target/debug/new_proxy -config /tmp/e2e_client.conf > 
 CLIENT_PID=$!
 sleep 2
 
-# 7.3 Verify a real IPv6 TCP request is intercepted by client TPROXY and proxied
+# 7.3 Verify a real IPv6 TCP request is intercepted by client TUN and proxied
 # through the authenticated QUIC pool to the server namespace.
-ip netns exec client_ns ip -6 rule add fwmark 1 lookup 100
-ip netns exec client_ns ip -6 route add local ::/0 dev lo table 100
-ip netns exec client_ns ip6tables -t mangle -A PREROUTING \
-  -p tcp -d fd00::1/128 \
-  -j TPROXY --on-port 1080 --on-ip :: --tproxy-mark 0x1/0x1
 
 ip netns exec server_ns python3 -m http.server 8080 --bind :: >/tmp/e2e_ipv6_http.log 2>&1 &
 HTTP_PID=$!
@@ -180,10 +172,10 @@ fi
 
 ip netns exec router_ns curl -g -fsS --connect-timeout 5 --max-time 10 "http://[fd00::1]:8080/" >/dev/null
 if [ $? -ne 0 ]; then
-  echo "✗ [FAIL] IPv6 HTTP over TPROXY/QUIC failed"
+  echo "✗ [FAIL] IPv6 HTTP over TUN/smoltcp/QUIC failed"
   exit 1
 fi
-echo "✓ [SUCCESS] IPv6 HTTP over TPROXY/QUIC verified successfully."
+echo "✓ [SUCCESS] IPv6 HTTP over TUN/smoltcp/QUIC verified successfully."
 
 # 7.4 Use new-proxy-cli to fetch statistics from UDS inside the namespace
 echo "=== Fetching Aggregated Gateway Telemetry via CLI ==="

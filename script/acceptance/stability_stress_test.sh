@@ -13,8 +13,6 @@ SHORT_PARALLEL="${STABILITY_SHORT_PARALLEL:-4}"
 ARTIFACT_DIR="${STABILITY_ARTIFACT_DIR:-/tmp/new_proxy_stability_$(date +%Y%m%d_%H%M%S)}"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
-source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
-new_proxy_select_wireguard_backend
 SERVER_CONF="$ARTIFACT_DIR/srv_stab.conf"
 CLIENT_CONF="$ARTIFACT_DIR/cli_stab.conf"
 CLIENT2_CONF="$ARTIFACT_DIR/cli2_stab.conf"
@@ -58,11 +56,11 @@ cleanup() {
   ip netns delete client4_ns 2>/dev/null || true
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete server_ns 2>/dev/null || true
-  rm -f /run/new_proxy/srv_stab.sock /run/new_proxy/cli_stab.sock /tmp/client_proxy_active
+  rm -f /run/new_proxy/srv_stab.sock /run/new_proxy/cli_stab.sock
 }
 trap cleanup EXIT
 
-for cmd in ip iptables python3 curl ping ps; do
+for cmd in ip python3 curl ping ps; do
   require_cmd "$cmd"
 done
 
@@ -100,7 +98,7 @@ AllowedIPs = 10.0.0.2/32, fd00::2/128
 PublicKey = ${NEW_PROXY_TEST_CLIENT2_PUBLIC_KEY}
 AllowedIPs = 10.0.0.4/32
 
-# Client 3/4: WireGuard-only peers; they must not enter any QUIC pool.
+# Client 3/4: direct physical L3 baseline namespaces; they must not enter any QUIC pool.
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT3_PUBLIC_KEY}
 AllowedIPs = 10.0.0.3/32
@@ -114,9 +112,8 @@ cat > "$CLIENT_CONF" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24, fd00::2/64
-TProxyPort = 1080
 MTU = 1400
-Table = off
+Table = auto
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
@@ -129,9 +126,8 @@ cat > "$CLIENT2_CONF" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT2_PRIVATE_KEY}
 Address = 10.0.0.4/24
-TProxyPort = 1080
 MTU = 1400
-Table = off
+Table = auto
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
@@ -176,7 +172,7 @@ ip link add veth-work2 type veth peer name veth-client2-w
 ip link set veth-work2 netns client2_work_ns
 ip link set veth-client2-w netns client2_ns
 
-# Client 3/4 <-> Router (WireGuard-only fallback clients)
+# Client 3/4 <-> Router (direct physical L3 baseline clients)
 ip link add veth-client3 type veth peer name veth-router-c3
 ip link set veth-client3 netns client3_ns
 ip link set veth-router-c3 netns router_ns
@@ -196,10 +192,9 @@ ip netns exec client1_ns ip link set veth-client1 up
 ip netns exec client1_ns ip addr add 10.0.4.1/24 dev veth-client1-w
 ip netns exec client1_ns ip link set veth-client1-w up
 ip netns exec client1_ns ip link set lo up
-ip netns exec client1_ns ip addr add 10.0.0.2/32 dev lo
 
-# Client 1 workload NS. Its TCP traffic enters client1_ns via PREROUTING,
-# so the TPROXY rules below are actually exercised.
+# Client 1 workload NS. Its TCP traffic enters client1_ns and is routed into
+# the userspace TUN route installed by new_proxy Table=auto.
 ip netns exec client1_work_ns ip addr add 10.0.4.2/24 dev veth-work
 ip netns exec client1_work_ns ip link set veth-work up
 ip netns exec client1_work_ns ip link set lo up
@@ -211,7 +206,6 @@ ip netns exec client2_ns ip link set veth-client2 up
 ip netns exec client2_ns ip addr add 10.0.8.1/24 dev veth-client2-w
 ip netns exec client2_ns ip link set veth-client2-w up
 ip netns exec client2_ns ip link set lo up
-ip netns exec client2_ns ip addr add 10.0.0.4/32 dev lo
 
 # Client 2 workload NS.
 ip netns exec client2_work_ns ip addr add 10.0.8.2/24 dev veth-work2
@@ -219,7 +213,7 @@ ip netns exec client2_work_ns ip link set veth-work2 up
 ip netns exec client2_work_ns ip link set lo up
 ip netns exec client2_work_ns ip route add default via 10.0.8.1
 
-# Client 3/4 NS (Standard WG-only fallback)
+# Client 3/4 NS (direct physical L3 baseline)
 ip netns exec client3_ns ip addr add 10.0.6.2/24 dev veth-client3
 ip netns exec client3_ns ip link set veth-client3 up
 ip netns exec client3_ns ip link set lo up
@@ -273,17 +267,6 @@ ip netns exec router_ns ip route add 10.0.0.3/32 via 10.0.6.2
 ip netns exec router_ns ip route add 10.0.0.4/32 via 10.0.5.2
 ip netns exec router_ns ip route add 10.0.0.5/32 via 10.0.7.2
 
-# Client 1 TPROXY Interception Setup
-ip netns exec client1_ns ip rule add fwmark 1 lookup 100
-ip netns exec client1_ns ip route add local 0.0.0.0/0 dev lo table 100
-ip netns exec client1_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
-ip netns exec client1_ns iptables -t mangle -A OUTPUT -p tcp -d 10.0.0.1 -j MARK --set-mark 1
-
-# Client 2 TPROXY Interception Setup
-ip netns exec client2_ns ip rule add fwmark 1 lookup 100
-ip netns exec client2_ns ip route add local 0.0.0.0/0 dev lo table 100
-ip netns exec client2_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
-ip netns exec client2_ns iptables -t mangle -A OUTPUT -p tcp -d 10.0.0.1 -j MARK --set-mark 1
 
 echo "=== [2/7] Starting target TCP/UDP server ==="
 ip netns exec server_ns python3 "$ROOT_DIR/script/acceptance/stability_server.py" > "$ARTIFACT_DIR/target_server.log" 2>&1 &
@@ -303,10 +286,10 @@ sleep 3
 echo "=== [4/7] Verifying initial TCP paths for both clients ==="
 # Direct L3 path (router_ns -> server_ns)
 ip netns exec router_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
-# Standard WG fallback paths (client3/4_ns -> router_ns -> server_ns)
+# Direct physical L3 baseline paths (client3/4_ns -> router_ns -> server_ns)
 ip netns exec client3_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
 ip netns exec client4_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
-# QUIC offload path (client1_work_ns -> client1_ns TPROXY:1080 -> QUIC pool -> server_ns)
+# QUIC offload path (client1_work_ns -> client1_ns TUN/smoltcp -> QUIC pool -> server_ns)
 ip netns exec client1_work_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
 ip netns exec client2_work_ns curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null http://10.0.0.1:8080/
 
@@ -390,7 +373,7 @@ short_loop() {
         echo "$(date +%s) FAIL" >> "$ARTIFACT_DIR/short_conn.log"
       fi &
     done
-    # Standard WG fallback paths: two WG-only peers bypass QUIC entirely.
+    # Direct physical L3 baseline paths: two namespaces bypass QUIC entirely.
     for _ in $(seq 1 "$SHORT_PARALLEL"); do
       if ip netns exec client3_ns curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null http://10.0.0.1:8080/; then
         echo "$(date +%s) OK" >> "$ARTIFACT_DIR/short_conn.log"
@@ -482,8 +465,8 @@ ping_loop() {
 
 echo "=== [5/7] Starting background traffic for ${DURATION}s ==="
 START_TS="$(date +%s)"
-# Long TCP MUST run from client1_work_ns so connections enter client1_ns via PREROUTING and go through TPROXY -> QUIC pool.
-# router_ns traffic bypasses TPROXY and goes directly to server_ns, defeating the test.
+# Long TCP MUST run from client workload namespaces so connections enter the
+# client gateway and are routed through TUN/smoltcp -> QUIC pool.
 ip netns exec client1_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
 LONG_PID=$!
 ip netns exec client2_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp2_stats.json" > "$ARTIFACT_DIR/long_tcp2.log" 2>&1 &

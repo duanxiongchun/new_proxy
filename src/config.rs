@@ -9,7 +9,6 @@ pub struct InterfaceConfig {
     pub addresses: Vec<IpNet>,
     pub listen_port: Option<u16>,
     pub listen_control_port: Option<u16>,
-    pub tproxy_port: Option<u16>,
     pub mtu: u16,
     pub table: Option<String>,
     pub pre_script: Option<String>,
@@ -119,14 +118,6 @@ impl GatewayConfig {
             })
             .transpose()?;
 
-        let tproxy_port = interface_section
-            .get("TProxyPort")
-            .map(|s| {
-                s.parse::<u16>()
-                    .map_err(|e| format!("Invalid TProxyPort: {}", e))
-            })
-            .transpose()?;
-
         let mtu = interface_section
             .get("MTU")
             .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid MTU: {}", e)))
@@ -153,7 +144,6 @@ impl GatewayConfig {
             addresses,
             listen_port,
             listen_control_port,
-            tproxy_port,
             mtu,
             table,
             pre_script,
@@ -294,7 +284,6 @@ PrivateKey = {key}
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
-TProxyPort = 1080
 MTU = 1420
 
 [Peer]
@@ -314,7 +303,6 @@ ListenPorts = 40001, 40002
         let config = GatewayConfig::load_from_file(path).unwrap();
         assert_eq!(config.interface.listen_port, Some(51820));
         assert_eq!(config.interface.listen_control_port, Some(51821));
-        assert_eq!(config.interface.tproxy_port, Some(1080));
         assert_eq!(config.interface.mtu, 1420);
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].proxy_port, Some(40001));

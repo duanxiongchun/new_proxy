@@ -13,7 +13,7 @@ endif
 DEB_DIR = target/deb-pkg
 DEB_FILE = target/new-proxy_$(VERSION)_$(ARCH).deb
 
-.PHONY: all build package clean
+.PHONY: all build package coverage clean
 
 all: build
 
@@ -57,6 +57,9 @@ package: build
 	# Build deb package
 	dpkg-deb --root-owner-group --build $(DEB_DIR) $(DEB_FILE)
 	@echo "Debian package created successfully: $(DEB_FILE)"
+
+coverage:
+	cargo tarpaulin
 
 clean:
 	cargo clean

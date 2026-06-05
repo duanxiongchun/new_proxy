@@ -5,8 +5,10 @@ use crate::tcp_util::set_tcp_keepalive;
 use crate::telemetry::TelemetryRegistry;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
+#[cfg(not(tarpaulin))]
 pub fn build_stream_handler(
     telemetry: Arc<TelemetryRegistry>,
     stream_handler_limit: Arc<tokio::sync::Semaphore>,
@@ -23,6 +25,10 @@ pub fn build_stream_handler(
                         "QUIC stream handler limit reached; rejecting stream for peer {:?}",
                         client_pub
                     );
+                    tokio::spawn(async move {
+                        let _ = send_mux.write_all(&[0]).await;
+                        let _ = send_mux.shutdown().await;
+                    });
                     return;
                 }
             };
