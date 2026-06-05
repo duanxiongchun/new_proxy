@@ -15,6 +15,8 @@ mod telemetry;
 mod tproxy;
 mod uds_server;
 mod wireguard;
+pub mod tun_device;
+
 
 use client_proxy::{build_peer_quic_pool, run_tproxy_accept_loop};
 use std::collections::HashMap;
