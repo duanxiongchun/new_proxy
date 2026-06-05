@@ -12,11 +12,11 @@
 
 本次修复覆盖：
 
-- 运行期动态 `AddPeer` 在 full-tunnel 路由已经接管默认路由时，仍可优先使用启动时缓存的 endpoint-specific 物理路由安装 endpoint bypass route，缺失时才回退物理默认路由，避免 QUIC 外层 endpoint 递归进入 TUN 或走错非默认出口。
-- `e2e_full_tunnel_bypass.sh` 增加动态 full-tunnel proxy peer replacement 验证。
+- full-tunnel endpoint bypass 改为 WireGuard 风格 `SO_MARK` + policy routing：外层 QUIC/control/userspace WireGuard UDP socket 自动带 mark，业务流量走专用 table，主表直连/更具体路由通过 `suppress_prefixlength 0` 保留。
+- `e2e_full_tunnel_bypass.sh` 增加 SO_MARK policy rule、marked endpoint route 和动态 full-tunnel proxy peer replacement 验证。
 - userspace WireGuard 未知 endpoint 握手/控制类入站包增加 per-IP token bucket，成功握手不消耗 token，失败 unknown 包才消耗 token；drop 计数进入 telemetry，降低多 peer 下恶意首包触发 O(N) 扫描的 CPU 风险，同时减少 NAT/reconnect storm 误伤。
 - 稳定性报告区分硬失败与 RSS 风险：业务失败、crash、UDP、ping、QUIC CV 失败会返回非零；RSS 默认记录为 `WARN`，设置 `STABILITY_ENFORCE_RSS=1` 后作为硬门禁。
-- 文档同步 full-tunnel 动态路由、IPv6 extension-header TCP fallback、WireGuard 未知握手限速和完整 E2E 入口。
+- 文档同步 full-tunnel SO_MARK 路由、IPv6 extension-header TCP fallback、WireGuard 未知握手限速和完整 E2E 入口。
 
 执行命令：
 

@@ -37,6 +37,7 @@ cleanup() {
 trap cleanup EXIT
 
 cleanup
+set -e
 
 mkdir -p /dev/net
 if [ ! -e /dev/net/tun ]; then
@@ -141,23 +142,43 @@ if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
   exit 1
 fi
 
-echo "=== [4/6] Verifying endpoint bypass route survives full-tunnel default ==="
-endpoint_route="$(ip netns exec ft_client_ns ip route get 10.20.2.2)"
-echo "$endpoint_route" > "$ARTIFACT_DIR/endpoint_route.txt"
-echo "$endpoint_route"
-if grep -q "dev ft_client" <<<"$endpoint_route"; then
-  echo "Endpoint route loops through TUN: $endpoint_route"
-  exit 1
-fi
-if ! grep -q "dev vf-c" <<<"$endpoint_route"; then
-  echo "Endpoint route does not use physical client link: $endpoint_route"
+echo "=== [4/6] Verifying SO_MARK endpoint bypass survives full-tunnel default ==="
+full_tunnel_route="$(ip netns exec ft_client_ns ip route get 198.51.100.10)"
+echo "$full_tunnel_route" > "$ARTIFACT_DIR/full_tunnel_route.txt"
+echo "$full_tunnel_route"
+if ! grep -q "dev ft_client" <<<"$full_tunnel_route"; then
+  echo "Expected generic unmarked traffic to follow full-tunnel policy table: $full_tunnel_route"
   exit 1
 fi
 
-default_route="$(ip netns exec ft_client_ns ip route show default)"
+marked_endpoint_route="$(ip netns exec ft_client_ns ip route get 10.20.2.2 mark 0x6e70)"
+echo "$marked_endpoint_route" > "$ARTIFACT_DIR/marked_endpoint_route.txt"
+echo "$marked_endpoint_route"
+if grep -q "dev ft_client" <<<"$marked_endpoint_route"; then
+  echo "Marked endpoint route loops through TUN: $marked_endpoint_route"
+  exit 1
+fi
+if ! grep -q "dev vf-c" <<<"$marked_endpoint_route"; then
+  echo "Marked endpoint route does not use physical client link: $marked_endpoint_route"
+  exit 1
+fi
+
+default_route="$(ip netns exec ft_client_ns ip route show table 28272 default)"
 echo "$default_route" > "$ARTIFACT_DIR/default_route.txt"
 if ! grep -q "dev ft_client" <<<"$default_route"; then
-  echo "Expected full-tunnel default route via ft_client TUN, got: $default_route"
+  echo "Expected full-tunnel policy-table default route via ft_client TUN, got: $default_route"
+  exit 1
+fi
+policy_rule="$(ip netns exec ft_client_ns ip rule show | grep 'not from all fwmark 0x6e70 lookup 28272' || true)"
+echo "$policy_rule" > "$ARTIFACT_DIR/policy_rule.txt"
+if [ -z "$policy_rule" ]; then
+  echo "Expected SO_MARK policy rule for unmarked full-tunnel traffic"
+  exit 1
+fi
+main_suppress_rule="$(ip netns exec ft_client_ns ip rule show | grep 'lookup main suppress_prefixlength 0' || true)"
+echo "$main_suppress_rule" > "$ARTIFACT_DIR/main_suppress_rule.txt"
+if [ -z "$main_suppress_rule" ]; then
+  echo "Expected main-table suppress rule so connected routes bypass full-tunnel default"
   exit 1
 fi
 
@@ -179,16 +200,24 @@ if ! grep -q "Peer added successfully" <<<"$replace_output"; then
   exit 1
 fi
 sleep 2
-endpoint_route_after_replace="$(ip netns exec ft_client_ns ip route get 10.20.2.2)"
-echo "$endpoint_route_after_replace" > "$ARTIFACT_DIR/endpoint_route_after_replace.txt"
-echo "$endpoint_route_after_replace"
-if grep -q "dev ft_client" <<<"$endpoint_route_after_replace"; then
-  echo "Endpoint route loops through TUN after dynamic peer replacement: $endpoint_route_after_replace"
+full_tunnel_route_after_replace="$(ip netns exec ft_client_ns ip route get 198.51.100.10)"
+echo "$full_tunnel_route_after_replace" > "$ARTIFACT_DIR/full_tunnel_route_after_replace.txt"
+echo "$full_tunnel_route_after_replace"
+if ! grep -q "dev ft_client" <<<"$full_tunnel_route_after_replace"; then
+  echo "Expected generic unmarked traffic to follow full-tunnel policy table after dynamic peer replacement: $full_tunnel_route_after_replace"
   cat "$ARTIFACT_DIR/client.log"
   exit 1
 fi
-if ! grep -q "dev vf-c" <<<"$endpoint_route_after_replace"; then
-  echo "Endpoint route does not use physical client link after dynamic peer replacement: $endpoint_route_after_replace"
+marked_endpoint_route_after_replace="$(ip netns exec ft_client_ns ip route get 10.20.2.2 mark 0x6e70)"
+echo "$marked_endpoint_route_after_replace" > "$ARTIFACT_DIR/marked_endpoint_route_after_replace.txt"
+echo "$marked_endpoint_route_after_replace"
+if grep -q "dev ft_client" <<<"$marked_endpoint_route_after_replace"; then
+  echo "Marked endpoint route loops through TUN after dynamic peer replacement: $marked_endpoint_route_after_replace"
+  cat "$ARTIFACT_DIR/client.log"
+  exit 1
+fi
+if ! grep -q "dev vf-c" <<<"$marked_endpoint_route_after_replace"; then
+  echo "Marked endpoint route does not use physical client link after dynamic peer replacement: $marked_endpoint_route_after_replace"
   cat "$ARTIFACT_DIR/client.log"
   exit 1
 fi

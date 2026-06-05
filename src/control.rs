@@ -112,13 +112,13 @@ impl ControlClient {
 
         // 2. 绑定本地 UDP 套接字 (根据对端 Endpoint IP 协议簇绑定，以在不同内核默认值下完美解决 IPV6_V6ONLY 限制)
         let socket = if self.server_control_endpoint.is_ipv6() {
-            UdpSocket::bind("[::]:0")
-                .await
-                .map_err(|e| format!("Failed to bind local IPv6 UDP socket: {}", e))?
+            bind_marked_udp_socket(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)).await?
         } else {
-            UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|e| format!("Failed to bind local IPv4 UDP socket: {}", e))?
+            bind_marked_udp_socket(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            ))
+            .await?
         };
 
         let client_pub_derived = PublicKey::from(&client_secret).to_bytes();
@@ -249,6 +249,16 @@ impl NonceCache {
 
 use std::time::Instant;
 
+async fn bind_marked_udp_socket(bind_addr: SocketAddr) -> Result<UdpSocket, String> {
+    let socket = StdUdpSocket::bind(bind_addr)
+        .map_err(|e| format!("Failed to bind UDP socket {}: {}", bind_addr, e))?;
+    crate::socket_mark::set_outer_mark(&socket)?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to set UDP socket nonblocking: {}", e))?;
+    UdpSocket::from_std(socket).map_err(|e| format!("Failed to convert UDP socket: {}", e))
+}
+
 struct IpRateLimiter {
     history: Mutex<HashMap<IpAddr, (Instant, f64)>>,
 }
@@ -323,6 +333,7 @@ impl ControlServer {
                 let _ = sock.set_reuse_address(true);
                 let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port);
                 if sock.bind(&bind_addr.into()).is_ok() {
+                    crate::socket_mark::set_socket2_outer_mark(&sock)?;
                     let std_sock: StdUdpSocket = sock.into();
                     std_sock
                         .set_nonblocking(true)
@@ -330,14 +341,20 @@ impl ControlServer {
                     UdpSocket::from_std(std_sock)
                         .map_err(|e| format!("Failed to convert to Tokio UdpSocket: {}", e))?
                 } else {
-                    UdpSocket::bind(format!("0.0.0.0:{}", listen_port))
-                        .await
-                        .map_err(|e| format!("Server failed to bind control UDP port: {}", e))?
+                    bind_marked_udp_socket(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        listen_port,
+                    ))
+                    .await?
                 }
             }
-            Err(_) => UdpSocket::bind(format!("0.0.0.0:{}", listen_port))
-                .await
-                .map_err(|e| format!("Server failed to bind control UDP port: {}", e))?,
+            Err(_) => {
+                bind_marked_udp_socket(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    listen_port,
+                ))
+                .await?
+            }
         };
         Ok(socket)
     }

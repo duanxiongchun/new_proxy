@@ -149,7 +149,7 @@ graph TD
 2. 将 TUN 接口的 MTU 设为配置值（默认 `1420`），并启用网卡（`ip link set dev <interface> up`）。
 3. 针对每个 peer 声明的 `AllowedIPs`，自动添加指向该 TUN 设备的系统路由规则（`ip route replace <allowed_ip> dev <interface>`）。
 
-为避免 full-tunnel `AllowedIPs = 0.0.0.0/0` 或 `::/0` 递归捕获 QUIC 外层 endpoint，程序在安装 TUN 路由前先缓存每个已配置 endpoint 的物理路由和物理默认路由，并为 peer endpoint 安装更高优先级的 host bypass route。运行期动态 `AddPeer` 若发现当前 endpoint route 已指向 TUN，或因 full-tunnel route replacement 导致 route discovery 失败，会优先使用启动时缓存的 endpoint-specific 物理路由安装 bypass；缺失 endpoint-specific baseline 时才回退到同地址族默认路由。
+为避免 full-tunnel `AllowedIPs = 0.0.0.0/0` 或 `::/0` 递归捕获 QUIC / control / userspace WireGuard 外层 UDP，程序采用 WireGuard 风格的 `SO_MARK` + policy routing：所有外层 UDP socket 自动设置固定 mark，`Table = auto` 时 peer `AllowedIPs` 被安装到专用 routing table，并添加 `lookup main suppress_prefixlength 0` 与 `not fwmark <mark> lookup <table>` 规则。这样未标记业务流量命中 full-tunnel table 进入 TUN，已标记外层流量和主表中的直连/更具体物理路由不会递归进入 TUN；动态 `AddPeer` 只需更新专用 table 中的 peer route，不再学习或缓存 endpoint host route。
 
 ## 8. 遥测与 API
 
