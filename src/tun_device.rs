@@ -4,6 +4,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::RawFd;
 
+const TUNSETIFF: libc::c_ulong = 0x400454ca;
+
 #[cfg(target_os = "linux")]
 pub fn open_tun(name: &str, num_queues: usize) -> io::Result<Vec<RawFd>> {
     let mut fds = Vec::new();
@@ -25,12 +27,11 @@ pub fn open_tun(name: &str, num_queues: usize) -> io::Result<Vec<RawFd>> {
 
         let name_bytes = name.as_bytes();
         let len = std::cmp::min(name_bytes.len(), ifr.ifr_name.len() - 1);
-        for i in 0..len {
-            ifr.ifr_name[i] = name_bytes[i] as i8;
+        for (i, byte) in name_bytes.iter().enumerate().take(len) {
+            ifr.ifr_name[i] = *byte as i8;
         }
 
-        // TUNSETIFF ioctl number is 2147767426
-        let res = unsafe { libc::ioctl(fd, 2147767426, &ifr) };
+        let res = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
         if res < 0 {
             let err = io::Error::last_os_error();
             unsafe { libc::close(fd) };
@@ -43,7 +44,10 @@ pub fn open_tun(name: &str, num_queues: usize) -> io::Result<Vec<RawFd>> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn open_tun(_name: &str, _num_queues: usize) -> io::Result<Vec<RawFd>> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Non-Linux platforms require custom TUN setup"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Non-Linux platforms require custom TUN setup",
+    ))
 }
 
 #[cfg(test)]
@@ -59,7 +63,9 @@ mod tests {
                 assert_eq!(fds.len(), 1);
                 assert!(fds[0] > 0);
                 for fd in fds {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
             }
             Err(_e) => {

@@ -7,11 +7,9 @@ use crate::client_proxy::build_peer_quic_pool;
 use crate::config::{self, decode_base64_32};
 use crate::control::NonceCache;
 use crate::quic_pool;
-use crate::runtime::{
-    cleanup_peer_routes_and_tproxy, run_blocking_command, setup_peer_routes_and_tproxy,
-};
+use crate::runtime::{cleanup_peer_routes, run_blocking_command, setup_peer_routes};
 use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry};
-use crate::wireguard::{get_wg_dump_stats, remove_peer_from_wireguard, sync_peer_to_wireguard};
+use crate::userspace_wg::UserspaceWgRegistry;
 use crate::{GatewayState, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -36,6 +34,7 @@ pub struct UdsServerContext {
     pub client_private_key: [u8; 32],
     pub runtime_mode: RuntimeMode,
     pub peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    pub l3_registry: UserspaceWgRegistry,
 }
 
 pub fn bind_listener(interface_name: &str) -> Option<UnixListener> {
@@ -176,9 +175,7 @@ async fn handle_stats(
     stream: &mut tokio::net::UnixStream,
     framed_response: bool,
 ) {
-    let l3_stats = get_wg_dump_stats(&context.interface_name)
-        .await
-        .unwrap_or_default();
+    let l3_stats = context.l3_registry.snapshot();
     let aggregated = {
         let mut aggregated = Vec::new();
         let mut seen = HashSet::new();
@@ -321,9 +318,7 @@ async fn handle_dump(
     stream: &mut tokio::net::UnixStream,
     framed_response: bool,
 ) {
-    let l3_stats = get_wg_dump_stats(&context.interface_name)
-        .await
-        .unwrap_or_default();
+    let l3_stats = context.l3_registry.snapshot();
     let response = {
         let telemetry = context.telemetry.snapshot();
         let quic_registry = context.shared_quic_registry.lock();
@@ -462,7 +457,7 @@ async fn handle_add_peer(
 
     let _mutation_guard = context.peer_mutation_lock.lock().await;
 
-    let (table_off, tproxy_port, tproxy_offload_enabled, old_peer, conflict) = {
+    let (table_off, old_peer, conflict) = {
         let state = context.state.read();
         let conflict = find_allowed_ip_conflict(&state.config.peers, &new_peer);
         (
@@ -473,8 +468,6 @@ async fn handle_add_peer(
                 .as_deref()
                 .map(|table| table.eq_ignore_ascii_case("off"))
                 .unwrap_or(false),
-            state.config.interface.tproxy_port,
-            state.tproxy_offload_enabled,
             state
                 .config
                 .peers
@@ -503,50 +496,39 @@ async fn handle_add_peer(
                 return;
             }
         }
-        if peer_has_l4_proxy(&new_peer) && tproxy_port.is_none() {
-            write_error(
-                stream,
-                framed_response,
-                "TProxyPort is required before adding a QUIC proxy peer".to_string(),
-            )
-            .await;
-            return;
-        }
     }
 
-    let prepared_client_pool =
-        if context.runtime_mode == RuntimeMode::Client && peer_has_l4_proxy(&new_peer) {
-            match build_peer_quic_pool(context.client_private_key, &new_peer).await {
-                Ok(pool) => Some(pool),
-                Err(e) => {
-                    write_error(
-                        stream,
-                        framed_response,
-                        format!("Failed to establish QUIC pool for peer: {}", e),
-                    )
-                    .await;
-                    return;
-                }
+    let prepared_client_pool = if context.runtime_mode == RuntimeMode::Client
+        && peer_has_l4_proxy(&new_peer)
+    {
+        match build_peer_quic_pool(context.client_private_key, &new_peer).await {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                log::warn!(
+                        "Failed to establish QUIC pool for dynamically added peer {}; adding peer in WireGuard L3 fallback mode and retrying in background: {}",
+                        encode_base64_32(&parsed_pub_key),
+                        e
+                    );
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
+    let quic_pool_unavailable = context.runtime_mode == RuntimeMode::Client
+        && peer_has_l4_proxy(&new_peer)
+        && prepared_client_pool.is_none();
 
     if !table_off {
         if let Some(peer) = old_peer.clone() {
-            let cleanup_tproxy_port = if tproxy_offload_enabled {
-                tproxy_port
-            } else {
-                None
-            };
-            if let Err(e) = cleanup_peer_routes(context, peer, cleanup_tproxy_port).await {
+            if let Err(e) = cleanup_peer_routes_for_context(context, peer).await {
                 if let Some(pool) = prepared_client_pool.as_ref() {
                     pool.shutdown(b"Peer route cleanup failed");
                 }
                 write_error(
                     stream,
                     framed_response,
-                    format!("Failed to clean old peer routes/tproxy: {}", e),
+                    format!("Failed to clean old peer routes: {}", e),
                 )
                 .await;
                 return;
@@ -554,24 +536,17 @@ async fn handle_add_peer(
         }
     }
 
-    let setup_tproxy_port = if tproxy_offload_enabled {
-        tproxy_port
-    } else {
-        None
-    };
-
     if !table_off {
-        let setup_result = setup_peer_routes(context, new_peer.clone(), setup_tproxy_port).await;
+        let setup_result = setup_peer_routes_for_context(context, new_peer.clone()).await;
         if let Err(e) = setup_result {
             if let Some(pool) = prepared_client_pool.as_ref() {
                 pool.shutdown(b"Peer route setup failed");
             }
-            let rollback_error =
-                rollback_peer_routes(context, &new_peer, old_peer.clone(), setup_tproxy_port).await;
+            let rollback_error = rollback_peer_routes(context, &new_peer, old_peer.clone()).await;
             let message = match rollback_error {
-                Ok(()) => format!("Failed to sync peer routes/tproxy: {}", e),
+                Ok(()) => format!("Failed to sync peer routes: {}", e),
                 Err(rollback) => format!(
-                    "Failed to sync peer routes/tproxy: {}; rollback failed: {}",
+                    "Failed to sync peer routes: {}; rollback failed: {}",
                     e, rollback
                 ),
             };
@@ -580,23 +555,16 @@ async fn handle_add_peer(
         }
     }
 
-    let interface_name = context.interface_name.clone();
-    let new_peer_for_wireguard = new_peer.clone();
-    if let Err(e) = run_blocking_command(move || {
-        sync_peer_to_wireguard(&interface_name, &new_peer_for_wireguard)
-    })
-    .await
-    {
+    if let Err(e) = context.l3_registry.add_or_replace_peer(new_peer.clone()) {
         if let Some(pool) = prepared_client_pool.as_ref() {
-            pool.shutdown(b"Peer WireGuard sync failed");
+            pool.shutdown(b"Peer userspace WireGuard update failed");
         }
         if !table_off {
-            let rollback_error =
-                rollback_peer_routes(context, &new_peer, old_peer.clone(), setup_tproxy_port).await;
+            let rollback_error = rollback_peer_routes(context, &new_peer, old_peer.clone()).await;
             let message = match rollback_error {
-                Ok(()) => format!("Failed to sync peer to WireGuard: {}", e),
+                Ok(()) => format!("Failed to update userspace WireGuard peer: {}", e),
                 Err(rollback) => format!(
-                    "Failed to sync peer to WireGuard: {}; route rollback failed: {}",
+                    "Failed to update userspace WireGuard peer: {}; route rollback failed: {}",
                     e, rollback
                 ),
             };
@@ -606,7 +574,7 @@ async fn handle_add_peer(
         write_error(
             stream,
             framed_response,
-            format!("Failed to sync peer to WireGuard: {}", e),
+            format!("Failed to update userspace WireGuard peer: {}", e),
         )
         .await;
         return;
@@ -627,6 +595,9 @@ async fn handle_add_peer(
             .retain(|peer| peer.public_key != parsed_pub_key);
         state.config.peers.push(new_peer);
         state.router = rebuild_l4_router(&state.config.peers);
+        if quic_pool_unavailable {
+            state.userspace_tcp_offload_enabled = false;
+        }
     }
 
     if context.runtime_mode == RuntimeMode::Client {
@@ -643,7 +614,15 @@ async fn handle_add_peer(
         }
     }
 
-    write_ok(stream, framed_response, None).await;
+    let message = if quic_pool_unavailable {
+        Some(
+            "Peer added; QUIC pool is unavailable, using WireGuard L3 fallback until recovery"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    write_ok(stream, framed_response, message).await;
 }
 
 async fn handle_remove_peer(
@@ -667,7 +646,7 @@ async fn handle_remove_peer(
 
     let _mutation_guard = context.peer_mutation_lock.lock().await;
 
-    let (removed_peer, table_off, tproxy_port, tproxy_offload_enabled) = {
+    let (removed_peer, table_off) = {
         let state = context.state.read();
         (
             state
@@ -683,63 +662,23 @@ async fn handle_remove_peer(
                 .as_deref()
                 .map(|table| table.eq_ignore_ascii_case("off"))
                 .unwrap_or(false),
-            state.config.interface.tproxy_port,
-            state.tproxy_offload_enabled,
         )
     };
 
-    let mut routes_cleaned = false;
     if let Some(peer) = &removed_peer {
         if !table_off {
-            let cleanup_tproxy_port = if tproxy_offload_enabled {
-                tproxy_port
-            } else {
-                None
-            };
-            if let Err(e) = cleanup_peer_routes(context, peer.clone(), cleanup_tproxy_port).await {
+            if let Err(e) = cleanup_peer_routes_for_context(context, peer.clone()).await {
                 write_error(
                     stream,
                     framed_response,
-                    format!("Failed to clean peer routes/tproxy: {}", e),
+                    format!("Failed to clean peer routes: {}", e),
                 )
                 .await;
                 return;
             }
-            routes_cleaned = true;
         }
     }
-    let interface_name = context.interface_name.clone();
-    if let Err(e) =
-        run_blocking_command(move || remove_peer_from_wireguard(&interface_name, parsed_pub_key))
-            .await
-    {
-        let restore_error = if routes_cleaned {
-            match removed_peer.clone() {
-                Some(peer) => {
-                    let restore_tproxy_port = if tproxy_offload_enabled {
-                        tproxy_port
-                    } else {
-                        None
-                    };
-                    setup_peer_routes(context, peer, restore_tproxy_port)
-                        .await
-                        .err()
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        let message = match restore_error {
-            Some(restore) => format!(
-                "Failed to remove WireGuard peer: {}; failed to restore peer routes/tproxy: {}",
-                e, restore
-            ),
-            None => format!("Failed to remove WireGuard peer: {}", e),
-        };
-        write_error(stream, framed_response, message).await;
-        return;
-    }
+    context.l3_registry.remove_peer(&parsed_pub_key);
 
     context.peer_secrets.write().remove(&parsed_pub_key);
     context.session_cache.write().remove(&parsed_pub_key);
@@ -815,42 +754,35 @@ fn ipnets_overlap(a: ipnet::IpNet, b: ipnet::IpNet) -> bool {
     }
 }
 
-async fn setup_peer_routes(
+async fn setup_peer_routes_for_context(
     context: &UdsServerContext,
     peer: config::PeerConfig,
-    tproxy_port: Option<u16>,
 ) -> Result<(), String> {
     let interface_name = context.interface_name.clone();
-    run_blocking_command(move || setup_peer_routes_and_tproxy(&peer, tproxy_port, &interface_name))
-        .await
+    run_blocking_command(move || setup_peer_routes(&peer, &interface_name)).await
 }
 
-async fn cleanup_peer_routes(
+async fn cleanup_peer_routes_for_context(
     context: &UdsServerContext,
     peer: config::PeerConfig,
-    tproxy_port: Option<u16>,
 ) -> Result<(), String> {
     let interface_name = context.interface_name.clone();
-    run_blocking_command(move || {
-        cleanup_peer_routes_and_tproxy(&peer, tproxy_port, &interface_name)
-    })
-    .await
+    run_blocking_command(move || cleanup_peer_routes(&peer, &interface_name)).await
 }
 
 async fn rollback_peer_routes(
     context: &UdsServerContext,
     new_peer: &config::PeerConfig,
     old_peer: Option<config::PeerConfig>,
-    tproxy_port: Option<u16>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
-    if let Err(e) = cleanup_peer_routes(context, new_peer.clone(), tproxy_port).await {
-        errors.push(format!("failed to clean new peer routes/tproxy: {}", e));
+    if let Err(e) = cleanup_peer_routes_for_context(context, new_peer.clone()).await {
+        errors.push(format!("failed to clean new peer routes: {}", e));
     }
     if let Some(peer) = old_peer {
-        if let Err(e) = setup_peer_routes(context, peer, tproxy_port).await {
-            errors.push(format!("failed to restore old peer routes/tproxy: {}", e));
+        if let Err(e) = setup_peer_routes_for_context(context, peer).await {
+            errors.push(format!("failed to restore old peer routes: {}", e));
         }
     }
 
@@ -896,7 +828,6 @@ mod tests {
                 addresses: vec![],
                 listen_port: Some(0),
                 listen_control_port: Some(51820),
-                tproxy_port: Some(8080),
                 mtu: 1420,
                 table: None,
                 pre_script: None,
@@ -919,12 +850,15 @@ mod tests {
         stats.rx_bytes.store(70, Ordering::Relaxed);
         stats.tx_bytes.store(80, Ordering::Relaxed);
 
+        let l3_registry =
+            UserspaceWgRegistry::new(config.interface.private_key, &config.peers).unwrap();
+
         UdsServerContext {
             telemetry,
             state: Arc::new(RwLock::new(GatewayState {
                 config,
                 router: AllowedIPsRouter::new(),
-                tproxy_offload_enabled: true,
+                userspace_tcp_offload_enabled: true,
             })),
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             server_secret: StaticSecret::from([1u8; 32]),
@@ -936,6 +870,7 @@ mod tests {
             client_private_key: [1u8; 32],
             runtime_mode: RuntimeMode::Server,
             peer_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            l3_registry,
         }
     }
 
@@ -953,6 +888,22 @@ mod tests {
         serde_json::from_slice(&response).unwrap()
     }
 
+    async fn send_framed_command<T: serde::de::DeserializeOwned>(
+        path: &str,
+        command: &CommandInput,
+    ) -> T {
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        let payload = serde_json::to_vec(command).unwrap();
+        stream.write_u32(payload.len() as u32).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let len = stream.read_u32().await.unwrap() as usize;
+        let mut response = vec![0u8; len];
+        stream.read_exact(&mut response).await.unwrap();
+        serde_json::from_slice(&response).unwrap()
+    }
+
     #[tokio::test]
     async fn test_uds_server_stats_uses_context_state_and_telemetry() {
         let path = "/tmp/test_real_uds_stats.sock";
@@ -967,7 +918,7 @@ mod tests {
         assert_eq!(stats[0].endpoint.as_deref(), Some("1.2.3.4:51820"));
         assert_eq!(stats[0].l4_rx_bytes, 70);
         assert_eq!(stats[0].l4_tx_bytes, 80);
-        assert_eq!(stats[0].source, "proxy");
+        assert_eq!(stats[0].source, "both");
 
         let _ = fs::remove_file(path);
     }
@@ -1025,6 +976,225 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Invalid request JSON"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_uds_add_peer_updates_runtime_state_and_registries() {
+        let path = "/tmp/test_real_uds_add_peer.sock";
+        let _ = fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        let context = test_context();
+        context.state.write().config.interface.table = Some("off".to_string());
+        let context_for_assert = context.clone();
+        start(listener, context);
+
+        let new_key = [8u8; 32];
+        let response: ApiResponse = send_framed_command(
+            path,
+            &CommandInput::AddPeer {
+                public_key: encode_base64_32(&new_key),
+                allowed_ips: vec!["10.8.0.0/24".to_string()],
+                endpoint: None,
+                proxy_port: None,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "Ok");
+        let state = context_for_assert.state.read();
+        assert!(state
+            .config
+            .peers
+            .iter()
+            .any(|peer| peer.public_key == new_key));
+        assert!(context_for_assert
+            .peer_secrets
+            .read()
+            .contains_key(&new_key));
+        assert!(context_for_assert
+            .l3_registry
+            .snapshot()
+            .contains_key(&new_key));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_uds_add_peer_replaces_existing_peer() {
+        let path = "/tmp/test_real_uds_replace_peer.sock";
+        let _ = fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        let context = test_context();
+        context.state.write().config.interface.table = Some("off".to_string());
+        let context_for_assert = context.clone();
+        start(listener, context);
+
+        let response: ApiResponse = send_raw_command(
+            path,
+            &CommandInput::AddPeer {
+                public_key: encode_base64_32(&[2u8; 32]),
+                allowed_ips: vec!["10.2.0.0/24".to_string()],
+                endpoint: Some("5.6.7.8:51820".to_string()),
+                proxy_port: Some(40002),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "Ok");
+        let state = context_for_assert.state.read();
+        let replaced = state
+            .config
+            .peers
+            .iter()
+            .filter(|peer| peer.public_key == [2u8; 32])
+            .collect::<Vec<_>>();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(
+            replaced[0].allowed_ips,
+            vec!["10.2.0.0/24".parse().unwrap()]
+        );
+        assert_eq!(
+            replaced[0].endpoint.map(|addr| addr.to_string()).as_deref(),
+            Some("5.6.7.8:51820")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_uds_remove_peer_clears_runtime_state_and_registries() {
+        let path = "/tmp/test_real_uds_remove_peer.sock";
+        let _ = fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        let context = test_context();
+        context.state.write().config.interface.table = Some("off".to_string());
+        context.peer_secrets.write().insert([2u8; 32], [3u8; 32]);
+        context.session_cache.write().insert([2u8; 32], [4u8; 32]);
+        context
+            .auth_nonce_cache
+            .lock()
+            .insert([2u8; 32], NonceCache::new(4));
+        let context_for_assert = context.clone();
+        start(listener, context);
+
+        let response: ApiResponse = send_raw_command(
+            path,
+            &CommandInput::RemovePeer {
+                public_key: encode_base64_32(&[2u8; 32]),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "Ok");
+        assert!(!context_for_assert
+            .state
+            .read()
+            .config
+            .peers
+            .iter()
+            .any(|peer| peer.public_key == [2u8; 32]));
+        assert!(!context_for_assert
+            .l3_registry
+            .snapshot()
+            .contains_key(&[2u8; 32]));
+        assert!(!context_for_assert
+            .peer_secrets
+            .read()
+            .contains_key(&[2u8; 32]));
+        assert!(!context_for_assert
+            .session_cache
+            .read()
+            .contains_key(&[2u8; 32]));
+        assert!(!context_for_assert
+            .auth_nonce_cache
+            .lock()
+            .contains_key(&[2u8; 32]));
+        assert!(!context_for_assert
+            .telemetry
+            .snapshot()
+            .contains_key(&[2u8; 32]));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_uds_client_add_peer_requires_endpoint_and_proxy_port_together() {
+        let path = "/tmp/test_real_uds_add_peer_client_pair.sock";
+        let _ = fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        let mut context = test_context();
+        context.runtime_mode = RuntimeMode::Client;
+        context.state.write().config.interface.table = Some("off".to_string());
+        start(listener, context);
+
+        let response: ApiResponse = send_raw_command(
+            path,
+            &CommandInput::AddPeer {
+                public_key: encode_base64_32(&[8u8; 32]),
+                allowed_ips: vec!["10.8.0.0/24".to_string()],
+                endpoint: Some("1.2.3.4:51820".to_string()),
+                proxy_port: None,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "Error");
+        assert!(response
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Endpoint and ProxyPort"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_uds_client_add_peer_keeps_peer_when_quic_pool_is_unavailable() {
+        let path = "/tmp/test_real_uds_add_peer_client_fallback.sock";
+        let _ = fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        let mut context = test_context();
+        context.runtime_mode = RuntimeMode::Client;
+        context.state.write().config.interface.table = Some("off".to_string());
+        let context_for_assert = context.clone();
+        start(listener, context);
+
+        let new_key = [8u8; 32];
+        let response: ApiResponse = send_raw_command(
+            path,
+            &CommandInput::AddPeer {
+                public_key: encode_base64_32(&new_key),
+                allowed_ips: vec!["10.8.0.0/24".to_string()],
+                endpoint: Some("127.0.0.1:9".to_string()),
+                proxy_port: Some(9),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "Ok");
+        assert!(response
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("WireGuard L3 fallback"));
+        let state = context_for_assert.state.read();
+        assert!(!state.userspace_tcp_offload_enabled);
+        assert!(state
+            .config
+            .peers
+            .iter()
+            .any(|peer| peer.public_key == new_key && peer.proxy_port == Some(9)));
+        drop(state);
+        assert!(context_for_assert
+            .l3_registry
+            .snapshot()
+            .contains_key(&new_key));
+        assert!(!context_for_assert
+            .client_quic_pools
+            .read()
+            .contains_key(&new_key));
 
         let _ = fs::remove_file(path);
     }

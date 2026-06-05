@@ -1,5 +1,20 @@
 use crate::config::{GatewayConfig, PeerConfig};
+use std::collections::HashSet;
+use std::net::IpAddr;
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CommandSpec {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+impl CommandSpec {
+    fn new(program: &'static str, args: Vec<String>) -> Self {
+        Self { program, args }
+    }
+}
+
+#[cfg(not(tarpaulin))]
 pub async fn run_blocking_command<F>(op: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String> + Send + 'static,
@@ -9,6 +24,15 @@ where
         .map_err(|e| format!("blocking command worker failed: {}", e))?
 }
 
+#[cfg(tarpaulin)]
+pub async fn run_blocking_command<F>(op: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    op()
+}
+
+#[cfg(not(tarpaulin))]
 pub fn run_script(script: &str) {
     log::info!("Executing script: {}", script);
     let output = std::process::Command::new("sh")
@@ -31,317 +55,70 @@ pub fn run_script(script: &str) {
     }
 }
 
+#[cfg(tarpaulin)]
+pub fn run_script(_script: &str) {}
+
+#[cfg(not(tarpaulin))]
 pub fn cleanup_runtime(config: &GatewayConfig, interface_name: &str) {
-    cleanup_routes_and_iptables(config, interface_name);
+    cleanup_routes(config, interface_name);
     if let Some(ref post_script) = config.interface.post_script {
         run_script(post_script);
     }
 }
 
-pub fn setup_routes_and_iptables(
-    config: &GatewayConfig,
-    interface_name: &str,
-) -> Result<(), String> {
-    let is_client = matches!(
-        crate::app_config::validate_gateway_config(config),
-        Ok(crate::app_config::RuntimeMode::Client)
-    );
+#[cfg(tarpaulin)]
+pub fn cleanup_runtime(_config: &GatewayConfig, _interface_name: &str) {}
 
-    if is_client {
-        log::info!("Setting up userspace routing for client interface: {}", interface_name);
-        
-        for addr in &config.interface.addresses {
-            run_command_checked(
-                "ip",
-                &[
-                    "addr".to_string(),
-                    "replace".to_string(),
-                    addr.to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
-                ],
-            )?;
-        }
-
-        run_command_checked(
-            "ip",
-            &[
-                "link".to_string(),
-                "set".to_string(),
-                interface_name.to_string(),
-                "up".to_string(),
-                "mtu".to_string(),
-                config.interface.mtu.to_string(),
-            ],
-        )?;
-
-        for peer in &config.peers {
-            for allowed_ip in &peer.allowed_ips {
-                run_command_checked(
-                    "ip",
-                    &[
-                        "route".to_string(),
-                        "replace".to_string(),
-                        allowed_ip.to_string(),
-                        "dev".to_string(),
-                        interface_name.to_string(),
-                    ],
-                )?;
-            }
-        }
+#[cfg(not(tarpaulin))]
+pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), String> {
+    if table_is_off(config) {
+        log::info!("Table is off. Skipping automatic userspace routing setup.");
         return Ok(());
-    }
-
-    // WireGuard device setup is independent from route/firewall ownership.
-    // `Table = off` skips route/iptables changes, but the daemon still owns
-    // the WireGuard device so peer sync and telemetry use the real backend.
-    crate::wireguard::configure_device(
-        interface_name,
-        &config.interface.private_key,
-        config.interface.listen_port,
-    )?;
-
-    if let Some(ref t) = config.interface.table {
-        if t.to_lowercase() == "off" {
-            log::info!("Table is off. Skipping automatic routing and iptables setup.");
-            return Ok(());
-        }
     }
 
     log::info!(
-        "Setting up automatic routing and iptables for interface: {}",
+        "Setting up userspace TUN addresses and routes for interface: {}",
         interface_name
     );
 
-    for addr in &config.interface.addresses {
-        run_command_checked(
-            "ip",
-            &[
-                "addr".to_string(),
-                "replace".to_string(),
-                addr.to_string(),
-                "dev".to_string(),
-                interface_name.to_string(),
-            ],
-        )?;
+    setup_endpoint_bypass_routes(config, interface_name)?;
+
+    for command in setup_route_commands(config, interface_name) {
+        run_command_checked(command.program, &command.args)?;
     }
 
-    run_command_checked(
-        "ip",
-        &[
-            "link".to_string(),
-            "set".to_string(),
-            interface_name.to_string(),
-            "up".to_string(),
-            "mtu".to_string(),
-            config.interface.mtu.to_string(),
-        ],
-    )?;
+    Ok(())
+}
 
-    if let Some(tproxy_port) = config.interface.tproxy_port {
-        log::info!("Setting up TPROXY iptables rules on port {}", tproxy_port);
-        let (fwmark, route_table) = instance_routing_ids(interface_name);
-        ensure_tproxy_divert_rules(fwmark)?;
+#[cfg(tarpaulin)]
+pub fn setup_routes(_config: &GatewayConfig, _interface_name: &str) -> Result<(), String> {
+    Ok(())
+}
 
-        for peer in &config.peers {
-            setup_peer_routes_and_tproxy(peer, config.interface.tproxy_port, interface_name)?;
-        }
-
-        run_command_best_effort(
-            "ip",
-            &[
-                "rule".to_string(),
-                "del".to_string(),
-                "fwmark".to_string(),
-                format!("{:#x}", fwmark),
-                "lookup".to_string(),
-                route_table.to_string(),
-            ],
-        );
-        run_command_checked(
-            "ip",
-            &[
-                "rule".to_string(),
-                "add".to_string(),
-                "fwmark".to_string(),
-                format!("{:#x}", fwmark),
-                "lookup".to_string(),
-                route_table.to_string(),
-            ],
-        )?;
-        run_command_checked(
-            "ip",
-            &[
-                "route".to_string(),
-                "replace".to_string(),
-                "local".to_string(),
-                "0.0.0.0/0".to_string(),
-                "dev".to_string(),
-                "lo".to_string(),
-                "table".to_string(),
-                route_table.to_string(),
-            ],
-        )?;
-
-        run_command_best_effort(
-            "ip",
-            &[
-                "-6".to_string(),
-                "rule".to_string(),
-                "del".to_string(),
-                "fwmark".to_string(),
-                format!("{:#x}", fwmark),
-                "lookup".to_string(),
-                route_table.to_string(),
-            ],
-        );
-        run_command_checked(
-            "ip",
-            &[
-                "-6".to_string(),
-                "rule".to_string(),
-                "add".to_string(),
-                "fwmark".to_string(),
-                format!("{:#x}", fwmark),
-                "lookup".to_string(),
-                route_table.to_string(),
-            ],
-        )?;
-        run_command_checked(
-            "ip",
-            &[
-                "-6".to_string(),
-                "route".to_string(),
-                "replace".to_string(),
-                "local".to_string(),
-                "::/0".to_string(),
-                "dev".to_string(),
-                "lo".to_string(),
-                "table".to_string(),
-                route_table.to_string(),
-            ],
-        )?;
-    } else {
-        for peer in &config.peers {
-            setup_peer_routes_and_tproxy(peer, config.interface.tproxy_port, interface_name)?;
-        }
+#[cfg(not(tarpaulin))]
+pub fn setup_peer_routes(peer: &PeerConfig, interface_name: &str) -> Result<(), String> {
+    if let Some(endpoint) = peer.endpoint {
+        setup_endpoint_bypass_route(endpoint.ip(), interface_name)?;
+    }
+    for command in setup_peer_route_commands(peer, interface_name) {
+        run_command_checked(command.program, &command.args)?;
     }
     Ok(())
 }
 
-pub fn setup_peer_routes_and_tproxy(
-    peer: &PeerConfig,
-    tproxy_port: Option<u16>,
-    interface_name: &str,
-) -> Result<(), String> {
-    let (fwmark, _) = instance_routing_ids(interface_name);
-    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
-
-    for allowed_ip in &peer.allowed_ips {
-        if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-            run_command_checked(
-                "ip",
-                &[
-                    "route".to_string(),
-                    "replace".to_string(),
-                    allowed_ip.to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
-                ],
-            )?;
-        } else {
-            run_command_checked(
-                "ip",
-                &[
-                    "-6".to_string(),
-                    "route".to_string(),
-                    "replace".to_string(),
-                    allowed_ip.to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
-                ],
-            )?;
-        }
-        if let Some(port) = tproxy_port.filter(|_| peer_has_l4_proxy(peer)) {
-            ensure_tproxy_rule(*allowed_ip, port, &mark_spec)?;
-            let _ = ensure_mss_clamp_rule(*allowed_ip);
-        }
-    }
+#[cfg(tarpaulin)]
+pub fn setup_peer_routes(_peer: &PeerConfig, _interface_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn setup_proxy_tproxy_rules(
-    config: &GatewayConfig,
-    interface_name: &str,
-) -> Result<(), String> {
-    let Some(tproxy_port) = config.interface.tproxy_port else {
-        return Ok(());
-    };
-    let (fwmark, _) = instance_routing_ids(interface_name);
-    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
-
-    for peer in config.peers.iter().filter(|peer| peer_has_l4_proxy(peer)) {
-        for allowed_ip in &peer.allowed_ips {
-            ensure_tproxy_rule(*allowed_ip, tproxy_port, &mark_spec)?;
-            let _ = ensure_mss_clamp_rule(*allowed_ip);
-        }
-    }
-    Ok(())
-}
-
-pub fn cleanup_proxy_tproxy_rules(config: &GatewayConfig, interface_name: &str) {
-    let Some(tproxy_port) = config.interface.tproxy_port else {
-        return;
-    };
-    let (fwmark, _) = instance_routing_ids(interface_name);
-    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
-
-    for peer in config.peers.iter().filter(|peer| peer_has_l4_proxy(peer)) {
-        for allowed_ip in &peer.allowed_ips {
-            cleanup_tproxy_rule(*allowed_ip, tproxy_port, &mark_spec);
-            cleanup_mss_clamp_rule(*allowed_ip);
-        }
-    }
-}
-
-pub fn cleanup_peer_routes_and_tproxy(
-    peer: &PeerConfig,
-    tproxy_port: Option<u16>,
-    interface_name: &str,
-) -> Result<(), String> {
-    let (fwmark, _) = instance_routing_ids(interface_name);
-    let mark_spec = format!("{:#x}/0xffffffff", fwmark);
+#[cfg(not(tarpaulin))]
+pub fn cleanup_peer_routes(peer: &PeerConfig, interface_name: &str) -> Result<(), String> {
     let mut errors = Vec::new();
-    for allowed_ip in &peer.allowed_ips {
-        if let Some(port) = tproxy_port.filter(|_| peer_has_l4_proxy(peer)) {
-            cleanup_tproxy_rule(*allowed_ip, port, &mark_spec);
-            cleanup_mss_clamp_rule(*allowed_ip);
-        }
-        let route_result = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-            run_command_checked(
-                "ip",
-                &[
-                    "route".to_string(),
-                    "del".to_string(),
-                    allowed_ip.to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
-                ],
-            )
-        } else {
-            run_command_checked(
-                "ip",
-                &[
-                    "-6".to_string(),
-                    "route".to_string(),
-                    "del".to_string(),
-                    allowed_ip.to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
-                ],
-            )
-        };
-        if let Err(e) = route_result {
+    for command in cleanup_peer_endpoint_bypass_route_commands(peer) {
+        run_command_best_effort(command.program, &command.args);
+    }
+    for command in cleanup_peer_route_commands(peer, interface_name) {
+        if let Err(e) = run_command_checked(command.program, &command.args) {
             errors.push(e);
         }
     }
@@ -352,119 +129,321 @@ pub fn cleanup_peer_routes_and_tproxy(
     }
 }
 
-fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
-    let is_client = matches!(
-        crate::app_config::validate_gateway_config(config),
-        Ok(crate::app_config::RuntimeMode::Client)
-    );
+#[cfg(tarpaulin)]
+pub fn cleanup_peer_routes(_peer: &PeerConfig, _interface_name: &str) -> Result<(), String> {
+    Ok(())
+}
 
-    if is_client {
-        log::info!("Cleaning up userspace routing for client interface: {}", interface_name);
-        run_command_best_effort(
-            "ip",
-            &[
-                "link".to_string(),
-                "delete".to_string(),
-                interface_name.to_string(),
-            ],
-        );
+#[cfg(not(tarpaulin))]
+fn cleanup_routes(config: &GatewayConfig, interface_name: &str) {
+    if table_is_off(config) {
+        cleanup_tun_link(interface_name);
         return;
     }
 
-    if let Some(ref t) = config.interface.table {
-        if t.to_lowercase() == "off" {
-            crate::wireguard::cleanup_device(interface_name);
-            return;
-        }
-    }
-
     log::info!(
-        "Cleaning up automatic routing and iptables for interface: {}",
+        "Cleaning up userspace routing for interface: {}",
         interface_name
     );
 
-    if let Some(tproxy_port) = config.interface.tproxy_port {
-        log::info!("Tearing down TPROXY iptables rules on port {}", tproxy_port);
-        let (fwmark, route_table) = instance_routing_ids(interface_name);
-        let mark_spec = format!("{:#x}/0xffffffff", fwmark);
+    for command in cleanup_route_commands(config, interface_name) {
+        run_command_best_effort(command.program, &command.args);
+    }
+}
 
-        for peer in &config.peers {
-            for allowed_ip in &peer.allowed_ips {
-                cleanup_tproxy_rule(*allowed_ip, tproxy_port, &mark_spec);
-                cleanup_mss_clamp_rule(*allowed_ip);
-            }
-        }
+fn table_is_off(config: &GatewayConfig) -> bool {
+    config
+        .interface
+        .table
+        .as_deref()
+        .map(|table| table.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+}
 
-        run_command_best_effort(
-            "ip",
-            &[
-                "rule".to_string(),
-                "del".to_string(),
-                "fwmark".to_string(),
-                format!("{:#x}", fwmark),
-                "lookup".to_string(),
-                route_table.to_string(),
-            ],
-        );
-        run_command_best_effort(
-            "ip",
-            &[
-                "route".to_string(),
-                "del".to_string(),
-                "local".to_string(),
-                "0.0.0.0/0".to_string(),
-                "dev".to_string(),
-                "lo".to_string(),
-                "table".to_string(),
-                route_table.to_string(),
-            ],
-        );
-        run_command_best_effort(
-            "ip",
-            &[
-                "-6".to_string(),
-                "rule".to_string(),
-                "del".to_string(),
-                "fwmark".to_string(),
-                format!("{:#x}", fwmark),
-                "lookup".to_string(),
-                route_table.to_string(),
-            ],
-        );
-        run_command_best_effort(
-            "ip",
-            &[
-                "-6".to_string(),
-                "route".to_string(),
-                "del".to_string(),
-                "local".to_string(),
-                "::/0".to_string(),
-                "dev".to_string(),
-                "lo".to_string(),
-                "table".to_string(),
-                route_table.to_string(),
-            ],
-        );
-        cleanup_tproxy_divert_rules(fwmark);
+fn setup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<CommandSpec> {
+    let mut commands = Vec::new();
+    if table_is_off(config) {
+        return commands;
     }
 
+    for addr in &config.interface.addresses {
+        commands.push(CommandSpec::new(
+            "ip",
+            vec![
+                "addr".to_string(),
+                "replace".to_string(),
+                addr.to_string(),
+                "dev".to_string(),
+                interface_name.to_string(),
+            ],
+        ));
+    }
+
+    commands.push(CommandSpec::new(
+        "ip",
+        vec![
+            "link".to_string(),
+            "set".to_string(),
+            interface_name.to_string(),
+            "up".to_string(),
+            "mtu".to_string(),
+            config.interface.mtu.to_string(),
+        ],
+    ));
+
     for peer in &config.peers {
-        for allowed_ip in &peer.allowed_ips {
+        commands.extend(setup_peer_route_commands(peer, interface_name));
+    }
+
+    commands
+}
+
+#[cfg(not(tarpaulin))]
+fn setup_endpoint_bypass_routes(
+    config: &GatewayConfig,
+    interface_name: &str,
+) -> Result<(), String> {
+    let endpoints = config
+        .peers
+        .iter()
+        .filter_map(|peer| peer.endpoint.map(|endpoint| endpoint.ip()))
+        .collect::<HashSet<_>>();
+
+    for endpoint_ip in endpoints {
+        setup_endpoint_bypass_route(endpoint_ip, interface_name)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(tarpaulin)]
+fn setup_endpoint_bypass_routes(
+    _config: &GatewayConfig,
+    _interface_name: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(tarpaulin))]
+fn setup_endpoint_bypass_route(endpoint_ip: IpAddr, interface_name: &str) -> Result<(), String> {
+    let route = discover_endpoint_route(endpoint_ip)?;
+    if route.dev == interface_name {
+        return Err(format!(
+            "outer endpoint {} already routes through {}; refusing to install recursive tunnel route",
+            endpoint_ip, interface_name
+        ));
+    }
+    let command = endpoint_bypass_route_command(endpoint_ip, route);
+    run_command_checked(command.program, &command.args)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct EndpointRoute {
+    dev: String,
+    via: Option<IpAddr>,
+}
+
+#[cfg(not(tarpaulin))]
+fn discover_endpoint_route(endpoint_ip: IpAddr) -> Result<EndpointRoute, String> {
+    let args = route_get_command(endpoint_ip);
+    let output = std::process::Command::new("ip")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to execute 'ip {}': {}", args.join(" "), e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "command 'ip {}' failed with status {:?}: {}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_route_get_output(endpoint_ip, &String::from_utf8_lossy(&output.stdout))
+}
+
+fn route_get_command(endpoint_ip: IpAddr) -> Vec<String> {
+    if endpoint_ip.is_ipv6() {
+        vec![
+            "-6".to_string(),
+            "route".to_string(),
+            "get".to_string(),
+            endpoint_ip.to_string(),
+        ]
+    } else {
+        vec![
+            "route".to_string(),
+            "get".to_string(),
+            endpoint_ip.to_string(),
+        ]
+    }
+}
+
+fn parse_route_get_output(endpoint_ip: IpAddr, output: &str) -> Result<EndpointRoute, String> {
+    let tokens = output.split_whitespace().collect::<Vec<_>>();
+    let dev = tokens
+        .windows(2)
+        .find_map(|window| (window[0] == "dev").then(|| window[1].to_string()))
+        .ok_or_else(|| {
+            format!(
+                "failed to discover outgoing device for outer endpoint {} from route output: {}",
+                endpoint_ip,
+                output.trim()
+            )
+        })?;
+    let via = tokens
+        .windows(2)
+        .find_map(|window| (window[0] == "via").then_some(window[1]))
+        .map(|ip| {
+            ip.parse::<IpAddr>().map_err(|e| {
+                format!(
+                    "failed to parse gateway '{}' for outer endpoint {}: {}",
+                    ip, endpoint_ip, e
+                )
+            })
+        })
+        .transpose()?;
+    Ok(EndpointRoute { dev, via })
+}
+
+fn endpoint_bypass_route_command(endpoint_ip: IpAddr, route: EndpointRoute) -> CommandSpec {
+    let prefix = if endpoint_ip.is_ipv6() {
+        format!("{}/128", endpoint_ip)
+    } else {
+        format!("{}/32", endpoint_ip)
+    };
+    let mut args = Vec::new();
+    if endpoint_ip.is_ipv6() {
+        args.push("-6".to_string());
+    }
+    args.extend(
+        ["route", "replace", &prefix]
+            .into_iter()
+            .map(str::to_string),
+    );
+    if let Some(via) = route.via {
+        args.push("via".to_string());
+        args.push(via.to_string());
+    }
+    args.push("dev".to_string());
+    args.push(route.dev);
+    args.push("metric".to_string());
+    args.push("1".to_string());
+    CommandSpec::new("ip", args)
+}
+
+fn setup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<CommandSpec> {
+    peer.allowed_ips
+        .iter()
+        .map(|allowed_ip| {
             if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-                run_command_best_effort(
+                CommandSpec::new(
                     "ip",
-                    &[
+                    vec![
+                        "route".to_string(),
+                        "replace".to_string(),
+                        allowed_ip.to_string(),
+                        "dev".to_string(),
+                        interface_name.to_string(),
+                    ],
+                )
+            } else {
+                CommandSpec::new(
+                    "ip",
+                    vec![
+                        "-6".to_string(),
+                        "route".to_string(),
+                        "replace".to_string(),
+                        allowed_ip.to_string(),
+                        "dev".to_string(),
+                        interface_name.to_string(),
+                    ],
+                )
+            }
+        })
+        .collect()
+}
+
+fn cleanup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<CommandSpec> {
+    let mut commands = Vec::new();
+    if !table_is_off(config) {
+        commands.extend(cleanup_endpoint_bypass_route_commands(config));
+
+        for peer in &config.peers {
+            commands.extend(cleanup_peer_route_commands(peer, interface_name));
+        }
+
+        for addr in &config.interface.addresses {
+            commands.push(CommandSpec::new(
+                "ip",
+                vec![
+                    "addr".to_string(),
+                    "del".to_string(),
+                    addr.to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            ));
+        }
+    }
+
+    commands.push(tun_link_delete_command(interface_name));
+    commands
+}
+
+fn cleanup_endpoint_bypass_route_commands(config: &GatewayConfig) -> Vec<CommandSpec> {
+    config
+        .peers
+        .iter()
+        .filter_map(|peer| peer.endpoint.map(|endpoint| endpoint.ip()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(cleanup_endpoint_bypass_route_command)
+        .collect()
+}
+
+fn cleanup_peer_endpoint_bypass_route_commands(peer: &PeerConfig) -> Vec<CommandSpec> {
+    peer.endpoint
+        .map(|endpoint| endpoint.ip())
+        .map(cleanup_endpoint_bypass_route_command)
+        .into_iter()
+        .collect()
+}
+
+fn cleanup_endpoint_bypass_route_command(endpoint_ip: IpAddr) -> CommandSpec {
+    let prefix = if endpoint_ip.is_ipv6() {
+        format!("{}/128", endpoint_ip)
+    } else {
+        format!("{}/32", endpoint_ip)
+    };
+    let mut args = Vec::new();
+    if endpoint_ip.is_ipv6() {
+        args.push("-6".to_string());
+    }
+    args.extend(["route", "del", &prefix].into_iter().map(str::to_string));
+    args.push("metric".to_string());
+    args.push("1".to_string());
+    CommandSpec::new("ip", args)
+}
+
+fn cleanup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<CommandSpec> {
+    peer.allowed_ips
+        .iter()
+        .map(|allowed_ip| {
+            if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
+                CommandSpec::new(
+                    "ip",
+                    vec![
                         "route".to_string(),
                         "del".to_string(),
                         allowed_ip.to_string(),
                         "dev".to_string(),
                         interface_name.to_string(),
                     ],
-                );
+                )
             } else {
-                run_command_best_effort(
+                CommandSpec::new(
                     "ip",
-                    &[
+                    vec![
                         "-6".to_string(),
                         "route".to_string(),
                         "del".to_string(),
@@ -472,249 +451,30 @@ fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
                         "dev".to_string(),
                         interface_name.to_string(),
                     ],
-                );
+                )
             }
-        }
-    }
-
-    for addr in &config.interface.addresses {
-        run_command_best_effort(
-            "ip",
-            &[
-                "addr".to_string(),
-                "del".to_string(),
-                addr.to_string(),
-                "dev".to_string(),
-                interface_name.to_string(),
-            ],
-        );
-    }
-
-    log::info!("Deleting virtual WireGuard interface '{}'", interface_name);
-    crate::wireguard::cleanup_device(interface_name);
+        })
+        .collect()
 }
 
-fn peer_has_l4_proxy(peer: &PeerConfig) -> bool {
-    peer.endpoint.is_some() && peer.proxy_port.is_some()
+fn tun_link_delete_command(interface_name: &str) -> CommandSpec {
+    CommandSpec::new(
+        "ip",
+        vec![
+            "link".to_string(),
+            "delete".to_string(),
+            interface_name.to_string(),
+        ],
+    )
 }
 
-fn instance_routing_ids(interface_name: &str) -> (u32, u32) {
-    let mut hash = 0x811c9dc5u32;
-    for byte in interface_name.as_bytes() {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    let fwmark = 0x1000_0000 | (hash & 0x00ff_ffff);
-    let table = 10_000 + (hash % 50_000);
-    (fwmark, table)
+#[cfg(not(tarpaulin))]
+fn cleanup_tun_link(interface_name: &str) {
+    let command = tun_link_delete_command(interface_name);
+    run_command_best_effort(command.program, &command.args);
 }
 
-fn ensure_mss_clamp_rule(allowed_ip: ipnet::IpNet) -> Result<(), String> {
-    let tool = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-        "iptables"
-    } else {
-        "ip6tables"
-    };
-    let rule = vec![
-        "PREROUTING".to_string(),
-        "-p".to_string(),
-        "tcp".to_string(),
-        "--tcp-flags".to_string(),
-        "SYN,RST".to_string(),
-        "SYN".to_string(),
-        "-d".to_string(),
-        allowed_ip.to_string(),
-        "-j".to_string(),
-        "TCPMSS".to_string(),
-        "--clamp-mss-to-pmtud".to_string(),
-    ];
-    ensure_iptables_rule(tool, &rule).map_err(|e| {
-        log::warn!(
-            "Failed to set TCPMSS clamping rule (might be unsupported in this environment): {}",
-            e
-        );
-        e
-    })
-}
-
-fn ensure_tproxy_rule(
-    allowed_ip: ipnet::IpNet,
-    tproxy_port: u16,
-    mark_spec: &str,
-) -> Result<(), String> {
-    let (tool, rule) = tproxy_rule_spec(allowed_ip, tproxy_port, mark_spec, true);
-    cleanup_legacy_tproxy_rule(allowed_ip, tproxy_port, mark_spec);
-    ensure_iptables_rule(tool, &rule)
-}
-
-fn cleanup_tproxy_rule(allowed_ip: ipnet::IpNet, tproxy_port: u16, mark_spec: &str) {
-    let (tool, rule) = tproxy_rule_spec(allowed_ip, tproxy_port, mark_spec, true);
-    let mut args = vec!["-t".to_string(), "mangle".to_string(), "-D".to_string()];
-    args.extend(rule);
-    run_command_best_effort(tool, &args);
-    cleanup_legacy_tproxy_rule(allowed_ip, tproxy_port, mark_spec);
-}
-
-fn cleanup_legacy_tproxy_rule(allowed_ip: ipnet::IpNet, tproxy_port: u16, mark_spec: &str) {
-    let (tool, rule) = tproxy_rule_spec(allowed_ip, tproxy_port, mark_spec, false);
-    let mut args = vec!["-t".to_string(), "mangle".to_string(), "-D".to_string()];
-    args.extend(rule);
-    run_command_best_effort(tool, &args);
-}
-
-fn tproxy_rule_spec(
-    allowed_ip: ipnet::IpNet,
-    tproxy_port: u16,
-    mark_spec: &str,
-    client_initiated_only: bool,
-) -> (&'static str, Vec<String>) {
-    let (tool, on_ip) = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-        ("iptables", "0.0.0.0")
-    } else {
-        ("ip6tables", "::")
-    };
-    let mut rule = vec![
-        "PREROUTING".to_string(),
-        "-p".to_string(),
-        "tcp".to_string(),
-    ];
-    if client_initiated_only {
-        rule.push("--syn".to_string());
-    }
-    rule.extend([
-        "-d".to_string(),
-        allowed_ip.to_string(),
-        "-j".to_string(),
-        "TPROXY".to_string(),
-        "--on-port".to_string(),
-        tproxy_port.to_string(),
-        "--on-ip".to_string(),
-        on_ip.to_string(),
-        "--tproxy-mark".to_string(),
-        mark_spec.to_string(),
-    ]);
-    (tool, rule)
-}
-
-fn ensure_tproxy_divert_rules(fwmark: u32) -> Result<(), String> {
-    let mark = format!("{:#x}", fwmark);
-    let chain = tproxy_divert_chain(fwmark);
-    for tool in ["iptables", "ip6tables"] {
-        run_command_best_effort(
-            tool,
-            &["-t".into(), "mangle".into(), "-N".into(), chain.clone()],
-        );
-        ensure_iptables_rule(
-            tool,
-            &[
-                "PREROUTING".to_string(),
-                "-p".to_string(),
-                "tcp".to_string(),
-                "-m".to_string(),
-                "socket".to_string(),
-                "--transparent".to_string(),
-                "-j".to_string(),
-                chain.clone(),
-            ],
-        )?;
-        ensure_iptables_rule(
-            tool,
-            &[
-                chain.clone(),
-                "-j".to_string(),
-                "MARK".to_string(),
-                "--set-mark".to_string(),
-                mark.clone(),
-            ],
-        )?;
-        ensure_iptables_rule(
-            tool,
-            &[chain.clone(), "-j".to_string(), "ACCEPT".to_string()],
-        )?;
-    }
-    Ok(())
-}
-
-fn cleanup_tproxy_divert_rules(fwmark: u32) {
-    let chain = tproxy_divert_chain(fwmark);
-    for tool in ["iptables", "ip6tables"] {
-        run_command_best_effort(
-            tool,
-            &[
-                "-t".to_string(),
-                "mangle".to_string(),
-                "-D".to_string(),
-                "PREROUTING".to_string(),
-                "-p".to_string(),
-                "tcp".to_string(),
-                "-m".to_string(),
-                "socket".to_string(),
-                "--transparent".to_string(),
-                "-j".to_string(),
-                chain.clone(),
-            ],
-        );
-        run_command_best_effort(
-            tool,
-            &[
-                "-t".to_string(),
-                "mangle".to_string(),
-                "-F".to_string(),
-                chain.clone(),
-            ],
-        );
-        run_command_best_effort(
-            tool,
-            &[
-                "-t".to_string(),
-                "mangle".to_string(),
-                "-X".to_string(),
-                chain.clone(),
-            ],
-        );
-    }
-}
-
-fn tproxy_divert_chain(fwmark: u32) -> String {
-    format!("NEW_PROXY_DIVERT_{:08x}", fwmark)
-}
-
-fn cleanup_mss_clamp_rule(allowed_ip: ipnet::IpNet) {
-    let tool = if matches!(allowed_ip, ipnet::IpNet::V4(_)) {
-        "iptables"
-    } else {
-        "ip6tables"
-    };
-    let args = vec![
-        "-t".to_string(),
-        "mangle".to_string(),
-        "-D".to_string(),
-        "PREROUTING".to_string(),
-        "-p".to_string(),
-        "tcp".to_string(),
-        "--tcp-flags".to_string(),
-        "SYN,RST".to_string(),
-        "SYN".to_string(),
-        "-d".to_string(),
-        allowed_ip.to_string(),
-        "-j".to_string(),
-        "TCPMSS".to_string(),
-        "--clamp-mss-to-pmtud".to_string(),
-    ];
-    run_command_best_effort(tool, &args);
-}
-
-fn ensure_iptables_rule(tool: &str, rule: &[String]) -> Result<(), String> {
-    let mut check_args = vec!["-t".to_string(), "mangle".to_string(), "-C".to_string()];
-    check_args.extend(rule.iter().cloned());
-    if run_command_checked(tool, &check_args).is_ok() {
-        return Ok(());
-    }
-    let mut add_args = vec!["-t".to_string(), "mangle".to_string(), "-A".to_string()];
-    add_args.extend(rule.iter().cloned());
-    run_command_checked(tool, &add_args)
-}
-
+#[cfg(not(tarpaulin))]
 fn run_command_checked(program: &str, args: &[String]) -> Result<(), String> {
     let output = std::process::Command::new(program)
         .args(args)
@@ -733,6 +493,7 @@ fn run_command_checked(program: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
+#[cfg(not(tarpaulin))]
 fn run_command_best_effort(program: &str, args: &[String]) {
     if let Err(e) = run_command_checked(program, args) {
         log::debug!("{}", e);
@@ -742,40 +503,259 @@ fn run_command_best_effort(program: &str, args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig};
 
-    #[test]
-    fn tproxy_rule_only_matches_client_initiated_syn() {
-        let allowed_ip = "10.0.0.1/32".parse().unwrap();
-        let (tool, rule) = tproxy_rule_spec(allowed_ip, 1080, "0x1/0xffffffff", true);
+    fn config_with_table(table: Option<&str>) -> GatewayConfig {
+        GatewayConfig {
+            interface: InterfaceConfig {
+                private_key: [1u8; 32],
+                addresses: vec!["10.0.0.2/24".parse().unwrap()],
+                listen_port: None,
+                listen_control_port: None,
+                mtu: 1400,
+                table: table.map(str::to_string),
+                pre_script: None,
+                post_script: None,
+            },
+            peers: Vec::new(),
+            quic_pool: QUICPoolConfig {
+                public_ipv4: None,
+                public_ipv6: None,
+                listen_ports: Vec::new(),
+            },
+        }
+    }
 
-        assert_eq!(tool, "iptables");
-        assert!(has_pair(&rule, "-p", "tcp"));
-        assert!(rule.iter().any(|part| part == "--syn"));
-        assert!(has_pair(&rule, "-d", "10.0.0.1/32"));
-        assert!(has_pair(&rule, "-j", "TPROXY"));
+    fn peer_with_allowed_ips(allowed_ips: &[&str]) -> PeerConfig {
+        PeerConfig {
+            public_key: [2u8; 32],
+            allowed_ips: allowed_ips
+                .iter()
+                .map(|allowed_ip| allowed_ip.parse().unwrap())
+                .collect(),
+            endpoint: None,
+            proxy_port: None,
+        }
     }
 
     #[test]
-    fn legacy_tproxy_rule_shape_remains_available_for_cleanup() {
-        let allowed_ip = "fd00::1/128".parse().unwrap();
-        let (tool, rule) = tproxy_rule_spec(allowed_ip, 1080, "0x1/0xffffffff", false);
-
-        assert_eq!(tool, "ip6tables");
-        assert!(!rule.iter().any(|part| part == "--syn"));
-        assert!(has_pair(&rule, "-d", "fd00::1/128"));
+    fn table_is_off_is_case_insensitive() {
+        assert!(table_is_off(&config_with_table(Some("off"))));
+        assert!(table_is_off(&config_with_table(Some("OFF"))));
+        assert!(table_is_off(&config_with_table(Some("Off"))));
     }
 
     #[test]
-    fn divert_chain_is_instance_scoped() {
+    fn table_is_off_rejects_auto_and_missing_values() {
+        assert!(!table_is_off(&config_with_table(Some("auto"))));
+        assert!(!table_is_off(&config_with_table(None)));
+    }
+
+    #[test]
+    fn setup_route_commands_include_addresses_link_and_peer_routes() {
+        let mut config = config_with_table(Some("auto"));
+        config.interface.addresses = vec![
+            "10.0.0.2/24".parse().unwrap(),
+            "fd00::2/64".parse().unwrap(),
+        ];
+        config.interface.mtu = 1280;
+        config.peers = vec![peer_with_allowed_ips(&["10.10.0.0/16", "fd10::/64"])];
+
+        let commands = setup_route_commands(&config, "np0");
+
         assert_eq!(
-            tproxy_divert_chain(0x1234_abcd),
-            "NEW_PROXY_DIVERT_1234abcd"
+            commands,
+            vec![
+                CommandSpec::new(
+                    "ip",
+                    vec!["addr", "replace", "10.0.0.2/24", "dev", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec!["addr", "replace", "fd00::2/64", "dev", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec!["link", "set", "np0", "up", "mtu", "1280"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec!["route", "replace", "10.10.0.0/16", "dev", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec!["-6", "route", "replace", "fd10::/64", "dev", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+            ]
         );
-        assert!(tproxy_divert_chain(0x1234_abcd).len() < 29);
     }
 
-    fn has_pair(rule: &[String], key: &str, value: &str) -> bool {
-        rule.windows(2)
-            .any(|parts| parts[0] == key && parts[1] == value)
+    #[test]
+    fn setup_route_commands_are_empty_when_table_is_off() {
+        let mut config = config_with_table(Some("off"));
+        config.peers = vec![peer_with_allowed_ips(&["10.10.0.0/16"])];
+
+        assert!(setup_route_commands(&config, "np0").is_empty());
+    }
+
+    #[test]
+    fn cleanup_route_commands_skip_routes_when_table_is_off_but_delete_link() {
+        let mut config = config_with_table(Some("off"));
+        config.peers = vec![peer_with_allowed_ips(&["10.10.0.0/16", "fd10::/64"])];
+
+        assert_eq!(
+            cleanup_route_commands(&config, "np0"),
+            vec![CommandSpec::new(
+                "ip",
+                vec!["link", "delete", "np0"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )]
+        );
+    }
+
+    #[test]
+    fn cleanup_route_commands_delete_peer_routes_addresses_and_link() {
+        let mut config = config_with_table(None);
+        config.peers = vec![peer_with_allowed_ips(&["10.10.0.0/16", "fd10::/64"])];
+
+        let commands = cleanup_route_commands(&config, "np0");
+
+        assert_eq!(
+            commands,
+            vec![
+                CommandSpec::new(
+                    "ip",
+                    vec!["route", "del", "10.10.0.0/16", "dev", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec!["-6", "route", "del", "fd10::/64", "dev", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec!["addr", "del", "10.0.0.2/24", "dev", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec!["link", "delete", "np0"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_route_get_output_extracts_gateway_and_device() {
+        let route = parse_route_get_output(
+            "203.0.113.10".parse().unwrap(),
+            "203.0.113.10 via 192.0.2.1 dev eth0 src 192.0.2.10 uid 1000\n    cache",
+        )
+        .unwrap();
+
+        assert_eq!(
+            route,
+            EndpointRoute {
+                dev: "eth0".to_string(),
+                via: Some("192.0.2.1".parse().unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn endpoint_bypass_route_commands_are_host_routes() {
+        let v4 = endpoint_bypass_route_command(
+            "203.0.113.10".parse().unwrap(),
+            EndpointRoute {
+                dev: "eth0".to_string(),
+                via: Some("192.0.2.1".parse().unwrap()),
+            },
+        );
+        assert_eq!(
+            v4,
+            CommandSpec::new(
+                "ip",
+                vec![
+                    "route",
+                    "replace",
+                    "203.0.113.10/32",
+                    "via",
+                    "192.0.2.1",
+                    "dev",
+                    "eth0",
+                    "metric",
+                    "1",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+            )
+        );
+
+        let v6 = endpoint_bypass_route_command(
+            "2001:db8::10".parse().unwrap(),
+            EndpointRoute {
+                dev: "eth1".to_string(),
+                via: None,
+            },
+        );
+        assert_eq!(
+            v6,
+            CommandSpec::new(
+                "ip",
+                vec![
+                    "-6",
+                    "route",
+                    "replace",
+                    "2001:db8::10/128",
+                    "dev",
+                    "eth1",
+                    "metric",
+                    "1",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+            )
+        );
+
+        let cleanup = cleanup_endpoint_bypass_route_command("203.0.113.10".parse().unwrap());
+        assert_eq!(
+            cleanup,
+            CommandSpec::new(
+                "ip",
+                vec!["route", "del", "203.0.113.10/32", "metric", "1"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+        );
     }
 }

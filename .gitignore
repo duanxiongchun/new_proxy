@@ -2,6 +2,8 @@
 *.log
 __pycache__/
 *.py[cod]
+/cobertura.xml
+/lcov.info
 /conf/server_11024.conf
 /conf/client.conf.production
 /conf/pre.sh

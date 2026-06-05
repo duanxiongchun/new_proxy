@@ -39,6 +39,12 @@ trap cleanup EXIT
 
 cleanup
 
+mkdir -p /dev/net
+if [ ! -e /dev/net/tun ]; then
+  mknod /dev/net/tun c 10 200
+fi
+chmod 666 /dev/net/tun
+
 cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
@@ -60,9 +66,8 @@ cat > "$ARTIFACT_DIR/client_perf.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-TProxyPort = 1080
 MTU = 1400
-Table = off
+Table = auto
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
@@ -118,19 +123,25 @@ ip netns exec perf_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec perf_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec perf_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 
-ip netns exec perf_client_ns ip rule add fwmark 1 lookup 100
-ip netns exec perf_client_ns ip route add local 0.0.0.0/0 dev lo table 100
-ip netns exec perf_client_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
-
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count=8 status=none
 ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
 ip netns exec perf_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "Server daemon exited early"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
 ip netns exec perf_client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
+if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+  echo "Client daemon exited early"
+  cat "$ARTIFACT_DIR/client.log"
+  exit 1
+fi
 
 python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
 import json
@@ -141,7 +152,7 @@ json.dump({"started_at": int(time.time())}, open(path, "w", encoding="utf-8"))
 PY
 
 echo "=== TTFB sample ==="
-ip netns exec perf_work_ns python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
+if ! ip netns exec perf_work_ns python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
 import json
 import subprocess
 import sys
@@ -165,9 +176,15 @@ data["ttfb_seconds"] = {
 json.dump(data, open(out, "w", encoding="utf-8"), indent=2, sort_keys=True)
 print(json.dumps(data["ttfb_seconds"], sort_keys=True))
 PY
+then
+  echo "TTFB sample failed"
+  cat "$ARTIFACT_DIR/client.log"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
 
 echo "=== Throughput sample ==="
-ip netns exec perf_work_ns python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
+if ! ip netns exec perf_work_ns python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
 import json
 import subprocess
 import sys
@@ -186,8 +203,18 @@ data["throughput_mib_s"] = size / elapsed / 1024 / 1024
 json.dump(data, open(out, "w", encoding="utf-8"), indent=2, sort_keys=True)
 print(json.dumps({"throughput_mib_s": data["throughput_mib_s"]}, sort_keys=True))
 PY
+then
+  echo "Throughput sample failed"
+  cat "$ARTIFACT_DIR/client.log"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
 
-ip netns exec perf_server_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface server show > "$ARTIFACT_DIR/server_show.txt"
+if ! ip netns exec perf_server_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface server show > "$ARTIFACT_DIR/server_show.txt"; then
+  echo "Failed to query server telemetry"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
 
 echo "Artifact directory: $ARTIFACT_DIR"
 cat "$ARTIFACT_DIR/perf_smoke.json"

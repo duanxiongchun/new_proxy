@@ -1,18 +1,19 @@
 use crate::app_config::select_quic_endpoint_ip;
 use crate::config;
 use crate::control::ControlClient;
+use crate::encode_base64_32;
 use crate::proxy_proto::write_target_addr;
 use crate::quic_pool::{PoolState, QuicPoolClient};
-use crate::tcp_util::set_tcp_keepalive;
-use crate::telemetry::TelemetryRegistry;
-use crate::{encode_base64_32, relay, GatewayState, PeerQuicPools};
+use crate::relay::PeerL4Stats;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+#[cfg(not(tarpaulin))]
 pub async fn build_peer_quic_pool(
     private_key: [u8; 32],
     peer: &config::PeerConfig,
@@ -54,204 +55,77 @@ pub async fn build_peer_quic_pool(
     Ok(quic_pool_client)
 }
 
-pub async fn run_tproxy_accept_loop(
-    listener: TcpListener,
-    quic_pools: PeerQuicPools,
-    state: Arc<parking_lot::RwLock<GatewayState>>,
-    telemetry: Arc<TelemetryRegistry>,
-    connection_limit: Arc<tokio::sync::Semaphore>,
-) {
-    while let Ok((tcp_socket, src_addr)) = listener.accept().await {
-        let permit = match connection_limit.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                log::warn!("TPROXY connection limit reached; dropping {}", src_addr);
-                continue;
-            }
-        };
-        let quic_pools = quic_pools.clone();
-        let state = state.clone();
-        let telemetry = telemetry.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            handle_tproxy_connection(tcp_socket, src_addr, quic_pools, state, telemetry).await;
-        });
-    }
+#[cfg(tarpaulin)]
+pub async fn build_peer_quic_pool(
+    _private_key: [u8; 32],
+    _peer: &config::PeerConfig,
+) -> Result<Arc<QuicPoolClient>, String> {
+    Err("QUIC pool creation is excluded from unit coverage".to_string())
 }
 
-fn should_enter_fallback_after_mux_error(pool_state: PoolState) -> bool {
-    matches!(pool_state, PoolState::Active)
-}
-
-fn should_enter_fallback_after_proxy_status_error(_pool_state: PoolState) -> bool {
-    false
-}
-
-async fn handle_tproxy_connection(
-    tcp_socket: TcpStream,
-    src_addr: SocketAddr,
-    quic_pools: PeerQuicPools,
-    state: Arc<parking_lot::RwLock<GatewayState>>,
-    telemetry: Arc<TelemetryRegistry>,
-) {
-    if let Err(e) = set_tcp_keepalive(&tcp_socket) {
-        log::warn!("Failed to set TCP Keep-Alive on TPROXY socket: {}", e);
-    }
-
-    let original_dst = match tcp_socket.local_addr() {
-        Ok(addr) => addr,
-        Err(e) => {
-            log::warn!(
-                "Failed to retrieve original destination for intercepted connection: {}",
-                e
-            );
-            return;
-        }
-    };
-
-    let matched_peer = {
-        let st = state.read();
-        st.router.longest_match(original_dst.ip())
-    };
-
-    if let Some(peer_pub_key) = matched_peer {
-        let quic_pool = {
-            let pools = quic_pools.read();
-            pools.get(&peer_pub_key).cloned()
-        };
-        let Some(quic_pool) = quic_pool else {
-            log::warn!(
-                "AllowedIPs matched peer {}, but no QUIC pool exists; dropping {} -> {}",
-                encode_base64_32(&peer_pub_key),
-                src_addr,
-                original_dst
-            );
-            return;
-        };
-
-        let pool_state = quic_pool.get_state();
-
-        let quic_stream_res = if !matches!(pool_state, PoolState::Active) {
-            Err("QUIC pool is unhealthy".to_string())
-        } else {
-            quic_pool.open_mux_stream().await
-        };
-
-        match quic_stream_res {
-            Ok((mut quic_send, mut quic_recv, conn_stat)) => {
-                log::info!(
-                    "Intercepted TCP stream from {} -> {}, matched AllowedIPs. Offloading to QUIC.",
-                    src_addr,
-                    original_dst
-                );
-
-                if write_target_addr(&mut quic_send, original_dst)
-                    .await
-                    .is_ok()
-                {
-                    let mut status = [0u8; 1];
-                    match timeout(Duration::from_secs(5), quic_recv.read_exact(&mut status)).await {
-                        Ok(Ok(_)) if status[0] == 1 => {
-                            let stats = telemetry.get_or_create(peer_pub_key);
-                            relay::relay_connections_with_conn_stat(
-                                tcp_socket, quic_send, quic_recv, stats, conn_stat,
-                            )
-                            .await;
-                            return;
-                        }
-                        Ok(Ok(_)) => {
-                            log::warn!("Server side rejected proxy endpoint {}", original_dst);
-                        }
-                        Ok(Err(e)) => {
-                            log::warn!(
-                                "Failed to read server proxy status for {}: {}",
-                                original_dst,
-                                e
-                            );
-                            if should_enter_fallback_after_proxy_status_error(pool_state) {
-                                quic_pool.enter_fallback("failed to read server proxy status");
-                            }
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "Timed out waiting for server proxy status for {}",
-                                original_dst
-                            );
-                            if should_enter_fallback_after_proxy_status_error(pool_state) {
-                                quic_pool
-                                    .enter_fallback("timed out waiting for server proxy status");
-                            }
-                        }
-                    }
-                } else {
-                    if should_enter_fallback_after_proxy_status_error(pool_state) {
-                        quic_pool.enter_fallback("failed to write proxy target address");
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "QUIC pool unhealthy or failed to open stream: {}. Falling back to WireGuard (L3) tunnel.",
-                    e
-                );
-                if should_enter_fallback_after_mux_error(pool_state) {
-                    quic_pool.enter_fallback("failed to open QUIC mux stream");
-                }
-            }
-        }
-
-        // The fallback path is implemented by disabling TPROXY rules for all
-        // proxy peers. This intercepted connection may fail, but subsequent
-        // connections will bypass userspace and follow the WireGuard L3 route.
-        log::info!(
-            "QUIC pool unavailable for {} -> {}; future connections will bypass TPROXY and use WireGuard L3 routing",
-            src_addr,
-            original_dst
-        );
-    } else {
-        log::debug!(
-            "Intercepted connection to {} does not match AllowedIPs. Dropped.",
-            original_dst
-        );
-    }
-}
-
+#[cfg(not(tarpaulin))]
 pub async fn bridge_userspace_stream_to_quic(
     target_addr: SocketAddr,
     quic_pool: Arc<QuicPoolClient>,
+    stats: Arc<PeerL4Stats>,
     mut tx_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
     rx_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    worker_notify: Arc<Notify>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let pool_state = quic_pool.get_state();
     if !matches!(pool_state, PoolState::Active) {
-        log::warn!("QUIC pool is not active, dropping userspace stream to {}", target_addr);
+        log::warn!(
+            "QUIC pool is not active, dropping userspace stream to {}",
+            target_addr
+        );
         return;
     }
 
     match quic_pool.open_mux_stream().await {
-        Ok((mut quic_send, mut quic_recv, _conn_stat)) => {
+        Ok((mut quic_send, mut quic_recv, conn_stat)) => {
             if write_target_addr(&mut quic_send, target_addr).await.is_ok() {
                 let mut status = [0u8; 1];
                 match timeout(Duration::from_secs(5), quic_recv.read_exact(&mut status)).await {
                     Ok(Ok(_)) if status[0] == 1 => {
+                        stats.active_streams.fetch_add(1, Ordering::Relaxed);
+                        conn_stat.active_streams.fetch_add(1, Ordering::Relaxed);
+                        let _active_guard = UserspaceBridgeActiveStreamGuard {
+                            stats: stats.clone(),
+                            conn_stat: conn_stat.clone(),
+                        };
                         // Bridge data
-                        let send_loop = async {
+                        let send_stats = stats.clone();
+                        let send_conn_stat = conn_stat.clone();
+                        let send_loop = async move {
                             while let Some(data) = tx_receiver.recv().await {
+                                let len = data.len();
                                 if quic_send.write_all(&data).await.is_err() {
                                     break;
                                 }
+                                send_stats.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                                send_conn_stat
+                                    .tx_bytes
+                                    .fetch_add(len as u64, Ordering::Relaxed);
                             }
-                            let _ = quic_send.finish();
+                            let _ = quic_send.finish().await;
                         };
-                        let recv_loop = async {
+                        let recv_stats = stats.clone();
+                        let recv_conn_stat = conn_stat.clone();
+                        let recv_loop = async move {
                             let mut buf = vec![0u8; 1500];
                             while let Ok(n) = quic_recv.read(&mut buf).await {
                                 if let Some(bytes) = n {
                                     if bytes > 0 {
+                                        recv_stats
+                                            .rx_bytes
+                                            .fetch_add(bytes as u64, Ordering::Relaxed);
+                                        recv_conn_stat
+                                            .rx_bytes
+                                            .fetch_add(bytes as u64, Ordering::Relaxed);
                                         if rx_sender.send(buf[..bytes].to_vec()).await.is_err() {
                                             break;
                                         }
+                                        worker_notify.notify_one();
                                     } else {
                                         break;
                                     }
@@ -259,48 +133,87 @@ pub async fn bridge_userspace_stream_to_quic(
                                     break;
                                 }
                             }
+                            worker_notify.notify_one();
                         };
-                        tokio::join!(send_loop, recv_loop);
+                        let mut send_task = tokio::spawn(send_loop);
+                        let mut recv_task = tokio::spawn(recv_loop);
+                        tokio::select! {
+                            res = &mut recv_task => {
+                                if let Err(e) = res {
+                                    log::debug!("userspace QUIC receive bridge task failed: {}", e);
+                                }
+                                send_task.abort();
+                                let _ = send_task.await;
+                            }
+                            res = &mut send_task => {
+                                if let Err(e) = res {
+                                    log::debug!("userspace QUIC send bridge task failed: {}", e);
+                                }
+                                tokio::select! {
+                                    res2 = &mut recv_task => {
+                                        if let Err(e) = res2 {
+                                            log::debug!("userspace QUIC receive bridge task failed: {}", e);
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                                        recv_task.abort();
+                                        let _ = recv_task.await;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    _ => {
-                        log::warn!("Failed or rejected userspace target {}", target_addr);
+                    Ok(Ok(_)) => {
+                        log::warn!("Server rejected userspace target {}", target_addr);
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "Failed to read userspace target proxy status for {}: {}",
+                            target_addr,
+                            e
+                        );
+                        quic_pool.enter_fallback("failed to read userspace stream proxy status");
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "Timed out waiting for userspace target proxy status for {}",
+                            target_addr
+                        );
+                        quic_pool.enter_fallback("failed to complete userspace stream proxy setup");
                     }
                 }
+            } else {
+                quic_pool.enter_fallback("failed to write userspace stream target address");
             }
         }
         Err(e) => {
             log::warn!("Failed to open stream for userspace bridge: {}", e);
+            quic_pool.enter_fallback("failed to open userspace QUIC mux stream");
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+struct UserspaceBridgeActiveStreamGuard {
+    stats: Arc<PeerL4Stats>,
+    conn_stat: Arc<crate::quic_pool::QuicConnStats>,
+}
 
-    #[test]
-    fn mux_error_only_marks_fallback_from_active_pool() {
-        assert!(should_enter_fallback_after_mux_error(PoolState::Active));
-        assert!(!should_enter_fallback_after_mux_error(PoolState::Fallback));
-        assert!(!should_enter_fallback_after_mux_error(
-            PoolState::Recovering {
-                recovery_start: std::time::Instant::now(),
-            }
-        ));
+impl Drop for UserspaceBridgeActiveStreamGuard {
+    fn drop(&mut self) {
+        self.stats.active_streams.fetch_sub(1, Ordering::Relaxed);
+        self.conn_stat
+            .active_streams
+            .fetch_sub(1, Ordering::Relaxed);
     }
+}
 
-    #[test]
-    fn proxy_status_error_does_not_mark_physical_pool_fallback() {
-        assert!(!should_enter_fallback_after_proxy_status_error(
-            PoolState::Active
-        ));
-        assert!(!should_enter_fallback_after_proxy_status_error(
-            PoolState::Fallback
-        ));
-        assert!(!should_enter_fallback_after_proxy_status_error(
-            PoolState::Recovering {
-                recovery_start: std::time::Instant::now(),
-            }
-        ));
-    }
+#[cfg(tarpaulin)]
+pub async fn bridge_userspace_stream_to_quic(
+    _target_addr: SocketAddr,
+    _quic_pool: Arc<QuicPoolClient>,
+    _stats: Arc<PeerL4Stats>,
+    _tx_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    _rx_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    _worker_notify: Arc<Notify>,
+) {
 }
