@@ -139,6 +139,8 @@ def main():
     available_cvs = [cv for cv in cv_by_peer.values() if cv is not None]
     no_crash_pass = not crashes
     short_pass = short_fail == 0 and short_ok > 0
+    udp_pass = udp_fail == 0 and udp_ok > 0
+    ping_pass = ping_fail == 0 and ping_ok > 0
     long_pass = (
         long_errors == 0
         and long_stats.get("iterations", 0) > 0
@@ -149,7 +151,7 @@ def main():
         rss_pass(rss, max_rss_growth_pct, max_rss_growth_mib)
         for rss in (client_rss, client2_rss, server_rss)
     )
-    hard_pass = all([no_crash_pass, short_pass, long_pass, cv_pass]) and (
+    hard_pass = all([no_crash_pass, short_pass, udp_pass, ping_pass, long_pass, cv_pass]) and (
         mem_pass or not enforce_rss
     )
 
@@ -196,6 +198,8 @@ def main():
         f.write("\n## Pass Criteria\n\n")
         f.write(f"- No proxy crash: {'PASS' if no_crash_pass else 'FAIL'}\n")
         f.write(f"- Short curl success: {'PASS' if short_pass else 'FAIL'}\n")
+        f.write(f"- UDP success: {'PASS' if udp_pass else 'FAIL'}\n")
+        f.write(f"- Ping success: {'PASS' if ping_pass else 'FAIL'}\n")
         f.write(f"- Long TCP success: {'PASS' if long_pass else 'FAIL'}\n")
         f.write(f"- Per-peer QUIC CV < 5%: {'PASS' if cv_pass else 'FAIL'}\n")
         rss_status = "PASS" if mem_pass else ("FAIL" if enforce_rss else "WARN")

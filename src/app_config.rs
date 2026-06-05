@@ -498,6 +498,7 @@ mod tests {
                 rx_bytes: 1,
                 tx_bytes: 2,
                 last_handshake: 0,
+                unknown_handshake_drops: 0,
             },
         );
         l3_stats.insert(
@@ -508,6 +509,7 @@ mod tests {
                 rx_bytes: 3,
                 tx_bytes: 4,
                 last_handshake: 0,
+                unknown_handshake_drops: 0,
             },
         );
 

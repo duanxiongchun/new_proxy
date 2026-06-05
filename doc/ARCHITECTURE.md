@@ -149,7 +149,7 @@ graph TD
 2. 将 TUN 接口的 MTU 设为配置值（默认 `1420`），并启用网卡（`ip link set dev <interface> up`）。
 3. 针对每个 peer 声明的 `AllowedIPs`，自动添加指向该 TUN 设备的系统路由规则（`ip route replace <allowed_ip> dev <interface>`）。
 
-为避免 full-tunnel `AllowedIPs = 0.0.0.0/0` 或 `::/0` 递归捕获 QUIC 外层 endpoint，程序在安装 TUN 路由前先缓存物理默认路由，并为 peer endpoint 安装更高优先级的 host bypass route。运行期动态 `AddPeer` 若发现当前 endpoint route 已指向 TUN，或因 full-tunnel route replacement 导致 route discovery 失败，会回退使用启动时缓存的物理默认路由安装 endpoint bypass route。
+为避免 full-tunnel `AllowedIPs = 0.0.0.0/0` 或 `::/0` 递归捕获 QUIC 外层 endpoint，程序在安装 TUN 路由前先缓存每个已配置 endpoint 的物理路由和物理默认路由，并为 peer endpoint 安装更高优先级的 host bypass route。运行期动态 `AddPeer` 若发现当前 endpoint route 已指向 TUN，或因 full-tunnel route replacement 导致 route discovery 失败，会优先使用启动时缓存的 endpoint-specific 物理路由安装 bypass；缺失 endpoint-specific baseline 时才回退到同地址族默认路由。
 
 ## 8. 遥测与 API
 
@@ -167,5 +167,5 @@ UDS 路径：`/run/new_proxy/<interface>.sock`
 - **服务端 L3 也在用户态**，不再依赖内核 WireGuard 模块；QUIC 接收池仍直接绑定宿主机 UDP 端口。
 - 动态 peer 管理（`AddPeer` / `RemovePeer`）在客户端会动态调整 `RtcWorker` 拥有的 AllowedIPs 路由与套接字映射关系。
 - userspace WireGuard registry 按 peer 维护共享的 `boringtun` 状态，并通过 AllowedIPs 路由选择出站 peer；入站数据优先使用 receiver index 与 endpoint 索引定位 peer，未知握手包才退回逐 peer 尝试。
-- 为避免未知来源 WireGuard 握手包在多 peer 场景下触发无界 O(N) 扫描，未知 endpoint 的握手/控制类入站包会经过轻量 per-IP token bucket 限速；已建立 receiver index 或已知 endpoint 的数据包不走该限速路径。
+- 为避免未知来源 WireGuard 握手包在多 peer 场景下触发无界 O(N) 扫描，未知 endpoint 的握手/控制类入站包会经过轻量 per-IP token bucket 限速；已建立 receiver index 或已知 endpoint 的数据包不走该限速路径。成功解开的 unknown handshake 不消耗 token，无法解开的 unknown 包才消耗 token；可通过 `NEW_PROXY_UNKNOWN_HANDSHAKE_BURST` 和 `NEW_PROXY_UNKNOWN_HANDSHAKE_REFILL_PER_SEC` 调整阈值，drop 计数会暴露在 UDS telemetry 中。
 - 当前 client/server 启动路径不创建 transparent listener，也不下发 TPROXY iptables 规则。

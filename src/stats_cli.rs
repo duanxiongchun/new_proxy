@@ -125,6 +125,7 @@ mod tests {
             endpoint: Some("1.2.3.4:51820".to_string()),
             l3_rx_bytes: 1024,
             l3_tx_bytes: 2048,
+            l3_unknown_handshake_drops: 0,
             last_handshake,
             l4_rx_bytes: 3 * 1024 * 1024,
             l4_tx_bytes: 4 * 1024 * 1024,

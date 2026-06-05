@@ -13,6 +13,8 @@ pub struct UnifiedTelemetry {
     pub endpoint: Option<String>,
     pub l3_rx_bytes: u64,
     pub l3_tx_bytes: u64,
+    #[serde(default)]
+    pub l3_unknown_handshake_drops: u64,
     pub last_handshake: u64,
     pub l4_rx_bytes: u64,
     pub l4_tx_bytes: u64,

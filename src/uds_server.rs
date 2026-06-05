@@ -225,6 +225,9 @@ async fn handle_stats(
                 endpoint,
                 l3_rx_bytes: wg_stats.map(|stats| stats.rx_bytes).unwrap_or(0),
                 l3_tx_bytes: wg_stats.map(|stats| stats.tx_bytes).unwrap_or(0),
+                l3_unknown_handshake_drops: wg_stats
+                    .map(|stats| stats.unknown_handshake_drops)
+                    .unwrap_or(0),
                 last_handshake: wg_stats.map(|stats| stats.last_handshake).unwrap_or(0),
                 l4_rx_bytes: l4_rx,
                 l4_tx_bytes: l4_tx,
@@ -262,6 +265,7 @@ async fn handle_stats(
                 endpoint: wg_stats.endpoint.clone(),
                 l3_rx_bytes: wg_stats.rx_bytes,
                 l3_tx_bytes: wg_stats.tx_bytes,
+                l3_unknown_handshake_drops: wg_stats.unknown_handshake_drops,
                 last_handshake: wg_stats.last_handshake,
                 l4_rx_bytes: l4_rx,
                 l4_tx_bytes: l4_tx,
@@ -299,6 +303,7 @@ async fn handle_stats(
                 endpoint: None,
                 l3_rx_bytes: 0,
                 l3_tx_bytes: 0,
+                l3_unknown_handshake_drops: 0,
                 last_handshake: 0,
                 l4_rx_bytes: l4_rx,
                 l4_tx_bytes: l4_tx,
@@ -387,7 +392,7 @@ async fn handle_dump(
                 })
                 .unwrap_or_else(|| "(none)".to_string());
             lines.push(format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}:{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}:{}\tunknown_wg_drops={}",
                 encode_base64_32(&key),
                 endpoint,
                 allowed_ips,
@@ -397,6 +402,7 @@ async fn handle_dump(
                 l4_rx + l4_tx,
                 quic_connections,
                 active_streams,
+                wg.map(|stats| stats.unknown_handshake_drops).unwrap_or(0),
             ));
         }
         lines.sort();
@@ -484,6 +490,15 @@ async fn handle_add_peer(
                 return;
             }
         }
+    }
+
+    let precheck_conflict = {
+        let state = context.state.read();
+        find_allowed_ip_conflict(&state.config.peers, &new_peer)
+    };
+    if let Some(conflict) = precheck_conflict {
+        write_error(stream, framed_response, conflict).await;
+        return;
     }
 
     let prepared_client_pool = if context.runtime_mode == RuntimeMode::Client
@@ -938,6 +953,7 @@ mod tests {
         assert_eq!(stats[0].endpoint.as_deref(), Some("1.2.3.4:51820"));
         assert_eq!(stats[0].l4_rx_bytes, 70);
         assert_eq!(stats[0].l4_tx_bytes, 80);
+        assert_eq!(stats[0].l3_unknown_handshake_drops, 0);
         assert_eq!(stats[0].source, "both");
 
         let _ = fs::remove_file(path);
@@ -1222,6 +1238,42 @@ mod tests {
             .client_quic_pools
             .read()
             .contains_key(&new_key));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_uds_client_add_peer_rejects_conflict_before_quic_pool_setup() {
+        let path = "/tmp/test_real_uds_add_peer_client_conflict.sock";
+        let _ = fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        let mut context = test_context();
+        context.runtime_mode = RuntimeMode::Client;
+        context.state.write().config.interface.table = Some("off".to_string());
+        let context_for_assert = context.clone();
+        start(listener, context);
+
+        let response: ApiResponse = send_raw_command(
+            path,
+            &CommandInput::AddPeer {
+                public_key: encode_base64_32(&[8u8; 32]),
+                allowed_ips: vec!["10.0.0.2/32".to_string()],
+                endpoint: Some("127.0.0.1:9".to_string()),
+                proxy_port: Some(9),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "Error");
+        assert!(response
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Overlapping AllowedIPs"));
+        assert!(!context_for_assert
+            .client_quic_pools
+            .read()
+            .contains_key(&[8u8; 32]));
 
         let _ = fs::remove_file(path);
     }

@@ -106,7 +106,7 @@ ip netns exec ft_client_ns ip addr add 10.20.4.1/24 dev vf-cw
 ip netns exec ft_client_ns ip link set vf-c up
 ip netns exec ft_client_ns ip link set vf-cw up
 ip netns exec ft_client_ns ip link set lo up
-ip netns exec ft_client_ns ip route add default via 10.20.1.1
+ip netns exec ft_client_ns ip route add 10.20.2.2/32 via 10.20.1.1
 ip netns exec ft_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 ip netns exec ft_work_ns ip addr add 10.20.4.2/24 dev vf-w

@@ -1,5 +1,5 @@
 use crate::config::{GatewayConfig, PeerConfig};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
@@ -8,8 +8,25 @@ static BASELINE_ENDPOINT_ROUTES: OnceLock<parking_lot::Mutex<BaselineEndpointRou
 
 #[derive(Default)]
 struct BaselineEndpointRoutes {
+    by_endpoint: HashMap<IpAddr, EndpointRoute>,
     v4: Option<EndpointRoute>,
     v6: Option<EndpointRoute>,
+}
+
+impl BaselineEndpointRoutes {
+    fn route_for(&self, endpoint_ip: IpAddr, interface_name: &str) -> Option<EndpointRoute> {
+        self.by_endpoint
+            .get(&endpoint_ip)
+            .cloned()
+            .or_else(|| {
+                if endpoint_ip.is_ipv6() {
+                    self.v6.clone()
+                } else {
+                    self.v4.clone()
+                }
+            })
+            .filter(|route| route.dev != interface_name)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -97,7 +114,7 @@ pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), 
         interface_name
     );
 
-    cache_baseline_endpoint_routes(interface_name);
+    cache_baseline_endpoint_routes(config, interface_name);
     setup_endpoint_bypass_routes(config, interface_name)?;
 
     for command in setup_route_commands(config, interface_name) {
@@ -284,8 +301,30 @@ struct EndpointRoute {
 }
 
 #[cfg(not(tarpaulin))]
-fn cache_baseline_endpoint_routes(interface_name: &str) {
+fn cache_baseline_endpoint_routes(config: &GatewayConfig, interface_name: &str) {
     let mut baseline = BaselineEndpointRoutes::default();
+    for endpoint_ip in config
+        .peers
+        .iter()
+        .filter_map(|peer| peer.endpoint.map(|endpoint| endpoint.ip()))
+        .collect::<HashSet<_>>()
+    {
+        match discover_endpoint_route(endpoint_ip) {
+            Ok(route) if route.dev != interface_name => {
+                baseline.by_endpoint.insert(endpoint_ip, route);
+            }
+            Ok(_) => log::debug!(
+                "Endpoint route for {} already points at {}; not caching",
+                endpoint_ip,
+                interface_name
+            ),
+            Err(e) => log::debug!(
+                "No cacheable endpoint route for {} before TUN setup: {}",
+                endpoint_ip,
+                e
+            ),
+        }
+    }
     match discover_default_route(false) {
         Ok(route) if route.dev != interface_name => baseline.v4 = Some(route),
         Ok(_) => log::debug!(
@@ -310,12 +349,7 @@ fn cache_baseline_endpoint_routes(interface_name: &str) {
 #[cfg(not(tarpaulin))]
 fn baseline_endpoint_route(endpoint_ip: IpAddr, interface_name: &str) -> Option<EndpointRoute> {
     let routes = BASELINE_ENDPOINT_ROUTES.get()?.lock();
-    let route = if endpoint_ip.is_ipv6() {
-        routes.v6.clone()
-    } else {
-        routes.v4.clone()
-    }?;
-    (route.dev != interface_name).then_some(route)
+    routes.route_for(endpoint_ip, interface_name)
 }
 
 #[cfg(not(tarpaulin))]
@@ -897,6 +931,44 @@ mod tests {
                     .map(str::to_string)
                     .collect()
             )
+        );
+    }
+
+    #[test]
+    fn endpoint_baseline_prefers_specific_endpoint_route_over_default() {
+        let endpoint_ip = "203.0.113.10".parse().unwrap();
+        let default_route = EndpointRoute {
+            dev: "eth-default".to_string(),
+            via: Some("192.0.2.1".parse().unwrap()),
+        };
+        let specific_route = EndpointRoute {
+            dev: "eth-specific".to_string(),
+            via: Some("198.51.100.1".parse().unwrap()),
+        };
+        let baseline = BaselineEndpointRoutes {
+            by_endpoint: HashMap::from([(endpoint_ip, specific_route.clone())]),
+            v4: Some(default_route),
+            v6: None,
+        };
+
+        assert_eq!(baseline.route_for(endpoint_ip, "np0"), Some(specific_route));
+    }
+
+    #[test]
+    fn endpoint_baseline_falls_back_to_default_route_by_family() {
+        let default_route = EndpointRoute {
+            dev: "eth-default".to_string(),
+            via: Some("192.0.2.1".parse().unwrap()),
+        };
+        let baseline = BaselineEndpointRoutes {
+            by_endpoint: HashMap::new(),
+            v4: Some(default_route.clone()),
+            v6: None,
+        };
+
+        assert_eq!(
+            baseline.route_for("203.0.113.10".parse().unwrap(), "np0"),
+            Some(default_route)
         );
     }
 

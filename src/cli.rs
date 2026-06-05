@@ -26,6 +26,8 @@ pub struct UnifiedTelemetry {
     pub endpoint: Option<String>,
     pub l3_rx_bytes: u64,
     pub l3_tx_bytes: u64,
+    #[serde(default)]
+    pub l3_unknown_handshake_drops: u64,
     pub last_handshake: u64,
     pub l4_rx_bytes: u64,
     pub l4_tx_bytes: u64,
@@ -198,6 +200,14 @@ fn print_wg_style_to<W: std::io::Write>(w: &mut W, peers: &[UnifiedTelemetry]) {
             fmt_bytes(peer.l3_tx_bytes)
         )
         .unwrap();
+        if peer.l3_unknown_handshake_drops > 0 {
+            writeln!(
+                w,
+                "  wireguard unknown handshake drops: {}",
+                peer.l3_unknown_handshake_drops
+            )
+            .unwrap();
+        }
 
         if peer.quic_connections.is_empty() {
             if peer.l4_rx_bytes > 0 || peer.l4_tx_bytes > 0 {
@@ -464,6 +474,7 @@ mod tests {
             endpoint: Some("1.2.3.4:51820".to_string()),
             l3_rx_bytes: 1024,
             l3_tx_bytes: 256,
+            l3_unknown_handshake_drops: 0,
             last_handshake: 0,
             l4_rx_bytes: 0,
             l4_tx_bytes: 0,
@@ -489,6 +500,7 @@ mod tests {
             endpoint: None,
             l3_rx_bytes: 3480,
             l3_tx_bytes: 256,
+            l3_unknown_handshake_drops: 0,
             last_handshake: 0,
             l4_rx_bytes: 3500,
             l4_tx_bytes: 231,
@@ -526,6 +538,7 @@ mod tests {
                                 endpoint: Some("1.2.3.4:51820".to_string()),
                                 l3_rx_bytes: 100,
                                 l3_tx_bytes: 200,
+                                l3_unknown_handshake_drops: 0,
                                 last_handshake: 0,
                                 l4_rx_bytes: 300,
                                 l4_tx_bytes: 400,
@@ -584,6 +597,7 @@ mod tests {
             endpoint: None,
             l3_rx_bytes: 100,
             l3_tx_bytes: 200,
+            l3_unknown_handshake_drops: 0,
             last_handshake: 0,
             l4_rx_bytes: 3500,
             l4_tx_bytes: 231,
