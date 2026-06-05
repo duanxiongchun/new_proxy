@@ -31,6 +31,7 @@ impl Device for DummyPhyDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = 1500;
+        caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
         caps
     }
 }
