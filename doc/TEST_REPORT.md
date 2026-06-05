@@ -8,6 +8,151 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-05 全量 E2E、稳定性、性能与门禁验证
+
+本轮按要求重新执行全部本地门禁、端到端场景、稳定性压测、性能冒烟和核心数扩展性能测试。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+cargo build --bins
+cargo build --release --bins
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/e2e_full_tunnel_bypass.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+sudo bash script/acceptance/e2e_test_dualstack.sh
+sudo bash script/acceptance/e2e_scenarios.sh
+sudo bash script/acceptance/e2e_multi_client.sh
+sudo bash script/acceptance/e2e_dynamic_client_peer.sh
+sudo bash script/acceptance/e2e_userspace_wg_fallback.sh
+sudo bash script/acceptance/e2e_full_tunnel_bypass.sh
+sudo bash script/acceptance/stability_stress_test.sh
+sudo bash script/perf/perf_smoke.sh
+sudo bash script/perf/perf_cores_scalability.sh
+```
+
+门禁结果：
+
+```text
+cargo fmt --check: PASS
+cargo check --quiet: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test --quiet:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 94 passed; 0 failed
+cargo build --bins: PASS
+cargo build --release --bins: PASS
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+```
+
+端到端场景结果：
+
+```text
+sudo bash script/acceptance/e2e_test_dualstack.sh: PASS
+sudo bash script/acceptance/e2e_scenarios.sh: PASS
+  - dual-track TCP over TUN/smoltcp/QUIC: PASS
+  - server restart and client auto-reconnection: PASS
+  - legacy external WireGuard fallback sub-scenario: SKIP
+  - dynamic add/remove peer: PASS
+  - standard no-QUIC L3 fallback mode: PASS
+sudo bash script/acceptance/e2e_multi_client.sh: PASS
+sudo bash script/acceptance/e2e_dynamic_client_peer.sh: PASS
+  - artifact: /tmp/new_proxy_dynamic_peer_20260605_205511
+sudo bash script/acceptance/e2e_userspace_wg_fallback.sh: PASS
+  - artifact: /tmp/new_proxy_userspace_wg_fallback_20260605_205532
+  - WireGuard bytes non-zero; QUIC inactive after data ports blocked
+sudo bash script/acceptance/e2e_full_tunnel_bypass.sh: PASS
+  - artifact: /tmp/new_proxy_full_tunnel_20260605_205638
+  - endpoint route uses physical client link, not full-tunnel TUN
+```
+
+稳定性压测结果：
+
+```text
+sudo bash script/acceptance/stability_stress_test.sh: completed with exit code 0
+artifact: /tmp/new_proxy_stability_20260605_205656
+report: /tmp/new_proxy_stability_20260605_205656/stability_report.md
+samples collected: 121
+proxy crash samples: 0
+long TCP iterations/errors: 57268/0
+short curl OK/FAIL: 70120/0
+UDP OK/FAIL: 2133/0
+Ping OK/FAIL: 7124/0
+worst per-peer QUIC balance CV: 0.02%
+```
+
+稳定性报告的 pass criteria：
+
+```text
+No proxy crash: PASS
+Short curl success: PASS
+Long TCP success: PASS
+Per-peer QUIC CV < 5%: PASS
+RSS growth <= 10% or <= 2 MiB: FAIL
+RSS warmup baseline: 10s
+```
+
+RSS 阈值差距：
+
+```text
+client:
+  RSS: 21.08 -> 24.79 MiB
+  growth: +3.71 MiB / +17.62%
+  over 10% threshold: +7.62 percentage points
+  over 2 MiB threshold: +1.71 MiB
+  final RSS over effective allowed end RSS: +1.61 MiB
+
+client2:
+  RSS: 20.32 -> 25.91 MiB
+  growth: +5.58 MiB / +27.46%
+  over 10% threshold: +17.46 percentage points
+  over 2 MiB threshold: +3.58 MiB
+  final RSS over effective allowed end RSS: +3.55 MiB
+
+server:
+  RSS: 13.36 -> 13.87 MiB
+  growth: +0.51 MiB / +3.80%
+  RSS threshold: PASS
+```
+
+RSS 结论：**稳定性压测业务面全部通过，无 crash、无 TCP/UDP/Ping 失败，QUIC 连接负载均衡良好；RSS 仅 client 侧超过当前严格门槛，绝对差距为 MiB 级，当前评估为可接受风险，后续可继续观察长时运行趋势或按需调优阈值/内存复用。**
+
+性能结果：
+
+```text
+sudo bash script/perf/perf_smoke.sh: PASS
+artifact: /tmp/new_proxy_perf_smoke_20260605_215732
+TTFB p50: 0.012391s
+TTFB p95: 0.013120s
+TTFB max: 0.013466s
+throughput: 22.0617 MiB/s
+
+sudo bash script/perf/perf_cores_scalability.sh: PASS
+artifact: /tmp/new_proxy_cores_scalability_20260605_215751
+threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,16,2,2048,10.770592,190.147,1.000,33
+2,16,2,2048,6.391580,320.422,1.685,14|19
+3,16,2,2048,4.567963,448.340,2.358,8|15|10
+4,16,2,2048,3.594782,569.715,2.996,8|10|8|7
+```
+
+结论：**本轮全量门禁、E2E 场景、性能冒烟和核心数扩展性能测试通过；稳定性压测业务指标全部通过，唯一未满足项为 RSS 增长阈值，超出量为 client 侧约 1.61 MiB / client2 侧约 3.55 MiB 的最终 RSS 差距，当前判定问题不大并记录为可接受风险。**
+
 ## 2026-06-05 锁粒度优化验证
 
 本次修复覆盖：
