@@ -42,6 +42,56 @@ pub fn setup_routes_and_iptables(
     config: &GatewayConfig,
     interface_name: &str,
 ) -> Result<(), String> {
+    let is_client = matches!(
+        crate::app_config::validate_gateway_config(config),
+        Ok(crate::app_config::RuntimeMode::Client)
+    );
+
+    if is_client {
+        log::info!("Setting up userspace routing for client interface: {}", interface_name);
+        
+        for addr in &config.interface.addresses {
+            run_command_checked(
+                "ip",
+                &[
+                    "addr".to_string(),
+                    "replace".to_string(),
+                    addr.to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            )?;
+        }
+
+        run_command_checked(
+            "ip",
+            &[
+                "link".to_string(),
+                "set".to_string(),
+                interface_name.to_string(),
+                "up".to_string(),
+                "mtu".to_string(),
+                config.interface.mtu.to_string(),
+            ],
+        )?;
+
+        for peer in &config.peers {
+            for allowed_ip in &peer.allowed_ips {
+                run_command_checked(
+                    "ip",
+                    &[
+                        "route".to_string(),
+                        "replace".to_string(),
+                        allowed_ip.to_string(),
+                        "dev".to_string(),
+                        interface_name.to_string(),
+                    ],
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
     // WireGuard device setup is independent from route/firewall ownership.
     // `Table = off` skips route/iptables changes, but the daemon still owns
     // the WireGuard device so peer sync and telemetry use the real backend.
@@ -303,6 +353,24 @@ pub fn cleanup_peer_routes_and_tproxy(
 }
 
 fn cleanup_routes_and_iptables(config: &GatewayConfig, interface_name: &str) {
+    let is_client = matches!(
+        crate::app_config::validate_gateway_config(config),
+        Ok(crate::app_config::RuntimeMode::Client)
+    );
+
+    if is_client {
+        log::info!("Cleaning up userspace routing for client interface: {}", interface_name);
+        run_command_best_effort(
+            "ip",
+            &[
+                "link".to_string(),
+                "delete".to_string(),
+                interface_name.to_string(),
+            ],
+        );
+        return;
+    }
+
     if let Some(ref t) = config.interface.table {
         if t.to_lowercase() == "off" {
             crate::wireguard::cleanup_device(interface_name);
