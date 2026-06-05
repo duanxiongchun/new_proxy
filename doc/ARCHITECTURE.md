@@ -126,6 +126,7 @@ graph TD
      - 执行 **NAT 转换**：将报文目标 IP 改写为本机配置的 `smoltcp` 虚拟接口地址（来自 `[Interface].Address` 的 IPv4/IPv6 地址）。为了加快处理速度，`smoltcp` 虚拟网卡的校验和（Checksum）功能被设为忽略；写回 TUN 前会重新计算 IPv4 header checksum 和 TCP pseudo-header checksum。
      - 投递至本地 `smoltcp` 实例。
      - 处理完成后，从 `smoltcp` 提取出站 TCP 包，通过 `nat_map` 反向改写源 IP 并写入 TUN 队列。
+     - IPv6 L4 offload 当前只解析固定 IPv6 base header 后直接承载 TCP 的报文；携带 IPv6 extension headers 的 TCP 报文不会进入 L4 offload，而是按普通 L3 报文走 userspace WireGuard fallback。
    - **UDP / ICMP 报文**：
      - 直接在当前线程中调用 `boringtun::Tunn::encapsulate` 加密，并通过本地 UDP 套接字发送给服务端。
    - **故障降级 (WireGuard Fallback)**：
@@ -148,6 +149,8 @@ graph TD
 2. 将 TUN 接口的 MTU 设为配置值（默认 `1420`），并启用网卡（`ip link set dev <interface> up`）。
 3. 针对每个 peer 声明的 `AllowedIPs`，自动添加指向该 TUN 设备的系统路由规则（`ip route replace <allowed_ip> dev <interface>`）。
 
+为避免 full-tunnel `AllowedIPs = 0.0.0.0/0` 或 `::/0` 递归捕获 QUIC 外层 endpoint，程序在安装 TUN 路由前先缓存物理默认路由，并为 peer endpoint 安装更高优先级的 host bypass route。运行期动态 `AddPeer` 若发现当前 endpoint route 已指向 TUN，或因 full-tunnel route replacement 导致 route discovery 失败，会回退使用启动时缓存的物理默认路由安装 endpoint bypass route。
+
 ## 8. 遥测与 API
 
 UDS 路径：`/run/new_proxy/<interface>.sock`
@@ -164,4 +167,5 @@ UDS 路径：`/run/new_proxy/<interface>.sock`
 - **服务端 L3 也在用户态**，不再依赖内核 WireGuard 模块；QUIC 接收池仍直接绑定宿主机 UDP 端口。
 - 动态 peer 管理（`AddPeer` / `RemovePeer`）在客户端会动态调整 `RtcWorker` 拥有的 AllowedIPs 路由与套接字映射关系。
 - userspace WireGuard registry 按 peer 维护共享的 `boringtun` 状态，并通过 AllowedIPs 路由选择出站 peer；入站数据优先使用 receiver index 与 endpoint 索引定位 peer，未知握手包才退回逐 peer 尝试。
+- 为避免未知来源 WireGuard 握手包在多 peer 场景下触发无界 O(N) 扫描，未知 endpoint 的握手/控制类入站包会经过轻量 per-IP token bucket 限速；已建立 receiver index 或已知 endpoint 的数据包不走该限速路径。
 - 当前 client/server 启动路径不创建 transparent listener，也不下发 TPROXY iptables 规则。

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::PeerConfig;
 use crate::routing::AllowedIPsRouter;
@@ -14,6 +14,8 @@ use crate::wireguard::WgPeerStats;
 const RECEIVER_INDEX_TTL_SECS: u64 = 180;
 const RECEIVER_INDEX_CLEANUP_INTERVAL_SECS: u64 = 60;
 const RECEIVER_INDEX_MAX_ENTRIES: usize = 65536;
+const UNKNOWN_HANDSHAKE_BURST: f64 = 20.0;
+const UNKNOWN_HANDSHAKE_REFILL_PER_SEC: f64 = 10.0;
 
 pub struct UserspaceWg {
     tunn: Tunn,
@@ -66,6 +68,39 @@ pub struct UserspaceWgRegistry {
     endpoint_index: Arc<parking_lot::RwLock<HashMap<SocketAddr, [u8; 32]>>>,
     receiver_index: Arc<parking_lot::RwLock<HashMap<u32, ReceiverIndexEntry>>>,
     receiver_index_last_cleanup: Arc<AtomicU64>,
+    unknown_handshake_limiter: Arc<IpTokenBucket>,
+}
+
+struct IpTokenBucket {
+    history: parking_lot::Mutex<HashMap<IpAddr, (Instant, f64)>>,
+}
+
+impl IpTokenBucket {
+    fn new() -> Self {
+        Self {
+            history: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn check(&self, ip: IpAddr) -> bool {
+        let mut history = self.history.lock();
+        if history.len() > 10000 {
+            let now = Instant::now();
+            history.retain(|_, (last_seen, _)| now.duration_since(*last_seen).as_secs() < 60);
+        }
+        let now = Instant::now();
+        let (last_seen, tokens) = history.entry(ip).or_insert((now, UNKNOWN_HANDSHAKE_BURST));
+        let elapsed = now.duration_since(*last_seen).as_secs_f64();
+        *last_seen = now;
+        *tokens =
+            (*tokens + elapsed * UNKNOWN_HANDSHAKE_REFILL_PER_SEC).min(UNKNOWN_HANDSHAKE_BURST);
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl UserspaceWgRegistry {
@@ -77,6 +112,7 @@ impl UserspaceWgRegistry {
             endpoint_index: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             receiver_index: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             receiver_index_last_cleanup: Arc::new(AtomicU64::new(0)),
+            unknown_handshake_limiter: Arc::new(IpTokenBucket::new()),
         };
         for peer in peers {
             registry.add_or_replace_peer(peer.clone())?;
@@ -275,6 +311,14 @@ impl UserspaceWgRegistry {
             Tunn::parse_incoming_packet(incoming).ok(),
             Some(Packet::PacketData(_))
         ) {
+            return None;
+        }
+
+        if !self.unknown_handshake_limiter.check(endpoint.ip()) {
+            log::debug!(
+                "Rate limit exceeded for unknown userspace WireGuard packet from {}",
+                endpoint
+            );
             return None;
         }
 
@@ -559,6 +603,17 @@ mod tests {
         let index = registry.receiver_index.read();
         assert!(!index.contains_key(&7));
         assert!(index.contains_key(&8));
+    }
+
+    #[test]
+    fn unknown_handshake_limiter_rejects_after_burst() {
+        let limiter = IpTokenBucket::new();
+        let ip = "192.0.2.10".parse().unwrap();
+
+        for _ in 0..(UNKNOWN_HANDSHAKE_BURST as usize) {
+            assert!(limiter.check(ip));
+        }
+        assert!(!limiter.check(ip));
     }
 
     #[test]

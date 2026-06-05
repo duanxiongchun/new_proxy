@@ -1,6 +1,16 @@
 use crate::config::{GatewayConfig, PeerConfig};
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::OnceLock;
+
+static BASELINE_ENDPOINT_ROUTES: OnceLock<parking_lot::Mutex<BaselineEndpointRoutes>> =
+    OnceLock::new();
+
+#[derive(Default)]
+struct BaselineEndpointRoutes {
+    v4: Option<EndpointRoute>,
+    v6: Option<EndpointRoute>,
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct CommandSpec {
@@ -87,6 +97,7 @@ pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), 
         interface_name
     );
 
+    cache_baseline_endpoint_routes(interface_name);
     setup_endpoint_bypass_routes(config, interface_name)?;
 
     for command in setup_route_commands(config, interface_name) {
@@ -232,12 +243,35 @@ fn setup_endpoint_bypass_routes(
 
 #[cfg(not(tarpaulin))]
 fn setup_endpoint_bypass_route(endpoint_ip: IpAddr, interface_name: &str) -> Result<(), String> {
-    let route = discover_endpoint_route(endpoint_ip)?;
+    let mut route = match discover_endpoint_route(endpoint_ip) {
+        Ok(route) => route,
+        Err(discover_error) => {
+            if let Some(baseline_route) = baseline_endpoint_route(endpoint_ip, interface_name) {
+                log::info!(
+                    "Using cached physical route for outer endpoint {} because route discovery failed: {}",
+                    endpoint_ip,
+                    discover_error
+                );
+                baseline_route
+            } else {
+                return Err(discover_error);
+            }
+        }
+    };
     if route.dev == interface_name {
-        return Err(format!(
-            "outer endpoint {} already routes through {}; refusing to install recursive tunnel route",
-            endpoint_ip, interface_name
-        ));
+        if let Some(baseline_route) = baseline_endpoint_route(endpoint_ip, interface_name) {
+            log::info!(
+                "Using cached physical route for outer endpoint {} because current route points at {}",
+                endpoint_ip,
+                interface_name
+            );
+            route = baseline_route;
+        } else {
+            return Err(format!(
+                "outer endpoint {} already routes through {}; refusing to install recursive tunnel route",
+                endpoint_ip, interface_name
+            ));
+        }
     }
     let command = endpoint_bypass_route_command(endpoint_ip, route);
     run_command_checked(command.program, &command.args)
@@ -247,6 +281,41 @@ fn setup_endpoint_bypass_route(endpoint_ip: IpAddr, interface_name: &str) -> Res
 struct EndpointRoute {
     dev: String,
     via: Option<IpAddr>,
+}
+
+#[cfg(not(tarpaulin))]
+fn cache_baseline_endpoint_routes(interface_name: &str) {
+    let mut baseline = BaselineEndpointRoutes::default();
+    match discover_default_route(false) {
+        Ok(route) if route.dev != interface_name => baseline.v4 = Some(route),
+        Ok(_) => log::debug!(
+            "IPv4 default route already points at {}; not caching",
+            interface_name
+        ),
+        Err(e) => log::debug!("No cacheable IPv4 default route before TUN setup: {}", e),
+    }
+    match discover_default_route(true) {
+        Ok(route) if route.dev != interface_name => baseline.v6 = Some(route),
+        Ok(_) => log::debug!(
+            "IPv6 default route already points at {}; not caching",
+            interface_name
+        ),
+        Err(e) => log::debug!("No cacheable IPv6 default route before TUN setup: {}", e),
+    }
+    let routes =
+        BASELINE_ENDPOINT_ROUTES.get_or_init(|| parking_lot::Mutex::new(Default::default()));
+    *routes.lock() = baseline;
+}
+
+#[cfg(not(tarpaulin))]
+fn baseline_endpoint_route(endpoint_ip: IpAddr, interface_name: &str) -> Option<EndpointRoute> {
+    let routes = BASELINE_ENDPOINT_ROUTES.get()?.lock();
+    let route = if endpoint_ip.is_ipv6() {
+        routes.v6.clone()
+    } else {
+        routes.v4.clone()
+    }?;
+    (route.dev != interface_name).then_some(route)
 }
 
 #[cfg(not(tarpaulin))]
@@ -265,6 +334,28 @@ fn discover_endpoint_route(endpoint_ip: IpAddr) -> Result<EndpointRoute, String>
         ));
     }
     parse_route_get_output(endpoint_ip, &String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(tarpaulin))]
+fn discover_default_route(ipv6: bool) -> Result<EndpointRoute, String> {
+    let args = if ipv6 {
+        vec!["-6", "route", "show", "default"]
+    } else {
+        vec!["route", "show", "default"]
+    };
+    let output = std::process::Command::new("ip")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to execute 'ip {}': {}", args.join(" "), e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "command 'ip {}' failed with status {:?}: {}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_default_route_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn route_get_command(endpoint_ip: IpAddr) -> Vec<String> {
@@ -306,6 +397,27 @@ fn parse_route_get_output(endpoint_ip: IpAddr, output: &str) -> Result<EndpointR
                     ip, endpoint_ip, e
                 )
             })
+        })
+        .transpose()?;
+    Ok(EndpointRoute { dev, via })
+}
+
+fn parse_default_route_output(output: &str) -> Result<EndpointRoute, String> {
+    let line = output
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("default"))
+        .ok_or_else(|| format!("default route not found in output: {}", output.trim()))?;
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    let dev = tokens
+        .windows(2)
+        .find_map(|window| (window[0] == "dev").then(|| window[1].to_string()))
+        .ok_or_else(|| format!("default route has no device: {}", line.trim()))?;
+    let via = tokens
+        .windows(2)
+        .find_map(|window| (window[0] == "via").then_some(window[1]))
+        .map(|ip| {
+            ip.parse::<IpAddr>()
+                .map_err(|e| format!("failed to parse default route gateway '{}': {}", ip, e))
         })
         .transpose()?;
     Ok(EndpointRoute { dev, via })
@@ -691,6 +803,29 @@ mod tests {
             EndpointRoute {
                 dev: "eth0".to_string(),
                 via: Some("192.0.2.1".parse().unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_default_route_output_extracts_gateway_and_device() {
+        let route =
+            parse_default_route_output("default via 192.0.2.1 dev eth0 proto dhcp metric 100\n")
+                .unwrap();
+        assert_eq!(
+            route,
+            EndpointRoute {
+                dev: "eth0".to_string(),
+                via: Some("192.0.2.1".parse().unwrap()),
+            }
+        );
+
+        let route = parse_default_route_output("default dev eth1 metric 100\n").unwrap();
+        assert_eq!(
+            route,
+            EndpointRoute {
+                dev: "eth1".to_string(),
+                via: None,
             }
         );
     }

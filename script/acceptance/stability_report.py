@@ -110,6 +110,8 @@ def main():
     udp_fail = count_lines(os.path.join(artifact_dir, "udp.log"), "FAIL")
     ping_ok = count_lines(os.path.join(artifact_dir, "ping.log"), "OK")
     ping_fail = count_lines(os.path.join(artifact_dir, "ping.log"), "FAIL")
+    long_iterations = long_stats.get("iterations", 0) + long2_stats.get("iterations", 0)
+    long_errors = long_stats.get("errors", 0) + long2_stats.get("errors", 0)
 
     conns_by_peer = latest_connections_by_peer(metrics)
     totals_by_peer = {
@@ -123,6 +125,7 @@ def main():
     max_rss_growth_pct = float(os.environ.get("STABILITY_MAX_RSS_GROWTH_PCT", "10.0"))
     max_rss_growth_mib = float(os.environ.get("STABILITY_MAX_RSS_GROWTH_MIB", "2.0"))
     rss_warmup_seconds = float(os.environ.get("STABILITY_RSS_WARMUP_SECONDS", "10.0"))
+    enforce_rss = os.environ.get("STABILITY_ENFORCE_RSS", "0") == "1"
     client_rss = rss_growth(metrics, "client", rss_warmup_seconds)
     server_rss = rss_growth(metrics, "server", rss_warmup_seconds)
     client2_rss = rss_growth(metrics, "client2", rss_warmup_seconds)
@@ -133,6 +136,22 @@ def main():
         or not row.get("client2", {}).get("alive")
         or not row.get("server", {}).get("alive")
     ]
+    available_cvs = [cv for cv in cv_by_peer.values() if cv is not None]
+    no_crash_pass = not crashes
+    short_pass = short_fail == 0 and short_ok > 0
+    long_pass = (
+        long_errors == 0
+        and long_stats.get("iterations", 0) > 0
+        and long2_stats.get("iterations", 0) > 0
+    )
+    cv_pass = bool(available_cvs) and all(cv < 5.0 for cv in available_cvs)
+    mem_pass = all(
+        rss_pass(rss, max_rss_growth_pct, max_rss_growth_mib)
+        for rss in (client_rss, client2_rss, server_rss)
+    )
+    hard_pass = all([no_crash_pass, short_pass, long_pass, cv_pass]) and (
+        mem_pass or not enforce_rss
+    )
 
     report_path = os.path.join(artifact_dir, "stability_report.md")
     with open(report_path, "w", encoding="utf-8") as f:
@@ -140,14 +159,11 @@ def main():
         f.write(f"- Artifact directory: `{artifact_dir}`\n")
         f.write(f"- Samples collected: {len(metrics)}\n")
         f.write(f"- Proxy crash samples: {len(crashes)}\n")
-        long_iterations = long_stats.get("iterations", 0) + long2_stats.get("iterations", 0)
-        long_errors = long_stats.get("errors", 0) + long2_stats.get("errors", 0)
         f.write(f"- Long TCP iterations: {long_iterations}\n")
         f.write(f"- Long TCP errors: {long_errors}\n")
         f.write(f"- Short curl OK/FAIL: {short_ok}/{short_fail}\n")
         f.write(f"- UDP OK/FAIL: {udp_ok}/{udp_fail}\n")
         f.write(f"- Ping OK/FAIL: {ping_ok}/{ping_fail}\n")
-        available_cvs = [cv for cv in cv_by_peer.values() if cv is not None]
         if not available_cvs:
             f.write("- QUIC balance CV: unavailable\n")
         else:
@@ -178,22 +194,19 @@ def main():
         else:
             f.write("- No per-connection QUIC telemetry was captured.\n")
         f.write("\n## Pass Criteria\n\n")
-        f.write(f"- No proxy crash: {'PASS' if not crashes else 'FAIL'}\n")
-        f.write(f"- Short curl success: {'PASS' if short_fail == 0 and short_ok > 0 else 'FAIL'}\n")
-        f.write(f"- Long TCP success: {'PASS' if long_errors == 0 and long_stats.get('iterations', 0) > 0 and long2_stats.get('iterations', 0) > 0 else 'FAIL'}\n")
-        cv_pass = bool(available_cvs) and all(cv < 5.0 for cv in available_cvs)
+        f.write(f"- No proxy crash: {'PASS' if no_crash_pass else 'FAIL'}\n")
+        f.write(f"- Short curl success: {'PASS' if short_pass else 'FAIL'}\n")
+        f.write(f"- Long TCP success: {'PASS' if long_pass else 'FAIL'}\n")
         f.write(f"- Per-peer QUIC CV < 5%: {'PASS' if cv_pass else 'FAIL'}\n")
-        mem_pass = all(
-            rss_pass(rss, max_rss_growth_pct, max_rss_growth_mib)
-            for rss in (client_rss, client2_rss, server_rss)
-        )
+        rss_status = "PASS" if mem_pass else ("FAIL" if enforce_rss else "WARN")
         f.write(
             f"- RSS growth <= {max_rss_growth_pct:g}% or <= {max_rss_growth_mib:g} MiB: "
-            f"{'PASS' if mem_pass else 'FAIL'}\n"
+            f"{rss_status}\n"
         )
+        f.write(f"- RSS hard gate enabled: {'yes' if enforce_rss else 'no'}\n")
         f.write(f"- RSS warmup baseline: {rss_warmup_seconds:g}s\n")
     print(report_path)
-    return 0
+    return 0 if hard_pass else 1
 
 
 if __name__ == "__main__":
