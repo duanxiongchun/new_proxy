@@ -8,6 +8,49 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-05 锁粒度优化验证
+
+本次修复覆盖：
+
+- `QuicPoolClient` 的物理连接 `slots` 改为 `arc-swap` 快照，业务新建 stream 热路径不再获取 `RwLock`。
+- UDS `add-peer` 在 mutation 锁外预建 QUIC pool，缩短动态 peer 串行锁持有时间；提交前仍在锁内重新检查 AllowedIPs 冲突。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check --quiet: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test --quiet:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 94 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+```
+
+结论：**锁粒度优化通过格式、编译、Clippy、单元测试和脚本语法检查；本轮未重新执行需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
 ## 2026-06-05 严格 Review 修复验证
 
 本次修复覆盖：

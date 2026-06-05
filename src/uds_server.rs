@@ -470,33 +470,6 @@ async fn handle_add_peer(
         proxy_port,
     };
 
-    let _mutation_guard = context.peer_mutation_lock.lock().await;
-
-    let (table_off, old_peer, conflict) = {
-        let state = context.state.read();
-        let conflict = find_allowed_ip_conflict(&state.config.peers, &new_peer);
-        (
-            state
-                .config
-                .interface
-                .table
-                .as_deref()
-                .map(|table| table.eq_ignore_ascii_case("off"))
-                .unwrap_or(false),
-            state
-                .config
-                .peers
-                .iter()
-                .find(|peer| peer.public_key == parsed_pub_key)
-                .cloned(),
-            conflict,
-        )
-    };
-    if let Some(conflict) = conflict {
-        write_error(stream, framed_response, conflict).await;
-        return;
-    }
-
     if context.runtime_mode == RuntimeMode::Client {
         match (new_peer.endpoint, new_peer.proxy_port) {
             (Some(_), Some(_)) | (None, None) => {}
@@ -533,6 +506,36 @@ async fn handle_add_peer(
     let quic_pool_unavailable = context.runtime_mode == RuntimeMode::Client
         && peer_has_l4_proxy(&new_peer)
         && prepared_client_pool.is_none();
+
+    let _mutation_guard = context.peer_mutation_lock.lock().await;
+
+    let (table_off, old_peer, conflict) = {
+        let state = context.state.read();
+        let conflict = find_allowed_ip_conflict(&state.config.peers, &new_peer);
+        (
+            state
+                .config
+                .interface
+                .table
+                .as_deref()
+                .map(|table| table.eq_ignore_ascii_case("off"))
+                .unwrap_or(false),
+            state
+                .config
+                .peers
+                .iter()
+                .find(|peer| peer.public_key == parsed_pub_key)
+                .cloned(),
+            conflict,
+        )
+    };
+    if let Some(conflict) = conflict {
+        if let Some(pool) = prepared_client_pool.as_ref() {
+            pool.shutdown(b"Peer add conflict");
+        }
+        write_error(stream, framed_response, conflict).await;
+        return;
+    }
 
     if !table_off {
         if let Some(peer) = old_peer.clone() {

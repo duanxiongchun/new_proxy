@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
 use rand::Rng;
@@ -197,7 +198,7 @@ pub struct QuicPoolClient {
     client_public_key: [u8; 32],
     runtime_config: Arc<RwLock<PoolRuntimeConfig>>,
     refresh_config: Option<ControlRefreshConfig>,
-    slots: Arc<RwLock<Vec<PoolSlot>>>,
+    slots: Arc<ArcSwap<Vec<PoolSlot>>>,
     rr_index: Arc<AtomicUsize>,
     endpoint: Arc<Mutex<Option<Endpoint>>>,
     shutdown: Arc<AtomicBool>,
@@ -268,7 +269,7 @@ impl QuicPoolClient {
                 endpoints,
             })),
             refresh_config,
-            slots: Arc::new(RwLock::new(Vec::new())),
+            slots: Arc::new(ArcSwap::from_pointee(Vec::new())),
             rr_index: Arc::new(AtomicUsize::new(0)),
             endpoint: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -282,7 +283,7 @@ impl QuicPoolClient {
 
     pub fn connection_snapshots(&self) -> Vec<QuicConnSnapshot> {
         self.slots
-            .read()
+            .load()
             .iter()
             .filter(|slot| slot.conn.close_reason().is_none())
             .map(|slot| slot.stats.snapshot())
@@ -300,7 +301,7 @@ impl QuicPoolClient {
     pub fn shutdown(&self, reason: &'static [u8]) {
         self.shutdown.store(true, Ordering::Relaxed);
         {
-            let slots = self.slots.read();
+            let slots = self.slots.load();
             for slot in slots.iter() {
                 slot.conn.close(0u32.into(), reason);
             }
@@ -328,7 +329,7 @@ impl QuicPoolClient {
             "Successfully initialized QUIC connection pool with {} active links",
             slots.len()
         );
-        *self.slots.write() = slots;
+        self.slots.store(Arc::new(slots));
         Ok(())
     }
 
@@ -517,7 +518,7 @@ impl QuicPoolClient {
             attempts += 1;
 
             let (conn, conn_stat, total_conns) = {
-                let slots = self.slots.read();
+                let slots = self.slots.load();
                 if slots.is_empty() {
                     return Err("No active QUIC connections in pool".to_string());
                 }
@@ -586,7 +587,7 @@ impl QuicPoolClient {
                     None => continue,
                 };
 
-                let active_slots = self.slots.read().clone();
+                let active_slots = self.slots.load_full();
 
                 let mut reconnects = tokio::task::JoinSet::new();
 
@@ -620,7 +621,7 @@ impl QuicPoolClient {
                 }
 
                 let missing_endpoints = {
-                    let slots = self.slots.read();
+                    let slots = self.slots.load();
                     endpoints
                         .iter()
                         .copied()
@@ -664,7 +665,7 @@ impl QuicPoolClient {
 
                     match reconnect_result {
                         Ok(new_slot) => {
-                            let mut slots = self.slots.write();
+                            let mut slots = self.slots.load_full().as_ref().clone();
                             if let Some(i) = slot_index {
                                 if i < slots.len() && slots[i].endpoint == target_addr {
                                     slots[i] = new_slot;
@@ -672,6 +673,7 @@ impl QuicPoolClient {
                                         "Successfully re-established dead connection to {}",
                                         target_addr
                                     );
+                                    self.slots.store(Arc::new(slots));
                                 }
                             } else if !slots.iter().any(|slot| slot.endpoint == target_addr) {
                                 slots.push(new_slot);
@@ -679,6 +681,7 @@ impl QuicPoolClient {
                                     "Successfully added recovered connection to {}",
                                     target_addr
                                 );
+                                self.slots.store(Arc::new(slots));
                             }
                         }
                         Err(e) => {
@@ -700,7 +703,7 @@ impl QuicPoolClient {
                 }
 
                 let has_live_connection = {
-                    let slots = self.slots.read();
+                    let slots = self.slots.load();
                     slots.iter().any(|slot| slot.conn.close_reason().is_none())
                 };
 
@@ -776,11 +779,12 @@ impl QuicPoolClient {
         if let Some(old_endpoint) = self.endpoint.lock().replace(endpoint) {
             old_endpoint.close(0u32.into(), b"QUIC session refreshed");
         }
-        for slot in self.slots.write().drain(..) {
+        let old_slots = self.slots.swap(Arc::new(Vec::new()));
+        for slot in old_slots.iter() {
             slot.conn.close(0u32.into(), b"QUIC session refreshed");
         }
         *self.runtime_config.write() = runtime_config;
-        *self.slots.write() = slots;
+        self.slots.store(Arc::new(slots));
         Ok(())
     }
 }
@@ -1240,7 +1244,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 9. 关闭客户端连接，验证 Registry 自动清理
-        if let Some(slot) = client_arc.slots.read().first() {
+        if let Some(slot) = client_arc.slots.load().first() {
             slot.conn.close(0u32.into(), b"Test shutdown");
         }
 
@@ -1307,7 +1311,7 @@ mod tests {
 
         old_session_cache.write().insert(client_pub, [8u8; 32]);
         {
-            let slots = client.slots.read();
+            let slots = client.slots.load();
             for slot in slots.iter() {
                 slot.conn.close(0u32.into(), b"simulated server restart");
             }
@@ -1318,7 +1322,7 @@ mod tests {
         loop {
             let refreshed =
                 client.runtime_config.read().endpoints == vec![new_addr]
-                    && client.slots.read().iter().any(|slot| {
+                    && client.slots.load().iter().any(|slot| {
                         slot.endpoint == new_addr && slot.conn.close_reason().is_none()
                     });
             if refreshed {
