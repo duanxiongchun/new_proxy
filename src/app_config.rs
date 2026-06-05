@@ -158,10 +158,9 @@ pub fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, Str
     if config.peers.is_empty() {
         return Err("Invalid client config: at least one [Peer] is required".to_string());
     }
-    let mut proxy_peer_count = 0;
     for peer in &config.peers {
         match (peer.endpoint, peer.proxy_port) {
-            (Some(_), Some(_)) => proxy_peer_count += 1,
+            (Some(_), Some(_)) => {}
             (None, None) => {}
             _ => {
                 return Err(format!(
@@ -170,9 +169,6 @@ pub fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, Str
                 ));
             }
         }
-    }
-    if proxy_peer_count > 0 && config.interface.tproxy_port.is_none() {
-        return Err("Invalid client config: TProxyPort is required when any peer defines Endpoint/ProxyPort".to_string());
     }
     Ok(RuntimeMode::Client)
 }
@@ -243,7 +239,6 @@ mod tests {
                 addresses: vec!["10.0.0.2/24".parse().unwrap()],
                 listen_port: None,
                 listen_control_port: None,
-                tproxy_port: Some(1080),
                 mtu: 1400,
                 table: None,
                 pre_script: None,
@@ -304,17 +299,61 @@ mod tests {
         }]);
 
         assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
-        config.interface.tproxy_port = None;
-        assert!(determine_runtime_mode(&config)
-            .unwrap_err()
-            .contains("TProxyPort is required"));
-        config.interface.tproxy_port = Some(1080);
         config.peers[0].proxy_port = None;
         assert!(determine_runtime_mode(&config)
             .unwrap_err()
             .contains("must define both Endpoint and ProxyPort"));
         config.peers[0].endpoint = None;
         assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
+    }
+
+    #[test]
+    fn interface_name_from_config_path_validates_linux_ifname_rules() {
+        assert_eq!(
+            interface_name_from_config_path("/etc/new_proxy/client-a.conf").unwrap(),
+            "client-a"
+        );
+        assert_eq!(
+            interface_name_from_config_path("/etc/new_proxy/tun_0.conf").unwrap(),
+            "tun_0"
+        );
+        assert!(
+            interface_name_from_config_path("/etc/new_proxy/this-name-is-too-long.conf")
+                .unwrap_err()
+                .contains("1..=15 bytes")
+        );
+        assert!(
+            interface_name_from_config_path("/etc/new_proxy/bad name.conf")
+                .unwrap_err()
+                .contains("allowed characters")
+        );
+    }
+
+    #[test]
+    fn validate_gateway_config_rejects_invalid_table_and_server_mode_gaps() {
+        let peer = PeerConfig {
+            public_key: [2u8; 32],
+            allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
+            endpoint: None,
+            proxy_port: None,
+        };
+        let mut config = client_config(vec![peer]);
+        config.interface.table = Some("manual".to_string());
+        assert!(validate_gateway_config(&config)
+            .unwrap_err()
+            .contains("Invalid Table value"));
+
+        config.interface.table = None;
+        config.interface.listen_control_port = Some(51820);
+        assert!(determine_runtime_mode(&config)
+            .unwrap_err()
+            .contains("QUICPool.ListenPorts must contain at least one port"));
+
+        config.interface.listen_control_port = None;
+        config.quic_pool.listen_ports = vec![40001];
+        assert!(determine_runtime_mode(&config)
+            .unwrap_err()
+            .contains("ListenControlPort is required"));
     }
 
     #[test]
@@ -325,7 +364,6 @@ mod tests {
                 addresses: vec!["10.0.0.1/24".parse().unwrap()],
                 listen_port: None,
                 listen_control_port: Some(51820),
-                tproxy_port: None,
                 mtu: 1400,
                 table: None,
                 pre_script: None,
@@ -417,6 +455,29 @@ mod tests {
         assert_eq!(
             select_quic_endpoint_ip(&resp, fallback_v6).unwrap(),
             fallback_v6.ip()
+        );
+    }
+
+    #[test]
+    fn test_select_quic_endpoint_ip_prefers_matching_advertised_public_ip() {
+        let fallback_v4 = "10.0.2.2:51820".parse::<SocketAddr>().unwrap();
+        let fallback_v6 = "[fd00:2::2]:51820".parse::<SocketAddr>().unwrap();
+        let resp = control::ControlResponse {
+            session_psk: [1u8; 32],
+            server_nonce: [4u8; 16],
+            port_pool: vec![40001],
+            public_ipv4: Some("203.0.113.10".to_string()),
+            public_ipv6: Some("2001:db8::10".to_string()),
+            quic_cert_sha256: [2u8; 32],
+        };
+
+        assert_eq!(
+            select_quic_endpoint_ip(&resp, fallback_v4).unwrap(),
+            "203.0.113.10".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            select_quic_endpoint_ip(&resp, fallback_v6).unwrap(),
+            "2001:db8::10".parse::<IpAddr>().unwrap()
         );
     }
 

@@ -1,11 +1,11 @@
 # new_proxy
 
-`new_proxy` 是一个高性能混合多协议安全代理网关。它将系统 WireGuard L3 通道和用户态 QUIC L4 多路复用通道组合起来：UDP、ICMP 等三层流量走内核态 L3 通道，TCP 流量通过 TPROXY 拦截后走用户态 QUIC 连接池，从而规避 TCP-over-VPN 的队头阻塞问题。
+`new_proxy` 是一个高性能混合多协议安全代理网关。它使用用户态 WireGuard L3 通道和用户态 QUIC L4 多路复用通道组合数据面：UDP、ICMP 以及 TCP fallback 走 `boringtun` L3 通道，TCP 命中 proxy peer 后由 TUN + `smoltcp` 接管并转发到 QUIC 连接池，从而规避 TCP-over-VPN 的队头阻塞问题。
 
 ## 主要功能
 
-- **双轨数据面**：L3 WireGuard 风格通道承载 UDP/ICMP，L4 QUIC 多路复用通道承载 TCP。
-- **TPROXY 透明拦截**：客户端按 `AllowedIPs` 判断 TCP 目的地址，命中后透明导入 QUIC 池。
+- **双轨数据面**：L3 WireGuard 风格通道承载 UDP/ICMP 和 TCP fallback，L4 QUIC 多路复用通道承载可卸载 TCP。
+- **用户态 TUN 透明接管**：客户端按 `AllowedIPs` 判断 TCP 目的地址，命中后由 `smoltcp` 接管并导入 QUIC 池，不依赖 iptables/TPROXY listener。
 - **多物理 QUIC 连接池**：服务端可配置多个 UDP 端口，客户端自动建立并轮询分流。
 - **对等密钥认证**：复用 WireGuard 密钥材料，通过 X25519 shared secret 和 HMAC-SHA256 进行用户态控制面协商。
 - **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端只接受该指纹对应证书。
@@ -31,12 +31,11 @@ src/                   Rust 源码
 - Rust stable toolchain
 - root 权限或具备等价网络管理能力
 - `iproute2`
-- `iptables`
 - `python3`
 - `curl`
 - `ping`
 
-测试脚本依赖 Linux Network Namespace 和 TPROXY，必须使用 root 权限运行。
+测试脚本依赖 Linux Network Namespace、TUN 设备和路由配置能力，必须使用 root 权限运行。
 
 ### 构建
 
@@ -81,15 +80,13 @@ target/release/new-proxy-cli
 ## 配置方式
 
 示例配置位于 `conf/`。支持以下高级配置项：
-* **`Table`**（`auto` / `off`，默认 `auto`）：设置为 `auto` 时，网关启动会自动配置路由表和 `iptables` 代理规则，退出时自动回滚。若为 `off` 则跳过该行为，交由外部配置。
+* **`Table`**（`auto` / `off`，默认 `auto`）：设置为 `auto` 时，网关启动会自动配置 TUN 地址和 peer 路由，退出时自动回滚。若为 `off` 则跳过该行为，交由外部配置。
 * **`PreScript` / `pre_script`**：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
 * **`PostScript` / `post_script`**：在网关优雅退出并清理完所有路由和防火墙之后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
 
 ### WireGuard 后端
 
-默认使用内核 WireGuard：程序通过 generic netlink 创建/配置 peer 并读取统计，不依赖 `wg set/show`。
-
-不能使用内核 WireGuard 的环境可设置 `NEW_PROXY_WG_USERSPACE=1`。此模式会启动 `wireguard-go <interface>`，然后直接连接 WireGuard UAPI Unix socket 配置私钥、监听端口、peer、AllowedIPs、endpoint，并读取统计；默认 socket 路径为 `/var/run/wireguard/<interface>.sock`。可用 `NEW_PROXY_WG_USERSPACE_BIN` 指定 `wireguard-go` 路径，用 `NEW_PROXY_WG_USERSPACE_SOCKET_DIR` 覆盖 socket 目录。
+当前版本内置 `boringtun`，client/server L3 数据面都在进程内完成 WireGuard 封装和解封装；程序仍需要创建 TUN 设备并配置路由，因此通常需要 root 或 `CAP_NET_ADMIN`。
 
 ### 服务端配置
 
@@ -125,13 +122,12 @@ sudo target/release/new_proxy -config conf/server.conf
 
 ### 客户端配置
 
-客户端的 QUIC proxy peer 需要配置本地 TPROXY 端口、服务端 endpoint、控制面端口和目标 `AllowedIPs`：
+客户端的 QUIC proxy peer 需要配置服务端 endpoint、控制面端口和目标 `AllowedIPs`：
 
 ```ini
 [Interface]
 PrivateKey = <client_private_key_base64>
 Address = 10.0.0.2/24, fd00::2/64
-TProxyPort = 1080
 MTU = 1400
 Table = auto
 PreScript = echo "Client starting..." && sysctl -w net.ipv4.ip_forward=1
@@ -153,20 +149,6 @@ sudo target/release/new_proxy -config conf/client.conf
 同样，`conf/client.conf` 会使用接口名 `client`；需要兼容现有 `tun0` 路由/脚本时，请使用 `tun0.conf`。
 
 客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint` 和 `ProxyPort`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，`Endpoint` 和 `ProxyPort` 必须同时存在。
-
-### TPROXY 路由规则
-
-客户端需要把命中 `AllowedIPs` 的 TCP 流量导入本地 TPROXY 端口。示例：
-
-```bash
-sudo ip rule add fwmark <derived_mark> lookup <derived_table>
-sudo ip route add local 0.0.0.0/0 dev lo table <derived_table>
-sudo iptables -t mangle -A PREROUTING \
-  -p tcp -d 10.0.0.1 \
-  -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark <derived_mark>/0xffffffff
-```
-
-`Table = auto` 时程序会按接口名稳定派生 mark/table 并自动配置这些规则；手工配置时应按业务网段替换 `10.0.0.1`，并确保 mark/table 与实例一致。
 
 ## 系统服务管理 (Systemd)
 

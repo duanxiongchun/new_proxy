@@ -8,6 +8,40 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-05 文档与用户态 client 路径复查
+
+本次复查执行了无需 root 的格式、编译、Clippy、单元测试和脚本语法检查：
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+bash -n script/perf/perf_cores_scalability.sh \
+  script/perf/perf_smoke.sh \
+  script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/stability_stress_test.sh
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 56 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+```
+
+备注：`cargo check` / `cargo test` / `cargo clippy` 会显示本地 path 依赖 `smoltcp` 和 `boringtun` 内部 warning，但本 crate 的检查已通过。
+
+结论：**本轮文档与用户态 client 路径复查的格式、编译、Clippy、单元测试和脚本语法检查全部通过；未执行需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
 ## 2026-06-04 增量复查
 
 本次复查执行了无需 root 的静态、单元与脚本语法检查：

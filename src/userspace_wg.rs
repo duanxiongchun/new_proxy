@@ -176,6 +176,14 @@ impl UserspaceWgRegistry {
 
     fn remember_receiver_index(&self, receiver_index: u32, public_key: [u8; 32]) {
         let now = now_unix_secs();
+        {
+            let index = self.receiver_index.read();
+            if let Some(entry) = index.get(&receiver_index) {
+                if entry.public_key == public_key && now.saturating_sub(entry.last_seen) < 30 {
+                    return;
+                }
+            }
+        }
         let last_cleanup = self.receiver_index_last_cleanup.load(Ordering::Relaxed);
         let should_cleanup = now.saturating_sub(last_cleanup)
             >= RECEIVER_INDEX_CLEANUP_INTERVAL_SECS
@@ -310,17 +318,23 @@ impl UserspaceWgRegistry {
             }
         };
         if let Some(action) = action {
-            let old_endpoint = {
-                let mut endpoint_guard = peer.endpoint.write();
-                let old_endpoint = *endpoint_guard;
-                *endpoint_guard = Some(endpoint);
-                old_endpoint
+            let endpoint_changed = {
+                let endpoint_guard = peer.endpoint.read();
+                *endpoint_guard != Some(endpoint)
             };
-            let mut endpoint_index = self.endpoint_index.write();
-            if let Some(old_endpoint) = old_endpoint.filter(|old| *old != endpoint) {
-                endpoint_index.remove(&old_endpoint);
+            if endpoint_changed {
+                let old_endpoint = {
+                    let mut endpoint_guard = peer.endpoint.write();
+                    let old_endpoint = *endpoint_guard;
+                    *endpoint_guard = Some(endpoint);
+                    old_endpoint
+                };
+                let mut endpoint_index = self.endpoint_index.write();
+                if let Some(old_endpoint) = old_endpoint.filter(|old| *old != endpoint) {
+                    endpoint_index.remove(&old_endpoint);
+                }
+                endpoint_index.insert(endpoint, public_key);
             }
-            endpoint_index.insert(endpoint, public_key);
             peer.last_handshake
                 .store(now_unix_secs(), Ordering::Relaxed);
             if let Some(receiver_index) = Self::receiver_index(incoming) {

@@ -69,4 +69,18 @@ mod tests {
         let decoded_addr = read_target_addr(&mut reader).await.unwrap();
         assert_eq!(addr, decoded_addr);
     }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_unknown_address_type() {
+        let mut reader = Cursor::new(vec![9, 0, 0]);
+        let err = read_target_addr(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_truncated_ipv6_address() {
+        let mut reader = Cursor::new(vec![1, 0, 1, 2, 3]);
+        let err = read_target_addr(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
 }

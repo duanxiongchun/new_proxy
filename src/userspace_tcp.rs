@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 pub struct DummyPhyDevice {
     pub rx_queue: VecDeque<Vec<u8>>,
     pub tx_queue: VecDeque<Vec<u8>>,
+    pub mtu: usize,
 }
 
 impl Device for DummyPhyDevice {
@@ -18,19 +19,23 @@ impl Device for DummyPhyDevice {
         self.rx_queue.pop_front().map(|packet| {
             (
                 DummyRxToken { packet },
-                DummyTxToken { queue: &mut self.tx_queue },
+                DummyTxToken {
+                    queue: &mut self.tx_queue,
+                },
             )
         })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(DummyTxToken { queue: &mut self.tx_queue })
+        Some(DummyTxToken {
+            queue: &mut self.tx_queue,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1500;
+        caps.max_transmission_unit = self.mtu;
         caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
         caps
     }
@@ -72,16 +77,30 @@ pub struct UserspaceTcpStack {
 }
 
 impl UserspaceTcpStack {
-    pub fn new(ip_cidr: IpCidr) -> Result<Self, String> {
+    pub fn new(ip_cidrs: Vec<IpCidr>, mtu: usize) -> Result<Self, String> {
+        if ip_cidrs.is_empty() {
+            return Err("smoltcp stack requires at least one interface address".to_string());
+        }
         let mut device = DummyPhyDevice {
             rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
+            mtu,
         };
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, Instant::now());
+        let mut push_error = None;
         iface.update_ip_addrs(|addrs| {
-            addrs.push(ip_cidr).unwrap();
+            addrs.clear();
+            for ip_cidr in ip_cidrs {
+                if addrs.push(ip_cidr).is_err() {
+                    push_error = Some("too many interface addresses for smoltcp stack".to_string());
+                    break;
+                }
+            }
         });
+        if let Some(error) = push_error {
+            return Err(error);
+        }
 
         let sockets = SocketSet::new(vec![]);
         Ok(Self {
@@ -110,7 +129,8 @@ impl UserspaceTcpStack {
     pub fn process_input_packet(&mut self, packet: Vec<u8>) {
         self.device.rx_queue.push_back(packet);
         let timestamp = Instant::now();
-        self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
+        self.iface
+            .poll(timestamp, &mut self.device, &mut self.sockets);
     }
 }
 
@@ -122,8 +142,14 @@ mod tests {
     #[test]
     fn test_smoltcp_stack_creation() {
         let ip_cidr = IpCidr::from_str("10.0.0.2/24").unwrap();
-        let mut stack = UserspaceTcpStack::new(ip_cidr).unwrap();
+        let mut stack = UserspaceTcpStack::new(vec![ip_cidr], 1400).unwrap();
         let handle = stack.create_tcp_socket(1024, 1024).unwrap();
         assert!(stack.get_socket_state(handle).is_ok());
+        assert_eq!(stack.device.capabilities().max_transmission_unit, 1400);
+    }
+
+    #[test]
+    fn test_smoltcp_stack_requires_configured_addresses() {
+        assert!(UserspaceTcpStack::new(Vec::new(), 1400).is_err());
     }
 }

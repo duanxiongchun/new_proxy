@@ -521,7 +521,7 @@ impl RtcWorker {
                                             }
                                         });
                                         if !has_listening {
-                                            if let Ok(handle) = self.tcp_stack.create_tcp_socket(65535, 65535) {
+                                            if let Ok(handle) = self.tcp_stack.create_tcp_socket(131072, 131072) {
                                                 let s = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
                                                 let _ = s.listen(local_port);
                                                 log::debug!("Created userspace listening TCP socket on port {}", local_port);
@@ -541,7 +541,6 @@ impl RtcWorker {
 
                                     rewrite_destination_ip(packet, local_ip);
                                     rewrite_destination_port(packet, local_port);
-                                    repair_tcp_checksums(packet);
 
                                     self.tcp_stack.process_input_packet(packet.to_vec());
                                 } else {

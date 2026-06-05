@@ -33,38 +33,46 @@ pub async fn run_cli_stats() -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to read stats from socket: {}", e))?;
 
+    let stats = parse_stats_payload(&buf)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    print!("{}", format_stats_table(&stats, now));
+    Ok(())
+}
+
+fn parse_stats_payload(buf: &[u8]) -> Result<Vec<UnifiedTelemetry>, String> {
     let body = if buf.len() >= 4 {
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         if len == buf.len().saturating_sub(4) {
             &buf[4..]
         } else {
-            &buf[..]
+            buf
         }
     } else {
-        &buf[..]
+        buf
     };
 
-    let stats: Vec<UnifiedTelemetry> =
-        serde_json::from_slice(body).map_err(|e| format!("Failed to parse JSON stats: {}", e))?;
+    serde_json::from_slice(body).map_err(|e| format!("Failed to parse JSON stats: {}", e))
+}
 
-    println!("\n+-------------------------------------------------------------------------------------------------------------------------------------------+");
-    println!("|                                             HYBRID SECURE PROXY GATEWAY TELEMETRY                                                         |");
-    println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
-    println!(
-        "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |",
+fn format_stats_table(stats: &[UnifiedTelemetry], now: u64) -> String {
+    let mut out = String::new();
+    out.push_str("\n+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
+    out.push_str("|                                             HYBRID SECURE PROXY GATEWAY TELEMETRY                                                         |\n");
+    out.push_str("+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
+    out.push_str(&format!(
+        "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |\n",
         "Peer Public Key",
         "Source",
         "L3 Transfer (RX/TX)",
         "L4 Transfer (RX/TX)",
         "Handshake (ago)",
         "Active Strm"
-    );
-    println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    ));
+    out.push_str("+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
 
     for s in stats {
         let l3_str = format!(
@@ -85,13 +93,13 @@ pub async fn run_cli_stats() -> Result<(), String> {
             "0s".to_string()
         };
 
-        println!(
-            "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |",
+        out.push_str(&format!(
+            "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |\n",
             s.public_key, s.source, l3_str, l4_str, handshake_str, s.active_streams
-        );
+        ));
     }
-    println!("+-------------------------------------------------------------------------------------------------------------------------------------------+");
-    Ok(())
+    out.push_str("+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
+    out
 }
 
 pub(crate) fn format_bytes(bytes: u64) -> String {
@@ -110,11 +118,57 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    fn telemetry(last_handshake: u64) -> UnifiedTelemetry {
+        UnifiedTelemetry {
+            public_key: "peer-key".to_string(),
+            allowed_ips: vec!["10.0.0.2/32".to_string()],
+            endpoint: Some("1.2.3.4:51820".to_string()),
+            l3_rx_bytes: 1024,
+            l3_tx_bytes: 2048,
+            last_handshake,
+            l4_rx_bytes: 3 * 1024 * 1024,
+            l4_tx_bytes: 4 * 1024 * 1024,
+            active_streams: 2,
+            quic_connections: Vec::new(),
+            source: "both".to_string(),
+        }
+    }
+
     #[test]
     fn test_format_bytes() {
         assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn parse_stats_payload_accepts_raw_and_framed_json() {
+        let payload = serde_json::to_vec(&vec![telemetry(0)]).unwrap();
+        assert_eq!(parse_stats_payload(&payload).unwrap().len(), 1);
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&payload);
+        assert_eq!(parse_stats_payload(&framed).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_stats_payload_falls_back_to_raw_when_length_prefix_does_not_match() {
+        let payload = serde_json::to_vec(&vec![telemetry(0)]).unwrap();
+        let parsed = parse_stats_payload(&payload).unwrap();
+        assert_eq!(parsed[0].public_key, "peer-key");
+    }
+
+    #[test]
+    fn format_stats_table_renders_never_past_and_future_handshakes() {
+        let table = format_stats_table(&[telemetry(0), telemetry(90), telemetry(120)], 100);
+
+        assert!(table.contains("peer-key"));
+        assert!(table.contains("1.00 KB/2.00 KB"));
+        assert!(table.contains("3.00 MB/4.00 MB"));
+        assert!(table.contains("never"));
+        assert!(table.contains("10s"));
+        assert!(table.contains("0s"));
     }
 }

@@ -313,6 +313,7 @@ pub fn run_cli_remove_peer(socket_path: &str, public_key: String) -> Result<(), 
     }
 }
 
+#[cfg(not(tarpaulin))]
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  new-proxy-cli [--client | --interface <name> | --socket <path>] show");
@@ -321,6 +322,7 @@ fn print_usage() {
     eprintln!("  new-proxy-cli [--client | --interface <name> | --socket <path>] remove-peer <public_key>");
 }
 
+#[cfg(not(tarpaulin))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut socket_path = DEFAULT_SERVER_UDS_PATH.to_string();

@@ -43,6 +43,8 @@ hmac = "0.12"
 sha2 = "0.10"
 parking_lot = "0.12"
 
-boringtun = { path = "/home/duanxiongchun/boringtun/boringtun" }
-smoltcp = { path = "/home/duanxiongchun/smoltcp", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+boringtun = "0.7.1"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }

@@ -4,7 +4,7 @@
 # ==============================================================================
 # 流量路径说明:
 #   Scenario 1 (QUIC卸载激活):
-#     TCP:  client_app -> router_ns -> [TPROXY in client_ns:1080] -> QUIC Pool -> server_ns:8080
+#     TCP:  client_app -> router_ns -> client_ns TUN/userspace TCP -> QUIC Pool -> server_ns:8080
 #     UDP/ICMP: client_ns -> router_ns -> server_ns (L3 native path)
 #   Scenario 3 (L3回退):
 #     ALL: client_ns -> router_ns -> server_ns:8080 (native path, no QUIC)
@@ -59,7 +59,7 @@ ip netns exec client_ns ip link set lo up
 # 虚拟 WireGuard 隧道 IP (AllowedIP)
 ip netns exec client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec client_ns ip route add default via 10.0.1.1
-# 启用 ip_forward 以便路由流量进入 PREROUTING 被 TPROXY 拦截
+# 启用 ip_forward 以便路由流量进入 client TUN/userspace 数据面
 ip netns exec client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # --- Server NS ---
@@ -80,31 +80,14 @@ ip netns exec router_ns ip link set veth-router-s up
 ip netns exec router_ns ip link set lo up
 ip netns exec router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-# router 路由: 访问 10.0.0.1 先经过 client_ns (Scenario 1 TPROXY 拦截)
+# router 路由: 访问 10.0.0.1 先经过 client_ns (Scenario 1 TUN/userspace 接管)
 ip netns exec router_ns ip route add 10.0.0.1/32 via 10.0.1.2
-# client_ns 中: 访问 10.0.0.1 也通过 veth (否则是 lo 路由，不过 PREROUTING)
+# client_ns 中: 访问 10.0.0.1 也通过 veth/TUN 路由
 ip netns exec client_ns ip route add 10.0.0.1/32 via 10.0.1.1
-
-# TPROXY 策略路由: 标记了 0x1 的包走 local 表
-ip netns exec client_ns ip rule add fwmark 1 lookup 100
-ip netns exec client_ns ip route add local 0.0.0.0/0 dev lo table 100
-
-# TPROXY 拦截规则:
-# - socket/DIVERT 负责把已被透明 socket 接管的连接后续包继续送回本地
-# - TPROXY 只接管客户端主动发起的初始 SYN，避免服务端主动连接的 SYN-ACK 回程被误拦截
-ip netns exec client_ns iptables -t mangle -N NEW_PROXY_E2E_DIVERT 2>/dev/null || true
-ip netns exec client_ns iptables -t mangle -A NEW_PROXY_E2E_DIVERT -j MARK --set-mark 0x1
-ip netns exec client_ns iptables -t mangle -A NEW_PROXY_E2E_DIVERT -j ACCEPT
-ip netns exec client_ns iptables -t mangle -A PREROUTING \
-    -p tcp -m socket --transparent \
-    -j NEW_PROXY_E2E_DIVERT
-ip netns exec client_ns iptables -t mangle -A PREROUTING \
-    -p tcp --syn -d 10.0.0.1 \
-    -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
 
 echo "  ✓ 命名空间配置完成"
 echo "  路由: router_ns -> 10.0.0.1 via 10.0.1.2 (client_ns)"
-echo "  TPROXY: client_ns PREROUTING tcp->10.0.0.1 重定向到 :1080"
+echo "  TCP: client_ns TUN/userspace TCP path handles tcp->10.0.0.1"
 
 # -------------------------------------------------------------------------
 # 2. START TARGET HOST SERVERS
@@ -125,7 +108,7 @@ sleep 1
 echo ""
 echo "=== [3/5] SCENARIO 1: Dual-Track Offloading & Telemetry Verification ==="
 echo "  流量路径:"
-echo "  [TCP]      router_ns ──► client_ns:TPROXY:1080 ──► QUIC Pool ──► server_ns:8080"
+echo "  [TCP]      router_ns ──► client_ns TUN/userspace TCP ──► QUIC Pool ──► server_ns:8080"
 echo "  [UDP/ICMP] client_ns ──► router_ns ──► server_ns (L3 native)"
 
 # 激活客户端代理路径标志
@@ -152,7 +135,6 @@ cat > /tmp/scenario_client.conf <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-TProxyPort = 1080
 MTU = 1400
 Table = off
 
@@ -168,7 +150,7 @@ ip netns exec server_ns ./target/debug/new_proxy -config /tmp/scenario_server.co
 SERVER_PID=$!
 sleep 2
 
-# 启动 Client Daemon (含 TPROXY 监听)
+# 启动 Client Daemon
 ip netns exec client_ns ./target/debug/new_proxy -config /tmp/scenario_client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
 CLIENT_PID=$!
 sleep 2
@@ -176,7 +158,7 @@ sleep 2
 echo ""
 echo "  >> 发射并行并发流量..."
 
-# 3 个并发 TCP 流: 从 router_ns 发出，经过 client_ns TPROXY 拦截后走 QUIC 卸载
+# 3 个并发 TCP 流: 从 router_ns 发出，经过 client_ns TUN/userspace TCP 后走 QUIC 卸载
 ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/ &
 TCP_PID1=$!
 ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/ &
@@ -339,9 +321,6 @@ echo "  [ALL]  client_ns ──► router_ns ──► server_ns:8080 (native L3
 kill $CLIENT_PID 2>/dev/null
 sleep 1
 
-# 清除 TPROXY 拦截规则
-ip netns exec client_ns iptables -t mangle -F PREROUTING
-ip netns exec client_ns ip rule del fwmark 1 lookup 100 2>/dev/null || true
 rm -f /tmp/client_proxy_active
 
 # 更新 router 路由: 10.0.0.1 现在直接去 server_ns (绕过 client_ns)
