@@ -11,6 +11,11 @@ source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 ARTIFACT_DIR="${PERF_SMOKE_ARTIFACT_DIR:-/tmp/new_proxy_perf_smoke_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$ARTIFACT_DIR"
 
+if [ ! -x "$ROOT_DIR/target/release/new_proxy" ] || [ ! -x "$ROOT_DIR/target/release/new-proxy-cli" ]; then
+  echo "Missing release binaries. Run: cargo build --release --bins" >&2
+  exit 1
+fi
+
 SERVER_PID=""
 CLIENT_PID=""
 HTTP_PID=""
@@ -104,7 +109,6 @@ ip netns exec perf_client_ns ip link set vp-c up
 ip netns exec perf_client_ns ip link set vp-c-w up
 ip netns exec perf_client_ns ip link set lo up
 ip netns exec perf_client_ns ip route add default via 10.0.1.1
-ip netns exec perf_client_ns ip route add 10.0.0.1/32 via 10.0.1.1
 ip netns exec perf_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 ip netns exec perf_work_ns ip addr add 10.0.4.2/24 dev vp-w
@@ -124,7 +128,7 @@ ip netns exec perf_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count=8 status=none
 ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
-ip netns exec perf_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
+ip netns exec perf_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server.conf" --threads 4 > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -132,7 +136,7 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   cat "$ARTIFACT_DIR/server.log"
   exit 1
 fi
-ip netns exec perf_client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" --threads 4 > "$ARTIFACT_DIR/client.log" 2>&1 &
+ip netns exec perf_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" --threads 4 > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
 if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
@@ -208,7 +212,7 @@ then
   exit 1
 fi
 
-if ! ip netns exec perf_server_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface server show > "$ARTIFACT_DIR/server_show.txt"; then
+if ! ip netns exec perf_server_ns "$ROOT_DIR/target/release/new-proxy-cli" --interface server show > "$ARTIFACT_DIR/server_show.txt"; then
   echo "Failed to query server telemetry"
   cat "$ARTIFACT_DIR/server.log"
   exit 1

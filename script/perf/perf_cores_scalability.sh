@@ -10,7 +10,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 
 THREADS_LIST="${PERF_THREADS_LIST:-1 2 3 4}"
-PARALLEL="${PERF_PARALLEL:-16}"
+PARALLEL="${PERF_PARALLEL:-32}"
 ROUNDS="${PERF_ROUNDS:-2}"
 BLOB_MIB="${PERF_BLOB_MIB:-64}"
 ARTIFACT_DIR="${PERF_ARTIFACT_DIR:-/tmp/new_proxy_cores_scalability_$(date +%Y%m%d_%H%M%S)}"
@@ -200,7 +200,6 @@ ip netns exec scale_client_ns ip link set vs-c up
 ip netns exec scale_client_ns ip link set vs-cw up
 ip netns exec scale_client_ns ip link set lo up
 ip netns exec scale_client_ns ip route add default via 10.0.1.1
-ip netns exec scale_client_ns ip route add 10.0.0.1/32 via 10.0.1.1
 ip netns exec scale_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 ip netns exec scale_work_ns ip addr add 10.0.4.2/24 dev vs-w
@@ -220,21 +219,23 @@ ip netns exec scale_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count="$BLOB_MIB" status=none
 ip netns exec scale_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
-ip netns exec scale_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server.log" 2>&1 &
-SERVER_PID=$!
-sleep 2
-if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-  echo "Server daemon exited early" >&2
-  cat "$ARTIFACT_DIR/server.log" >&2
-  exit 1
-fi
 
 run_group() {
   local threads="$1"
   local cpus
+  local server_log="$ARTIFACT_DIR/server_${threads}.log"
   local client_log="$ARTIFACT_DIR/client_${threads}.log"
   local worker_dump="$ARTIFACT_DIR/client_${threads}_dump.txt"
   cpus="$(cpus_for_threads "$threads")"
+
+  ip netns exec scale_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$SERVER_CONF" --threads "$threads" > "$server_log" 2>&1 &
+  SERVER_PID=$!
+  sleep 2
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "Server daemon exited early for threads=$threads" >&2
+    cat "$server_log" >&2
+    exit 1
+  fi
 
   ip netns exec scale_client_ns taskset -c "$cpus" "$ROOT_DIR/target/release/new_proxy" -config "$CLIENT_CONF" --threads "$threads" > "$client_log" 2>&1 &
   CLIENT_PID=$!
@@ -248,7 +249,7 @@ run_group() {
   ip netns exec scale_work_ns curl -fsS --connect-timeout 5 --max-time 30 -o /dev/null "http://10.0.0.1:8080/blob.bin"
 
   local line
-  line="$(ip netns exec scale_work_ns python3 - "$threads" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
+  if ! line="$(ip netns exec scale_work_ns python3 - "$threads" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
 import concurrent.futures
 import subprocess
 import sys
@@ -274,12 +275,26 @@ elapsed = time.monotonic() - start
 total_mib = blob_mib * parallel * rounds
 print(f"{threads},{parallel},{rounds},{total_mib},{elapsed:.6f},{total_mib / elapsed:.3f}")
 PY
-)"
+)"; then
+    echo "Throughput load failed for threads=$threads" >&2
+    cat "$client_log" >&2
+    cat "$server_log" >&2
+    kill "$CLIENT_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" 2>/dev/null || true
+    CLIENT_PID=""
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+    exit 1
+  fi
 
   ip netns exec scale_client_ns "$ROOT_DIR/target/release/new-proxy-cli" --interface client dump > "$worker_dump"
   kill "$CLIENT_PID" 2>/dev/null || true
   wait "$CLIENT_PID" 2>/dev/null || true
   CLIENT_PID=""
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
 
   printf "%s" "$line"
 }
@@ -288,7 +303,9 @@ echo "Artifact directory: $ARTIFACT_DIR"
 echo "threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows" | tee "$RESULTS_CSV"
 base_rate=""
 for threads in $THREADS_LIST; do
-  line="$(run_group "$threads")"
+  if ! line="$(run_group "$threads")"; then
+    exit 1
+  fi
   rate="$(printf "%s" "$line" | awk -F, '{print $6}')"
   if [ -z "$base_rate" ]; then
     base_rate="$rate"
