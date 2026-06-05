@@ -8,6 +8,337 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-05 全量 E2E、稳定性、性能与门禁验证
+
+本轮按要求重新执行全部本地门禁、端到端场景、稳定性压测、性能冒烟和核心数扩展性能测试。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+cargo build --bins
+cargo build --release --bins
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/e2e_full_tunnel_bypass.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+sudo bash script/acceptance/e2e_test_dualstack.sh
+sudo bash script/acceptance/e2e_scenarios.sh
+sudo bash script/acceptance/e2e_multi_client.sh
+sudo bash script/acceptance/e2e_dynamic_client_peer.sh
+sudo bash script/acceptance/e2e_userspace_wg_fallback.sh
+sudo bash script/acceptance/e2e_full_tunnel_bypass.sh
+sudo bash script/acceptance/stability_stress_test.sh
+sudo bash script/perf/perf_smoke.sh
+sudo bash script/perf/perf_cores_scalability.sh
+```
+
+门禁结果：
+
+```text
+cargo fmt --check: PASS
+cargo check --quiet: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test --quiet:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 94 passed; 0 failed
+cargo build --bins: PASS
+cargo build --release --bins: PASS
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+```
+
+端到端场景结果：
+
+```text
+sudo bash script/acceptance/e2e_test_dualstack.sh: PASS
+sudo bash script/acceptance/e2e_scenarios.sh: PASS
+  - dual-track TCP over TUN/smoltcp/QUIC: PASS
+  - server restart and client auto-reconnection: PASS
+  - legacy external WireGuard fallback sub-scenario: SKIP
+  - dynamic add/remove peer: PASS
+  - standard no-QUIC L3 fallback mode: PASS
+sudo bash script/acceptance/e2e_multi_client.sh: PASS
+sudo bash script/acceptance/e2e_dynamic_client_peer.sh: PASS
+  - artifact: /tmp/new_proxy_dynamic_peer_20260605_205511
+sudo bash script/acceptance/e2e_userspace_wg_fallback.sh: PASS
+  - artifact: /tmp/new_proxy_userspace_wg_fallback_20260605_205532
+  - WireGuard bytes non-zero; QUIC inactive after data ports blocked
+sudo bash script/acceptance/e2e_full_tunnel_bypass.sh: PASS
+  - artifact: /tmp/new_proxy_full_tunnel_20260605_205638
+  - endpoint route uses physical client link, not full-tunnel TUN
+```
+
+稳定性压测结果：
+
+```text
+sudo bash script/acceptance/stability_stress_test.sh: completed with exit code 0
+artifact: /tmp/new_proxy_stability_20260605_205656
+report: /tmp/new_proxy_stability_20260605_205656/stability_report.md
+samples collected: 121
+proxy crash samples: 0
+long TCP iterations/errors: 57268/0
+short curl OK/FAIL: 70120/0
+UDP OK/FAIL: 2133/0
+Ping OK/FAIL: 7124/0
+worst per-peer QUIC balance CV: 0.02%
+```
+
+稳定性报告的 pass criteria：
+
+```text
+No proxy crash: PASS
+Short curl success: PASS
+Long TCP success: PASS
+Per-peer QUIC CV < 5%: PASS
+RSS growth <= 10% or <= 2 MiB: FAIL
+RSS warmup baseline: 10s
+```
+
+RSS 阈值差距：
+
+```text
+client:
+  RSS: 21.08 -> 24.79 MiB
+  growth: +3.71 MiB / +17.62%
+  over 10% threshold: +7.62 percentage points
+  over 2 MiB threshold: +1.71 MiB
+  final RSS over effective allowed end RSS: +1.61 MiB
+
+client2:
+  RSS: 20.32 -> 25.91 MiB
+  growth: +5.58 MiB / +27.46%
+  over 10% threshold: +17.46 percentage points
+  over 2 MiB threshold: +3.58 MiB
+  final RSS over effective allowed end RSS: +3.55 MiB
+
+server:
+  RSS: 13.36 -> 13.87 MiB
+  growth: +0.51 MiB / +3.80%
+  RSS threshold: PASS
+```
+
+RSS 结论：**稳定性压测业务面全部通过，无 crash、无 TCP/UDP/Ping 失败，QUIC 连接负载均衡良好；RSS 仅 client 侧超过当前严格门槛，绝对差距为 MiB 级，当前评估为可接受风险，后续可继续观察长时运行趋势或按需调优阈值/内存复用。**
+
+性能结果：
+
+```text
+sudo bash script/perf/perf_smoke.sh: PASS
+artifact: /tmp/new_proxy_perf_smoke_20260605_215732
+TTFB p50: 0.012391s
+TTFB p95: 0.013120s
+TTFB max: 0.013466s
+throughput: 22.0617 MiB/s
+
+sudo bash script/perf/perf_cores_scalability.sh: PASS
+artifact: /tmp/new_proxy_cores_scalability_20260605_215751
+threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,16,2,2048,10.770592,190.147,1.000,33
+2,16,2,2048,6.391580,320.422,1.685,14|19
+3,16,2,2048,4.567963,448.340,2.358,8|15|10
+4,16,2,2048,3.594782,569.715,2.996,8|10|8|7
+```
+
+结论：**本轮全量门禁、E2E 场景、性能冒烟和核心数扩展性能测试通过；稳定性压测业务指标全部通过，唯一未满足项为 RSS 增长阈值，超出量为 client 侧约 1.61 MiB / client2 侧约 3.55 MiB 的最终 RSS 差距，当前判定问题不大并记录为可接受风险。**
+
+## 2026-06-05 锁粒度优化验证
+
+本次修复覆盖：
+
+- `QuicPoolClient` 的物理连接 `slots` 改为 `arc-swap` 快照，业务新建 stream 热路径不再获取 `RwLock`。
+- UDS `add-peer` 在 mutation 锁外预建 QUIC pool，缩短动态 peer 串行锁持有时间；提交前仍在锁内重新检查 AllowedIPs 冲突。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check --quiet: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test --quiet:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 94 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+```
+
+结论：**锁粒度优化通过格式、编译、Clippy、单元测试和脚本语法检查；本轮未重新执行需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
+## 2026-06-05 严格 Review 修复验证
+
+本次修复覆盖：
+
+- `RtcWorker` bridge pending 队列增加按字节上限，client bridge 全局并发上限从 4096 收紧到 1024，降低慢读/慢写场景 RSS 放大风险。
+- QUIC pool 在 `open_bi()` 失败或超时时主动关闭该物理连接，避免后续 health checker 将无法开 stream 的连接继续视为健康。
+- 架构文档修正 L3 userspace WireGuard 语义：当前是 shared per-peer `boringtun` 状态，不是 per-worker 独立状态。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+git diff --check
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check --quiet: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test --quiet:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 94 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+git diff --check: PASS
+```
+
+结论：**严格 Review 后的稳定性修复通过格式、编译、Clippy、单元测试和脚本语法检查；本轮未重新执行需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
+## 2026-06-05 Review 修复验证
+
+本次修复覆盖：
+
+- `PreScript` 执行失败时启动立即失败，不再只记录 warning 后继续启动；`PostScript` 仍保持 cleanup best-effort。
+- `RtcWorker` IPv4 TCP parser 拒绝非法 IHL、过短 total length 和截断 packet，避免 malformed TUN packet 被误分类。
+- `script/perf/perf_cores_scalability.sh` 删除模拟吞吐 fallback，缺 root、release binary、必需系统工具、可用 CPU 或 benchmark 拓扑时失败，不再生成可误读的性能数据；脚本强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 `--threads`。
+- 架构和测试文档同步当前真实语义：client 按 `--threads` 使用多队列；L4 proxy 多 worker 正确性依赖 Linux TUN multiqueue 的 flow queue affinity。
+- 取消 L4 proxy client 强制单 TUN 队列，已有 proxy E2E/perf smoke 入口改为使用 `--threads 4` 启动 client。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+bash -n script/perf/perf_cores_scalability.sh \
+  script/perf/perf_smoke.sh \
+  script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/stability_stress_test.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+sudo script/acceptance/e2e_dynamic_client_peer.sh
+```
+
+结果：
+
+```text
+cargo fmt --check: PASS
+cargo check: PASS
+cargo clippy --all-targets -- -D warnings: PASS
+cargo test:
+  new_proxy_cli: 10 passed; 0 failed
+  new_proxy: 93 passed; 0 failed
+bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+sudo script/acceptance/e2e_dynamic_client_peer.sh: PASS
+  - client daemon uses --threads 4
+  - artifact: /tmp/new_proxy_dynamic_peer_20260605_200459
+```
+
+结论：**Review 修复后的格式、编译、Clippy、单元测试、脚本语法检查和 `--threads 4` 动态 client proxy peer E2E 通过；本轮未重新执行其他需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+
+## 2026-06-05 L4 Proxy 多队列扩展实测
+
+测试目标：确认取消 L4 proxy 单队列限制后，`--threads 1..4` 是否真实开启对应 TUN queue，观察 TCP over QUIC 吞吐扩展，并通过 per-worker telemetry 判断 flow 是否分散到多个 `RtcWorker`。
+
+测试方法：
+
+- 使用 release binary：`cargo build --release --bins`
+- 使用 Linux network namespace 搭建 `scale_work_ns -> scale_client_ns -> scale_router_ns -> scale_server_ns`
+- server 运行 4 个 QUIC data ports：`40001..40004`
+- client 分别以 `--threads 1`、`--threads 2`、`--threads 3`、`--threads 4` 启动
+- 每组 client 使用当前允许 cpuset 的前 N 个 CPU 运行，支持 `PERF_CPU_LIST` 覆盖，`--threads=N`
+- 每组先 warmup 一次 64 MiB HTTP 下载，再运行并发 HTTP 下载同一 64 MiB 对象
+- 统计来自 client UDS dump 的 `worker:` 行：`new_flows` 表示每个 worker 新建 TCP flow 数
+
+16 并发、2 轮、总传输量 2048 MiB：
+
+```text
+artifact: /tmp/new_proxy_cores_scalability_20260605_202207
+threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,16,2,2048,10.534491,194.409,1.000,33
+2,16,2,2048,6.294708,325.353,1.674,15|18
+3,16,2,2048,4.682595,437.364,2.250,13|10|10
+4,16,2,2048,3.575260,572.825,2.946,7|7|11|8
+```
+
+64 并发、1 轮、总传输量 4096 MiB：
+
+```text
+artifact: /tmp/new_proxy_cores_scalability_20260605_202329
+threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,64,1,4096,49.274695,83.126,1.000,65
+2,64,1,4096,20.422916,200.559,2.413,37|28
+3,64,1,4096,14.139338,289.688,3.485,22|22|21
+4,64,1,4096,11.392930,359.521,4.325,17|16|19|13
+```
+
+worker dump 示例显示 4 threads 下流量进入全部 worker，且没有 L3 fallback：
+
+```text
+worker:0 tun_rx=103907:4157015 tcp_offload=103907:4157015 l3=0:0 new_flows=7 current_flows=0
+worker:1 tun_rx=110968:4439455 tcp_offload=110968:4439455 l3=0:0 new_flows=7 current_flows=0
+worker:2 tun_rx=183794:7352931 tcp_offload=183792:7352835 l3=0:0 new_flows=11 current_flows=0
+worker:3 tun_rx=122252:4890920 tcp_offload=122252:4890920 l3=0:0 new_flows=8 current_flows=0
+```
+
+结论：**L4 proxy 多队列改动已生效，flow 确实分散到多个 worker。16 并发下 4 threads 为 2.946x，不是严格线性；64 并发下相对扩展达到 4.325x，但绝对吞吐下降，说明 curl/Python HTTP/连接调度引入了额外测试瓶颈。本测试能证明多 worker 参与转发和吞吐随 worker 增长，但还不能作为最终性能基准。正式结论仍需要 iperf3 或专用 Rust traffic generator、多轮 median、CPU/RSS/worker 分布联合报告。**
+
 ## 2026-06-05 文档与用户态 client 路径复查
 
 本次复查执行了格式、编译、Clippy、单元测试、脚本语法检查，并复跑了需要 root/network namespace 的场景脚本：

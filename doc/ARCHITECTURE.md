@@ -8,10 +8,10 @@
 
 - **L3 数据面**：
   - **服务端**：打开 TUN 设备并通过内建 `boringtun` 处理 WireGuard 风格 L3 加解密；配置 `Table = auto` 时会为 peer AllowedIPs 下发指向 TUN 的路由。
-  - **客户端**：采用用户态协议栈。程序先打开并持有多队列 TUN 设备文件描述符，再配置该 TUN 的地址和 AllowedIPs 路由；在进程内通过 `boringtun`（用户态 WireGuard 协议库）对 UDP/ICMP 报文和 TCP fallback 报文进行加密封装，并发送至宿主机物理网卡。客户端不再同步 peer 到内核 WireGuard 设备，但创建 TUN 和配置路由仍需要相应系统权限（通常是 `CAP_NET_ADMIN` 或 root）。
+  - **客户端**：采用用户态协议栈。程序按 `--threads` 打开并持有一个或多个 TUN 队列文件描述符，再配置该 TUN 的地址和 AllowedIPs 路由；在进程内通过 `boringtun`（用户态 WireGuard 协议库）对 UDP/ICMP 报文和 TCP fallback 报文进行加密封装，并发送至宿主机物理网卡。客户端不再同步 peer 到内核 WireGuard 设备，但创建 TUN 和配置路由仍需要相应系统权限（通常是 `CAP_NET_ADMIN` 或 root）。
 - **L4 TCP 路径**：
   - **服务端**：通过物理 QUIC 连接池接收并解密来自客户端的透明流。
-  - **客户端**：通过多队列 TUN 拦截 TCP 流量，由各工作线程独立的 `smoltcp` 用户态协议栈接管。建立连接后，通过在进程内桥接 `smoltcp` 套接字与对应的 QUIC 复用连接流（Quinn）进行转发，从而完全免除了内核 iptables 和 TPROXY 的防火墙规则依赖。
+  - **客户端**：通过 TUN 拦截 TCP 流量，由各 TUN 队列对应的 `RtcWorker` 内部 `smoltcp` 用户态协议栈接管。建立连接后，通过在进程内桥接 `smoltcp` 套接字与对应的 QUIC 复用连接流（Quinn）进行转发，从而完全免除了内核 iptables 和 TPROXY 的防火墙规则依赖。同一 TCP flow 的状态保存在接收该 flow 的 worker 中，当前实现依赖 Linux TUN multiqueue 的 flow queue affinity。
 - **控制面**：独立的 UDP 报文协议，使用 WireGuard 密钥材料派生 X25519 shared secret，并用 HMAC-SHA256 认证 JSON 请求/响应。
 - **QUIC 数据面**：使用服务端自签证书，服务端在已认证控制面响应中下发证书 SHA-256 指纹，客户端只接受该指纹对应证书。
 - **运行期 API**：通过 Unix Domain Socket 提供 `Stats`、`Dump`、`AddPeer`、`RemovePeer` API。
@@ -34,7 +34,7 @@ Client mode 支持：
 - **用户态混合代理**：TCP 流量匹配 proxy peer 的 `AllowedIPs` 最长前缀后卸载到用户态 QUIC 连接池中；UDP/ICMP 以及 QUIC 不可用时的 TCP fallback 通过 `boringtun` 在用户态进行 WireGuard 加密封装。
 - proxy peer 需要同时配置 `Endpoint` 和 `ProxyPort`。`ProxyPort` 是控制面 UDP 端口；`Endpoint` 和 `ProxyPort` 必须成对出现。
 - `TProxyPort` 是旧 TPROXY 路径遗留配置，当前用户态 TUN client 不再需要它。
-- 客户端可以指定并发工作线程数（通过 `--threads <count>`），对应开启多队列 TUN 设备和多个独立的 `RtcWorker` 事件循环。
+- 客户端可以指定并发工作线程数（通过 `--threads <count>`），对应开启多队列 TUN 设备和多个独立的 `RtcWorker` 循环。L4 proxy 模式下每个 worker 拥有独立的 `smoltcp`、NAT 映射和桥接通道；L3 userspace WireGuard 状态按 peer 共享，并通过内部锁串行访问。
 
 ## 3. WireGuard 后端
 
@@ -94,7 +94,7 @@ graph TD
         subgraph Worker Thread N (Core N)
             TunQ[TUN 队列 N FD] <-->|读/写| Worker[RtcWorker Loop]
             Worker <-->|TCP (NAT)| SmolTCP[smoltcp Stack]
-            Worker <-->|UDP/ICMP| UserspaceWg[Userspace boringtun]
+            Worker <-->|UDP/ICMP| UserspaceWg[Shared per-peer userspace boringtun]
 
             SmolTCP <-->|Channel Bridge| QuicStream[QUIC Stream]
             UserspaceWg <-->|加密包| RawUDP[物理 UDP Socket]
@@ -111,8 +111,9 @@ graph TD
 ### 6.1 Multiqueue TUN 与多线程扩展
 
 客户端会根据线程参数开启多队列（`IFF_MULTI_QUEUE`）TUN 设备。
-- **出站流量**：内核自动计算 4-Tuple 的哈希值，并将包均衡分发到不同的队列 FD。
-- **工作线程**：每个核心独立运行一个 `RtcWorker` 事件循环。每个工作线程绑定一个 TUN 队列 FD，并且拥有自己独立的 `smoltcp` 协议栈、`boringtun` 状态机与物理 UDP 套接字，实现完全无锁的并行处理。
+- **出站流量**：Linux TUN multiqueue 按 flow 选择队列，单个 TCP flow 的后续包应保持队列亲和；不同 flow 可被分散到不同队列 FD。
+- **L4 TCP offload 出站流量**：接收某个 TCP flow 的 `RtcWorker` 持有该 flow 的 `smoltcp` socket、NAT 映射和桥接通道。
+- **工作线程**：每个 worker 绑定一个 TUN 队列 FD，并拥有自己的 L4 TCP 用户态协议状态。L3 userspace WireGuard 状态当前按 peer 共享，多个 worker 会在同一 peer 的 `boringtun::Tunn` 上串行加解密。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
 
 ### 6.2 Run-to-Completion (RTC) 运行完成环路
 
@@ -162,5 +163,5 @@ UDS 路径：`/run/new_proxy/<interface>.sock`
 - **客户端 L3/L4 均在用户态**，消除任何系统 WireGuard 内核模块及 `iptables` / TPROXY 依赖。
 - **服务端 L3 也在用户态**，不再依赖内核 WireGuard 模块；QUIC 接收池仍直接绑定宿主机 UDP 端口。
 - 动态 peer 管理（`AddPeer` / `RemovePeer`）在客户端会动态调整 `RtcWorker` 拥有的 AllowedIPs 路由与套接字映射关系。
-- userspace WireGuard registry 按 peer 维护独立 `boringtun` 状态，并通过 AllowedIPs 路由选择出站 peer；入站数据优先使用 receiver index 与 endpoint 索引定位 peer，未知握手包才退回逐 peer 尝试。
+- userspace WireGuard registry 按 peer 维护共享的 `boringtun` 状态，并通过 AllowedIPs 路由选择出站 peer；入站数据优先使用 receiver index 与 endpoint 索引定位 peer，未知握手包才退回逐 peer 尝试。
 - 当前 client/server 启动路径不创建 transparent listener，也不下发 TPROXY iptables 规则。

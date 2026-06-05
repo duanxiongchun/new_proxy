@@ -6,6 +6,7 @@ use smoltcp::socket::tcp;
 use smoltcp::socket::AnySocket;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -16,6 +17,8 @@ type ActiveConnHandler = Arc<
 type NatKey = (IpAddr, u16, u16);
 type FlowKey = (IpAddr, u16, IpAddr, u16);
 const BRIDGE_PENDING_LIMIT: usize = 256;
+const BRIDGE_PENDING_BYTES_LIMIT: usize = 128 * 1024;
+const BRIDGE_CHANNEL_CAPACITY: usize = 32;
 const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_WORKER_TCP_FLOWS: usize = 4096;
@@ -63,6 +66,13 @@ pub fn parse_tcp_packet(packet: &[u8]) -> Option<(IpAddr, u16, IpAddr, u16, bool
                 return None;
             }
             let ihl = (packet[0] & 0x0f) as usize * 4;
+            if ihl < 20 {
+                return None;
+            }
+            let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+            if total_len < ihl + 20 || packet.len() < total_len {
+                return None;
+            }
             if packet.len() < ihl + 20 {
                 return None;
             }
@@ -248,7 +258,60 @@ pub struct BridgeChannels {
     pub recv_buf: Vec<u8>,
     pub to_quic_pending: VecDeque<Vec<u8>>,
     pub from_quic_pending: VecDeque<Vec<u8>>,
+    pub to_quic_pending_bytes: usize,
+    pub from_quic_pending_bytes: usize,
     pub quic_rx_closed: bool,
+}
+
+impl BridgeChannels {
+    fn push_to_quic_pending(&mut self, data: Vec<u8>) -> bool {
+        if self.to_quic_pending.len() >= BRIDGE_PENDING_LIMIT
+            || self.to_quic_pending_bytes.saturating_add(data.len()) > BRIDGE_PENDING_BYTES_LIMIT
+        {
+            return false;
+        }
+        self.to_quic_pending_bytes += data.len();
+        self.to_quic_pending.push_back(data);
+        true
+    }
+
+    fn pop_to_quic_pending(&mut self) -> Option<Vec<u8>> {
+        let data = self.to_quic_pending.pop_front()?;
+        self.to_quic_pending_bytes = self.to_quic_pending_bytes.saturating_sub(data.len());
+        Some(data)
+    }
+
+    fn push_front_to_quic_pending(&mut self, data: Vec<u8>) {
+        self.to_quic_pending_bytes += data.len();
+        self.to_quic_pending.push_front(data);
+    }
+
+    fn has_from_quic_pending_capacity(&self) -> bool {
+        self.from_quic_pending.len() < BRIDGE_PENDING_LIMIT
+            && self.from_quic_pending_bytes + 1500 <= BRIDGE_PENDING_BYTES_LIMIT
+    }
+
+    fn push_from_quic_pending(&mut self, data: Vec<u8>) -> bool {
+        if self.from_quic_pending.len() >= BRIDGE_PENDING_LIMIT
+            || self.from_quic_pending_bytes.saturating_add(data.len()) > BRIDGE_PENDING_BYTES_LIMIT
+        {
+            return false;
+        }
+        self.from_quic_pending_bytes += data.len();
+        self.from_quic_pending.push_back(data);
+        true
+    }
+
+    fn consume_from_quic_front(&mut self, consumed: usize) {
+        self.from_quic_pending_bytes = self.from_quic_pending_bytes.saturating_sub(consumed);
+        if let Some(front) = self.from_quic_pending.front_mut() {
+            if consumed >= front.len() {
+                self.from_quic_pending.pop_front();
+            } else {
+                front.drain(..consumed);
+            }
+        }
+    }
 }
 
 pub struct RtcWorker {
@@ -266,6 +329,7 @@ pub struct RtcWorker {
     mtu: usize,
     last_housekeeping: Instant,
     bridge_notify: Arc<Notify>,
+    worker_stats: Option<Arc<crate::telemetry::WorkerTelemetry>>,
 }
 
 impl RtcWorker {
@@ -293,6 +357,50 @@ impl RtcWorker {
             mtu,
             last_housekeeping: Instant::now(),
             bridge_notify: Arc::new(Notify::new()),
+            worker_stats: None,
+        }
+    }
+
+    pub fn set_worker_stats(&mut self, worker_stats: Arc<crate::telemetry::WorkerTelemetry>) {
+        self.worker_stats = Some(worker_stats);
+    }
+
+    fn record_tun_rx(&self, bytes: usize) {
+        if let Some(stats) = &self.worker_stats {
+            stats.tun_rx_packets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .tun_rx_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_tcp_offload(&self, bytes: usize) {
+        if let Some(stats) = &self.worker_stats {
+            stats.tcp_offload_packets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .tcp_offload_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_l3_packet(&self, bytes: usize) {
+        if let Some(stats) = &self.worker_stats {
+            stats.l3_packets.fetch_add(1, Ordering::Relaxed);
+            stats.l3_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_new_tcp_flow(&self) {
+        if let Some(stats) = &self.worker_stats {
+            stats.new_tcp_flows.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_current_tcp_flows(&self) {
+        if let Some(stats) = &self.worker_stats {
+            stats
+                .current_tcp_flows
+                .store(self.flow_map.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -386,6 +494,7 @@ impl RtcWorker {
 
         loop {
             self.cleanup_stale_flows();
+            self.record_current_tcp_flows();
             let now = smoltcp::time::Instant::now();
             self.tcp_stack
                 .iface
@@ -419,6 +528,7 @@ impl RtcWorker {
                 read_res = self.tun_io.read(&mut tun_buf) => {
                     match read_res {
                         Ok(n) if n > 0 => {
+                            self.record_tun_rx(n);
                             let packet = &mut tun_buf[..n];
                             if let Some((src_ip, src_port, dst_ip, dst_port, is_syn)) = parse_tcp_packet(packet) {
                                 let flow_key = (src_ip, src_port, dst_ip, dst_port);
@@ -454,6 +564,7 @@ impl RtcWorker {
                                         if let Some((endpoint, enc_pkt)) =
                                             self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                         {
+                                            self.record_l3_packet(n);
                                             if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                 log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                             }
@@ -470,6 +581,7 @@ impl RtcWorker {
                                         if let Some((endpoint, enc_pkt)) =
                                             self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                         {
+                                            self.record_l3_packet(n);
                                             if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                 log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                             }
@@ -483,6 +595,7 @@ impl RtcWorker {
                                             None => match self.allocate_local_port() {
                                                 Some(port) => {
                                                     self.flow_map.insert(flow_key, port);
+                                                    self.record_new_tcp_flow();
                                                     port
                                                 }
                                                 None => {
@@ -490,6 +603,7 @@ impl RtcWorker {
                                                     if let Some((endpoint, enc_pkt)) =
                                                         self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                                     {
+                                                        self.record_l3_packet(n);
                                                         if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                             log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                                         }
@@ -505,6 +619,7 @@ impl RtcWorker {
                                         if let Some((endpoint, enc_pkt)) =
                                             self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                         {
+                                            self.record_l3_packet(n);
                                             if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                                 log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
                                             }
@@ -542,11 +657,13 @@ impl RtcWorker {
                                     rewrite_destination_ip(packet, local_ip);
                                     rewrite_destination_port(packet, local_port);
 
+                                    self.record_tcp_offload(n);
                                     self.tcp_stack.process_input_packet(packet.to_vec());
                                 } else {
                                     if let Some((endpoint, enc_pkt)) =
                                         self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                     {
+                                        self.record_l3_packet(n);
                                         if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                             log::warn!("Failed to send userspace WireGuard packet to {}: {}", endpoint, e);
                                         }
@@ -556,6 +673,7 @@ impl RtcWorker {
                                 if let Some((endpoint, enc_pkt)) =
                                     self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
                                 {
+                                    self.record_l3_packet(n);
                                     if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
                                         log::warn!("Failed to send userspace WireGuard packet to {}: {}", endpoint, e);
                                     }
@@ -629,8 +747,8 @@ impl RtcWorker {
 
         for (handle, original_dest, nat_key) in new_connections {
             if let Some(ref handler) = self.active_conn_handler {
-                let (tx_sender, tx_receiver) = mpsc::channel(100);
-                let (rx_sender, rx_receiver) = mpsc::channel(100);
+                let (tx_sender, tx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
+                let (rx_sender, rx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
                 self.bridges.insert(
                     handle,
                     BridgeChannels {
@@ -640,6 +758,8 @@ impl RtcWorker {
                         recv_buf: vec![0u8; self.mtu],
                         to_quic_pending: VecDeque::new(),
                         from_quic_pending: VecDeque::new(),
+                        to_quic_pending_bytes: 0,
+                        from_quic_pending_bytes: 0,
                         quic_rx_closed: false,
                     },
                 );
@@ -669,11 +789,11 @@ impl RtcWorker {
                 continue;
             }
 
-            while let Some(data) = bridge.to_quic_pending.pop_front() {
+            while let Some(data) = bridge.pop_to_quic_pending() {
                 match bridge.tx_sender.try_send(data) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(data)) => {
-                        bridge.to_quic_pending.push_front(data);
+                        bridge.push_front_to_quic_pending(data);
                         break;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -685,9 +805,17 @@ impl RtcWorker {
                 }
             }
 
-            while bridge.from_quic_pending.len() < BRIDGE_PENDING_LIMIT {
+            while bridge.has_from_quic_pending_capacity() {
                 match bridge.rx_receiver.try_recv() {
-                    Ok(data) => bridge.from_quic_pending.push_back(data),
+                    Ok(data) => {
+                        if !bridge.push_from_quic_pending(data) {
+                            log::warn!("Userspace TCP bridge from-QUIC queue byte limit reached; closing bridge");
+                            if !closed_handles.contains(&handle) {
+                                closed_handles.push(handle);
+                            }
+                            break;
+                        }
+                    }
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         bridge.quic_rx_closed = true;
                         break;
@@ -697,16 +825,21 @@ impl RtcWorker {
             }
 
             while socket.can_send() {
-                let Some(front) = bridge.from_quic_pending.front_mut() else {
+                let Some(front_len) = bridge.from_quic_pending.front().map(|front| front.len())
+                else {
                     break;
                 };
-                match socket.send_slice(front) {
+                let send_result = {
+                    let front = bridge.from_quic_pending.front_mut().expect("front exists");
+                    socket.send_slice(front)
+                };
+                match send_result {
                     Ok(0) => break,
-                    Ok(n) if n >= front.len() => {
-                        bridge.from_quic_pending.pop_front();
+                    Ok(n) if n >= front_len => {
+                        bridge.consume_from_quic_front(n);
                     }
                     Ok(n) => {
-                        front.drain(..n);
+                        bridge.consume_from_quic_front(n);
                     }
                     Err(_) => break,
                 }
@@ -715,15 +848,27 @@ impl RtcWorker {
                 socket.close();
             }
 
-            while socket.can_recv() && bridge.to_quic_pending.len() < BRIDGE_PENDING_LIMIT {
+            while socket.can_recv()
+                && bridge.to_quic_pending.len() < BRIDGE_PENDING_LIMIT
+                && bridge.to_quic_pending_bytes < BRIDGE_PENDING_BYTES_LIMIT
+            {
                 if bridge.recv_buf.len() != self.mtu {
                     bridge.recv_buf.resize(self.mtu, 0);
                 }
-                if let Ok(n) = socket.recv_slice(&mut bridge.recv_buf) {
+                let remaining = BRIDGE_PENDING_BYTES_LIMIT - bridge.to_quic_pending_bytes;
+                let read_len = self.mtu.min(remaining);
+                if read_len == 0 {
+                    break;
+                }
+                if let Ok(n) = socket.recv_slice(&mut bridge.recv_buf[..read_len]) {
                     if n > 0 {
-                        bridge
-                            .to_quic_pending
-                            .push_back(bridge.recv_buf[..n].to_vec());
+                        if !bridge.push_to_quic_pending(bridge.recv_buf[..n].to_vec()) {
+                            log::warn!("Userspace TCP bridge to-QUIC queue byte limit reached; closing bridge");
+                            if !closed_handles.contains(&handle) {
+                                closed_handles.push(handle);
+                            }
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -906,6 +1051,37 @@ mod tests {
     }
 
     #[test]
+    fn bridge_pending_queues_are_capped_by_bytes() {
+        let (tx_sender, _tx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
+        let (_rx_sender, rx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
+        let mut bridge = BridgeChannels {
+            tx_sender,
+            rx_receiver,
+            nat_key: ("10.0.0.2".parse().unwrap(), 40000, 49152),
+            recv_buf: vec![0u8; 1400],
+            to_quic_pending: VecDeque::new(),
+            from_quic_pending: VecDeque::new(),
+            to_quic_pending_bytes: 0,
+            from_quic_pending_bytes: 0,
+            quic_rx_closed: false,
+        };
+
+        assert!(bridge.push_to_quic_pending(vec![0u8; BRIDGE_PENDING_BYTES_LIMIT]));
+        assert!(!bridge.push_to_quic_pending(vec![0u8; 1]));
+        let popped = bridge.pop_to_quic_pending().unwrap();
+        assert_eq!(popped.len(), BRIDGE_PENDING_BYTES_LIMIT);
+        assert_eq!(bridge.to_quic_pending_bytes, 0);
+
+        assert!(bridge.push_from_quic_pending(vec![0u8; BRIDGE_PENDING_BYTES_LIMIT]));
+        assert!(!bridge.push_from_quic_pending(vec![0u8; 1]));
+        bridge.consume_from_quic_front(1024);
+        assert_eq!(
+            bridge.from_quic_pending_bytes,
+            BRIDGE_PENDING_BYTES_LIMIT - 1024
+        );
+    }
+
+    #[test]
     fn test_packet_classification() {
         let ipv4_tcp_packet = vec![
             0x45, 0x00, 0x00, 0x28, 0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 127, 0, 0, 1,
@@ -964,6 +1140,21 @@ mod tests {
                 true,
             ))
         );
+    }
+
+    #[test]
+    fn parse_tcp_packet_rejects_malformed_ipv4_lengths() {
+        let mut bad_ihl = ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 12345, 443);
+        bad_ihl[0] = 0x44;
+        assert_eq!(parse_tcp_packet(&bad_ihl), None);
+
+        let mut bad_total_len = ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 12345, 443);
+        bad_total_len[2..4].copy_from_slice(&(30u16).to_be_bytes());
+        assert_eq!(parse_tcp_packet(&bad_total_len), None);
+
+        let mut truncated = ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 12345, 443);
+        truncated[2..4].copy_from_slice(&(60u16).to_be_bytes());
+        assert_eq!(parse_tcp_packet(&truncated), None);
     }
 
     #[test]
@@ -1053,6 +1244,8 @@ mod tests {
                 recv_buf: vec![0; 1400],
                 to_quic_pending: VecDeque::new(),
                 from_quic_pending: VecDeque::new(),
+                to_quic_pending_bytes: 0,
+                from_quic_pending_bytes: 0,
                 quic_rx_closed: false,
             },
         );

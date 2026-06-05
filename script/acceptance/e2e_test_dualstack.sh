@@ -149,8 +149,8 @@ ip netns exec server_ns ./target/debug/new_proxy -config /tmp/e2e_server.conf > 
 SERVER_PID=$!
 sleep 2
 
-# 7.2 Start Client proxy daemon in client_ns
-ip netns exec client_ns ./target/debug/new_proxy -config /tmp/e2e_client.conf > /tmp/new_proxy_client_daemon.log 2>&1 &
+# 7.2 Start Client proxy daemon in client_ns with multiple TUN queues.
+ip netns exec client_ns ./target/debug/new_proxy -config /tmp/e2e_client.conf --threads 4 > /tmp/new_proxy_client_daemon.log 2>&1 &
 CLIENT_PID=$!
 sleep 2
 

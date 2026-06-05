@@ -8,7 +8,7 @@ use crate::config::{self, decode_base64_32};
 use crate::control::NonceCache;
 use crate::quic_pool;
 use crate::runtime::{cleanup_peer_routes, run_blocking_command, setup_peer_routes};
-use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry};
+use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry, WorkerTelemetryRegistry};
 use crate::userspace_wg::UserspaceWgRegistry;
 use crate::{GatewayState, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
@@ -23,6 +23,7 @@ const MAX_UDS_CLIENTS: usize = 1024;
 #[derive(Clone)]
 pub struct UdsServerContext {
     pub telemetry: Arc<TelemetryRegistry>,
+    pub worker_telemetry: Arc<WorkerTelemetryRegistry>,
     pub state: Arc<RwLock<GatewayState>>,
     pub peer_secrets: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     pub server_secret: StaticSecret,
@@ -338,6 +339,20 @@ async fn handle_dump(
         keys.extend(context.client_quic_pools.read().keys().copied());
 
         let mut lines = Vec::new();
+        for worker in context.worker_telemetry.snapshot() {
+            lines.push(format!(
+                "worker:{}\ttun_rx={}:{}\ttcp_offload={}:{}\tl3={}:{}\tnew_flows={}\tcurrent_flows={}",
+                worker.worker_id,
+                worker.tun_rx_packets,
+                worker.tun_rx_bytes,
+                worker.tcp_offload_packets,
+                worker.tcp_offload_bytes,
+                worker.l3_packets,
+                worker.l3_bytes,
+                worker.new_tcp_flows,
+                worker.current_tcp_flows,
+            ));
+        }
         for key in keys {
             let configured = peer_map.get(&key).copied();
             let wg = l3_stats.get(&key);
@@ -455,33 +470,6 @@ async fn handle_add_peer(
         proxy_port,
     };
 
-    let _mutation_guard = context.peer_mutation_lock.lock().await;
-
-    let (table_off, old_peer, conflict) = {
-        let state = context.state.read();
-        let conflict = find_allowed_ip_conflict(&state.config.peers, &new_peer);
-        (
-            state
-                .config
-                .interface
-                .table
-                .as_deref()
-                .map(|table| table.eq_ignore_ascii_case("off"))
-                .unwrap_or(false),
-            state
-                .config
-                .peers
-                .iter()
-                .find(|peer| peer.public_key == parsed_pub_key)
-                .cloned(),
-            conflict,
-        )
-    };
-    if let Some(conflict) = conflict {
-        write_error(stream, framed_response, conflict).await;
-        return;
-    }
-
     if context.runtime_mode == RuntimeMode::Client {
         match (new_peer.endpoint, new_peer.proxy_port) {
             (Some(_), Some(_)) | (None, None) => {}
@@ -518,6 +506,36 @@ async fn handle_add_peer(
     let quic_pool_unavailable = context.runtime_mode == RuntimeMode::Client
         && peer_has_l4_proxy(&new_peer)
         && prepared_client_pool.is_none();
+
+    let _mutation_guard = context.peer_mutation_lock.lock().await;
+
+    let (table_off, old_peer, conflict) = {
+        let state = context.state.read();
+        let conflict = find_allowed_ip_conflict(&state.config.peers, &new_peer);
+        (
+            state
+                .config
+                .interface
+                .table
+                .as_deref()
+                .map(|table| table.eq_ignore_ascii_case("off"))
+                .unwrap_or(false),
+            state
+                .config
+                .peers
+                .iter()
+                .find(|peer| peer.public_key == parsed_pub_key)
+                .cloned(),
+            conflict,
+        )
+    };
+    if let Some(conflict) = conflict {
+        if let Some(pool) = prepared_client_pool.as_ref() {
+            pool.shutdown(b"Peer add conflict");
+        }
+        write_error(stream, framed_response, conflict).await;
+        return;
+    }
 
     if !table_off {
         if let Some(peer) = old_peer.clone() {
@@ -846,6 +864,7 @@ mod tests {
             },
         };
         let telemetry = Arc::new(TelemetryRegistry::new());
+        let worker_telemetry = Arc::new(WorkerTelemetryRegistry::new());
         let stats = telemetry.get_or_create([2u8; 32]);
         stats.rx_bytes.store(70, Ordering::Relaxed);
         stats.tx_bytes.store(80, Ordering::Relaxed);
@@ -855,6 +874,7 @@ mod tests {
 
         UdsServerContext {
             telemetry,
+            worker_telemetry,
             state: Arc::new(RwLock::new(GatewayState {
                 config,
                 router: AllowedIPsRouter::new(),
@@ -929,6 +949,11 @@ mod tests {
         let _ = fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
         let context = test_context();
+        context
+            .worker_telemetry
+            .get_or_create(1)
+            .tun_rx_packets
+            .store(42, Ordering::Relaxed);
         {
             let mut state = context.state.write();
             state.config.peers.push(PeerConfig {
@@ -952,6 +977,8 @@ mod tests {
         assert!(dump.contains(&encode_base64_32(&[9u8; 32])));
         assert!(dump.contains("10.0.9.0/24"));
         assert!(dump.contains("150"));
+        assert!(dump.contains("worker:1"));
+        assert!(dump.contains("tun_rx=42:0"));
 
         let _ = fs::remove_file(path);
     }

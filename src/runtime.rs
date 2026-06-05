@@ -33,7 +33,7 @@ where
 }
 
 #[cfg(not(tarpaulin))]
-pub fn run_script(script: &str) {
+pub fn run_script(script: &str) -> Result<(), String> {
     log::info!("Executing script: {}", script);
     let output = std::process::Command::new("sh")
         .arg("-c")
@@ -42,27 +42,33 @@ pub fn run_script(script: &str) {
     match output {
         Ok(out) => {
             if !out.status.success() {
-                log::warn!("Script exited with error: {:?}", out.status);
-                log::warn!("Script stdout: {}", String::from_utf8_lossy(&out.stdout));
-                log::warn!("Script stderr: {}", String::from_utf8_lossy(&out.stderr));
+                Err(format!(
+                    "script exited with status {:?}: stdout: {}; stderr: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
             } else {
                 log::info!("Script completed successfully.");
+                Ok(())
             }
         }
-        Err(e) => {
-            log::error!("Failed to execute script '{}': {}", script, e);
-        }
+        Err(e) => Err(format!("failed to execute script '{}': {}", script, e)),
     }
 }
 
 #[cfg(tarpaulin)]
-pub fn run_script(_script: &str) {}
+pub fn run_script(_script: &str) -> Result<(), String> {
+    Ok(())
+}
 
 #[cfg(not(tarpaulin))]
 pub fn cleanup_runtime(config: &GatewayConfig, interface_name: &str) {
     cleanup_routes(config, interface_name);
     if let Some(ref post_script) = config.interface.post_script {
-        run_script(post_script);
+        if let Err(e) = run_script(post_script) {
+            log::warn!("PostScript failed during cleanup: {}", e);
+        }
     }
 }
 
@@ -757,5 +763,13 @@ mod tests {
                     .collect()
             )
         );
+    }
+
+    #[test]
+    fn run_script_reports_failures() {
+        assert!(run_script("exit 0").is_ok());
+        let err = run_script("echo pre-script-failed >&2; exit 7").unwrap_err();
+        assert!(err.contains("pre-script-failed"));
+        assert!(err.contains("status"));
     }
 }
