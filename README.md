@@ -241,6 +241,12 @@ sudo script/acceptance/e2e_scenarios.sh
 sudo script/acceptance/e2e_multi_client.sh
 ```
 
+运行 userspace WireGuard TCP fallback E2E 测试：
+
+```bash
+sudo script/acceptance/e2e_userspace_wg_fallback.sh
+```
+
 运行 1 小时稳定性压测：
 
 ```bash

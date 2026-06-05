@@ -568,18 +568,20 @@ impl RtcWorker {
 
                 udp_res = self.udp_socket.recv_from(&mut udp_buf) => {
                     if let Ok((n, addr)) = udp_res {
-                        if let Some((reply_endpoint, action)) =
+                        if let Some((reply_endpoint, actions)) =
                             self.l3_registry.decapsulate_network_packet(addr, &udp_buf[..n], &mut wg_buf)
                         {
-                            match action {
-                                UserspaceWgAction::WriteToTunnel(dec_pkt) => {
-                                    if let Err(e) = self.tun_io.write_packet(&dec_pkt).await {
-                                        log::warn!("Failed to write userspace WireGuard packet to TUN: {}", e);
+                            for action in actions {
+                                match action {
+                                    UserspaceWgAction::WriteToTunnel(dec_pkt) => {
+                                        if let Err(e) = self.tun_io.write_packet(&dec_pkt).await {
+                                            log::warn!("Failed to write userspace WireGuard packet to TUN: {}", e);
+                                        }
                                     }
-                                }
-                                UserspaceWgAction::WriteToNetwork(resp_pkt) => {
-                                    if let Err(e) = self.udp_socket.send_to(&resp_pkt, reply_endpoint).await {
-                                        log::warn!("Failed to send userspace WireGuard response to {}: {}", reply_endpoint, e);
+                                    UserspaceWgAction::WriteToNetwork(resp_pkt) => {
+                                        if let Err(e) = self.udp_socket.send_to(&resp_pkt, reply_endpoint).await {
+                                            log::warn!("Failed to send userspace WireGuard response to {}: {}", reply_endpoint, e);
+                                        }
                                     }
                                 }
                             }
@@ -858,6 +860,19 @@ mod tests {
         finish_checksum(sum) == 0
     }
 
+    fn ipv6_tcp_checksum_valid(packet: &[u8]) -> bool {
+        if packet.len() < 60 {
+            return false;
+        }
+        let tcp_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+        let mut sum = 0u32;
+        sum = add_ones_complement(sum, &packet[8..40]);
+        sum = add_ones_complement(sum, &(tcp_len as u32).to_be_bytes());
+        sum += 6;
+        sum = add_ones_complement(sum, &packet[40..40 + tcp_len]);
+        finish_checksum(sum) == 0
+    }
+
     fn test_worker() -> RtcWorker {
         let private_key = boringtun::x25519::StaticSecret::from([1u8; 32]);
         let public_key = boringtun::x25519::PublicKey::from(&private_key);
@@ -965,6 +980,28 @@ mod tests {
         repair_tcp_checksums(&mut packet);
         assert!(ipv4_header_checksum_valid(&packet));
         assert!(ipv4_tcp_checksum_valid(&packet));
+    }
+
+    #[test]
+    fn rewrites_repair_ipv6_tcp_checksums() {
+        let mut packet = ipv6_tcp_packet(
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            12345,
+            8443,
+        );
+        repair_tcp_checksums(&mut packet);
+        assert!(ipv6_tcp_checksum_valid(&packet));
+
+        rewrite_destination_ip(&mut packet, "2001:db8::3".parse().unwrap());
+        rewrite_destination_port(&mut packet, 9000);
+        repair_tcp_checksums(&mut packet);
+        assert!(ipv6_tcp_checksum_valid(&packet));
+
+        rewrite_source_ip(&mut packet, "2001:db8::4".parse().unwrap());
+        rewrite_source_port(&mut packet, 54321);
+        repair_tcp_checksums(&mut packet);
+        assert!(ipv6_tcp_checksum_valid(&packet));
     }
 
     #[tokio::test]

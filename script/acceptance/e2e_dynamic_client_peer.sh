@@ -8,8 +8,6 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
-source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
-new_proxy_select_wireguard_backend
 ARTIFACT_DIR="${DYNAMIC_PEER_ARTIFACT_DIR:-/tmp/new_proxy_dynamic_peer_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$ARTIFACT_DIR"
 
@@ -105,7 +103,6 @@ ip netns exec dyn_server_ns ip route add 10.0.4.0/24 via 10.0.2.1
 
 ip netns exec dyn_client_ns ip addr add 10.0.1.2/24 dev vd-c
 ip netns exec dyn_client_ns ip addr add 10.0.4.1/24 dev vd-c-w
-ip netns exec dyn_client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec dyn_client_ns ip link set vd-c up
 ip netns exec dyn_client_ns ip link set vd-c-w up
 ip netns exec dyn_client_ns ip link set lo up

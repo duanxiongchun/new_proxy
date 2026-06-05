@@ -3,27 +3,35 @@
 ## 测试概览
 
 - 项目版本：`new_proxy v5.0.0`
-- 报告日期：2026-06-04
-- 主要测试对象：配置冲突校验、UDS API/server、TPROXY TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer 并发/冲突防护、聚合遥测、稳定性与 perf smoke
+- 报告日期：2026-06-05
+- 主要测试对象：配置冲突校验、UDS API/server、TUN/smoltcp TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer 并发/冲突防护、聚合遥测、稳定性与 perf smoke
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
 ## 2026-06-05 文档与用户态 client 路径复查
 
-本次复查执行了无需 root 的格式、编译、Clippy、单元测试和脚本语法检查：
+本次复查执行了格式、编译、Clippy、单元测试、脚本语法检查，并复跑了需要 root/network namespace 的场景脚本：
 
 ```bash
 cargo fmt --check
 cargo check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo build --bins
 bash -n script/perf/perf_cores_scalability.sh \
   script/perf/perf_smoke.sh \
   script/acceptance/e2e_test_dualstack.sh \
   script/acceptance/e2e_scenarios.sh \
   script/acceptance/e2e_multi_client.sh \
   script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
   script/acceptance/stability_stress_test.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+sudo script/acceptance/e2e_scenarios.sh
+sudo script/acceptance/e2e_userspace_wg_fallback.sh
 ```
 
 结果：
@@ -34,13 +42,21 @@ cargo check: PASS
 cargo clippy --all-targets -- -D warnings: PASS
 cargo test:
   new_proxy_cli: 10 passed; 0 failed
-  new_proxy: 56 passed; 0 failed
+  new_proxy: 90 passed; 0 failed
+cargo build --bins: PASS
 bash -n acceptance/perf scripts: PASS
+python3 -m py_compile stability helpers: PASS
+sudo script/acceptance/e2e_scenarios.sh: PASS
+  - SCENARIO 2B dynamic L3 fallback: SKIP
+  - skip reason: userspace WireGuard backend does not expose a real fallback netdev for this legacy sub-scenario
+sudo script/acceptance/e2e_userspace_wg_fallback.sh: PASS
+  - artifact: /tmp/new_proxy_userspace_wg_fallback_20260605_184329
+  - server telemetry: latest handshake just now; WireGuard bytes non-zero; QUIC inactive (disconnected)
 ```
 
 备注：`cargo check` / `cargo test` / `cargo clippy` 会显示本地 path 依赖 `smoltcp` 和 `boringtun` 内部 warning，但本 crate 的检查已通过。
 
-结论：**本轮文档与用户态 client 路径复查的格式、编译、Clippy、单元测试和脚本语法检查全部通过；未执行需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+结论：**本轮文档与用户态 client 路径复查的格式、编译、Clippy、单元测试、脚本语法检查、`e2e_scenarios.sh` 和新增 `e2e_userspace_wg_fallback.sh` 通过；未重新执行其他需要 root/network namespace 的 E2E、稳定性和性能脚本。**
 
 ## 2026-06-04 增量复查
 
@@ -138,7 +154,7 @@ cargo build --release --bins: PASS
 
 - 静态配置拒绝重复 peer public key、重复 AllowedIPs 和重叠 AllowedIPs。
 - UDS 动态 AddPeer 拒绝请求内重复 AllowedIPs，并拒绝与其他 peer 重叠的 AllowedIPs。
-- 保留 QUIC registry、动态 peer remove、control HMAC/replay、TPROXY listener、relay、telemetry 等既有覆盖。
+- 保留 QUIC registry、动态 peer remove、control HMAC/replay、userspace TCP fallback、relay、telemetry 等既有覆盖。
 
 结论：**全部 49 个 Rust 单元测试通过（0 失败）**。
 
@@ -173,11 +189,11 @@ sudo bash script/acceptance/e2e_test_dualstack.sh
 
 ```text
 ✓ [SUCCESS] Dual-stack physical network WAN path verified successfully.
-✓ [SUCCESS] IPv6 HTTP over TPROXY/QUIC verified successfully.
+✓ [SUCCESS] IPv6 HTTP over TUN/smoltcp/QUIC verified successfully.
 ✓ [SUCCESS] E2E Integration tests passed cleanly!
 ```
 
-结论：**通过。双栈 WAN、IPv6 HTTP 真实业务闭环、TPROXY/QUIC 和 CLI telemetry 均验证成功。**
+结论：**通过。双栈 WAN、IPv6 HTTP 真实业务闭环、TUN/smoltcp/QUIC 和 CLI telemetry 均验证成功。**
 
 ### 4. 端到端场景集成测试
 
@@ -193,7 +209,7 @@ sudo bash script/acceptance/e2e_scenarios.sh
 ✓ [SUCCESS] All E2E Integration and CLI scenarios fully passed!
 ```
 
-结论：**通过。TPROXY->QUIC、动态 server peer add/remove、WireGuard L3 fallback 场景验证成功。**
+结论：**通过。TUN/smoltcp->QUIC、动态 server peer add/remove、WireGuard L3 fallback 场景验证成功。**
 
 ### 5. 并发多客户端 E2E 混合验收
 
@@ -211,7 +227,7 @@ sudo bash script/acceptance/e2e_multi_client.sh
 ✓ [ALL PASS] Concurrent Multi-Client E2E Test Completed Successfully!
 ```
 
-结论：**通过。多客户端并发 proxy + WireGuard-only fallback 验证成功。**
+结论：**通过。多客户端并发 proxy + direct L3 baseline 验证成功。**
 
 ### 6. 动态 client proxy peer 生命周期 E2E
 

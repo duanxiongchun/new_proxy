@@ -237,7 +237,7 @@ impl UserspaceWgRegistry {
         endpoint: SocketAddr,
         incoming: &[u8],
         wg_buf: &mut [u8],
-    ) -> Option<(SocketAddr, UserspaceWgAction)> {
+    ) -> Option<(SocketAddr, Vec<UserspaceWgAction>)> {
         let receiver_index = Self::receiver_index(incoming);
         if let Some(receiver_index) = receiver_index {
             let indexed_peer = {
@@ -255,12 +255,6 @@ impl UserspaceWgRegistry {
                     return Some((endpoint, action));
                 }
             }
-            if matches!(
-                Tunn::parse_incoming_packet(incoming).ok(),
-                Some(Packet::PacketData(_))
-            ) {
-                return None;
-            }
         }
 
         let endpoint_peer = {
@@ -276,6 +270,12 @@ impl UserspaceWgRegistry {
                 }
                 return Some((endpoint, action));
             }
+        }
+        if matches!(
+            Tunn::parse_incoming_packet(incoming).ok(),
+            Some(Packet::PacketData(_))
+        ) {
+            return None;
         }
 
         for (public_key, peer) in self
@@ -304,20 +304,33 @@ impl UserspaceWgRegistry {
         endpoint: SocketAddr,
         incoming: &[u8],
         wg_buf: &mut [u8],
-    ) -> Option<UserspaceWgAction> {
-        let action = {
+    ) -> Option<Vec<UserspaceWgAction>> {
+        let actions = {
             let mut tunn = peer.tunn.lock();
-            match tunn.decapsulate(Some(endpoint.ip()), incoming, wg_buf) {
-                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                    Some(UserspaceWgAction::WriteToTunnel(packet.to_vec()))
+            let mut actions = Vec::new();
+            let mut first = true;
+            loop {
+                let result = if first {
+                    first = false;
+                    tunn.decapsulate(Some(endpoint.ip()), incoming, wg_buf)
+                } else {
+                    tunn.decapsulate(None, &[], wg_buf)
+                };
+                match result {
+                    TunnResult::WriteToTunnelV4(packet, _)
+                    | TunnResult::WriteToTunnelV6(packet, _) => {
+                        actions.push(UserspaceWgAction::WriteToTunnel(packet.to_vec()))
+                    }
+                    TunnResult::WriteToNetwork(response) => {
+                        actions.push(UserspaceWgAction::WriteToNetwork(response.to_vec()))
+                    }
+                    TunnResult::Done => break,
+                    TunnResult::Err(_) => break,
                 }
-                TunnResult::WriteToNetwork(response) => {
-                    Some(UserspaceWgAction::WriteToNetwork(response.to_vec()))
-                }
-                TunnResult::Done | TunnResult::Err(_) => None,
             }
+            (!actions.is_empty()).then_some(actions)
         };
-        if let Some(action) = action {
+        if let Some(actions) = actions {
             let endpoint_changed = {
                 let endpoint_guard = peer.endpoint.read();
                 *endpoint_guard != Some(endpoint)
@@ -340,11 +353,13 @@ impl UserspaceWgRegistry {
             if let Some(receiver_index) = Self::receiver_index(incoming) {
                 self.remember_receiver_index(receiver_index, public_key);
             }
-            if let UserspaceWgAction::WriteToTunnel(packet) = &action {
-                peer.rx_bytes
-                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
+            for action in &actions {
+                if let UserspaceWgAction::WriteToTunnel(packet) = action {
+                    peer.rx_bytes
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                }
             }
-            return Some(action);
+            return Some(actions);
         }
         None
     }
@@ -421,18 +436,20 @@ pub async fn run_userspace_wg_loop(
                 if n == 0 {
                     continue;
                 }
-                if let Some((reply_endpoint, action)) =
+                if let Some((reply_endpoint, actions)) =
                     registry.decapsulate_network_packet(endpoint, &udp_buf[..n], &mut wg_buf)
                 {
-                    match action {
-                        UserspaceWgAction::WriteToTunnel(packet) => {
-                            if let Err(e) = tun_io.write_packet(&packet).await {
-                                log::warn!("Failed to write userspace WireGuard packet to TUN: {}", e);
+                    for action in actions {
+                        match action {
+                            UserspaceWgAction::WriteToTunnel(packet) => {
+                                if let Err(e) = tun_io.write_packet(&packet).await {
+                                    log::warn!("Failed to write userspace WireGuard packet to TUN: {}", e);
+                                }
                             }
-                        }
-                        UserspaceWgAction::WriteToNetwork(packet) => {
-                            if let Err(e) = udp_socket.send_to(&packet, reply_endpoint).await {
-                                log::warn!("Failed to send userspace WireGuard response to {}: {}", reply_endpoint, e);
+                            UserspaceWgAction::WriteToNetwork(packet) => {
+                                if let Err(e) = udp_socket.send_to(&packet, reply_endpoint).await {
+                                    log::warn!("Failed to send userspace WireGuard response to {}: {}", reply_endpoint, e);
+                                }
                             }
                         }
                     }
@@ -468,15 +485,19 @@ pub async fn run_userspace_wg_timer_loop(
 mod tests {
     use super::*;
 
-    fn ipv4_packet_to(dst: [u8; 4]) -> Vec<u8> {
+    fn ipv4_packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
         let mut packet = vec![0u8; 20];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&(20u16).to_be_bytes());
         packet[8] = 64;
         packet[9] = 6;
-        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        packet[12..16].copy_from_slice(&src);
         packet[16..20].copy_from_slice(&dst);
         packet
+    }
+
+    fn ipv4_packet_to(dst: [u8; 4]) -> Vec<u8> {
+        ipv4_packet([10, 0, 0, 2], dst)
     }
 
     #[test]
@@ -620,5 +641,84 @@ mod tests {
         let mut wg_buf = vec![0u8; 2048];
 
         assert!(registry.timer_packets(&mut wg_buf).is_empty());
+    }
+
+    #[test]
+    fn decapsulate_flushes_queued_packet_after_handshake_response() {
+        let client_private = StaticSecret::from([1u8; 32]);
+        let server_private = StaticSecret::from([2u8; 32]);
+        let client_public = PublicKey::from(&client_private).to_bytes();
+        let server_public = PublicKey::from(&server_private).to_bytes();
+        let client_endpoint = "127.0.0.1:41000".parse::<SocketAddr>().unwrap();
+        let server_endpoint = "127.0.0.1:51820".parse::<SocketAddr>().unwrap();
+
+        let client = UserspaceWgRegistry::new(
+            client_private.to_bytes(),
+            &[PeerConfig {
+                public_key: server_public,
+                allowed_ips: vec!["10.40.0.1/32".parse().unwrap()],
+                endpoint: Some(server_endpoint),
+                proxy_port: None,
+            }],
+        )
+        .unwrap();
+        let server = UserspaceWgRegistry::new(
+            server_private.to_bytes(),
+            &[PeerConfig {
+                public_key: client_public,
+                allowed_ips: vec!["10.40.0.2/32".parse().unwrap()],
+                endpoint: None,
+                proxy_port: None,
+            }],
+        )
+        .unwrap();
+
+        let original = ipv4_packet([10, 40, 0, 2], [10, 40, 0, 1]);
+        let mut client_buf = vec![0u8; 2048];
+        let mut server_buf = vec![0u8; 2048];
+        let (endpoint, handshake_init) = client
+            .encapsulate_tunnel_packet(&original, &mut client_buf)
+            .unwrap();
+        assert_eq!(endpoint, server_endpoint);
+
+        let (_, server_actions) = server
+            .decapsulate_network_packet(client_endpoint, &handshake_init, &mut server_buf)
+            .unwrap();
+        let handshake_response = server_actions
+            .into_iter()
+            .find_map(|action| match action {
+                UserspaceWgAction::WriteToNetwork(packet) => Some(packet),
+                UserspaceWgAction::WriteToTunnel(_) => None,
+            })
+            .unwrap();
+
+        let (_, client_actions) = client
+            .decapsulate_network_packet(server_endpoint, &handshake_response, &mut client_buf)
+            .unwrap();
+        let network_packets = client_actions
+            .into_iter()
+            .filter_map(|action| match action {
+                UserspaceWgAction::WriteToNetwork(packet) => Some(packet),
+                UserspaceWgAction::WriteToTunnel(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            network_packets.len() >= 2,
+            "client must send handshake keepalive and flushed queued tunnel packet"
+        );
+
+        let mut delivered = None;
+        for packet in network_packets {
+            if let Some((_, actions)) =
+                server.decapsulate_network_packet(client_endpoint, &packet, &mut server_buf)
+            {
+                for action in actions {
+                    if let UserspaceWgAction::WriteToTunnel(packet) = action {
+                        delivered = Some(packet);
+                    }
+                }
+            }
+        }
+        assert_eq!(delivered.as_deref(), Some(original.as_slice()));
     }
 }

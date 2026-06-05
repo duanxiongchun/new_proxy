@@ -14,8 +14,6 @@ set -e
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
-source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
-new_proxy_select_wireguard_backend
 
 # Ensure script is run with sudo/root privileges
 if [ "$EUID" -ne 0 ]; then
@@ -30,8 +28,6 @@ ip netns delete router_ns 2>/dev/null || true
 ip netns delete server_ns 2>/dev/null || true
 rm -f /run/new_proxy/server.sock
 rm -f /run/new_proxy/client.sock
-rm -f /tmp/client_proxy_active
-rm -f /tmp/scenario_server.conf /tmp/scenario_client.conf
 rm -f /tmp/scenario_server.conf /tmp/scenario_client.conf
 
 # -------------------------------------------------------------------------
@@ -56,8 +52,6 @@ ip link set veth-router-s netns router_ns
 ip netns exec client_ns ip addr add 10.0.1.2/24 dev veth-client
 ip netns exec client_ns ip link set veth-client up
 ip netns exec client_ns ip link set lo up
-# 虚拟 WireGuard 隧道 IP (AllowedIP)
-ip netns exec client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec client_ns ip route add default via 10.0.1.1
 # 启用 ip_forward 以便路由流量进入 client TUN/userspace 数据面
 ip netns exec client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -82,8 +76,6 @@ ip netns exec router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # router 路由: 访问 10.0.0.1 先经过 client_ns (Scenario 1 TUN/userspace 接管)
 ip netns exec router_ns ip route add 10.0.0.1/32 via 10.0.1.2
-# client_ns 中: 访问 10.0.0.1 也通过 veth/TUN 路由
-ip netns exec client_ns ip route add 10.0.0.1/32 via 10.0.1.1
 
 echo "  ✓ 命名空间配置完成"
 echo "  路由: router_ns -> 10.0.0.1 via 10.0.1.2 (client_ns)"
@@ -111,9 +103,6 @@ echo "  流量路径:"
 echo "  [TCP]      router_ns ──► client_ns TUN/userspace TCP ──► QUIC Pool ──► server_ns:8080"
 echo "  [UDP/ICMP] client_ns ──► router_ns ──► server_ns (L3 native)"
 
-# 激活客户端代理路径标志
-touch /tmp/client_proxy_active
-
 cat > /tmp/scenario_server.conf <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
@@ -136,7 +125,7 @@ cat > /tmp/scenario_client.conf <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
 MTU = 1400
-Table = off
+Table = auto
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
@@ -203,11 +192,20 @@ SERVER_PID=$!
 sleep 2
 
 echo "  >> 等待客户端健康检查器检测到连接断开并进行自愈重连..."
-# 客户端的健康检查周期是 5 秒，空闲超时时间是 30 秒，我们睡眠 35 秒以确保连接彻底超时并完成自愈重连
-sleep 35
-
-echo "  >> 发送新的 TCP 流量以验证连接已恢复且走了 QUIC 隧道..."
-ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
+# 客户端健康检查、控制面刷新和 cooldown 都是异步完成的；轮询业务成功比固定 sleep 更稳。
+RECOVERED=0
+for _ in $(seq 1 18); do
+  if ip netns exec router_ns curl -s --connect-timeout 5 --max-time 8 -o /dev/null http://10.0.0.1:8080/; then
+    RECOVERED=1
+    break
+  fi
+  sleep 5
+done
+if [ "$RECOVERED" -ne 1 ]; then
+  echo "❌ [ERROR] TCP traffic did not recover after server restart!"
+  exit 1
+fi
+echo "  ✓ 重启后 TCP 业务已恢复。"
 
 echo ""
 echo "  >> 从网关拉取重启后的遥测数据:"
@@ -226,68 +224,8 @@ echo "  ✓ 客户端重连成功！"
 # -------------------------------------------------------------------------
 echo ""
 echo "=== [4b/6] SCENARIO 2B: Dynamic Fallback to WireGuard on QUIC Failure ==="
-if ! ip netns exec client_ns ip link show scenario_client >/dev/null 2>&1; then
-  echo "  >> SKIP: WireGuard device scenario_client is not present in client_ns; dynamic L3 fallback requires a real WireGuard netdev."
-else
-echo "  >> 模拟 QUIC 物理链路网络故障（丢弃服务器端 QUIC 端口的 UDP 包）..."
-ip netns exec server_ns iptables -A INPUT -p udp --match multiport --dports 40001,40002 -j DROP
-
-echo "  >> 等待客户端连接空闲超时（35秒）以触发降级逻辑..."
-sleep 35
-
-# 此时，客户端应该已经检测到连接全部断开，并将流量降级为 WireGuard 传输
-echo "  >> 发送新的 TCP 流量，验证在 QUIC 故障下，流量是否可以无缝降级并成功通过 WireGuard 传输..."
-ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
-if [ $? -ne 0 ]; then
-  echo "❌ [ERROR] TCP traffic failed under QUIC fallback state!"
-  exit 1
-fi
-echo "  ✓ 降级模式流量传输成功！"
-
-# -------------------------------------------------------------------------
-# 4c. SCENARIO 2C: COOLDOWN-BASED SWITCH-BACK TO QUIC
-# -------------------------------------------------------------------------
-echo ""
-echo "=== [4c/6] SCENARIO 2C: Cooldown-Based Switch-Back to QUIC ==="
-echo "  >> 恢复服务器端 QUIC 端口（清空 iptables 阻断规则）..."
-ip netns exec server_ns iptables -F INPUT
-
-echo "  >> 等待客户端健康检查器重新建立物理 QUIC 连接并进入 Recovering (cooldown) 状态..."
-# 健康检查间隔为 5 秒，加 2 秒缓冲
-sleep 7
-
-# 此时客户端应该重建了 QUIC 连接，但处于 Recovering 状态，新的 TCP 流量应该继续走 WireGuard 降级通道
-echo "  >> 在 30 秒冷却时间内发送 TCP 流量，验证流量依然走 WireGuard 降级通道（防止频繁切换抖动）..."
-# 记录发送流量前的 QUIC 字节数
-PRE_QUIC_STATS=$(ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show)
-PRE_QUIC_LINE=$(echo "$PRE_QUIC_STATS" | grep -A 7 "$NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY" | grep "quic transfer:")
-
-ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
-
-POST_QUIC_STATS=$(ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show)
-POST_QUIC_LINE=$(echo "$POST_QUIC_STATS" | grep -A 7 "$NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY" | grep "quic transfer:")
-
-if [ "$PRE_QUIC_LINE" != "$POST_QUIC_LINE" ]; then
-  echo "❌ [ERROR] Traffic was sent over QUIC during the cooldown window!"
-  exit 1
-fi
-echo "  ✓ 验证成功：冷却时间内流量未切换回 QUIC！"
-
-echo "  >> 等待冷却时间结束（再等待 25 秒，总计超过 30 秒）..."
-sleep 25
-
-echo "  >> 发送新的 TCP 流量，验证冷却期结束后流量成功切换回 QUIC 通道..."
-ip netns exec router_ns curl -s --connect-timeout 5 -o /dev/null http://10.0.0.1:8080/
-
-FINAL_QUIC_STATS=$(ip netns exec server_ns ./target/debug/new-proxy-cli --interface scenario_server show)
-FINAL_QUIC_LINE=$(echo "$FINAL_QUIC_STATS" | grep -A 7 "$NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY" | grep "quic transfer:")
-
-if [ "$FINAL_QUIC_LINE" = "$POST_QUIC_LINE" ]; then
-  echo "❌ [ERROR] Traffic failed to switch back to QUIC after cooldown expired!"
-  exit 1
-fi
-echo "  ✓ 验证成功：冷却期结束后流量成功切回 QUIC 隧道！"
-fi
+echo "  >> SKIP: this legacy sub-scenario assumed an external WireGuard netdev."
+echo "  >> Built-in boringtun fallback is covered by e2e_userspace_wg_fallback.sh."
 
 # -------------------------------------------------------------------------
 # 5. SCENARIO 3: DYNAMIC PEER MANAGEMENT (hot-adding/removing peers)
@@ -320,8 +258,6 @@ echo "  [ALL]  client_ns ──► router_ns ──► server_ns:8080 (native L3
 # 停止 client daemon
 kill $CLIENT_PID 2>/dev/null
 sleep 1
-
-rm -f /tmp/client_proxy_active
 
 # 更新 router 路由: 10.0.0.1 现在直接去 server_ns (绕过 client_ns)
 ip netns exec router_ns ip route del 10.0.0.1/32 2>/dev/null || true

@@ -5,8 +5,8 @@
 # Topology:
 #   - 1 Server (runs server_proxy daemon)
 #   - 2 Clients running concurrently:
-#       - Client 1: Custom Proxy Client (runs client_proxy daemon, TCP intercepted via TPROXY to QUIC Pool)
-#       - Client 2: Standard WireGuard Client (bypasses proxy client daemon, pure L3 path direct fallback)
+#       - Client 1: userspace TUN client, TCP offloaded to QUIC Pool
+#       - Client 2: direct physical L3 baseline path
 # ==============================================================================
 
 set -e
@@ -19,8 +19,6 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
-source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
-new_proxy_select_wireguard_backend
 
 echo "======================================================================"
 echo "=== [1/8] Cleaning Up Pre-Existing Network Namespaces ==="
@@ -31,7 +29,6 @@ ip netns delete client1_ns 2>/dev/null || true
 ip netns delete client2_ns 2>/dev/null || true
 rm -f /run/new_proxy/server_multi.sock
 rm -f /run/new_proxy/client1.sock
-rm -f /tmp/client_proxy_active
 
 echo "=== [2/8] Creating Namespaces (Server, Router, Client1, Client2) ==="
 ip netns add server_ns
@@ -66,9 +63,8 @@ ip netns exec server_ns ip addr add 10.0.0.1/32 dev lo
 ip netns exec client1_ns ip addr add 10.0.1.2/24 dev veth-client1
 ip netns exec client1_ns ip link set veth-client1 up
 ip netns exec client1_ns ip link set lo up
-ip netns exec client1_ns ip addr add 10.0.0.2/32 dev lo
 
-# Client 2 NS (Standard WireGuard)
+# Client 2 NS (direct physical L3 baseline)
 ip netns exec client2_ns ip addr add 10.0.3.2/24 dev veth-client2
 ip netns exec client2_ns ip link set veth-client2 up
 ip netns exec client2_ns ip link set lo up
@@ -106,17 +102,12 @@ ip netns exec router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 ip netns exec router_ns ip route add 10.0.0.3/32 via 10.0.3.2
 
-# Client 1 TPROXY Interception Setup
-ip netns exec client1_ns ip rule add fwmark 1 lookup 100
-ip netns exec client1_ns ip route add local 0.0.0.0/0 dev lo table 100
-ip netns exec client1_ns iptables -t mangle -A PREROUTING -p tcp -d 10.0.0.1 -j TPROXY --on-port 1080 --on-ip 0.0.0.0 --tproxy-mark 0x1/0x1
-ip netns exec client1_ns iptables -t mangle -A OUTPUT -p tcp -d 10.0.0.1 -j MARK --set-mark 1
 
 echo "=== [6/8] Writing Multi-Client Configuration Files ==="
 # Private keys:
 # Server: ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 # Client 1: ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
-# Client 2: AAAAA... (standard fallback peer)
+# Client 2: direct physical L3 baseline namespace
 
 cat > /tmp/server_multi.conf <<EOF_CONF
 [Interface]
@@ -141,9 +132,8 @@ cat > /tmp/client1.conf <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24, fd00::2/64
-TProxyPort = 1080
 MTU = 1400
-Table = off
+Table = auto
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
@@ -172,23 +162,23 @@ ip netns exec client1_ns ping -c 2 10.0.2.2 >/dev/null
 ip netns exec client2_ns ping -c 2 10.0.2.2 >/dev/null
 
 echo "=== [8/8] Executing Concurrent Multi-Client Interception & Fallback Verification ==="
-# Client 1: custom proxy stream (TCP via parallel QUIC pool)
+# Client 1: userspace TUN stream (TCP via parallel QUIC pool)
 echo ">> [Client 1 - Custom Proxy]: Sending concurrent TCP request..."
 ip netns exec client1_ns curl -fsS --connect-timeout 5 http://10.0.0.1:8080/ >/dev/null
 if [ $? -eq 0 ]; then
-  echo "✓ [PASS] Client 1 (Proxy) successfully fetched data via intercepted TCP-over-QUIC!"
+  echo "✓ [PASS] Client 1 (Proxy) successfully fetched data via TUN/smoltcp/QUIC!"
 else
   echo "✗ [FAIL] Client 1 (Proxy) TCP connection failed"
   exit 1
 fi
 
-# Client 2: standard client stream (TCP bypasses proxy daemon, falls back to L3 direct MASQUERADE)
-echo ">> [Client 2 - Standard WG]: Sending concurrent TCP request..."
+# Client 2: direct physical L3 baseline path.
+echo ">> [Client 2 - Direct L3]: Sending concurrent TCP request..."
 ip netns exec client2_ns curl -fsS --connect-timeout 5 http://10.0.0.1:8080/ >/dev/null
 if [ $? -eq 0 ]; then
-  echo "✓ [PASS] Client 2 (Standard WG Fallback) successfully fetched data via native L3 tunnel!"
+  echo "✓ [PASS] Client 2 (Direct L3) successfully fetched data via physical routed path!"
 else
-  echo "✗ [FAIL] Client 2 (Standard WG) fallback TCP connection failed"
+  echo "✗ [FAIL] Client 2 (Direct L3) TCP connection failed"
   exit 1
 fi
 

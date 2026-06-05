@@ -8,8 +8,6 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
-source "$ROOT_DIR/script/acceptance/wireguard_backend.sh"
-new_proxy_select_wireguard_backend
 ARTIFACT_DIR="${PERF_SMOKE_ARTIFACT_DIR:-/tmp/new_proxy_perf_smoke_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$ARTIFACT_DIR"
 

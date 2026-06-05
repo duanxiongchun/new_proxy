@@ -15,6 +15,7 @@ use tokio::time::timeout;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+const QUIC_RECOVERY_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_AUTH_PACKET_LEN: usize = 2048;
 const MAX_INCOMING_QUIC_CONNECTIONS: usize = 4096;
 static NEXT_QUIC_CONN_RECORD_ID: AtomicU64 = AtomicU64::new(1);
@@ -709,7 +710,7 @@ impl QuicPoolClient {
                             new_pool_state = PoolState::Fallback;
                         } else if let PoolState::Recovering { recovery_start } = pool_state {
                             if std::time::Instant::now().duration_since(recovery_start)
-                                >= Duration::from_secs(30)
+                                >= QUIC_RECOVERY_COOLDOWN
                             {
                                 log::info!(
                                     "QUIC pool cooldown period expired; entering Active state."

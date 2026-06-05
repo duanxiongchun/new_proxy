@@ -122,7 +122,7 @@ graph TD
    - **TCP 报文**：
      - 若为 SYN 握手包且未匹配当前任何套接字，则在 `smoltcp` 中动态创建并绑定一个 Listen 状态的 TCP 套接字。
      - 在 `nat_map` 中记录原始目标 IP 和端口 `(client_ip, client_port, dest_port) -> original_dest_ip`。
-     - 执行 **NAT 转换**：将报文目标 IP 改写为 `smoltcp` 虚拟接口的 IP（IPv4 使用 `10.0.0.2`，IPv6 使用 `2001:db8::2`）。为了加快处理速度，`smoltcp` 虚拟网卡的校验和（Checksum）功能被设为忽略。
+     - 执行 **NAT 转换**：将报文目标 IP 改写为本机配置的 `smoltcp` 虚拟接口地址（来自 `[Interface].Address` 的 IPv4/IPv6 地址）。为了加快处理速度，`smoltcp` 虚拟网卡的校验和（Checksum）功能被设为忽略；写回 TUN 前会重新计算 IPv4 header checksum 和 TCP pseudo-header checksum。
      - 投递至本地 `smoltcp` 实例。
      - 处理完成后，从 `smoltcp` 提取出站 TCP 包，通过 `nat_map` 反向改写源 IP 并写入 TUN 队列。
    - **UDP / ICMP 报文**：
