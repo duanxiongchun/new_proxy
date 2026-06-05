@@ -42,3 +42,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 hmac = "0.12"
 sha2 = "0.10"
 parking_lot = "0.12"
+
+boringtun = { path = "/home/duanxiongchun/boringtun/boringtun" }
+smoltcp = { path = "/home/duanxiongchun/smoltcp", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+
