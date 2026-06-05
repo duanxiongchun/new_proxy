@@ -87,16 +87,9 @@ fn start_tproxy_failover_manager(
         loop {
             tokio::time::sleep(TPROXY_FAILOVER_POLL_INTERVAL).await;
 
-            let (table_off, tproxy_port, current_enabled, proxy_peers) = {
+            let (current_enabled, proxy_peers) = {
                 let st = state.read();
                 (
-                    st.config
-                        .interface
-                        .table
-                        .as_deref()
-                        .map(|table| table.eq_ignore_ascii_case("off"))
-                        .unwrap_or(false),
-                    st.config.interface.tproxy_port,
                     st.tproxy_offload_enabled,
                     st.config
                         .peers
@@ -106,9 +99,6 @@ fn start_tproxy_failover_manager(
                         .collect::<Vec<_>>(),
                 )
             };
-            if table_off || tproxy_port.is_none() {
-                continue;
-            }
             if proxy_peers.is_empty() {
                 continue;
             }
@@ -177,26 +167,11 @@ fn start_tproxy_failover_manager(
                 continue;
             }
 
-            let config = state.read().config.clone();
+            state.write().tproxy_offload_enabled = desired_enabled;
             if desired_enabled {
-                match setup_proxy_tproxy_rules(&config, &interface_name) {
-                    Ok(()) => {
-                        state.write().tproxy_offload_enabled = true;
-                        log::info!(
-                            "QUIC pools recovered after cooldown; restored TPROXY rules for proxy peers"
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to restore TPROXY rules after QUIC recovery: {}", e);
-                        cleanup_proxy_tproxy_rules(&config, &interface_name);
-                    }
-                }
+                log::info!("QUIC pools recovered after cooldown; userspace offload active");
             } else {
-                cleanup_proxy_tproxy_rules(&config, &interface_name);
-                state.write().tproxy_offload_enabled = false;
-                log::warn!(
-                    "At least one QUIC pool is in fallback/recovering; removed all proxy TPROXY rules so new connections use WireGuard L3"
-                );
+                log::warn!("At least one QUIC pool is in fallback/recovering; userspace offload disabled, using userspace WireGuard L3 fallback");
             }
         }
     })
@@ -322,10 +297,16 @@ async fn main() {
     }
 
     let mut config_path = "proxy.conf".to_string();
+    let mut num_threads = 1usize;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "-config" && i + 1 < args.len() {
             config_path = args[i + 1].clone();
+            i += 2;
+        } else if args[i] == "--threads" && i + 1 < args.len() {
+            if let Ok(t) = args[i + 1].parse::<usize>() {
+                num_threads = t;
+            }
             i += 2;
         } else {
             i += 1;
@@ -573,70 +554,99 @@ async fn main() {
             config.interface.private_key,
         );
 
-        if proxy_peers.is_empty() && config.interface.tproxy_port.is_none() {
+        if proxy_peers.is_empty() {
             wait_for_shutdown().await;
         } else {
-            let tproxy_port = match config.interface.tproxy_port {
-                Some(port) => port,
-                None => {
-                    log::error!("Error: TProxyPort required for Client mode");
+            log::info!("Opening userspace multiqueue TUN device: {} with {} queues", interface_name, num_threads);
+            let tun_fds = match tun_device::open_tun(&interface_name, num_threads) {
+                Ok(fds) => fds,
+                Err(e) => {
+                    log::error!("Failed to open TUN device: {}", e);
                     let cleanup_config = gateway_state.read().config.clone();
                     cleanup_runtime(&cleanup_config, &interface_name);
                     std::process::exit(1);
                 }
             };
-            let tproxy_v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), tproxy_port);
-            let tproxy_v4_listener = match tproxy::create_tproxy_listener(tproxy_v4_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    log::error!("IPv4 TPROXY Listener bind FAILED: {}", e);
-                    let cleanup_config = gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &interface_name);
-                    std::process::exit(1);
-                }
-            };
-            let tproxy_v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tproxy_port);
-            let tproxy_v6_listener = match tproxy::create_tproxy_listener(tproxy_v6_addr) {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    log::warn!(
-                        "IPv6 TPROXY Listener bind FAILED: {}. IPv4 interception remains active.",
-                        e
-                    );
-                    None
-                }
-            };
 
-            log::info!("------------------------------------------------------");
-            log::info!(
-                "  TPROXY TCP transparent intercept running on port {} ",
-                tproxy_port
-            );
-            log::info!("  All TCP streams routed to AllowedIPs will offload to ");
-            log::info!("  Parallel Userspace QUIC Connection Pool bypass L3 !  ");
-            log::info!("------------------------------------------------------");
+            let peer = config.peers.iter().find(|p| p.endpoint.is_some()).expect("Client requires at least one peer with an endpoint");
+            let server_endpoint = peer.endpoint.unwrap();
 
-            let tproxy_connection_limit =
-                Arc::new(tokio::sync::Semaphore::new(MAX_TPROXY_CONNECTIONS));
-            if let Some(listener) = tproxy_v6_listener {
-                tokio::spawn(run_tproxy_accept_loop(
-                    listener,
-                    client_quic_pools.clone(),
-                    gateway_state.clone(),
-                    telemetry_registry.clone(),
-                    tproxy_connection_limit.clone(),
-                ));
+            // Set up active connection handler
+            let gateway_state_clone = gateway_state.clone();
+            let client_quic_pools_clone = client_quic_pools.clone();
+            let active_conn_handler = Arc::new(move |original_dest: SocketAddr, tx_receiver, rx_sender| {
+                let peer_pub_key = {
+                    let st = gateway_state_clone.read();
+                    st.router.longest_match(original_dest.ip())
+                };
+                if let Some(peer_pub_key) = peer_pub_key {
+                    let quic_pool = {
+                        let pools = client_quic_pools_clone.read();
+                        pools.get(&peer_pub_key).cloned()
+                    };
+                    if let Some(quic_pool) = quic_pool {
+                        tokio::spawn(async move {
+                            crate::client_proxy::bridge_userspace_stream_to_quic(
+                                original_dest,
+                                quic_pool,
+                                tx_receiver,
+                                rx_sender,
+                            ).await;
+                        });
+                    }
+                }
+            });
+
+            let mut worker_tasks = Vec::new();
+            for fd in tun_fds {
+                let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
+                    Ok(io) => io,
+                    Err(e) => {
+                        log::error!("Failed to wrap TUN FD in AsyncTunIo: {}", e);
+                        std::process::exit(1);
+                    }
+                });
+
+                let udp_socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+                udp_socket.set_nonblocking(true).unwrap();
+                let tokio_udp = Arc::new(tokio::net::UdpSocket::from_std(udp_socket).unwrap());
+
+                let private_key = boringtun::x25519::StaticSecret::from(config.interface.private_key);
+                let public_key = boringtun::x25519::PublicKey::from(peer.public_key);
+                let wg = userspace_wg::UserspaceWg::new(private_key, public_key).unwrap();
+
+                let ip_cidr_str = config.interface.addresses.first().map(|addr| addr.to_string()).unwrap_or_else(|| "10.0.0.2/24".to_string());
+                let ip_cidr = std::str::FromStr::from_str(&ip_cidr_str).unwrap();
+                let tcp_stack = userspace_tcp::UserspaceTcpStack::new(ip_cidr).unwrap();
+
+                let mut worker = rtc_loop::RtcWorker::new(
+                    tun_io,
+                    tokio_udp,
+                    server_endpoint,
+                    wg,
+                    tcp_stack,
+                );
+                worker.active_conn_handler = Some(active_conn_handler.clone());
+
+                let gateway_state_for_worker = gateway_state.clone();
+                let client_quic_pools_for_worker = client_quic_pools.clone();
+
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = worker.run_loop(gateway_state_for_worker, client_quic_pools_for_worker).await {
+                        log::error!("RtcWorker loop failed: {}", e);
+                    }
+                });
+                worker_tasks.push(handle);
             }
 
-            tokio::select! {
-                _ = run_tproxy_accept_loop(
-                    tproxy_v4_listener,
-                    client_quic_pools.clone(),
-                    gateway_state.clone(),
-                    telemetry_registry.clone(),
-                    tproxy_connection_limit.clone(),
-                ) => {}
-                _ = wait_for_shutdown() => {}
+            log::info!("------------------------------------------------------");
+            log::info!("  Userspace multiqueue TUN transparent proxy running  ");
+            log::info!("  All L3 and L4 traffic processed in userspace.       ");
+            log::info!("------------------------------------------------------");
+
+            wait_for_shutdown().await;
+            for t in worker_tasks {
+                t.abort();
             }
         }
         tproxy_failover_task.abort();
