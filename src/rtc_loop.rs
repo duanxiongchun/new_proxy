@@ -316,7 +316,7 @@ impl BridgeChannels {
 
 pub struct RtcWorker {
     pub tun_io: Arc<AsyncTunIo>,
-    pub udp_socket: Arc<tokio::net::UdpSocket>,
+    pub udp_socket: crate::virtual_tunnel::TunnelSocket,
     pub l3_registry: UserspaceWgRegistry,
     pub tcp_stack: UserspaceTcpStack,
     pub bridges: HashMap<SocketHandle, BridgeChannels>,
@@ -335,7 +335,7 @@ pub struct RtcWorker {
 impl RtcWorker {
     pub fn new(
         tun_io: Arc<AsyncTunIo>,
-        udp_socket: Arc<tokio::net::UdpSocket>,
+        udp_socket: crate::virtual_tunnel::TunnelSocket,
         l3_registry: UserspaceWgRegistry,
         tcp_stack: UserspaceTcpStack,
         local_ipv4: Option<IpAddr>,
@@ -1041,7 +1041,7 @@ mod tests {
 
         RtcWorker::new(
             tun_io,
-            tokio_udp,
+            crate::virtual_tunnel::TunnelSocket::Single(tokio_udp),
             l3_registry,
             tcp_stack,
             Some("10.0.0.2".parse().unwrap()),

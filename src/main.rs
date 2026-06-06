@@ -20,6 +20,8 @@ mod uds_server;
 pub mod userspace_tcp;
 pub mod userspace_wg;
 mod wireguard;
+pub mod virtual_tunnel;
+
 
 use client_proxy::build_peer_quic_pool;
 use std::collections::HashMap;
@@ -496,7 +498,8 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let server_udp = Arc::new(tokio::net::UdpSocket::from_std(server_udp).unwrap());
+        let server_udp_raw = Arc::new(tokio::net::UdpSocket::from_std(server_udp).unwrap());
+        let server_udp = crate::virtual_tunnel::TunnelSocket::Single(server_udp_raw);
         let mut l3_tasks = Vec::new();
         for fd in tun_fds {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -709,17 +712,25 @@ async fn main() {
             },
         );
 
-        let client_udp = match bind_l3_udp_socket(0, needs_ipv6_l3_socket(&config)) {
-            Ok(socket) => Arc::new(tokio::net::UdpSocket::from_std(socket).unwrap()),
-            Err(e) => {
-                log::error!(
-                    "Failed to bind client userspace WireGuard UDP socket: {}",
-                    e
-                );
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
+        let client_udp = {
+            let mut sockets = Vec::new();
+            for i in 0..2 {
+                match bind_l3_udp_socket(0, needs_ipv6_l3_socket(&config)) {
+                    Ok(socket) => sockets.push(tokio::net::UdpSocket::from_std(socket).unwrap()),
+                    Err(e) => {
+                        log::error!(
+                            "Failed to bind client userspace WireGuard UDP socket {}: {}",
+                            i,
+                            e
+                        );
+                        let cleanup_config = gateway_state.read().config.clone();
+                        cleanup_runtime(&cleanup_config, &interface_name);
+                        std::process::exit(1);
+                    }
+                }
             }
+            let virtual_sock = crate::virtual_tunnel::VirtualTunnelSocket::new(sockets);
+            crate::virtual_tunnel::TunnelSocket::Virtual(virtual_sock)
         };
         let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
             client_udp.clone(),
