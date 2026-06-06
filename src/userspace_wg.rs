@@ -489,7 +489,7 @@ fn env_f64(name: &str, default: f64) -> f64 {
 #[cfg(not(tarpaulin))]
 pub async fn run_userspace_wg_loop(
     tun_io: Arc<AsyncTunIo>,
-    udp_socket: Arc<tokio::net::UdpSocket>,
+    udp_socket: crate::virtual_tunnel::TunnelSocket,
     registry: UserspaceWgRegistry,
 ) -> Result<(), String> {
     let mut tun_buf = vec![0u8; 65535];
@@ -524,6 +524,10 @@ pub async fn run_userspace_wg_loop(
                 if n == 0 {
                     continue;
                 }
+                if n >= 4 && &udp_buf[..4] == b"PING" {
+                    let _ = udp_socket.send_to(b"PONG", endpoint).await;
+                    continue;
+                }
                 if let Some((reply_endpoint, actions)) =
                     registry.decapsulate_network_packet(endpoint, &udp_buf[..n], &mut wg_buf)
                 {
@@ -550,7 +554,7 @@ pub async fn run_userspace_wg_loop(
 
 #[cfg(not(tarpaulin))]
 pub async fn run_userspace_wg_timer_loop(
-    udp_socket: Arc<tokio::net::UdpSocket>,
+    udp_socket: crate::virtual_tunnel::TunnelSocket,
     registry: UserspaceWgRegistry,
 ) {
     let mut wg_buf = vec![0u8; 65535];
