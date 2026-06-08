@@ -322,6 +322,7 @@ impl UserspaceWgRegistry {
                 if let Some(action) =
                     self.decapsulate_with_peer(public_key, peer, endpoint, incoming, wg_buf)
                 {
+                    self.remember_receiver_index(receiver_index, public_key);
                     return Some((endpoint, action));
                 }
             }

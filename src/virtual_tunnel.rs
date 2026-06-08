@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex};
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use std::io;
@@ -62,7 +63,7 @@ impl VirtualTunnelSocket {
                             }
                             let data = &buf[..n];
                             if n >= 4 && data == b"PONG" {
-                                *last_pong_clone.write().await = Some(Instant::now());
+                                *last_pong_clone.write() = Some(Instant::now());
                                 continue;
                             }
                             if n >= 4 && data == b"PING" {
@@ -93,10 +94,7 @@ impl VirtualTunnelSocket {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let target = {
-                    let guard = last_target_for_ping.read().await;
-                    *guard
-                };
+                let target = *last_target_for_ping.read();
 
                 if let Some(target_addr) = target {
                     for p_socket in &sockets_for_ping {
@@ -109,10 +107,7 @@ impl VirtualTunnelSocket {
                 let mut best_idx = 0;
                 let mut best_time = None;
                 for (i, p_socket) in sockets_for_ping.iter().enumerate() {
-                    let pong_time = {
-                        let guard = p_socket.last_pong.read().await;
-                        *guard
-                    };
+                    let pong_time = *p_socket.last_pong.read();
                     if let Some(t) = pong_time {
                         if now.duration_since(t) < Duration::from_secs(5) {
                             if best_time.map_or(true, |bt| t > bt) {
@@ -149,9 +144,12 @@ impl VirtualTunnelSocket {
     }
 
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        {
-            let mut guard = self.inner.last_target.write().await;
-            *guard = Some(target);
+        let needs_write = {
+            let guard = self.inner.last_target.read();
+            *guard != Some(target)
+        };
+        if needs_write {
+            *self.inner.last_target.write() = Some(target);
         }
 
         let active_idx = self.inner.active_idx.load(Ordering::Relaxed);
