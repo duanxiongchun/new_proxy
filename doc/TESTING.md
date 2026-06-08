@@ -80,7 +80,7 @@ python3 -m py_compile \
 
 | 层级 | 已覆盖 | 主要缺口 |
 | --- | --- | --- |
-| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限 | QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
+| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限、VirtualTunnel drop/failover 边界、worker flow limit fallback 判断 | QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
 | E2E | 双栈 WAN、IPv6 HTTP over TUN/smoltcp/QUIC、TUN/smoltcp->QUIC、QUIC 被阻断时新 TCP 经 userspace WireGuard fallback、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy + direct L3 baseline、动态 client proxy peer add/remove 生命周期、full-tunnel endpoint bypass 与动态 full-tunnel peer replacement、server 主动访问 client 后端的物理路径保持可达 | UDP/ICMP 经 userspace boringtun 的 namespace 闭环、服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、direct L3 baseline、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV；crash、短/长 TCP、UDP、ping、QUIC CV 为硬门禁，RSS 默认 WARN、`STABILITY_ENFORCE_RSS=1` 时为硬门禁 | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
 | 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 `--threads 1..4` 同步重启 server/client，并用 `taskset` 约束 client CPU，默认 32 并发输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator；L3 userspace WireGuard 仍是 per-peer shared state，需单独评估 UDP/ICMP/fallback 扩展性 |
@@ -239,9 +239,12 @@ Rust 单元测试覆盖：
 - `src/rtc_loop.rs::parse_ipv6_tcp_rejects_short_header_without_panicking`：验证 IPv6 TCP 短包不会越界 panic。
 - `src/rtc_loop.rs::rewrites_repair_ipv4_tcp_checksums` / `rewrites_repair_ipv6_tcp_checksums`：验证 NAT 改写后校验和会被重算。
 - `src/rtc_loop.rs::bridge_pending_queues_are_capped_by_bytes`：验证 bridge 慢读/慢写 pending 队列存在字节上限。
+- `src/rtc_loop.rs::new_syn_falls_back_when_worker_flow_limit_is_reached`：验证 worker TCP flow 数达到上限时，新 SYN 会被判定为 fallback，而已有 flow 不受影响。
 - `src/rtc_loop.rs::test_rtc_worker_creation`：验证 `RtcWorker` 组合 `AsyncTunIo`、UDP socket、boringtun 和 smoltcp 后可执行一次 poll/flush 迭代。
 - `src/virtual_tunnel.rs::virtual_tunnel_socket_rejects_empty_physical_socket_set`：验证虚拟 UDP socket 不接受空物理 socket 集。
 - `src/virtual_tunnel.rs::virtual_tunnel_recv_waiters_do_not_hold_global_async_lock`：验证多个接收 waiter 不会被单个跨 `await` receiver 锁串行卡住。
+- `src/virtual_tunnel.rs::virtual_tunnel_drop_counters_increment_when_packet_queue_is_full`：验证物理 UDP 入站队列满时 drop packets/bytes 计数递增。
+- `src/virtual_tunnel.rs::virtual_tunnel_keeps_active_socket_when_all_pongs_are_stale`：验证所有物理路径健康探测都过期时不会强制回切到 socket 0。
 
 需要补齐的回归用例：
 

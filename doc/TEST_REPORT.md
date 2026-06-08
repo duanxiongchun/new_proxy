@@ -8,6 +8,40 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-08 Review 后稳定性边界补充验证
+
+本次修复覆盖：
+
+- `VirtualTunnelSocket` 入站队列满时累计 drop packets/bytes，并在 UDS `dump` 的 `virtual_tunnel` 行输出当前队列和累计丢弃量。
+- 物理 UDP socket 健康探测没有任何新鲜 PONG 时保持当前 active socket，不再强制回切到 socket 0。
+- L4 userspace TCP 资源预算保留默认值，同时支持通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_BRIDGE_CHANNEL_CAPACITY` 覆盖。
+- 补充 `VirtualTunnelSocket` drop/failover 边界和 `RtcWorker` flow limit fallback 单元测试。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/e2e_full_tunnel_bypass.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+sudo bash script/acceptance/e2e_userspace_wg_fallback.sh
+```
+
+结果：**通过。** `cargo test` 当前为 CLI 10 个测试、主程序 103 个测试全部通过。`e2e_userspace_wg_fallback.sh` 产物目录为 `/tmp/new_proxy_userspace_wg_fallback_20260608_154552`，验证 QUIC 阻断后新 TCP 仍可经 userspace WireGuard fallback 成功闭环。本轮未执行其余 root/network namespace E2E、稳定性和 perf 脚本。
+
 ## 2026-06-08 Review 后静态与单元验证
 
 本次修复覆盖：

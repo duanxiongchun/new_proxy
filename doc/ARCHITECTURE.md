@@ -140,7 +140,7 @@ graph TD
 `RtcWorker` 内部为每个活跃的 `smoltcp` 套接字维护了异步通道。当套接字成功建立连接后：
 - `RtcWorker` 会通过 `nat_map` 将 smoltcp 虚拟本地地址反查为原始目标地址，动态唤醒对应的桥接任务，异步从 `smoltcp` 套接字读取 payload，并将其写入客户端连接池的 QUIC stream 中。
 - 从 QUIC stream 读取的数据在工作线程中被写回 `smoltcp` 套接字的发送队列。
-- 每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有固定上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。
+- 每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有默认上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。默认上限可通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_BRIDGE_CHANNEL_CAPACITY` 覆盖，用于不同机器规格和压测场景调参。
 
 ## 7. 路由配置
 
@@ -161,6 +161,7 @@ UDS 路径：`/run/new_proxy/<interface>.sock`
 - `rx` / `received`：从该 peer 收到的字节。
 - `tx` / `sent`：发给该 peer 的字节。
 - 用户态协议栈收发数据同样使用该语义：数据经 `QUIC -> smoltcp -> TUN` 计为 `rx`，经 `TUN -> smoltcp -> QUIC` 计为 `tx`。
+- `dump` 输出包含 `virtual_tunnel` 行，`queue=<packets>:<bytes>` 表示物理 UDP 入站有界队列当前积压，`drops=<packets>:<bytes>` 表示队列包数或字节上限触发后的累计丢弃量。
 
 ## 9. 已知架构边界
 
