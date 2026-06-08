@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--host", default="10.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--duration", type=int, default=3600)
-    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--payload-size", type=int, default=1024)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--stats-out", required=True)
@@ -75,7 +75,7 @@ def main():
             target=worker,
             args=(i, args.host, args.port, args.duration, args.payload_size, args.interval, stats, lock),
         )
-        for i in range(args.threads)
+        for i in range(args.workers)
     ]
     started = int(time.time())
     for thread in threads:

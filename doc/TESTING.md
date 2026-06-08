@@ -33,9 +33,9 @@ cargo test
 - `src/tun_io.rs`：基于 `AsyncFd` 的 TUN 异步读写。
 - `src/userspace_tcp.rs`：smoltcp 用户态 TCP/IP 栈创建、socket buffer 与 socket handle 生命周期。
 - `src/userspace_wg.rs`：boringtun tunnel 状态初始化。
-- `src/virtual_tunnel.rs`：空物理 socket 集拒绝、无跨 await receiver 全局锁的并发接收、双物理 UDP socket failover。
-- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、QUIC pool fallback/recovering/active 状态。
-- `src/main.rs`：userspace TCP failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TCP offload，所有 pool active 后才允许回切。
+- `src/virtual_tunnel.rs`：空物理 socket 集拒绝、RTC receive path 不预取业务包、调用方 buffer 直接接收、双物理 UDP socket 直接 readiness 接收、发送使用当前 active socket。
+- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、旧 QUIC data port 不可达后的控制面刷新恢复、控制面刷新拒绝 data port 数变化、QUIC pool fallback/recovering/active 状态、控制面刷新触发条件和退避。
+- `src/main.rs`：userspace TCP failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TCP offload，所有 pool active 后才允许回切；启动期 QUIC data 连接失败但控制面已返回 data port 数时，client worker 数使用协商端口数，并拒绝多个 peer 间不一致的启动期端口数。
 - `src/relay.rs`：双向 relay、计数 reader。
 - `src/routing.rs`：AllowedIPs longest-prefix matching。
 - `src/uds_server.rs`：真实 UDS server 的 `Stats`、`Dump`、非法请求响应和 remove-peer 缓存清理。
@@ -83,7 +83,7 @@ python3 -m py_compile \
 | 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限、VirtualTunnel drop/failover 边界、worker flow limit fallback 判断 | QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
 | E2E | 双栈 WAN、IPv6 HTTP over TUN/smoltcp/QUIC、TUN/smoltcp->QUIC、QUIC 被阻断时新 TCP 经 userspace WireGuard fallback、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy + direct L3 baseline、动态 client proxy peer add/remove 生命周期、full-tunnel endpoint bypass 与动态 full-tunnel peer replacement、server 主动访问 client 后端的物理路径保持可达 | UDP/ICMP 经 userspace boringtun 的 namespace 闭环、服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、direct L3 baseline、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV；crash、短/长 TCP、UDP、ping、QUIC CV 为硬门禁，RSS 默认 WARN、`STABILITY_ENFORCE_RSS=1` 时为硬门禁 | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要 |
-| 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 `--threads 1..4` 同步重启 server/client，并用 `taskset` 约束 client CPU，默认 32 并发输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator；L3 userspace WireGuard 仍是 per-peer shared state，需单独评估 UDP/ICMP/fallback 扩展性 |
+| 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 QUIC data port 数 `1..4` 同步重启 server/client，并用 `taskset` 约束 client CPU，默认 32 并发输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator；L3 userspace WireGuard 仍是 per-peer shared state，需单独评估 UDP/ICMP/fallback 扩展性 |
 | 弱网/混沌 | 无正式脚本 | 缺丢包、端口阻断、服务端重启、session rotation、控制面丢包场景 |
 | 安全负向 | 控制面坏 HMAC/重放/stale nonce、QUIC 证书 pinning、空 endpoint pool | 缺恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E |
 
@@ -240,21 +240,26 @@ Rust 单元测试覆盖：
 - `src/rtc_loop.rs::rewrites_repair_ipv4_tcp_checksums` / `rewrites_repair_ipv6_tcp_checksums`：验证 NAT 改写后校验和会被重算。
 - `src/rtc_loop.rs::bridge_pending_queues_are_capped_by_bytes`：验证 bridge 慢读/慢写 pending 队列存在字节上限。
 - `src/rtc_loop.rs::new_syn_falls_back_when_worker_flow_limit_is_reached`：验证 worker TCP flow 数达到上限时，新 SYN 会被判定为 fallback，而已有 flow 不受影响。
+- `src/rtc_loop.rs::allocate_local_port_can_use_final_ephemeral_port`：验证 userspace TCP 本地端口分配覆盖完整 ephemeral 范围。
+- `src/rtc_loop.rs::cleanup_stale_flows_removes_half_open_socket_for_local_port`：验证 stale flow 清理会移除半开 smoltcp socket 并释放本地端口索引。
+- `src/rtc_loop.rs::insert_flow_port_rejects_duplicate_port_in_debug_builds`：验证本地端口索引 helper 在 debug/test 构建中拒绝重复端口误用。
 - `src/rtc_loop.rs::test_rtc_worker_creation`：验证 `RtcWorker` 组合 `AsyncTunIo`、UDP socket、boringtun 和 smoltcp 后可执行一次 poll/flush 迭代。
 - `src/virtual_tunnel.rs::virtual_tunnel_socket_rejects_empty_physical_socket_set`：验证虚拟 UDP socket 不接受空物理 socket 集。
-- `src/virtual_tunnel.rs::virtual_tunnel_recv_waiters_do_not_hold_global_async_lock`：验证多个接收 waiter 不会被单个跨 `await` receiver 锁串行卡住。
-- `src/virtual_tunnel.rs::virtual_tunnel_drop_counters_increment_when_packet_queue_is_full`：验证物理 UDP 入站队列满时 drop packets/bytes 计数递增。
+- `src/virtual_tunnel.rs::virtual_tunnel_sequential_recv_uses_caller_buffer_without_queue`：验证 RTC receive path 直接使用调用方 buffer 连续收包，不经过中间接收队列。
+- `src/virtual_tunnel.rs::virtual_tunnel_does_not_consume_business_packets_before_recv`：验证虚拟 UDP socket 不用后台任务预取业务包，只有 RTC worker 调用 `recv_from` 时才收包。
+- `src/virtual_tunnel.rs::virtual_tunnel_recv_reads_directly_from_multiple_physical_sockets`：验证多个物理 UDP socket 任一 ready 时都能直接读入调用方 buffer。
 - `src/virtual_tunnel.rs::virtual_tunnel_keeps_active_socket_when_all_pongs_are_stale`：验证所有物理路径健康探测都过期时不会强制回切到 socket 0。
+- `src/virtual_tunnel.rs::virtual_tunnel_send_uses_active_physical_socket`：验证发送使用当前 active 底层 UDP socket。
 
 需要补齐的回归用例：
 
 - `RtcWorker` TCP 路由选择：目标 IP 命中 router 且 QUIC pool 为 `Active` 时进入 smoltcp；未命中、pool 缺失、`Fallback` 或 `Recovering` 时进入 boringtun L3。
 - 桥接通道：smoltcp socket payload 经 `BridgeChannels` 发往 QUIC handler，QUIC 返回 payload 能写回 smoltcp socket；通道断开时 socket abort 并清理 bridge。
 - WireGuard timer/UDP 入站：`update_timers()` 产生网络包时写入物理 UDP socket；`decapsulate()` 返回 tunnel 包时写回 TUN。
-- 多队列启动：`--threads <count>` 打开同数量 TUN FD，并为每个 FD 启动独立 `RtcWorker`/userspace WireGuard loop；L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。
+- 多队列启动：server 队列数严格跟随 `QuicPool.ListenPorts` 数量；client 队列数在启动时固定为已建立 QUIC pool 的 data port 数量，若控制面已返回 data port 数但 data 连接失败，则使用协商端口数启动 worker。多个 proxy peer 的 data port 数量必须一致，动态新增、后台恢复或控制面刷新得到的 data port 数必须匹配当前已启动 worker 数，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。client WireGuard L3 路径仍共享单个外层 UDP socket，且只有 worker 0 负责入站 receive/timer。L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。
 - 多 peer userspace WireGuard：每个 proxy peer 拥有共享的 per-peer `boringtun` 状态和 UDP endpoint，并按 `AllowedIPs` 选择 L3 fallback 目标；需要覆盖多 worker 并发 fallback 时不会死锁或明显退化。
 - E2E：补齐 UDP/ICMP 经 TUN -> boringtun -> server TUN 闭环。
-- 性能：`script/perf/perf_cores_scalability.sh` 在具备 root、release binary、`ip`、`python3`、`curl`、`taskset`、`awk` 和可用 CPU cpuset 的环境下运行真实 HTTP 吞吐；工具、CPU 或拓扑缺失时必须失败，不能生成模拟性能数据。脚本还必须强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 `--threads`。
+- 性能：`script/perf/perf_cores_scalability.sh` 在具备 root、release binary、`ip`、`python3`、`curl`、`taskset`、`awk` 和可用 CPU cpuset 的环境下运行真实 HTTP 吞吐；工具、CPU 或拓扑缺失时必须失败，不能生成模拟性能数据。脚本还必须强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 QUIC data port 数。
 
 ## 4. Backlog
 

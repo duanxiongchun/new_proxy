@@ -8,7 +8,7 @@
 
 - **L3 数据面**：
   - **服务端**：打开 TUN 设备并通过内建 `boringtun` 处理 WireGuard 风格 L3 加解密；配置 `Table = auto` 时会为 peer AllowedIPs 下发指向 TUN 的路由。
-  - **客户端**：采用用户态协议栈。程序按 `--threads` 打开并持有一个或多个 TUN 队列文件描述符，再配置该 TUN 的地址和 AllowedIPs 路由；在进程内通过 `boringtun`（用户态 WireGuard 协议库）对 UDP/ICMP 报文和 TCP fallback 报文进行加密封装，并发送至宿主机物理网卡。客户端不再同步 peer 到内核 WireGuard 设备，但创建 TUN 和配置路由仍需要相应系统权限（通常是 `CAP_NET_ADMIN` 或 root）。
+  - **客户端**：采用用户态协议栈。启动时程序按已建立 QUIC pool 的 data port 数量打开并持有一个或多个 TUN 队列文件描述符；若控制面已协商出 data port 数但 QUIC data 连接暂时失败，则仍按该协商数量打开队列，避免恢复时 worker 拓扑不匹配。随后程序配置该 TUN 的地址和 AllowedIPs 路由；在进程内通过 `boringtun`（用户态 WireGuard 协议库）对 UDP/ICMP 报文和 TCP fallback 报文进行加密封装，并发送至宿主机物理网卡。客户端不再同步 peer 到内核 WireGuard 设备，但创建 TUN 和配置路由仍需要相应系统权限（通常是 `CAP_NET_ADMIN` 或 root）。
 - **L4 TCP 路径**：
   - **服务端**：通过物理 QUIC 连接池接收并解密来自客户端的透明流。
   - **客户端**：通过 TUN 拦截 TCP 流量，由各 TUN 队列对应的 `RtcWorker` 内部 `smoltcp` 用户态协议栈接管。建立连接后，通过在进程内桥接 `smoltcp` 套接字与对应的 QUIC 复用连接流（Quinn）进行转发，从而完全免除了内核 iptables 和 TPROXY 的防火墙规则依赖。同一 TCP flow 的状态保存在接收该 flow 的 worker 中，当前实现依赖 Linux TUN multiqueue 的 flow queue affinity。
@@ -34,7 +34,7 @@ Client mode 支持：
 - **用户态混合代理**：TCP 流量匹配 proxy peer 的 `AllowedIPs` 最长前缀后卸载到用户态 QUIC 连接池中；UDP/ICMP 以及 QUIC 不可用时的 TCP fallback 通过 `boringtun` 在用户态进行 WireGuard 加密封装。
 - proxy peer 需要同时配置 `Endpoint` 和 `ProxyPort`。`ProxyPort` 是控制面 UDP 端口；`Endpoint` 和 `ProxyPort` 必须成对出现。
 - `TProxyPort` 是旧 TPROXY 路径遗留配置，当前用户态 TUN client 不再需要它。
-- 客户端可以指定并发工作线程数（通过 `--threads <count>`），对应开启多队列 TUN 设备和多个独立的 `RtcWorker` 循环。L4 proxy 模式下每个 worker 拥有独立的 `smoltcp`、NAT 映射和桥接通道；L3 userspace WireGuard 状态按 peer 共享，并通过内部锁串行访问。
+- 客户端 worker 数在启动时固定为已建立 QUIC pool 的 data port 数量；如果控制面协商成功但 data 连接失败，则使用协商得到的 data port 数量。多个 proxy peer 的 data port 数量必须一致，并且动态新增、后台恢复或控制面刷新得到的 data port 数必须匹配当前已启动 worker 数，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。需要改变 client worker 拓扑时必须重启客户端。服务端 worker 数严格跟随 `QuicPool.ListenPorts` 数量。L4 proxy 模式下每个 worker 拥有独立的 `smoltcp`、NAT 映射和桥接通道；L3 userspace WireGuard 状态按 peer 共享，并通过内部锁串行访问。
 
 ## 3. WireGuard 后端
 
@@ -90,8 +90,8 @@ graph TD
         App[客户端应用程序] <-->| AllowedIPs 路由| Tun[Multiqueue TUN 设备]
     end
 
-    subgraph new_proxy Client (Worker Threads)
-        subgraph Worker Thread N (Core N)
+    subgraph new_proxy Client (Fixed Workers)
+        subgraph Worker N
             TunQ[TUN 队列 N FD] <-->|读/写| Worker[RtcWorker Loop]
             Worker <-->|TCP (NAT)| SmolTCP[smoltcp Stack]
             Worker <-->|UDP/ICMP| UserspaceWg[Shared per-peer userspace boringtun]
@@ -110,22 +110,25 @@ graph TD
 
 ### 6.1 Multiqueue TUN 与多线程扩展
 
-客户端会根据线程参数开启多队列（`IFF_MULTI_QUEUE`）TUN 设备。
+客户端启动时根据已建立 QUIC pool 的 data port 数开启多队列（`IFF_MULTI_QUEUE`）TUN 设备；若控制面已返回 data port 数但 data 连接失败，也使用该协商数量启动 worker；运行中不热扩容 worker。
 - **出站流量**：Linux TUN multiqueue 按 flow 选择队列，单个 TCP flow 的后续包应保持队列亲和；不同 flow 可被分散到不同队列 FD。
 - **L4 TCP offload 出站流量**：接收某个 TCP flow 的 `RtcWorker` 持有该 flow 的 `smoltcp` socket、NAT 映射和桥接通道。
-- **工作线程**：每个 worker 绑定一个 TUN 队列 FD，并拥有自己的 L4 TCP 用户态协议状态。L3 userspace WireGuard 状态当前按 peer 共享，多个 worker 会在同一 peer 的 `boringtun::Tunn` 上串行加解密。物理 UDP 入站包先进入 `VirtualTunnelSocket` 的有界内存队列，worker 取包时不会持有跨 `await` 的全局 receiver 锁；队列满时丢弃新入站包，避免反压失效造成 RSS 无界增长。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
+- **固定 worker**：worker 数在启动时确定，不随连接数增长。每个 worker 绑定一个 TUN 队列 FD，拥有自己的 L4 TCP 用户态协议状态、NAT 映射和数据面 packet buffer pool；数据面热路径不使用跨 worker 的共享大池，避免全局锁竞争。
+- **线程模型**：所有连接状态都由所属 `RtcWorker` 的事件循环驱动，不能按连接创建新的数据面线程或长期 task。当前实现固定 worker 数，smoltcp RX/TX 队列使用 worker 内 `PooledBuf` 流转，QUIC stream 句柄也保存在 worker 的 bridge 状态中。
+- **L3 外层 UDP**：客户端 WireGuard L3 路径流量较小，当前共享单个外层 UDP socket 和共享 per-peer `boringtun::Tunn` 状态；只有 worker 0 负责该 UDP socket 的入站 receive 与 timer 包，其他 worker 只在 TCP fallback/UDP/ICMP 出站时发送。`VirtualTunnelSocket` 保留为多底层 UDP socket readiness 聚合器：它不后台预取业务包、不维护中间接收队列，调用方 `recv_from` 时直接把 ready socket 的数据读入调用方 buffer；发送使用当前 active 底层 UDP socket。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
 
 ### 6.2 Run-to-Completion (RTC) 运行完成环路
 
-每个 `RtcWorker` 的事件循环执行路径遵循 **Run-to-Completion** 模式，保证包在同一线程中终结，消除线程上下文切换：
+每个 `RtcWorker` 的事件循环执行路径遵循 **Run-to-Completion** 模式：包从所属 TUN queue 读入该 worker 的 `PooledBuf` 后，尽量通过所有权转移在 worker 内继续流转，避免中间 `Vec` 分配和 payload copy。必须发生的 copy 只保留在内核 syscall 边界、加解密输出边界和协议库不可避免的内部缓冲边界。
+写回 TUN、发送外层 UDP 和 QUIC stream 读写均按非阻塞方式推进；当出口暂不可写时，包所有权进入所属 worker 的 pending 队列，并由 TUN/UDP writable 事件唤醒后继续 flush。只有内部 pending 字节数达到上限时才会丢弃或关闭连接，以保护 worker 内存不会无界增长。
 
 1. **TUN 出站包**：读取 TUN 队列中的原始 L3 IP 报文。
    - **TCP 报文**：
      - 若为 SYN 握手包且未匹配当前任何套接字，则在 `smoltcp` 中动态创建并绑定一个 Listen 状态的 TCP 套接字。若 socket 创建或 listen 失败，会回滚本地 flow 状态并立即走 userspace WireGuard L3 fallback。
      - 在 `nat_map` 中记录原始目标 IP 和端口 `(client_ip, client_port, dest_port) -> original_dest_ip`。
      - 执行 **NAT 转换**：将报文目标 IP 改写为本机配置的 `smoltcp` 虚拟接口地址（来自 `[Interface].Address` 的 IPv4/IPv6 地址）。为了加快处理速度，`smoltcp` 虚拟网卡的校验和（Checksum）功能被设为忽略；写回 TUN 前会重新计算 IPv4 header checksum 和 TCP pseudo-header checksum。
-     - 投递至本地 `smoltcp` 实例。
-     - 处理完成后，从 `smoltcp` 提取出站 TCP 包，通过 `nat_map` 反向改写源 IP 并写入 TUN 队列。
+     - 将同一个 `PooledBuf` 投递至本地 `smoltcp` 实例，不再把 TUN packet 复制成新的 `Vec`。
+     - 处理完成后，从 `smoltcp` 提取出站 TCP 包；出站包也从该 worker 的 pool 获取 buffer，通过 `nat_map` 反向改写源 IP 并写入 TUN 队列。
      - IPv6 L4 offload 当前只解析固定 IPv6 base header 后直接承载 TCP 的报文；携带 IPv6 extension headers 的 TCP 报文不会进入 L4 offload，而是按普通 L3 报文走 userspace WireGuard fallback。
    - **UDP / ICMP 报文**：
      - 直接在当前线程中调用 `boringtun::Tunn::encapsulate` 加密，并通过本地 UDP 套接字发送给服务端。
@@ -137,10 +140,12 @@ graph TD
 
 ### 6.3 管道数据桥接 (BridgeChannels)
 
-`RtcWorker` 内部为每个活跃的 `smoltcp` 套接字维护了异步通道。当套接字成功建立连接后：
+`RtcWorker` 内部为每个活跃的 `smoltcp` 套接字维护桥接状态。当套接字成功建立连接后：
 - `RtcWorker` 会通过 `nat_map` 将 smoltcp 虚拟本地地址反查为原始目标地址，动态唤醒对应的桥接任务，异步从 `smoltcp` 套接字读取 payload，并将其写入客户端连接池的 QUIC stream 中。
 - 从 QUIC stream 读取的数据在工作线程中被写回 `smoltcp` 套接字的发送队列。
-- 每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有默认上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。默认上限可通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_BRIDGE_CHANNEL_CAPACITY` 覆盖，用于不同机器规格和压测场景调参。
+- 每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有默认上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。TUN/UDP/WireGuard/QUIC bridge 的运行时 packet buffer 默认按 `MTU + 256` 派生，下限 1500、上限 65535，默认 MTU 1400 时为 1656，jumbo MTU 9000 时为 9256。默认上限可通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖，用于不同机器规格和压测场景调参。
+
+QUIC bridge 不再按连接 `spawn` 长生命周期 task，而是作为 `RtcWorker` 内部 bridge 状态由同一个事件循环驱动 TUN、UDP、smoltcp socket、QUIC stream 和 timer。新连接建立 QUIC stream 时先进入 `Opening` 状态，握手 future 保存在该 bridge 中，每次 worker tick 只 poll 一次；建立完成后切到 active stream 状态，读写 QUIC 时也只做单次非阻塞 poll，不能读写时立即回到 worker 事件循环。
 
 ## 7. 路由配置
 
@@ -161,7 +166,7 @@ UDS 路径：`/run/new_proxy/<interface>.sock`
 - `rx` / `received`：从该 peer 收到的字节。
 - `tx` / `sent`：发给该 peer 的字节。
 - 用户态协议栈收发数据同样使用该语义：数据经 `QUIC -> smoltcp -> TUN` 计为 `rx`，经 `TUN -> smoltcp -> QUIC` 计为 `tx`。
-- `dump` 输出包含 `virtual_tunnel` 行，`queue=<packets>:<bytes>` 表示物理 UDP 入站有界队列当前积压，`drops=<packets>:<bytes>` 表示队列包数或字节上限触发后的累计丢弃量。
+- `dump` 输出包含 `virtual_tunnel` 行；仅启用 `VirtualTunnelSocket` 时，`rx=<packets>:<bytes>` 表示经虚拟 UDP socket 直接交给调用方的业务包，`control=<packets>` 表示 PING/PONG 健康探测控制包，`errors=<count>` 表示底层 UDP receive 错误数。当前 client WireGuard L3 使用单 UDP socket，因此该行通常为 0。
 
 ## 9. 已知架构边界
 

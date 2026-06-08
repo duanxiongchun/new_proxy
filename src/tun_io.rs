@@ -56,6 +56,11 @@ impl AsyncTunIo {
         }
     }
 
+    pub async fn writable(&self) -> io::Result<()> {
+        let _guard = self.fd.writable().await?;
+        Ok(())
+    }
+
     pub async fn write_packet(&self, buf: &[u8]) -> io::Result<()> {
         let written = self.write(buf).await?;
         if written == buf.len() {
@@ -69,6 +74,18 @@ impl AsyncTunIo {
                     buf.len()
                 ),
             ))
+        }
+    }
+
+    pub fn try_write_packet(&self, buf: &[u8]) -> io::Result<()> {
+        let fd = self.fd.get_ref().as_raw_fd();
+        match unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) } {
+            r if r >= 0 && r as usize == buf.len() => Ok(()),
+            r if r >= 0 => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("short packet write: wrote {} of {} bytes", r, buf.len()),
+            )),
+            _ => Err(io::Error::last_os_error()),
         }
     }
 }

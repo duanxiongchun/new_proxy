@@ -1,4 +1,5 @@
 /target
+.codegraph/
 *.log
 __pycache__/
 *.py[cod]

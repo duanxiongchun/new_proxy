@@ -161,8 +161,8 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   exit 1
 fi
 
-# 7.2 Start Client proxy daemon in client_ns with multiple TUN queues.
-ip netns exec client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" --threads 4 > "$CLIENT_LOG" 2>&1 &
+# 7.2 Start Client proxy daemon in client_ns. TUN queues follow negotiated QUIC data ports.
+ip netns exec client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 sleep 2
 if ! kill -0 "$CLIENT_PID" 2>/dev/null; then

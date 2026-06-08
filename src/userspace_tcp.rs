@@ -1,3 +1,4 @@
+use crate::buffer_pool::{BufferPool, PooledBuf};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -6,9 +7,10 @@ use smoltcp::wire::{HardwareAddress, IpCidr};
 use std::collections::VecDeque;
 
 pub struct DummyPhyDevice {
-    pub rx_queue: VecDeque<Vec<u8>>,
-    pub tx_queue: VecDeque<Vec<u8>>,
+    pub rx_queue: VecDeque<PooledBuf>,
+    pub tx_queue: VecDeque<PooledBuf>,
     pub mtu: usize,
+    pub buffer_pool: BufferPool,
 }
 
 impl Device for DummyPhyDevice {
@@ -21,6 +23,7 @@ impl Device for DummyPhyDevice {
                 DummyRxToken { packet },
                 DummyTxToken {
                     queue: &mut self.tx_queue,
+                    pool: self.buffer_pool.clone(),
                 },
             )
         })
@@ -29,6 +32,7 @@ impl Device for DummyPhyDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(DummyTxToken {
             queue: &mut self.tx_queue,
+            pool: self.buffer_pool.clone(),
         })
     }
 
@@ -42,7 +46,7 @@ impl Device for DummyPhyDevice {
 }
 
 pub struct DummyRxToken {
-    packet: Vec<u8>,
+    packet: PooledBuf,
 }
 
 impl RxToken for DummyRxToken {
@@ -50,12 +54,13 @@ impl RxToken for DummyRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.packet)
+        f(self.packet.as_slice())
     }
 }
 
 pub struct DummyTxToken<'a> {
-    queue: &'a mut VecDeque<Vec<u8>>,
+    queue: &'a mut VecDeque<PooledBuf>,
+    pool: BufferPool,
 }
 
 impl<'a> TxToken for DummyTxToken<'a> {
@@ -63,8 +68,9 @@ impl<'a> TxToken for DummyTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
+        let mut buffer = self.pool.get();
+        let result = f(&mut buffer.as_mut_capacity()[..len]);
+        buffer.set_len(len);
         self.queue.push_back(buffer);
         result
     }
@@ -77,7 +83,7 @@ pub struct UserspaceTcpStack {
 }
 
 impl UserspaceTcpStack {
-    pub fn new(ip_cidrs: Vec<IpCidr>, mtu: usize) -> Result<Self, String> {
+    pub fn new(ip_cidrs: Vec<IpCidr>, mtu: usize, buffer_pool: BufferPool) -> Result<Self, String> {
         if ip_cidrs.is_empty() {
             return Err("smoltcp stack requires at least one interface address".to_string());
         }
@@ -85,6 +91,7 @@ impl UserspaceTcpStack {
             rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
             mtu,
+            buffer_pool,
         };
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, Instant::now());
@@ -126,7 +133,7 @@ impl UserspaceTcpStack {
         Ok(())
     }
 
-    pub fn process_input_packet(&mut self, packet: Vec<u8>) {
+    pub fn process_input_packet(&mut self, packet: PooledBuf) {
         self.device.rx_queue.push_back(packet);
         let timestamp = Instant::now();
         self.iface
@@ -142,7 +149,7 @@ mod tests {
     #[test]
     fn test_smoltcp_stack_creation() {
         let ip_cidr = IpCidr::from_str("10.0.0.2/24").unwrap();
-        let mut stack = UserspaceTcpStack::new(vec![ip_cidr], 1400).unwrap();
+        let mut stack = UserspaceTcpStack::new(vec![ip_cidr], 1400, BufferPool::new(1656)).unwrap();
         let handle = stack.create_tcp_socket(1024, 1024).unwrap();
         assert!(stack.get_socket_state(handle).is_ok());
         assert_eq!(stack.device.capabilities().max_transmission_unit, 1400);
@@ -150,6 +157,6 @@ mod tests {
 
     #[test]
     fn test_smoltcp_stack_requires_configured_addresses() {
-        assert!(UserspaceTcpStack::new(Vec::new(), 1400).is_err());
+        assert!(UserspaceTcpStack::new(Vec::new(), 1400, BufferPool::new(1656)).is_err());
     }
 }

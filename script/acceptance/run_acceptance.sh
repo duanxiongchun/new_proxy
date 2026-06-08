@@ -11,7 +11,28 @@ echo "======================================================================"
 echo " Starting Unified Acceptance Tests"
 echo "======================================================================"
 
-# 1. Run Cargo Tests
+# 1. Run Rust static checks and unit tests
+echo "--- Checking Rust Formatting ---"
+if ! cargo fmt --check; then
+  echo "❌ Rust formatting check failed!" >&2
+  exit 1
+fi
+echo "✅ Rust formatting check passed."
+
+echo "--- Running Cargo Check ---"
+if ! cargo check --quiet; then
+  echo "❌ Cargo check failed!" >&2
+  exit 1
+fi
+echo "✅ Cargo check passed."
+
+echo "--- Running Clippy ---"
+if ! cargo clippy --all-targets -- -D warnings; then
+  echo "❌ Clippy failed!" >&2
+  exit 1
+fi
+echo "✅ Clippy passed."
+
 echo "--- Running Unit Tests ---"
 if ! cargo test --quiet; then
   echo "❌ Unit tests failed!" >&2
@@ -27,6 +48,15 @@ if ! cargo build --bins; then
 fi
 echo "✅ Build succeeded."
 
+if [ "${RUN_PERF:-0}" = "1" ]; then
+  echo "--- Building Release Binaries For Perf ---"
+  if ! cargo build --release --bins; then
+    echo "❌ Release build failed!" >&2
+    exit 1
+  fi
+  echo "✅ Release build succeeded."
+fi
+
 # 3. Compile/Syntax checks on scripts
 echo "--- Checking Scripts Syntax ---"
 bash_scripts=(
@@ -36,6 +66,9 @@ bash_scripts=(
   "script/acceptance/e2e_dynamic_client_peer.sh"
   "script/acceptance/e2e_userspace_wg_fallback.sh"
   "script/acceptance/e2e_full_tunnel_bypass.sh"
+  "script/acceptance/stability_stress_test.sh"
+  "script/perf/perf_smoke.sh"
+  "script/perf/perf_cores_scalability.sh"
 )
 
 for s in "${bash_scripts[@]}"; do
@@ -46,6 +79,16 @@ for s in "${bash_scripts[@]}"; do
 done
 echo "✅ Script syntax checks passed."
 
+echo "--- Checking Python Helpers ---"
+if ! python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py; then
+  echo "❌ Python helper syntax check failed!" >&2
+  exit 1
+fi
+echo "✅ Python helper syntax checks passed."
+
 # 4. Run E2E scenarios
 TESTS=(
   "e2e_test_dualstack"
@@ -55,6 +98,15 @@ TESTS=(
   "e2e_userspace_wg_fallback"
   "e2e_full_tunnel_bypass"
 )
+
+if [ "${RUN_STABILITY:-0}" = "1" ]; then
+  TESTS+=("stability_stress_test")
+fi
+
+if [ "${RUN_PERF:-0}" = "1" ]; then
+  TESTS+=("../perf/perf_smoke")
+  TESTS+=("../perf/perf_cores_scalability")
+fi
 
 declare -A RESULTS
 FAILED=0

@@ -128,7 +128,7 @@ ip netns exec perf_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count=8 status=none
 ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
-ip netns exec perf_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server.conf" --threads 4 > "$ARTIFACT_DIR/server.log" 2>&1 &
+ip netns exec perf_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -136,7 +136,7 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   cat "$ARTIFACT_DIR/server.log"
   exit 1
 fi
-ip netns exec perf_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" --threads 4 > "$ARTIFACT_DIR/client.log" 2>&1 &
+ip netns exec perf_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
 if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
