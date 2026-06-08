@@ -4,11 +4,6 @@
 # ==============================================================================
 set -u
 
-if [ "$EUID" -ne 0 ]; then
-  echo "Error: This script must be run as root / using sudo." >&2
-  exit 1
-fi
-
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -69,7 +64,7 @@ for test_name in "${TESTS[@]}"; do
   echo " Running E2E Test: $test_name"
   echo "======================================================================"
   
-  if bash "script/acceptance/${test_name}.sh"; then
+  if sudo bash "script/acceptance/${test_name}.sh"; then
     RESULTS["$test_name"]="PASS"
   else
     RESULTS["$test_name"]="FAIL"

@@ -84,8 +84,8 @@ echo "=== [5/7] Establishing Routes and Enabling IP Forwarding ==="
 # Client default gateway routing
 ip netns exec client_ns ip route add default via 10.0.1.1
 ip netns exec client_ns ip -6 route add default via fd00:1::1
-ip netns exec client_ns ip -6 route add fd00::1/128 via fd00:1::1
 ip netns exec client_ns sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+ip netns exec client_ns sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
 
 # Server default gateway routing
 ip netns exec server_ns ip route add default via 10.0.2.1
@@ -94,6 +94,7 @@ ip netns exec server_ns ip -6 route add default via fd00:2::1
 # Enable routing on Router
 ip netns exec router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec router_ns sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+ip netns exec router_ns sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
 ip netns exec router_ns ip -6 route add fd00::1/128 via fd00:1::2
 
 echo "=== [6/7] Verifying WAN Network Connectivity (WAN Ping Tests) ==="
