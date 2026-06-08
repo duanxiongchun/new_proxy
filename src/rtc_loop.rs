@@ -16,12 +16,13 @@ type ActiveConnHandler = Arc<
 >;
 type NatKey = (IpAddr, u16, u16);
 type FlowKey = (IpAddr, u16, IpAddr, u16);
-const BRIDGE_PENDING_LIMIT: usize = 256;
-const BRIDGE_PENDING_BYTES_LIMIT: usize = 128 * 1024;
-const BRIDGE_CHANNEL_CAPACITY: usize = 32;
+const BRIDGE_PENDING_LIMIT: usize = 64;
+const BRIDGE_PENDING_BYTES_LIMIT: usize = 64 * 1024;
+const BRIDGE_CHANNEL_CAPACITY: usize = 16;
 const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_WORKER_TCP_FLOWS: usize = 4096;
+const MAX_WORKER_TCP_FLOWS: usize = 1024;
+const USERSPACE_TCP_SOCKET_BUFFER_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy)]
 pub struct NatEntry {
@@ -636,10 +637,57 @@ impl RtcWorker {
                                             }
                                         });
                                         if !has_listening {
-                                            if let Ok(handle) = self.tcp_stack.create_tcp_socket(131072, 131072) {
-                                                let s = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
-                                                let _ = s.listen(local_port);
-                                                log::debug!("Created userspace listening TCP socket on port {}", local_port);
+                                            match self.tcp_stack.create_tcp_socket(
+                                                USERSPACE_TCP_SOCKET_BUFFER_BYTES,
+                                                USERSPACE_TCP_SOCKET_BUFFER_BYTES,
+                                            ) {
+                                                Ok(handle) => {
+                                                    let listen_result = {
+                                                        let s = self
+                                                            .tcp_stack
+                                                            .sockets
+                                                            .get_mut::<tcp::Socket>(handle);
+                                                        s.listen(local_port)
+                                                    };
+                                                    if let Err(e) = listen_result {
+                                                        self.tcp_stack.sockets.remove(handle);
+                                                        self.flow_map.remove(&flow_key);
+                                                        log::warn!(
+                                                            "Failed to create userspace TCP listener on port {}: {}; falling back to userspace WireGuard L3",
+                                                            local_port,
+                                                            e
+                                                        );
+                                                        if let Some((endpoint, enc_pkt)) =
+                                                            self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
+                                                        {
+                                                            self.record_l3_packet(n);
+                                                            if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
+                                                                log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
+                                                            }
+                                                        }
+                                                        continue;
+                                                    }
+                                                    log::debug!(
+                                                        "Created userspace listening TCP socket on port {}",
+                                                        local_port
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    self.flow_map.remove(&flow_key);
+                                                    log::warn!(
+                                                        "Failed to allocate userspace TCP socket: {}; falling back to userspace WireGuard L3",
+                                                        e
+                                                    );
+                                                    if let Some((endpoint, enc_pkt)) =
+                                                        self.l3_registry.encapsulate_tunnel_packet(packet, &mut wg_buf)
+                                                    {
+                                                        self.record_l3_packet(n);
+                                                        if let Err(e) = self.udp_socket.send_to(&enc_pkt, endpoint).await {
+                                                            log::warn!("Failed to send userspace WireGuard fallback packet to {}: {}", endpoint, e);
+                                                        }
+                                                    }
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }

@@ -23,7 +23,7 @@ cargo test
 - `src/control.rs`：HMAC roundtrip、控制面协商、错误 HMAC、请求重放、stale `client_nonce` 响应拒绝。
 - `src/main.rs`：mock peer sync 跨模块状态同步。
 - `src/proxy_proto.rs`：QUIC mux 目标地址头部 IPv4/IPv6 编解码。
-- `src/rtc_loop.rs`：RTC packet classification、IPv6 短 TCP 包拒绝、`RtcWorker` 创建、smoltcp 出站包回写 TUN、QUIC bridge 原始目标地址反查、QUIC 不可用时 TCP fallback 到 userspace WireGuard。
+- `src/rtc_loop.rs`：RTC packet classification、IPv6 短 TCP 包拒绝、`RtcWorker` 创建、smoltcp 出站包回写 TUN、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限、QUIC bridge 原始目标地址反查、QUIC 不可用时 TCP fallback 到 userspace WireGuard。
 - `src/runtime.rs`：TUN 地址、peer 路由、endpoint bypass route、pre/post script runtime setup/cleanup。
 - `src/server_proxy.rs`：server-side QUIC mux stream 目标 TCP connect、状态回写和 relay。
 - `src/stats_cli.rs`：`new_proxy stats` 内置 telemetry table 输出、byte formatter。
@@ -33,6 +33,7 @@ cargo test
 - `src/tun_io.rs`：基于 `AsyncFd` 的 TUN 异步读写。
 - `src/userspace_tcp.rs`：smoltcp 用户态 TCP/IP 栈创建、socket buffer 与 socket handle 生命周期。
 - `src/userspace_wg.rs`：boringtun tunnel 状态初始化。
+- `src/virtual_tunnel.rs`：空物理 socket 集拒绝、无跨 await receiver 全局锁的并发接收、双物理 UDP socket failover。
 - `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、QUIC pool fallback/recovering/active 状态。
 - `src/main.rs`：userspace TCP failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TCP offload，所有 pool active 后才允许回切。
 - `src/relay.rs`：双向 relay、计数 reader。
@@ -236,13 +237,16 @@ Rust 单元测试覆盖：
 - `src/userspace_tcp.rs::test_smoltcp_stack_creation`：验证 smoltcp interface、socket set 和 TCP socket handle 创建。
 - `src/rtc_loop.rs::test_packet_classification`：验证 IPv4 TCP 报文协议号识别。
 - `src/rtc_loop.rs::parse_ipv6_tcp_rejects_short_header_without_panicking`：验证 IPv6 TCP 短包不会越界 panic。
+- `src/rtc_loop.rs::rewrites_repair_ipv4_tcp_checksums` / `rewrites_repair_ipv6_tcp_checksums`：验证 NAT 改写后校验和会被重算。
+- `src/rtc_loop.rs::bridge_pending_queues_are_capped_by_bytes`：验证 bridge 慢读/慢写 pending 队列存在字节上限。
 - `src/rtc_loop.rs::test_rtc_worker_creation`：验证 `RtcWorker` 组合 `AsyncTunIo`、UDP socket、boringtun 和 smoltcp 后可执行一次 poll/flush 迭代。
+- `src/virtual_tunnel.rs::virtual_tunnel_socket_rejects_empty_physical_socket_set`：验证虚拟 UDP socket 不接受空物理 socket 集。
+- `src/virtual_tunnel.rs::virtual_tunnel_recv_waiters_do_not_hold_global_async_lock`：验证多个接收 waiter 不会被单个跨 `await` receiver 锁串行卡住。
 
 需要补齐的回归用例：
 
 - `RtcWorker` TCP 路由选择：目标 IP 命中 router 且 QUIC pool 为 `Active` 时进入 smoltcp；未命中、pool 缺失、`Fallback` 或 `Recovering` 时进入 boringtun L3。
-- NAT 重写：TUN 入站 TCP 目标 IP 改写为 smoltcp 虚拟 IP，smoltcp 出站响应源 IP 改写回原始目标 IP，IPv4/IPv6 都需要覆盖；同时必须覆盖 IPv4 header checksum 和 TCP pseudo-header checksum 重算。
-- 桥接通道：smoltcp socket payload 经 `BridgeChannels` 发往 QUIC handler，QUIC 返回 payload 能写回 smoltcp socket；通道断开时 socket abort 并清理 bridge；慢读/慢写场景不能超过 pending 字节上限。
+- 桥接通道：smoltcp socket payload 经 `BridgeChannels` 发往 QUIC handler，QUIC 返回 payload 能写回 smoltcp socket；通道断开时 socket abort 并清理 bridge。
 - WireGuard timer/UDP 入站：`update_timers()` 产生网络包时写入物理 UDP socket；`decapsulate()` 返回 tunnel 包时写回 TUN。
 - 多队列启动：`--threads <count>` 打开同数量 TUN FD，并为每个 FD 启动独立 `RtcWorker`/userspace WireGuard loop；L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。
 - 多 peer userspace WireGuard：每个 proxy peer 拥有共享的 per-peer `boringtun` 状态和 UDP endpoint，并按 `AllowedIPs` 选择 L3 fallback 目标；需要覆盖多 worker 并发 fallback 时不会死锁或明显退化。

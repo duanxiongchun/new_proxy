@@ -19,9 +19,8 @@ pub mod tun_io;
 mod uds_server;
 pub mod userspace_tcp;
 pub mod userspace_wg;
-mod wireguard;
 pub mod virtual_tunnel;
-
+mod wireguard;
 
 use client_proxy::build_peer_quic_pool;
 use std::collections::HashMap;
@@ -729,7 +728,15 @@ async fn main() {
                     }
                 }
             }
-            let virtual_sock = crate::virtual_tunnel::VirtualTunnelSocket::new(sockets);
+            let virtual_sock = match crate::virtual_tunnel::VirtualTunnelSocket::new(sockets) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    log::error!("Failed to initialize client virtual UDP socket: {}", e);
+                    let cleanup_config = gateway_state.read().config.clone();
+                    cleanup_runtime(&cleanup_config, &interface_name);
+                    std::process::exit(1);
+                }
+            };
             crate::virtual_tunnel::TunnelSocket::Virtual(virtual_sock)
         };
         let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
