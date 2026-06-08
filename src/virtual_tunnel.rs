@@ -1,10 +1,16 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use parking_lot::{Mutex, RwLock};
+use std::collections::VecDeque;
 use std::io;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
+use tokio::sync::Notify;
+
+const RECV_QUEUE_PACKET_LIMIT: usize = 512;
+const RECV_QUEUE_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+type RecvQueue = Arc<Mutex<VecDeque<(Vec<u8>, SocketAddr)>>>;
 
 #[derive(Clone)]
 struct PhysicalSocket {
@@ -16,7 +22,9 @@ struct VirtualTunnelSocketInner {
     sockets: Vec<PhysicalSocket>,
     active_idx: Arc<AtomicUsize>,
     last_target: Arc<RwLock<Option<SocketAddr>>>,
-    recv_rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    recv_queue: RecvQueue,
+    recv_queue_bytes: Arc<AtomicUsize>,
+    recv_notify: Arc<Notify>,
     abort_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -34,11 +42,16 @@ pub struct VirtualTunnelSocket {
 }
 
 impl VirtualTunnelSocket {
-    pub fn new(sockets: Vec<UdpSocket>) -> Self {
-        let (recv_tx, recv_rx) = mpsc::channel(10000);
+    pub fn new(sockets: Vec<UdpSocket>) -> Result<Self, String> {
+        if sockets.is_empty() {
+            return Err("VirtualTunnelSocket requires at least one physical socket".to_string());
+        }
         let last_target = Arc::new(RwLock::new(None));
         let mut abort_handles = Vec::new();
         let mut physical_sockets = Vec::new();
+        let recv_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let recv_queue_bytes = Arc::new(AtomicUsize::new(0));
+        let recv_notify = Arc::new(Notify::new());
 
         for socket in sockets {
             let socket = Arc::new(socket);
@@ -48,8 +61,9 @@ impl VirtualTunnelSocket {
                 last_pong: last_pong.clone(),
             });
 
-            // Spawn receiver loop for this socket
-            let recv_tx_clone = recv_tx.clone();
+            let recv_queue_clone = recv_queue.clone();
+            let recv_queue_bytes_clone = recv_queue_bytes.clone();
+            let recv_notify_clone = recv_notify.clone();
             let socket_clone = socket.clone();
             let last_pong_clone = last_pong.clone();
             let handle = tokio::spawn(async move {
@@ -62,17 +76,33 @@ impl VirtualTunnelSocket {
                             }
                             let data = &buf[..n];
                             if n >= 4 && data == b"PONG" {
-                                *last_pong_clone.write().await = Some(Instant::now());
+                                *last_pong_clone.write() = Some(Instant::now());
                                 continue;
                             }
                             if n >= 4 && data == b"PING" {
                                 let _ = socket_clone.send_to(b"PONG", addr).await;
                                 continue;
                             }
-                            // Forward data packet
-                            if recv_tx_clone.send((data.to_vec(), addr)).await.is_err() {
-                                break;
+                            let mut queue = recv_queue_clone.lock();
+                            let queued_bytes = recv_queue_bytes_clone.load(Ordering::Relaxed);
+                            if queued_bytes.saturating_add(n) > RECV_QUEUE_BYTES_LIMIT {
+                                log::warn!(
+                                    "Virtual tunnel receive queue byte limit reached; dropping packet from {}",
+                                    addr
+                                );
+                                continue;
                             }
+                            if queue.len() >= RECV_QUEUE_PACKET_LIMIT {
+                                log::warn!(
+                                    "Virtual tunnel receive queue packet limit reached; dropping packet from {}",
+                                    addr
+                                );
+                                continue;
+                            }
+                            queue.push_back((data.to_vec(), addr));
+                            recv_queue_bytes_clone.fetch_add(n, Ordering::Relaxed);
+                            drop(queue);
+                            recv_notify_clone.notify_one();
                         }
                         Err(_) => {
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -93,10 +123,7 @@ impl VirtualTunnelSocket {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let target = {
-                    let guard = last_target_for_ping.read().await;
-                    *guard
-                };
+                let target = *last_target_for_ping.read();
 
                 if let Some(target_addr) = target {
                     for p_socket in &sockets_for_ping {
@@ -109,16 +136,13 @@ impl VirtualTunnelSocket {
                 let mut best_idx = 0;
                 let mut best_time = None;
                 for (i, p_socket) in sockets_for_ping.iter().enumerate() {
-                    let pong_time = {
-                        let guard = p_socket.last_pong.read().await;
-                        *guard
-                    };
+                    let pong_time = *p_socket.last_pong.read();
                     if let Some(t) = pong_time {
-                        if now.duration_since(t) < Duration::from_secs(5) {
-                            if best_time.map_or(true, |bt| t > bt) {
-                                best_time = Some(t);
-                                best_idx = i;
-                            }
+                        if now.duration_since(t) < Duration::from_secs(5)
+                            && best_time.is_none_or(|bt| t > bt)
+                        {
+                            best_time = Some(t);
+                            best_idx = i;
                         }
                     }
                 }
@@ -141,17 +165,22 @@ impl VirtualTunnelSocket {
             sockets: physical_sockets,
             active_idx,
             last_target,
-            recv_rx: Mutex::new(recv_rx),
+            recv_queue,
+            recv_queue_bytes,
+            recv_notify,
             abort_handles,
         });
 
-        Self { inner }
+        Ok(Self { inner })
     }
 
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        {
-            let mut guard = self.inner.last_target.write().await;
-            *guard = Some(target);
+        let needs_write = {
+            let guard = self.inner.last_target.read();
+            *guard != Some(target)
+        };
+        if needs_write {
+            *self.inner.last_target.write() = Some(target);
         }
 
         let active_idx = self.inner.active_idx.load(Ordering::Relaxed);
@@ -160,17 +189,25 @@ impl VirtualTunnelSocket {
     }
 
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let mut rx = self.inner.recv_rx.lock().await;
-        match rx.recv().await {
-            Some((data, addr)) => {
+        loop {
+            if let Some((data, addr)) = {
+                let mut queue = self.inner.recv_queue.lock();
+                let item = queue.pop_front();
+                if let Some((data, _)) = &item {
+                    self.inner
+                        .recv_queue_bytes
+                        .fetch_sub(data.len(), Ordering::Relaxed);
+                }
+                item
+            } {
                 if data.len() <= buf.len() {
                     buf[..data.len()].copy_from_slice(&data);
-                    Ok((data.len(), addr))
+                    return Ok((data.len(), addr));
                 } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "buffer too small"))
+                    return Err(io::Error::other("buffer too small"));
                 }
             }
-            None => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "channel closed")),
+            self.inner.recv_notify.notified().await;
         }
     }
 }
@@ -201,6 +238,52 @@ impl TunnelSocket {
 mod tests {
     use super::*;
     use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn virtual_tunnel_socket_rejects_empty_physical_socket_set() {
+        assert!(VirtualTunnelSocket::new(Vec::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn virtual_tunnel_recv_waiters_do_not_hold_global_async_lock() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let vt = VirtualTunnelSocket::new(vec![socket]).unwrap();
+
+        let recv_a = {
+            let vt = vt.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 16];
+                let (n, _) = vt.recv_from(&mut buf).await.unwrap();
+                buf[..n].to_vec()
+            })
+        };
+        let recv_b = {
+            let vt = vt.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 16];
+                let (n, _) = vt.recv_from(&mut buf).await.unwrap();
+                buf[..n].to_vec()
+            })
+        };
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"one", local_addr).await.unwrap();
+        sender.send_to(b"two", local_addr).await.unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(1), recv_a)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), recv_b)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut received = vec![first, second];
+        received.sort();
+        assert_eq!(received, vec![b"one".to_vec(), b"two".to_vec()]);
+    }
 
     #[tokio::test]
     async fn test_virtual_tunnel_socket_failover() {
@@ -214,7 +297,7 @@ mod tests {
         let srv_addr1 = server1.local_addr().unwrap();
         let srv_addr2 = server2.local_addr().unwrap();
 
-        let vt = VirtualTunnelSocket::new(vec![s1, s2]);
+        let vt = VirtualTunnelSocket::new(vec![s1, s2]).unwrap();
 
         // Initially index 0 is active, sends to server1
         let n = vt.send_to(b"hello", srv_addr1).await.unwrap();

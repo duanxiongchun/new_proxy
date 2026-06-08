@@ -113,7 +113,7 @@ graph TD
 客户端会根据线程参数开启多队列（`IFF_MULTI_QUEUE`）TUN 设备。
 - **出站流量**：Linux TUN multiqueue 按 flow 选择队列，单个 TCP flow 的后续包应保持队列亲和；不同 flow 可被分散到不同队列 FD。
 - **L4 TCP offload 出站流量**：接收某个 TCP flow 的 `RtcWorker` 持有该 flow 的 `smoltcp` socket、NAT 映射和桥接通道。
-- **工作线程**：每个 worker 绑定一个 TUN 队列 FD，并拥有自己的 L4 TCP 用户态协议状态。L3 userspace WireGuard 状态当前按 peer 共享，多个 worker 会在同一 peer 的 `boringtun::Tunn` 上串行加解密。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
+- **工作线程**：每个 worker 绑定一个 TUN 队列 FD，并拥有自己的 L4 TCP 用户态协议状态。L3 userspace WireGuard 状态当前按 peer 共享，多个 worker 会在同一 peer 的 `boringtun::Tunn` 上串行加解密。物理 UDP 入站包先进入 `VirtualTunnelSocket` 的有界内存队列，worker 取包时不会持有跨 `await` 的全局 receiver 锁；队列满时丢弃新入站包，避免反压失效造成 RSS 无界增长。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
 
 ### 6.2 Run-to-Completion (RTC) 运行完成环路
 
@@ -121,7 +121,7 @@ graph TD
 
 1. **TUN 出站包**：读取 TUN 队列中的原始 L3 IP 报文。
    - **TCP 报文**：
-     - 若为 SYN 握手包且未匹配当前任何套接字，则在 `smoltcp` 中动态创建并绑定一个 Listen 状态的 TCP 套接字。
+     - 若为 SYN 握手包且未匹配当前任何套接字，则在 `smoltcp` 中动态创建并绑定一个 Listen 状态的 TCP 套接字。若 socket 创建或 listen 失败，会回滚本地 flow 状态并立即走 userspace WireGuard L3 fallback。
      - 在 `nat_map` 中记录原始目标 IP 和端口 `(client_ip, client_port, dest_port) -> original_dest_ip`。
      - 执行 **NAT 转换**：将报文目标 IP 改写为本机配置的 `smoltcp` 虚拟接口地址（来自 `[Interface].Address` 的 IPv4/IPv6 地址）。为了加快处理速度，`smoltcp` 虚拟网卡的校验和（Checksum）功能被设为忽略；写回 TUN 前会重新计算 IPv4 header checksum 和 TCP pseudo-header checksum。
      - 投递至本地 `smoltcp` 实例。
@@ -140,6 +140,7 @@ graph TD
 `RtcWorker` 内部为每个活跃的 `smoltcp` 套接字维护了异步通道。当套接字成功建立连接后：
 - `RtcWorker` 会通过 `nat_map` 将 smoltcp 虚拟本地地址反查为原始目标地址，动态唤醒对应的桥接任务，异步从 `smoltcp` 套接字读取 payload，并将其写入客户端连接池的 QUIC stream 中。
 - 从 QUIC stream 读取的数据在工作线程中被写回 `smoltcp` 套接字的发送队列。
+- 每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有固定上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。
 
 ## 7. 路由配置
 

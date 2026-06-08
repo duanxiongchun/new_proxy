@@ -8,6 +8,41 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-08 Review 后静态与单元验证
+
+本次修复覆盖：
+
+- `VirtualTunnelSocket` 物理 UDP 入站改为有界内存队列，队列满时丢弃新入站包，避免 mpsc 大队列和跨 `await` receiver 锁造成 RSS 与并发风险。
+- L4 userspace TCP 默认资源预算下调：降低单 worker flow 上限、单 socket buffer、bridge pending 队列容量。
+- `RtcWorker` 在 SYN offload 的 socket 创建或 listen 失败时回滚 flow 状态并立即走 userspace WireGuard L3 fallback。
+- 修复 fmt/clippy 门禁问题，并补充 `virtual_tunnel` 空 socket 集和并发接收 waiter 单元测试。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --bins
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/e2e_full_tunnel_bypass.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+sudo bash script/acceptance/e2e_userspace_wg_fallback.sh
+```
+
+结果：**通过。** `cargo test` 当前为 CLI 10 个测试、主程序 100 个测试全部通过。`e2e_userspace_wg_fallback.sh` 产物目录为 `/tmp/new_proxy_userspace_wg_fallback_20260608_152441`，验证 QUIC 阻断后新 TCP 可经 userspace WireGuard fallback 成功闭环，telemetry 显示 WireGuard traffic 且 QUIC inactive。本轮未执行其余 root/network namespace E2E、稳定性和 perf 脚本。
+
 ## 2026-06-05 严格 Review 问题修复验证
 
 本次修复覆盖：
