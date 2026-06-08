@@ -10,6 +10,7 @@ use crate::quic_pool;
 use crate::runtime::{cleanup_peer_routes, run_blocking_command, setup_peer_routes};
 use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry, WorkerTelemetryRegistry};
 use crate::userspace_wg::UserspaceWgRegistry;
+use crate::virtual_tunnel::VirtualTunnelTelemetry;
 use crate::{GatewayState, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,7 @@ pub struct UdsServerContext {
     pub runtime_mode: RuntimeMode,
     pub peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     pub l3_registry: UserspaceWgRegistry,
+    pub virtual_tunnel_telemetry: Arc<VirtualTunnelTelemetry>,
 }
 
 pub fn bind_listener(interface_name: &str) -> Option<UnixListener> {
@@ -358,6 +360,14 @@ async fn handle_dump(
                 worker.current_tcp_flows,
             ));
         }
+        let virtual_tunnel = context.virtual_tunnel_telemetry.snapshot();
+        lines.push(format!(
+            "virtual_tunnel\tqueue={}:{}\tdrops={}:{}",
+            virtual_tunnel.queued_packets,
+            virtual_tunnel.queued_bytes,
+            virtual_tunnel.dropped_packets,
+            virtual_tunnel.dropped_bytes,
+        ));
         for key in keys {
             let configured = peer_map.get(&key).copied();
             let wg = l3_stats.get(&key);
@@ -906,6 +916,7 @@ mod tests {
             runtime_mode: RuntimeMode::Server,
             peer_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             l3_registry,
+            virtual_tunnel_telemetry: Arc::new(VirtualTunnelTelemetry::default()),
         }
     }
 
@@ -995,6 +1006,7 @@ mod tests {
         assert!(dump.contains("150"));
         assert!(dump.contains("worker:1"));
         assert!(dump.contains("tun_rx=42:0"));
+        assert!(dump.contains("virtual_tunnel\tqueue=0:0\tdrops=0:0"));
 
         let _ = fs::remove_file(path);
     }

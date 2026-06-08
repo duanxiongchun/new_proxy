@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
@@ -16,13 +17,70 @@ type ActiveConnHandler = Arc<
 >;
 type NatKey = (IpAddr, u16, u16);
 type FlowKey = (IpAddr, u16, IpAddr, u16);
-const BRIDGE_PENDING_LIMIT: usize = 64;
-const BRIDGE_PENDING_BYTES_LIMIT: usize = 64 * 1024;
-const BRIDGE_CHANNEL_CAPACITY: usize = 16;
+const DEFAULT_BRIDGE_PENDING_LIMIT: usize = 64;
+const DEFAULT_BRIDGE_PENDING_BYTES_LIMIT: usize = 64 * 1024;
+const DEFAULT_BRIDGE_CHANNEL_CAPACITY: usize = 16;
 const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_WORKER_TCP_FLOWS: usize = 1024;
-const USERSPACE_TCP_SOCKET_BUFFER_BYTES: usize = 32 * 1024;
+const DEFAULT_MAX_WORKER_TCP_FLOWS: usize = 1024;
+const DEFAULT_USERSPACE_TCP_SOCKET_BUFFER_BYTES: usize = 32 * 1024;
+
+const BRIDGE_PENDING_LIMIT_ENV: &str = "NEW_PROXY_BRIDGE_PENDING_LIMIT";
+const BRIDGE_PENDING_BYTES_LIMIT_ENV: &str = "NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT";
+const BRIDGE_CHANNEL_CAPACITY_ENV: &str = "NEW_PROXY_BRIDGE_CHANNEL_CAPACITY";
+const MAX_WORKER_TCP_FLOWS_ENV: &str = "NEW_PROXY_MAX_WORKER_TCP_FLOWS";
+const USERSPACE_TCP_SOCKET_BUFFER_BYTES_ENV: &str = "NEW_PROXY_TCP_SOCKET_BUFFER_BYTES";
+
+fn bridge_pending_limit() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| env_usize(BRIDGE_PENDING_LIMIT_ENV, DEFAULT_BRIDGE_PENDING_LIMIT, 1))
+}
+
+fn bridge_pending_bytes_limit() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize(
+            BRIDGE_PENDING_BYTES_LIMIT_ENV,
+            DEFAULT_BRIDGE_PENDING_BYTES_LIMIT,
+            1500,
+        )
+    })
+}
+
+fn bridge_channel_capacity() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize(
+            BRIDGE_CHANNEL_CAPACITY_ENV,
+            DEFAULT_BRIDGE_CHANNEL_CAPACITY,
+            1,
+        )
+    })
+}
+
+fn max_worker_tcp_flows() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| env_usize(MAX_WORKER_TCP_FLOWS_ENV, DEFAULT_MAX_WORKER_TCP_FLOWS, 1))
+}
+
+fn userspace_tcp_socket_buffer_bytes() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env_usize(
+            USERSPACE_TCP_SOCKET_BUFFER_BYTES_ENV,
+            DEFAULT_USERSPACE_TCP_SOCKET_BUFFER_BYTES,
+            4096,
+        )
+    })
+}
+
+fn env_usize(name: &str, default: usize, min: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
 
 #[derive(Clone, Copy)]
 pub struct NatEntry {
@@ -266,8 +324,8 @@ pub struct BridgeChannels {
 
 impl BridgeChannels {
     fn push_to_quic_pending(&mut self, data: Vec<u8>) -> bool {
-        if self.to_quic_pending.len() >= BRIDGE_PENDING_LIMIT
-            || self.to_quic_pending_bytes.saturating_add(data.len()) > BRIDGE_PENDING_BYTES_LIMIT
+        if self.to_quic_pending.len() >= bridge_pending_limit()
+            || self.to_quic_pending_bytes.saturating_add(data.len()) > bridge_pending_bytes_limit()
         {
             return false;
         }
@@ -288,13 +346,14 @@ impl BridgeChannels {
     }
 
     fn has_from_quic_pending_capacity(&self) -> bool {
-        self.from_quic_pending.len() < BRIDGE_PENDING_LIMIT
-            && self.from_quic_pending_bytes + 1500 <= BRIDGE_PENDING_BYTES_LIMIT
+        self.from_quic_pending.len() < bridge_pending_limit()
+            && self.from_quic_pending_bytes + 1500 <= bridge_pending_bytes_limit()
     }
 
     fn push_from_quic_pending(&mut self, data: Vec<u8>) -> bool {
-        if self.from_quic_pending.len() >= BRIDGE_PENDING_LIMIT
-            || self.from_quic_pending_bytes.saturating_add(data.len()) > BRIDGE_PENDING_BYTES_LIMIT
+        if self.from_quic_pending.len() >= bridge_pending_limit()
+            || self.from_quic_pending_bytes.saturating_add(data.len())
+                > bridge_pending_bytes_limit()
         {
             return false;
         }
@@ -450,6 +509,12 @@ impl RtcWorker {
         self.flow_map.contains_key(flow_key) || (is_syn && offload_available_for_new_flow)
     }
 
+    fn tcp_flow_limit_reached_for_new_flow(&self, flow_key: &FlowKey, is_syn: bool) -> bool {
+        is_syn
+            && !self.flow_map.contains_key(flow_key)
+            && self.flow_map.len() >= max_worker_tcp_flows()
+    }
+
     pub async fn run_one_iteration(&mut self) -> Result<std::time::Duration, String> {
         self.cleanup_stale_flows();
         let now = smoltcp::time::Instant::now();
@@ -572,10 +637,7 @@ impl RtcWorker {
                                         }
                                         continue;
                                     };
-                                    if is_syn
-                                        && !self.flow_map.contains_key(&flow_key)
-                                        && self.flow_map.len() >= MAX_WORKER_TCP_FLOWS
-                                    {
+                                    if self.tcp_flow_limit_reached_for_new_flow(&flow_key, is_syn) {
                                         log::warn!(
                                             "Userspace TCP flow limit reached; falling back to userspace WireGuard L3"
                                         );
@@ -638,8 +700,8 @@ impl RtcWorker {
                                         });
                                         if !has_listening {
                                             match self.tcp_stack.create_tcp_socket(
-                                                USERSPACE_TCP_SOCKET_BUFFER_BYTES,
-                                                USERSPACE_TCP_SOCKET_BUFFER_BYTES,
+                                                userspace_tcp_socket_buffer_bytes(),
+                                                userspace_tcp_socket_buffer_bytes(),
                                             ) {
                                                 Ok(handle) => {
                                                     let listen_result = {
@@ -795,8 +857,8 @@ impl RtcWorker {
 
         for (handle, original_dest, nat_key) in new_connections {
             if let Some(ref handler) = self.active_conn_handler {
-                let (tx_sender, tx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
-                let (rx_sender, rx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
+                let (tx_sender, tx_receiver) = mpsc::channel(bridge_channel_capacity());
+                let (rx_sender, rx_receiver) = mpsc::channel(bridge_channel_capacity());
                 self.bridges.insert(
                     handle,
                     BridgeChannels {
@@ -897,13 +959,13 @@ impl RtcWorker {
             }
 
             while socket.can_recv()
-                && bridge.to_quic_pending.len() < BRIDGE_PENDING_LIMIT
-                && bridge.to_quic_pending_bytes < BRIDGE_PENDING_BYTES_LIMIT
+                && bridge.to_quic_pending.len() < bridge_pending_limit()
+                && bridge.to_quic_pending_bytes < bridge_pending_bytes_limit()
             {
                 if bridge.recv_buf.len() != self.mtu {
                     bridge.recv_buf.resize(self.mtu, 0);
                 }
-                let remaining = BRIDGE_PENDING_BYTES_LIMIT - bridge.to_quic_pending_bytes;
+                let remaining = bridge_pending_bytes_limit() - bridge.to_quic_pending_bytes;
                 let read_len = self.mtu.min(remaining);
                 if read_len == 0 {
                     break;
@@ -1100,8 +1162,8 @@ mod tests {
 
     #[test]
     fn bridge_pending_queues_are_capped_by_bytes() {
-        let (tx_sender, _tx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
-        let (_rx_sender, rx_receiver) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
+        let (tx_sender, _tx_receiver) = mpsc::channel(bridge_channel_capacity());
+        let (_rx_sender, rx_receiver) = mpsc::channel(bridge_channel_capacity());
         let mut bridge = BridgeChannels {
             tx_sender,
             rx_receiver,
@@ -1114,18 +1176,18 @@ mod tests {
             quic_rx_closed: false,
         };
 
-        assert!(bridge.push_to_quic_pending(vec![0u8; BRIDGE_PENDING_BYTES_LIMIT]));
+        assert!(bridge.push_to_quic_pending(vec![0u8; bridge_pending_bytes_limit()]));
         assert!(!bridge.push_to_quic_pending(vec![0u8; 1]));
         let popped = bridge.pop_to_quic_pending().unwrap();
-        assert_eq!(popped.len(), BRIDGE_PENDING_BYTES_LIMIT);
+        assert_eq!(popped.len(), bridge_pending_bytes_limit());
         assert_eq!(bridge.to_quic_pending_bytes, 0);
 
-        assert!(bridge.push_from_quic_pending(vec![0u8; BRIDGE_PENDING_BYTES_LIMIT]));
+        assert!(bridge.push_from_quic_pending(vec![0u8; bridge_pending_bytes_limit()]));
         assert!(!bridge.push_from_quic_pending(vec![0u8; 1]));
         bridge.consume_from_quic_front(1024);
         assert_eq!(
             bridge.from_quic_pending_bytes,
-            BRIDGE_PENDING_BYTES_LIMIT - 1024
+            bridge_pending_bytes_limit() - 1024
         );
     }
 
@@ -1272,6 +1334,32 @@ mod tests {
 
         worker.flow_map.insert(flow_key, 49152);
         assert!(worker.should_route_via_smoltcp(&flow_key, false, false));
+    }
+
+    #[tokio::test]
+    async fn new_syn_falls_back_when_worker_flow_limit_is_reached() {
+        let mut worker = test_worker();
+        let flow_key = (
+            "10.0.0.10".parse().unwrap(),
+            40000,
+            "10.9.0.1".parse().unwrap(),
+            443,
+        );
+
+        for i in 0..max_worker_tcp_flows() {
+            let existing_flow = (
+                "10.0.0.10".parse().unwrap(),
+                10000 + i as u16,
+                "10.9.0.1".parse().unwrap(),
+                443,
+            );
+            worker.flow_map.insert(existing_flow, 49152);
+        }
+
+        assert!(worker.tcp_flow_limit_reached_for_new_flow(&flow_key, true));
+        assert!(!worker.tcp_flow_limit_reached_for_new_flow(&flow_key, false));
+        worker.flow_map.insert(flow_key, 49153);
+        assert!(!worker.tcp_flow_limit_reached_for_new_flow(&flow_key, true));
     }
 
     #[tokio::test]

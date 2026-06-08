@@ -405,6 +405,7 @@ async fn main() {
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
     let worker_telemetry_registry = Arc::new(telemetry::WorkerTelemetryRegistry::new());
+    let virtual_tunnel_telemetry = Arc::new(virtual_tunnel::VirtualTunnelTelemetry::default());
 
     let gateway_state = Arc::new(parking_lot::RwLock::new(build_initial_gateway_state(
         config.clone(),
@@ -452,6 +453,7 @@ async fn main() {
                 runtime_mode,
                 peer_mutation_lock: peer_mutation_lock.clone(),
                 l3_registry: l3_registry.clone(),
+                virtual_tunnel_telemetry: virtual_tunnel_telemetry.clone(),
             },
         );
     }
@@ -728,7 +730,10 @@ async fn main() {
                     }
                 }
             }
-            let virtual_sock = match crate::virtual_tunnel::VirtualTunnelSocket::new(sockets) {
+            let virtual_sock = match crate::virtual_tunnel::VirtualTunnelSocket::new_with_telemetry(
+                sockets,
+                virtual_tunnel_telemetry.clone(),
+            ) {
                 Ok(socket) => socket,
                 Err(e) => {
                     log::error!("Failed to initialize client virtual UDP socket: {}", e);

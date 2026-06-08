@@ -12,6 +12,13 @@ fi
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 
+ARTIFACT_DIR="/tmp/new_proxy_dualstack_$(date +%Y%m%d_%H%M%S)"
+SERVER_CONF="$ARTIFACT_DIR/e2e_server.conf"
+CLIENT_CONF="$ARTIFACT_DIR/e2e_client.conf"
+SERVER_LOG="$ARTIFACT_DIR/server.log"
+CLIENT_LOG="$ARTIFACT_DIR/client.log"
+HTTP_LOG="$ARTIFACT_DIR/http.log"
+
 SERVER_PID=""
 CLIENT_PID=""
 HTTP_PID=""
@@ -28,7 +35,6 @@ cleanup() {
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete server_ns 2>/dev/null || true
   rm -f /run/new_proxy/server_e2e.sock /run/new_proxy/client_e2e.sock
-  rm -f /tmp/e2e_server.conf /tmp/e2e_client.conf
 }
 trap cleanup EXIT
 
@@ -37,7 +43,7 @@ ip netns delete client_ns 2>/dev/null || true
 ip netns delete router_ns 2>/dev/null || true
 ip netns delete server_ns 2>/dev/null || true
 rm -f /run/new_proxy/server_e2e.sock /run/new_proxy/client_e2e.sock
-rm -f /tmp/e2e_server.conf /tmp/e2e_client.conf
+mkdir -p "$ARTIFACT_DIR"
 
 echo "=== [2/7] Creating Client, Router, and Server Namespaces ==="
 ip netns add client_ns
@@ -113,7 +119,7 @@ fi
 echo "✓ [SUCCESS] Dual-stack physical network WAN path verified successfully."
 
 echo "=== [7/7] Starting Gateway Daemons and Verifying IPC CLI ==="
-cat > /tmp/e2e_server.conf <<EOF_CONF
+cat > "$SERVER_CONF" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24, fd00::1/64
@@ -131,7 +137,7 @@ PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
 AllowedIPs = 10.0.0.2/32, fd00::2/128
 EOF_CONF
 
-cat > /tmp/e2e_client.conf <<EOF_CONF
+cat > "$CLIENT_CONF" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24, fd00::2/64
@@ -146,19 +152,29 @@ AllowedIPs = 10.0.0.1/32, fd00::1/128
 EOF_CONF
 
 # 7.1 Start Server proxy daemon in server_ns
-ip netns exec server_ns ./target/debug/new_proxy -config /tmp/e2e_server.conf > /tmp/new_proxy_server_daemon.log 2>&1 &
+ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 sleep 2
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "✗ [FAIL] Server daemon exited early"
+  cat "$SERVER_LOG"
+  exit 1
+fi
 
 # 7.2 Start Client proxy daemon in client_ns with multiple TUN queues.
-ip netns exec client_ns ./target/debug/new_proxy -config /tmp/e2e_client.conf --threads 4 > /tmp/new_proxy_client_daemon.log 2>&1 &
+ip netns exec client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" --threads 4 > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 sleep 2
+if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+  echo "✗ [FAIL] Client daemon exited early"
+  cat "$CLIENT_LOG"
+  exit 1
+fi
 
 # 7.3 Verify a real IPv6 TCP request is intercepted by client TUN and proxied
 # through the authenticated QUIC pool to the server namespace.
 
-ip netns exec server_ns python3 -m http.server 8080 --bind :: >/tmp/e2e_ipv6_http.log 2>&1 &
+ip netns exec server_ns python3 -m http.server 8080 --bind fd00::1 > "$HTTP_LOG" 2>&1 &
 HTTP_PID=$!
 for _ in $(seq 1 20); do
   if ip netns exec server_ns curl -g -fsS --connect-timeout 1 --max-time 2 "http://[fd00::1]:8080/" >/dev/null 2>&1; then
@@ -168,12 +184,25 @@ for _ in $(seq 1 20); do
 done
 if ! ip netns exec server_ns curl -g -fsS --connect-timeout 1 --max-time 2 "http://[fd00::1]:8080/" >/dev/null 2>&1; then
   echo "✗ [FAIL] IPv6 HTTP target server did not become ready"
+  echo "--- http.log ---"
+  cat "$HTTP_LOG"
+  echo "--- server.log ---"
+  cat "$SERVER_LOG"
+  echo "--- client.log ---"
+  cat "$CLIENT_LOG"
+  echo "Artifact directory: $ARTIFACT_DIR"
   exit 1
 fi
 
-ip netns exec router_ns curl -g -fsS --connect-timeout 5 --max-time 10 "http://[fd00::1]:8080/" >/dev/null
-if [ $? -ne 0 ]; then
+if ! ip netns exec router_ns curl -g -fsS --connect-timeout 5 --max-time 10 "http://[fd00::1]:8080/" >/dev/null; then
   echo "✗ [FAIL] IPv6 HTTP over TUN/smoltcp/QUIC failed"
+  echo "--- http.log ---"
+  cat "$HTTP_LOG"
+  echo "--- server.log ---"
+  cat "$SERVER_LOG"
+  echo "--- client.log ---"
+  cat "$CLIENT_LOG"
+  echo "Artifact directory: $ARTIFACT_DIR"
   exit 1
 fi
 echo "✓ [SUCCESS] IPv6 HTTP over TUN/smoltcp/QUIC verified successfully."
@@ -189,4 +218,5 @@ fi
 
 # Clean up namespaces and processes
 echo "=== Integration Test Complete, Tearing Down Namespaces ==="
+echo "Artifact directory: $ARTIFACT_DIR"
 echo "✓ [SUCCESS] E2E Integration tests passed cleanly!"

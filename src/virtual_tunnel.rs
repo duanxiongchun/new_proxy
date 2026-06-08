@@ -2,7 +2,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -11,6 +11,49 @@ use tokio::sync::Notify;
 const RECV_QUEUE_PACKET_LIMIT: usize = 512;
 const RECV_QUEUE_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 type RecvQueue = Arc<Mutex<VecDeque<(Vec<u8>, SocketAddr)>>>;
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct VirtualTunnelTelemetrySnapshot {
+    pub queued_packets: u64,
+    pub queued_bytes: u64,
+    pub dropped_packets: u64,
+    pub dropped_bytes: u64,
+}
+
+#[derive(Default)]
+pub struct VirtualTunnelTelemetry {
+    queued_packets: AtomicU64,
+    queued_bytes: AtomicU64,
+    dropped_packets: AtomicU64,
+    dropped_bytes: AtomicU64,
+}
+
+impl VirtualTunnelTelemetry {
+    pub fn snapshot(&self) -> VirtualTunnelTelemetrySnapshot {
+        VirtualTunnelTelemetrySnapshot {
+            queued_packets: self.queued_packets.load(Ordering::Relaxed),
+            queued_bytes: self.queued_bytes.load(Ordering::Relaxed),
+            dropped_packets: self.dropped_packets.load(Ordering::Relaxed),
+            dropped_bytes: self.dropped_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_enqueue(&self, bytes: usize) {
+        self.queued_packets.fetch_add(1, Ordering::Relaxed);
+        self.queued_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_dequeue(&self, bytes: usize) {
+        self.queued_packets.fetch_sub(1, Ordering::Relaxed);
+        self.queued_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_drop(&self, bytes: usize) {
+        self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+        self.dropped_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone)]
 struct PhysicalSocket {
@@ -25,6 +68,7 @@ struct VirtualTunnelSocketInner {
     recv_queue: RecvQueue,
     recv_queue_bytes: Arc<AtomicUsize>,
     recv_notify: Arc<Notify>,
+    telemetry: Arc<VirtualTunnelTelemetry>,
     abort_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -43,6 +87,13 @@ pub struct VirtualTunnelSocket {
 
 impl VirtualTunnelSocket {
     pub fn new(sockets: Vec<UdpSocket>) -> Result<Self, String> {
+        Self::new_with_telemetry(sockets, Arc::new(VirtualTunnelTelemetry::default()))
+    }
+
+    pub fn new_with_telemetry(
+        sockets: Vec<UdpSocket>,
+        telemetry: Arc<VirtualTunnelTelemetry>,
+    ) -> Result<Self, String> {
         if sockets.is_empty() {
             return Err("VirtualTunnelSocket requires at least one physical socket".to_string());
         }
@@ -64,6 +115,7 @@ impl VirtualTunnelSocket {
             let recv_queue_clone = recv_queue.clone();
             let recv_queue_bytes_clone = recv_queue_bytes.clone();
             let recv_notify_clone = recv_notify.clone();
+            let telemetry_clone = telemetry.clone();
             let socket_clone = socket.clone();
             let last_pong_clone = last_pong.clone();
             let handle = tokio::spawn(async move {
@@ -86,6 +138,7 @@ impl VirtualTunnelSocket {
                             let mut queue = recv_queue_clone.lock();
                             let queued_bytes = recv_queue_bytes_clone.load(Ordering::Relaxed);
                             if queued_bytes.saturating_add(n) > RECV_QUEUE_BYTES_LIMIT {
+                                telemetry_clone.record_drop(n);
                                 log::warn!(
                                     "Virtual tunnel receive queue byte limit reached; dropping packet from {}",
                                     addr
@@ -93,6 +146,7 @@ impl VirtualTunnelSocket {
                                 continue;
                             }
                             if queue.len() >= RECV_QUEUE_PACKET_LIMIT {
+                                telemetry_clone.record_drop(n);
                                 log::warn!(
                                     "Virtual tunnel receive queue packet limit reached; dropping packet from {}",
                                     addr
@@ -101,6 +155,7 @@ impl VirtualTunnelSocket {
                             }
                             queue.push_back((data.to_vec(), addr));
                             recv_queue_bytes_clone.fetch_add(n, Ordering::Relaxed);
+                            telemetry_clone.record_enqueue(n);
                             drop(queue);
                             recv_notify_clone.notify_one();
                         }
@@ -133,7 +188,8 @@ impl VirtualTunnelSocket {
 
                 // Evaluate health
                 let now = Instant::now();
-                let mut best_idx = 0;
+                let prev_idx = active_idx_for_ping.load(Ordering::Relaxed);
+                let mut best_idx = prev_idx;
                 let mut best_time = None;
                 for (i, p_socket) in sockets_for_ping.iter().enumerate() {
                     let pong_time = *p_socket.last_pong.read();
@@ -148,7 +204,6 @@ impl VirtualTunnelSocket {
                 }
 
                 // Update active index
-                let prev_idx = active_idx_for_ping.load(Ordering::Relaxed);
                 if best_idx != prev_idx {
                     log::info!(
                         "Switching active virtual tunnel socket index from {} to {}",
@@ -168,6 +223,7 @@ impl VirtualTunnelSocket {
             recv_queue,
             recv_queue_bytes,
             recv_notify,
+            telemetry,
             abort_handles,
         });
 
@@ -197,6 +253,7 @@ impl VirtualTunnelSocket {
                     self.inner
                         .recv_queue_bytes
                         .fetch_sub(data.len(), Ordering::Relaxed);
+                    self.inner.telemetry.record_dequeue(data.len());
                 }
                 item
             } {
@@ -209,6 +266,10 @@ impl VirtualTunnelSocket {
             }
             self.inner.recv_notify.notified().await;
         }
+    }
+
+    pub fn telemetry_snapshot(&self) -> VirtualTunnelTelemetrySnapshot {
+        self.inner.telemetry.snapshot()
     }
 }
 
@@ -283,6 +344,45 @@ mod tests {
         let mut received = vec![first, second];
         received.sort();
         assert_eq!(received, vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn virtual_tunnel_drop_counters_increment_when_packet_queue_is_full() {
+        let telemetry = Arc::new(VirtualTunnelTelemetry::default());
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let vt = VirtualTunnelSocket::new_with_telemetry(vec![socket], telemetry.clone()).unwrap();
+
+        {
+            let mut queue = vt.inner.recv_queue.lock();
+            for _ in 0..RECV_QUEUE_PACKET_LIMIT {
+                queue.push_back((Vec::new(), local_addr));
+            }
+        }
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"drop-me", local_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.dropped_packets, 1);
+        assert_eq!(snapshot.dropped_bytes, 7);
+    }
+
+    #[tokio::test]
+    async fn virtual_tunnel_keeps_active_socket_when_all_pongs_are_stale() {
+        let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let vt = VirtualTunnelSocket::new(vec![s1, s2]).unwrap();
+
+        vt.inner.active_idx.store(1, Ordering::Relaxed);
+        for physical in &vt.inner.sockets {
+            *physical.last_pong.write() = Some(Instant::now() - Duration::from_secs(10));
+        }
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        assert_eq!(vt.inner.active_idx.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
