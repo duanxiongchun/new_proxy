@@ -11,10 +11,10 @@ use crate::runtime::{cleanup_peer_routes, run_blocking_command, setup_peer_route
 use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry, WorkerTelemetryRegistry};
 use crate::userspace_wg::UserspaceWgRegistry;
 use crate::virtual_tunnel::VirtualTunnelTelemetry;
-use crate::{GatewayState, PeerQuicPools};
+use crate::{ClientQuicDataPortBaseline, GatewayState, L4DataPlane, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -33,12 +33,13 @@ pub struct UdsServerContext {
     pub session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
     pub auth_nonce_cache: Arc<Mutex<HashMap<[u8; 32], NonceCache>>>,
     pub client_quic_pools: PeerQuicPools,
+    pub l4_data_plane: L4DataPlane,
     pub client_private_key: [u8; 32],
     pub runtime_mode: RuntimeMode,
     pub peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     pub l3_registry: UserspaceWgRegistry,
     pub virtual_tunnel_telemetry: Arc<VirtualTunnelTelemetry>,
-    pub client_quic_data_port_baseline: Arc<AtomicUsize>,
+    pub client_quic_data_port_baseline: ClientQuicDataPortBaseline,
 }
 
 pub fn bind_listener(interface_name: &str) -> Option<UnixListener> {
@@ -519,6 +520,7 @@ async fn handle_add_peer(
             Ok(pool) => Some(pool),
             Err(e) => {
                 if let Some(data_port_count) = e.data_port_count() {
+                    let baseline = *context.client_quic_data_port_baseline.lock();
                     if let Err(mismatch) = crate::validate_client_quic_data_port_count(
                         &context.client_quic_pools,
                         data_port_count,
@@ -529,9 +531,7 @@ async fn handle_add_peer(
                     if let Err(mismatch) =
                         crate::validate_client_quic_data_port_count_matches_baseline(
                             data_port_count,
-                            context
-                                .client_quic_data_port_baseline
-                                .load(Ordering::Relaxed),
+                            baseline,
                         )
                     {
                         write_error(stream, framed_response, mismatch).await;
@@ -585,6 +585,7 @@ async fn handle_add_peer(
 
     if context.runtime_mode == RuntimeMode::Client {
         if let Some(pool) = prepared_client_pool.as_ref() {
+            let baseline = *context.client_quic_data_port_baseline.lock();
             if let Err(e) = crate::validate_client_quic_data_port_count(
                 &context.client_quic_pools,
                 pool.endpoint_count(),
@@ -595,9 +596,7 @@ async fn handle_add_peer(
             }
             if let Err(e) = crate::validate_client_quic_data_port_count_matches_baseline(
                 pool.endpoint_count(),
-                context
-                    .client_quic_data_port_baseline
-                    .load(Ordering::Relaxed),
+                baseline,
             ) {
                 pool.shutdown(b"QUIC data port count does not match baseline");
                 write_error(stream, framed_response, e).await;
@@ -704,6 +703,11 @@ async fn handle_add_peer(
         if let Some(pool) = old_pool {
             pool.shutdown(b"Peer replaced");
         }
+        crate::publish_l4_data_plane_snapshot(
+            &context.l4_data_plane,
+            &context.state,
+            &context.client_quic_pools,
+        );
     }
 
     let message = if quic_pool_unavailable {
@@ -796,6 +800,11 @@ async fn handle_remove_peer(
             .retain(|peer| peer.public_key != parsed_pub_key);
         state.router = rebuild_l4_router(&state.config.peers);
     }
+    crate::publish_l4_data_plane_snapshot(
+        &context.l4_data_plane,
+        &context.state,
+        &context.client_quic_pools,
+    );
 
     write_ok(stream, framed_response, None).await;
 }
@@ -945,28 +954,34 @@ mod tests {
 
         let l3_registry =
             UserspaceWgRegistry::new(config.interface.private_key, &config.peers).unwrap();
+        let state = Arc::new(RwLock::new(GatewayState {
+            config,
+            router: AllowedIPsRouter::new(),
+            userspace_tcp_offload_enabled: true,
+        }));
+        let client_quic_pools = Arc::new(RwLock::new(HashMap::new()));
+        let l4_data_plane = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::current_l4_data_plane_snapshot(&state, &client_quic_pools),
+        ));
 
         UdsServerContext {
             telemetry,
             worker_telemetry,
-            state: Arc::new(RwLock::new(GatewayState {
-                config,
-                router: AllowedIPsRouter::new(),
-                userspace_tcp_offload_enabled: true,
-            })),
+            state,
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             server_secret: StaticSecret::from([1u8; 32]),
             shared_quic_registry: Arc::new(Mutex::new(HashMap::new())),
             interface_name: "nonexistent_interface".to_string(),
             session_cache: Arc::new(RwLock::new(HashMap::new())),
             auth_nonce_cache: Arc::new(Mutex::new(HashMap::new())),
-            client_quic_pools: Arc::new(RwLock::new(HashMap::new())),
+            client_quic_pools,
+            l4_data_plane,
             client_private_key: [1u8; 32],
             runtime_mode: RuntimeMode::Server,
             peer_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             l3_registry,
             virtual_tunnel_telemetry: Arc::new(VirtualTunnelTelemetry::default()),
-            client_quic_data_port_baseline: Arc::new(AtomicUsize::new(1)),
+            client_quic_data_port_baseline: Arc::new(Mutex::new(1)),
         }
     }
 
@@ -1026,11 +1041,13 @@ mod tests {
         let _ = fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
         let context = test_context();
-        context
-            .worker_telemetry
-            .get_or_create(1)
-            .tun_rx_packets
-            .store(42, Ordering::Relaxed);
+        context.worker_telemetry.get_or_create(1).publish(
+            &crate::telemetry::WorkerTelemetrySnapshot {
+                worker_id: 1,
+                tun_rx_packets: 42,
+                ..crate::telemetry::WorkerTelemetrySnapshot::default()
+            },
+        );
         {
             let mut state = context.state.write();
             state.config.peers.push(PeerConfig {

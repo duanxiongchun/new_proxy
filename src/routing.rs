@@ -1,7 +1,7 @@
 use ipnet::IpNet;
 use std::net::IpAddr;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TrieNode<V> {
     value: Option<V>,
     children: [Option<Box<TrieNode<V>>>; 2],
@@ -16,6 +16,7 @@ impl<V> TrieNode<V> {
     }
 }
 
+#[derive(Clone)]
 pub struct AllowedIPsRouter<V> {
     v4_root: TrieNode<V>,
     v6_root: TrieNode<V>,
