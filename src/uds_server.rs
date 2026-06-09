@@ -163,12 +163,19 @@ fn combine_peer_telemetries(
     for registry in peer_telemetries {
         let snap = registry.snapshot();
         for (pub_key, stats) in snap {
-            let combined_stats = combined.entry(pub_key).or_insert_with(|| {
-                Arc::new(crate::telemetry::PeerL4Stats::default())
-            });
-            combined_stats.rx_bytes.fetch_add(stats.rx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            combined_stats.tx_bytes.fetch_add(stats.tx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            combined_stats.active_streams.fetch_add(stats.active_streams.load(Ordering::Relaxed), Ordering::Relaxed);
+            let combined_stats = combined
+                .entry(pub_key)
+                .or_insert_with(|| Arc::new(crate::telemetry::PeerL4Stats::default()));
+            combined_stats
+                .rx_bytes
+                .fetch_add(stats.rx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            combined_stats
+                .tx_bytes
+                .fetch_add(stats.tx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            combined_stats.active_streams.fetch_add(
+                stats.active_streams.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
     }
     combined
@@ -727,6 +734,12 @@ async fn handle_add_peer(
             &context.state,
             &context.client_quic_pools,
         );
+    } else {
+        if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
+            for conn in conns {
+                conn.close(b"Peer replaced");
+            }
+        }
     }
 
     let message = if quic_pool_unavailable {
@@ -1254,8 +1267,7 @@ mod tests {
             .auth_nonce_cache
             .lock()
             .contains_key(&[2u8; 32]));
-        assert!(!context_for_assert
-            .peer_telemetries[0]
+        assert!(!context_for_assert.peer_telemetries[0]
             .snapshot()
             .contains_key(&[2u8; 32]));
 

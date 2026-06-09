@@ -8,6 +8,23 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-09 管控面单线程与架构文档整合验证
+
+### 1. 架构文档清理与整合
+* **操作内容**：将 `docs` 目录下的所有架构设计及设计规约文档整合并入 [doc/ARCHITECTURE.md](file:///home/duanxiongchun/new_proxy/doc/ARCHITECTURE.md)，并将冗余的 `docs` 目录彻底删除。
+* **文件状态**：`docs/` 目录已删除，所有设计及规约细节已统一至单个权威架构文档中。
+
+### 2. 管控面单线程化（Single-Threaded Control Plane）
+* **主运行时改造**：将主入口 Tokio 异步运行时变更为 `tokio::runtime::Builder::new_current_thread()`，集约管理所有控制面任务（UDS API Server, pre-negotiation Server, Health Checker / Failover 等），消除了主运行时的调度线冲突。
+* **数据面独立多线程绑定**：高频数据转发 Worker 线程（`RtcWorker`）通过 `std::thread::Builder` 派生独立 OS 线程，并在线程内部启动专属单线程 Tokio 运行时，确保控制面与数据面物理级别隔离，防止低频控制面事件（如慢 UDS、DNS 查询等）抢占高频数据面 RTC 流的 CPU 资源。
+
+### 3. 测试用例验证与修复
+* **单线程回归**：所有控制面 API 及 CLI 命令在此单线程运行时下运行稳定。
+* **测试用例修复**：修复了 `rtc_loop::tests::test_rtc_worker_datagram_loop` 在单线程环境下调用 `read_exact` 出现 `WouldBlock` 的缺陷（通过使 mock socketpair 的读端保持 blocking）。
+* **测试结果**：
+  * **单元测试**：所有 89 个单元测试 100% 通过。
+  * **E2E 验收测试**：全部 8 项 E2E 场景测试通过（包含双栈、多客户端、动态 peer、拓扑防御门禁、全隧道 bypass、MSS 夹紧等）。
+
 ## 2026-06-09 数据面超时机制与定时器优化验证
 
 本次补充优化覆盖：

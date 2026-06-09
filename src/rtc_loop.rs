@@ -12,6 +12,19 @@ pub struct RtcWorkerConfig {
 }
 
 #[derive(Clone)]
+struct ActiveConn {
+    conn: Connection,
+    stats: Arc<crate::quic_pool::QuicConnStats>,
+    peer_stats: Option<Arc<crate::telemetry::PeerL4Stats>>,
+    _pub_key: [u8; 32],
+}
+
+enum ReadDatagramResult {
+    Ok(bytes::Bytes, usize),
+    Err(usize),
+}
+
+#[derive(Clone)]
 pub enum WorkerRole {
     Client,
     Server {
@@ -72,14 +85,23 @@ impl RtcWorker {
         &self,
         data_plane: &crate::L4DataPlaneSnapshot,
         dst_ip: IpAddr,
-    ) -> Option<(Connection, Arc<crate::quic_pool::QuicConnStats>, [u8; 32])> {
+    ) -> Option<ActiveConn> {
         match &self.role {
             WorkerRole::Client => {
                 let peer_pub_key = data_plane.router.longest_match(dst_ip)?;
                 let pool = data_plane.client_quic_pools.get(&peer_pub_key)?;
                 let (conn, stats) = pool.get_connection_by_slot(self.worker_id)?;
                 if conn.close_reason().is_none() {
-                    Some((conn, stats, peer_pub_key))
+                    let peer_stats = self
+                        .peer_telemetry
+                        .as_ref()
+                        .map(|pt| pt.get_or_create(peer_pub_key));
+                    Some(ActiveConn {
+                        conn,
+                        stats,
+                        peer_stats,
+                        _pub_key: peer_pub_key,
+                    })
                 } else {
                     None
                 }
@@ -98,11 +120,16 @@ impl RtcWorker {
                 for record in records {
                     if record.stats.local_port == local_port && record.conn.close_reason().is_none()
                     {
-                        return Some((
-                            record.conn.clone(),
-                            Arc::new(record.stats.clone()),
-                            peer_pub_key,
-                        ));
+                        let peer_stats = self
+                            .peer_telemetry
+                            .as_ref()
+                            .map(|pt| pt.get_or_create(peer_pub_key));
+                        return Some(ActiveConn {
+                            conn: record.conn.clone(),
+                            stats: Arc::new(record.stats.clone()),
+                            peer_stats,
+                            _pub_key: peer_pub_key,
+                        });
                     }
                 }
                 None
@@ -113,14 +140,23 @@ impl RtcWorker {
     fn get_all_active_connections(
         &self,
         data_plane: &crate::L4DataPlaneSnapshot,
-    ) -> Vec<(Connection, Arc<crate::quic_pool::QuicConnStats>, [u8; 32])> {
+    ) -> Vec<ActiveConn> {
         let mut conns = Vec::new();
         match &self.role {
             WorkerRole::Client => {
                 for (&pub_key, pool) in &data_plane.client_quic_pools {
                     if let Some((conn, stats)) = pool.get_connection_by_slot(self.worker_id) {
                         if conn.close_reason().is_none() {
-                            conns.push((conn, stats, pub_key));
+                            let peer_stats = self
+                                .peer_telemetry
+                                .as_ref()
+                                .map(|pt| pt.get_or_create(pub_key));
+                            conns.push(ActiveConn {
+                                conn,
+                                stats,
+                                peer_stats,
+                                _pub_key: pub_key,
+                            });
                         }
                     }
                 }
@@ -137,11 +173,16 @@ impl RtcWorker {
                             if record.stats.local_port == local_port
                                 && record.conn.close_reason().is_none()
                             {
-                                conns.push((
-                                    record.conn.clone(),
-                                    Arc::new(record.stats.clone()),
-                                    pub_key,
-                                ));
+                                let peer_stats = self
+                                    .peer_telemetry
+                                    .as_ref()
+                                    .map(|pt| pt.get_or_create(pub_key));
+                                conns.push(ActiveConn {
+                                    conn: record.conn.clone(),
+                                    stats: Arc::new(record.stats.clone()),
+                                    peer_stats,
+                                    _pub_key: pub_key,
+                                });
                             }
                         }
                     }
@@ -162,14 +203,8 @@ impl RtcWorker {
 
         let mut dp_snapshot = data_plane.load();
         let mut active_conns = self.get_all_active_connections(&dp_snapshot);
-        let mut conn_cache: std::collections::HashMap<
-            std::net::IpAddr,
-            (
-                quinn::Connection,
-                std::sync::Arc<crate::quic_pool::QuicConnStats>,
-                [u8; 32],
-            ),
-        > = std::collections::HashMap::new();
+        let mut conn_cache: std::collections::HashMap<std::net::IpAddr, ActiveConn> =
+            std::collections::HashMap::new();
 
         let mut tun_vec = vec![0u8; 1600];
 
@@ -191,8 +226,7 @@ impl RtcWorker {
                                 crate::mss_clamping::clamp_tcp_mss(&mut tun_vec[..n], 1160);
 
                                 let cached_conn = if let Some(info) = conn_cache.get(&dst_ip) {
-                                    let (conn, _, _) = info;
-                                    if conn.close_reason().is_none() {
+                                    if info.conn.close_reason().is_none() {
                                         Some(info.clone())
                                     } else {
                                         None
@@ -201,45 +235,42 @@ impl RtcWorker {
                                     None
                                 };
 
-                                let conn_info = match cached_conn {
+                                let active_conn = match cached_conn {
                                     Some(info) => Some(info),
                                     None => {
-                                        if let Some((conn, stats, pub_key)) = self.get_active_connection(&dp_snapshot, dst_ip) {
-                                            conn_cache.insert(dst_ip, (conn.clone(), stats.clone(), pub_key));
-                                            Some((conn, stats, pub_key))
+                                        if let Some(info) = self.get_active_connection(&dp_snapshot, dst_ip) {
+                                            conn_cache.insert(dst_ip, info.clone());
+                                            Some(info)
                                         } else {
                                             None
                                         }
                                     }
                                 };
 
-                                if let Some((conn, stats, pub_key)) = conn_info {
+                                if let Some(active_conn) = active_conn {
                                     tun_vec.truncate(n);
                                     let payload = bytes::Bytes::from(tun_vec);
                                     tun_vec = vec![0u8; 1600];
                                     packet_sent = true;
 
-                                    if let Err(e) = conn.send_datagram(payload) {
+                                    if let Err(e) = active_conn.conn.send_datagram(payload) {
                                         log::debug!("Failed to send QUIC datagram: {}", e);
                                     } else {
                                         local_stats.l3_packets += 1;
                                         local_stats.l3_bytes += n as u64;
 
                                         // Update connection stats
-                                        let _old_tx = stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                        active_conn.stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
                                         // Update peer stats
-                                        if let Some(ref peer_telemetry) = self.peer_telemetry {
-                                            let peer_stats = peer_telemetry.get_or_create(pub_key);
+                                        if let Some(ref peer_stats) = active_conn.peer_stats {
                                             peer_stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                                         }
                                     }
                                 }
                             }
-                            if !packet_sent {
-                                if tun_vec.len() != 1600 {
-                                    tun_vec.resize(1600, 0);
-                                }
+                            if !packet_sent && tun_vec.len() != 1600 {
+                                tun_vec.resize(1600, 0);
                             }
                         }
                         Ok(_) => {}
@@ -249,26 +280,33 @@ impl RtcWorker {
                     }
                 }
 
-                read_dg = read_any_datagram(&active_conns) => {
-                    if let Some((bytes, idx)) = read_dg {
-                        let n = bytes.len();
-                        if let Err(e) = self.tun_io.write_packet(&bytes).await {
-                            log::warn!("Failed to write to TUN: {}", e);
-                        } else {
-                            local_stats.l3_packets += 1;
-                            local_stats.l3_bytes += n as u64;
+                read_dg = ReadAnyDatagram { conns: &active_conns } => {
+                    match read_dg {
+                        ReadDatagramResult::Ok(bytes, idx) => {
+                            let n = bytes.len();
+                            if let Err(e) = self.tun_io.write_packet(&bytes).await {
+                                log::warn!("Failed to write to TUN: {}", e);
+                            } else {
+                                local_stats.l3_packets += 1;
+                                local_stats.l3_bytes += n as u64;
 
-                            // Update connection stats
-                            let (_, stats, pub_key) = &active_conns[idx];
-                            let _old_rx = stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                // Update connection stats
+                                let active_conn = &active_conns[idx];
+                                active_conn.stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
-                            // Update peer stats
-                            if let Some(ref peer_telemetry) = self.peer_telemetry {
-                                let peer_stats = peer_telemetry.get_or_create(*pub_key);
-                                peer_stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                // Update peer stats
+                                if let Some(ref peer_stats) = active_conn.peer_stats {
+                                    peer_stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
-                    }
+                        ReadDatagramResult::Err(idx) => {
+                            log::warn!("QUIC link at index {} is dead, removing from active pool", idx);
+                            if idx < active_conns.len() {
+                                active_conns.remove(idx);
+                            }
+                        }
+                        }
                 }
 
                 _ = reload_timer.tick() => {
@@ -308,114 +346,51 @@ fn parse_destination_ip(packet: &[u8]) -> Option<IpAddr> {
     }
 }
 
-async fn read_any_datagram(
-    conns: &[(Connection, Arc<crate::quic_pool::QuicConnStats>, [u8; 32])],
-) -> Option<(bytes::Bytes, usize)> {
-    match conns.len() {
-        0 => {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            None
-        }
-        1 => match conns[0].0.read_datagram().await {
-            Ok(bytes) => Some((bytes, 0)),
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                None
-            }
-        },
-        2 => {
-            tokio::select! {
-                r0 = conns[0].0.read_datagram() => match r0 {
-                    Ok(bytes) => Some((bytes, 0)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                },
-                r1 = conns[1].0.read_datagram() => match r1 {
-                    Ok(bytes) => Some((bytes, 1)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                }
-            }
-        }
-        3 => {
-            tokio::select! {
-                r0 = conns[0].0.read_datagram() => match r0 {
-                    Ok(bytes) => Some((bytes, 0)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                },
-                r1 = conns[1].0.read_datagram() => match r1 {
-                    Ok(bytes) => Some((bytes, 1)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                },
-                r2 = conns[2].0.read_datagram() => match r2 {
-                    Ok(bytes) => Some((bytes, 2)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                }
-            }
-        }
-        4 => {
-            tokio::select! {
-                r0 = conns[0].0.read_datagram() => match r0 {
-                    Ok(bytes) => Some((bytes, 0)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                },
-                r1 = conns[1].0.read_datagram() => match r1 {
-                    Ok(bytes) => Some((bytes, 1)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                },
-                r2 = conns[2].0.read_datagram() => match r2 {
-                    Ok(bytes) => Some((bytes, 2)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                },
-                r3 = conns[3].0.read_datagram() => match r3 {
-                    Ok(bytes) => Some((bytes, 3)),
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        None
-                    }
-                }
-            }
-        }
-        _ => {
-            let futures = conns
-                .iter()
-                .enumerate()
-                .map(|(idx, (conn, _, _))| {
-                    Box::pin(async move { (conn.read_datagram().await, idx) })
-                })
-                .collect::<Vec<_>>();
+struct ReadAnyDatagram<'a> {
+    conns: &'a [ActiveConn],
+}
 
-            let (res, _, _) = futures::future::select_all(futures).await;
-            match res {
-                (Ok(bytes), idx) => Some((bytes, idx)),
-                (Err(_), _) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    None
+impl<'a> std::future::Future for ReadAnyDatagram<'a> {
+    type Output = ReadDatagramResult;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.conns.is_empty() {
+            return std::task::Poll::Pending;
+        }
+
+        if this.conns.len() == 1 {
+            let mut read_future = this.conns[0].conn.read_datagram();
+            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut read_future) };
+            match pinned.poll(cx) {
+                std::task::Poll::Ready(Ok(bytes)) => {
+                    return std::task::Poll::Ready(ReadDatagramResult::Ok(bytes, 0))
                 }
+                std::task::Poll::Ready(Err(_)) => {
+                    return std::task::Poll::Ready(ReadDatagramResult::Err(0))
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
         }
+
+        for (idx, conn) in this.conns.iter().enumerate() {
+            let mut read_future = conn.conn.read_datagram();
+            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut read_future) };
+            match pinned.poll(cx) {
+                std::task::Poll::Ready(Ok(bytes)) => {
+                    return std::task::Poll::Ready(ReadDatagramResult::Ok(bytes, idx))
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    return std::task::Poll::Ready(ReadDatagramResult::Err(idx))
+                }
+                std::task::Poll::Pending => {}
+            }
+        }
+
+        std::task::Poll::Pending
     }
 }
 
@@ -487,7 +462,6 @@ mod tests {
         // Setup Unix socketpair for mocking TUN
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
         sock1.set_nonblocking(true).unwrap();
-        sock2.set_nonblocking(true).unwrap();
 
         let tun_io = Arc::new(AsyncTunIo::new(sock1.into_raw_fd()).unwrap());
         let pool = Arc::new(client);

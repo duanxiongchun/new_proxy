@@ -68,47 +68,54 @@ cargo test
 
 验收测试需要在支持 Linux Network Namespace 的环境下运行，使用 `ip` 网络空间隔离并模拟真实的网络公网延迟与物理包传输。
 
-运行所有 E2E 脚本：
+运行所有验收测试：
 ```bash
-sudo bash script/acceptance/run_all_e2e.sh
+sudo ./script/acceptance/run_acceptance.sh
 ```
 
 ### 3.1 核心 E2E 测试场景清单
 
-#### 1. 双栈 L3 Datagram 透明转发 (`e2e_pure_l3_dualstack.sh`)
+#### 1. 双栈 L3 Datagram 透明转发 (`e2e_test_dualstack.sh`)
 * **拓扑**：建立 `client_ns` $\leftrightarrow$ `router_ns` $\leftrightarrow$ `server_ns` 三层空间。
 * **验证点**：
   * 通过客户端 TUN 网卡注入 TCP、UDP、ICMP（IPv4 及 IPv6）流量。
   * 验证所有流量直接被打包为 QUIC Datagram 发送，服务端解包后转发给目标真实服务。
-  * 目标服务应能成功响应。**通过 ICMP 测试断言 Ping 能够完美双向闭环**。
+  * 目标服务应能成功响应。通过 IPv6 HTTP curl 测试断言流量完美闭环。
   * 检查 UDS Stats，断言 QUIC Datagram 收发字节与包计数非零，且无 stream 开启。
 
-#### 2. TCP MSS 夹紧有效性与零分片 (`e2e_mss_clamping.sh`)
+#### 2. 多客户端并发隔离 (`e2e_multi_client.sh`)
+* **拓扑**：两个 `client1_ns` & `client2_ns` 并发连接一个 `server_ns`。
 * **验证点**：
-  * 将客户端 TUN 的 MTU 设为 1200。
-  * 在客户端空间中启动大文件传输（如通过 HTTP `curl` 下载 64 MiB 的 blob 文件）。
-  * 在 `router_ns` 物理链路上使用 `tcpdump` 抓取底层传输的 UDP (QUIC) 报文。
-  * **硬性断言**：
-    1. 抓包中绝对不能出现任何 IP 层的分片包（Fragmentation）。
-    2. 大文件能以极高的吞吐顺利传输完毕。
-    3. 握手阶段的 SYN 包 MSS 选项值已被强行修改为符合 QUIC 承载上限的安全值。
+  * 两个客户端分别建立各自独立的 QUIC 物理连接槽位，独立进行数据收发。
+  * 验证服务端可为多客户端并发进行数据面流量哈希和转发。
 
-#### 3. 对称多队列与流亲和度测试 (`e2e_multi_port_symmetric.sh`)
+#### 3. 动态 Peer 增删与会话自愈 (`e2e_dynamic_client_peer.sh`)
 * **验证点**：
-  * 配置服务端开启 4 个数据面端口，客户端自动协商并拉起 4 个 Worker 线程和 4 个网卡队列。
-  * 发起 32 个并发不同的 TCP/UDP 连接流量。
-  * **硬性断言**：
-    1. 验证 4 个 Worker 线程的 telemetry 指标。
-    2. 依赖内核的 `IFF_MULTI_QUEUE` 哈希，所有流被大体均匀地分配到 4 个队列上。
-    3. 数据流在其双向链路上始终绑定在同一个工作线程 ID $i$ 上（对称亲和度验证）。
+  * 运行时通过 CLI 动态添加/删除对等体。
+  * 验证未配置 peer 前数据包拦截丢弃；动态 `add-peer` 之后隧道立即打通，流量恢复；`remove-peer` 之后拦截重建。
+  * 验证重新添加 Peer 后，QUIC 物理池能自动触发预协商并快速恢复。
 
-#### 4. 链路故障自愈与 Slot 隔离 (`e2e_reconnection_robustness.sh`)
+#### 4. 客户端拓扑基准防御门禁 (`e2e_client_topology_gate.sh`)
 * **验证点**：
-  * 在 4 端口并发流量传输过程中，人为利用 `iptables` 阻断其中第 2 个物理数据端口（`40002`）的 UDP 通信。
-  * **硬性断言**：
-    1. 只有分配在该 Slot 上的流量触发重连或 fallback 丢包。
-    2. 运行在其他 3 个端口（`40001`、`40003`、`40004`）上的业务流量完全不受任何影响，吞吐量保持平稳（Slot 级强隔离）。
-    3. 撤销阻断后，健康检查自动通过控制面重协商，自动恢复该 Slot 的 QUIC 连接。
+  * 客户端首个添加的对等体其 QUIC 数据端口数 $N$ 确立本地静态基准（分配 $N$ 宽度队列和线程）。
+  * 动态添加新对等体时，如果其数据端口数不等于 $N$，校验机制必须拒绝添加并报错，以保护本地静态工作线程和 TUN 多队列网卡拓扑。
+
+#### 5. 全隧道绕过与回环防御 (`e2e_full_tunnel_bypass.sh`)
+* **验证点**：
+  * 验证 `SO_MARK` 标记的下发和系统策略路由规则，防止在代理 `0.0.0.0/0` 全网流量时出现加密包重新注入 TUN 接口的物理回环。
+
+#### 6. TCP MSS 夹紧有效性与零分片 (`e2e_mss_clamping.sh`)
+* **验证点**：
+  * 将客户端 TUN 的 MTU 设为 1200，并发起大流量 TCP 传输。
+  * 在物理链路上抓包硬性断言：绝对不能出现 IP 层的分片包（Fragmentation），且 TCP 握手 SYN 的 MSS 字段被完美夹紧至 `1160` 安全值。
+
+#### 7. UDP 与 ICMP 隧道穿透 (`e2e_udp_icmp_tunnel.sh`)
+* **验证点**：
+  * 验证非 TCP 流量（ICMP ping、UDP DNS）直接被无状态分包至 QUIC Datagram 传输并在对端恢复，支持 ICMP ping 双向闭环。
+
+#### 8. UDP-over-QUIC 性能极限吞吐 (`e2e_udp_over_quic.sh`)
+* **验证点**：
+  * 验证 UDP 数据流量在 QUIC Datagram 物理下的传输吞吐能力。
 
 ---
 

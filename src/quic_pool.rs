@@ -382,7 +382,6 @@ pub struct QuicPoolClient {
     refresh_config: Option<ControlRefreshConfig>,
     slots: Arc<ArcSwap<Vec<PoolSlot>>>,
     rr_index: Arc<AtomicUsize>,
-    endpoint: Arc<Mutex<Option<Endpoint>>>,
     shutdown: Arc<AtomicBool>,
     pool_state: Arc<RwLock<PoolState>>,
     control_refresh_backoff: Arc<Mutex<ControlRefreshBackoff>>,
@@ -395,6 +394,7 @@ struct PoolSlot {
     endpoint: SocketAddr,
     conn: Connection,
     stats: Arc<QuicConnStats>,
+    client_endpoint: Endpoint,
 }
 
 impl QuicPoolClient {
@@ -457,7 +457,6 @@ impl QuicPoolClient {
             refresh_config,
             slots: Arc::new(ArcSwap::from_pointee(Vec::new())),
             rr_index: Arc::new(AtomicUsize::new(0)),
-            endpoint: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             pool_state: Arc::new(RwLock::new(PoolState::Active)),
             control_refresh_backoff: Arc::new(Mutex::new(ControlRefreshBackoff::default())),
@@ -515,10 +514,8 @@ impl QuicPoolClient {
             let slots = self.slots.load();
             for slot in slots.iter() {
                 slot.conn.close(0u32.into(), reason);
+                slot.client_endpoint.close(0u32.into(), reason);
             }
-        }
-        if let Some(endpoint) = self.endpoint.lock().as_ref() {
-            endpoint.close(0u32.into(), reason);
         }
     }
 
@@ -558,12 +555,7 @@ impl QuicPoolClient {
             return Err("Empty endpoints pool".to_string());
         }
 
-        let endpoint = Self::create_client_endpoint(&runtime_config)?;
-        *self.endpoint.lock() = Some(endpoint.clone());
-
-        let slots = self
-            .connect_all_endpoints(&endpoint, &runtime_config)
-            .await?;
+        let slots = self.connect_all_endpoints(&runtime_config).await?;
 
         log::info!(
             "Successfully initialized QUIC connection pool with {} active links",
@@ -618,29 +610,31 @@ impl QuicPoolClient {
 
     async fn connect_all_endpoints(
         &self,
-        endpoint: &Endpoint,
         runtime_config: &PoolRuntimeConfig,
     ) -> Result<Vec<PoolSlot>, String> {
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut join_set: tokio::task::JoinSet<Result<PoolSlot, String>> =
+            tokio::task::JoinSet::new();
 
         for &target_addr in &runtime_config.endpoints {
             log::info!(
                 "Establishing physical QUIC connection pool link to {}",
                 target_addr
             );
-            let endpoint_clone = endpoint.clone();
             let client_public_key = self.client_public_key;
             let session_psk = runtime_config.session_psk;
             let connect_timeout = self.timing.read().connect_timeout;
+            let runtime_config_clone = runtime_config.clone();
             join_set.spawn(async move {
-                Self::connect_authenticated_with(
-                    endpoint_clone,
+                let endpoint = Self::create_client_endpoint(&runtime_config_clone)?;
+                let slot = Self::connect_authenticated_with(
+                    endpoint,
                     target_addr,
                     client_public_key,
                     session_psk,
                     connect_timeout,
                 )
-                .await
+                .await?;
+                Ok(slot)
             });
         }
 
@@ -758,6 +752,7 @@ impl QuicPoolClient {
                 target_addr.port(),
             )),
             conn,
+            client_endpoint: endpoint,
         })
     }
 
@@ -827,20 +822,9 @@ impl QuicPoolClient {
                 let pool_state = { *self.pool_state.read() };
 
                 let runtime_config = self.runtime_config.read().clone();
-                let (endpoints, session_psk, endpoint_opt) = {
-                    let ep = self.endpoint.lock();
-                    (
-                        runtime_config.endpoints.clone(),
-                        runtime_config.session_psk,
-                        ep.clone(),
-                    )
-                };
+                let (endpoints, session_psk) =
+                    (runtime_config.endpoints.clone(), runtime_config.session_psk);
                 let connect_timeout = self.timing.read().connect_timeout;
-
-                let endpoint = match endpoint_opt {
-                    Some(ep) => ep,
-                    None => continue,
-                };
 
                 let active_slots = self.slots.load_full();
 
@@ -856,15 +840,21 @@ impl QuicPoolClient {
                             slot.endpoint
                         );
 
-                        let endpoint_clone = endpoint.clone();
+                        slot.client_endpoint.close(0u32.into(), b"reconnecting");
                         let target_addr = slot.endpoint;
                         let client_public_key = self.client_public_key;
+                        let runtime_config_clone = runtime_config.clone();
                         reconnects.spawn(async move {
+                            let endpoint = match Self::create_client_endpoint(&runtime_config_clone)
+                            {
+                                Ok(ep) => ep,
+                                Err(e) => return (Some(i), target_addr, Err(e)),
+                            };
                             (
                                 Some(i),
                                 target_addr,
                                 Self::connect_authenticated_with(
-                                    endpoint_clone,
+                                    endpoint,
                                     target_addr,
                                     client_public_key,
                                     session_psk,
@@ -892,14 +882,18 @@ impl QuicPoolClient {
                         "Connection to {} is missing from pool. Connecting...",
                         target_addr
                     );
-                    let endpoint_clone = endpoint.clone();
                     let client_public_key = self.client_public_key;
+                    let runtime_config_clone = runtime_config.clone();
                     reconnects.spawn(async move {
+                        let endpoint = match Self::create_client_endpoint(&runtime_config_clone) {
+                            Ok(ep) => ep,
+                            Err(e) => return (None, target_addr, Err(e)),
+                        };
                         (
                             None,
                             target_addr,
                             Self::connect_authenticated_with(
-                                endpoint_clone,
+                                endpoint,
                                 target_addr,
                                 client_public_key,
                                 session_psk,
@@ -1044,17 +1038,13 @@ impl QuicPoolClient {
             endpoints,
         };
 
-        let endpoint = Self::create_client_endpoint(&runtime_config)?;
-        let slots = self
-            .connect_all_endpoints(&endpoint, &runtime_config)
-            .await?;
+        let slots = self.connect_all_endpoints(&runtime_config).await?;
 
-        if let Some(old_endpoint) = self.endpoint.lock().replace(endpoint) {
-            old_endpoint.close(0u32.into(), b"QUIC session refreshed");
-        }
         let old_slots = self.slots.swap(Arc::new(Vec::new()));
         for slot in old_slots.iter() {
             slot.conn.close(0u32.into(), b"QUIC session refreshed");
+            slot.client_endpoint
+                .close(0u32.into(), b"QUIC session refreshed");
         }
         *self.runtime_config.write() = runtime_config;
         self.slots.store(Arc::new(slots));
@@ -1991,6 +1981,7 @@ mod tests {
                 endpoint: dead_addr,
                 stats: Arc::new(QuicConnStats::new(dead_addr, dead_port)),
                 conn: old_conn,
+                client_endpoint: old_slots[0].client_endpoint.clone(),
             }]));
         }
 

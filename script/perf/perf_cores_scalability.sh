@@ -10,9 +10,9 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 
 DATA_PORT_COUNTS="${PERF_DATA_PORT_COUNTS:-1 2 3 4}"
-PARALLEL="${PERF_PARALLEL:-32}"
+PARALLEL="${PERF_PARALLEL:-16}"
 ROUNDS="${PERF_ROUNDS:-2}"
-BLOB_MIB="${PERF_BLOB_MIB:-64}"
+BLOB_MIB="${PERF_BLOB_MIB:-16}"
 ARTIFACT_DIR="${PERF_ARTIFACT_DIR:-/tmp/new_proxy_cores_scalability_$(date +%Y%m%d_%H%M%S)}"
 RESULTS_CSV="$ARTIFACT_DIR/results.csv"
 
@@ -255,7 +255,15 @@ PY
     exit 1
   fi
 
-  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
+  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$ARTIFACT_DIR" <<'PY' > "$ARTIFACT_DIR/http.log" 2>&1 &
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import sys
+import os
+
+os.chdir(sys.argv[1])
+server = ThreadingHTTPServer(('10.0.0.1', 8080), SimpleHTTPRequestHandler)
+server.serve_forever()
+PY
   HTTP_PID=$!
 
   ip netns exec scale_client_ns taskset -c "$cpus" "$ROOT_DIR/target/release/new_proxy" -config "$CLIENT_CONF" > "$client_log" 2>&1 &
@@ -310,69 +318,126 @@ PY
   fi
 
   # Run UDP benchmark
-  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
+  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$data_ports" "$target_cpus" <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
 import socket
 import sys
 import time
+import multiprocessing
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-sock.bind(('10.0.0.1', 9999))
-sock.settimeout(5.0)
+data_ports = int(sys.argv[1])
+cpu_str = sys.argv[2]
+target_cpus = []
+for part in cpu_str.split(','):
+    part = part.strip()
+    if not part:
+        continue
+    if '-' in part:
+        start, end = part.split('-')
+        target_cpus.extend(range(int(start), int(end) + 1))
+    else:
+        target_cpus.append(int(part))
 
-bytes_received = 0
-start = None
-last_packet_time = None
+def recv_worker(port, cpu, conn):
+    try:
+        import os
+        if hasattr(os, 'sched_setaffinity'):
+            os.sched_setaffinity(0, {cpu})
+    except:
+        pass
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    sock.bind(('10.0.0.1', port))
+    sock.settimeout(5.0)
+    
+    bytes_received = 0
+    start = None
+    last_packet_time = None
+    
+    try:
+        while True:
+            data, addr = sock.recvfrom(65535)
+            if not data:
+                break
+            if start is None:
+                start = time.monotonic()
+            if data == b'EOF':
+                break
+            bytes_received += len(data)
+        last_packet_time = time.monotonic()
+    except socket.timeout:
+        last_packet_time = time.monotonic()
+        
+    duration = last_packet_time - start if (start and last_packet_time) else 0.001
+    conn.send((bytes_received, duration))
 
-try:
-    while True:
-        data, addr = sock.recvfrom(65535)
-        if not data:
-            break
-        now = time.monotonic()
-        if start is None:
-            start = now
-        last_packet_time = now
-        if data == b'EOF':
-            break
-        bytes_received += len(data)
-except socket.timeout:
-    pass
-
-duration = last_packet_time - start if (start and last_packet_time) else 0.001
-if duration <= 0:
-    duration = 0.001
-print(f"{bytes_received},{duration:.6f}")
+if __name__ == '__main__':
+    processes = []
+    pipes = []
+    for i in range(data_ports):
+        port = 9990 + i
+        cpu = target_cpus[i % len(target_cpus)]
+        parent_conn, child_conn = multiprocessing.Pipe()
+        p = multiprocessing.Process(target=recv_worker, args=(port, cpu, child_conn))
+        p.start()
+        processes.append(p)
+        pipes.append(parent_conn)
+        
+    total_bytes = 0
+    max_duration = 0.001
+    for i, p in enumerate(processes):
+        p.join()
+        bytes_rec, duration = pipes[i].recv()
+        total_bytes += bytes_rec
+        if duration > max_duration:
+            max_duration = duration
+            
+    print(f"{total_bytes},{max_duration:.6f}")
 PY
   UDP_RECV_PID=$!
   sleep 1
 
-  ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$PARALLEL" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
+  ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$PARALLEL" "$data_ports" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
 import socket
 import sys
-import time
-import concurrent.futures
+import multiprocessing
 
 parallel = int(sys.argv[1])
+data_ports = int(sys.argv[2])
 total_to_send = 128 * 1024 * 1024
 per_thread = total_to_send // parallel
 chunk_size = 1100
 data = b'X' * chunk_size
 
-def send_one(_):
+def send_worker(thread_idx):
+    import time
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    dest = ('10.0.0.1', 9999)
+    port = 9990 + (thread_idx % data_ports)
+    dest = ('10.0.0.1', port)
     sent = 0
+    packet_interval = 0.000080
     while sent < per_thread:
+        t0 = time.monotonic()
         sock.sendto(data, dest)
         sent += chunk_size
+        while time.monotonic() - t0 < packet_interval:
+            pass
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
-    list(ex.map(send_one, range(parallel)))
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-for _ in range(20):
-    sock.sendto(b'EOF', ('10.0.0.1', 9999))
+if __name__ == '__main__':
+    processes = []
+    for i in range(parallel):
+        p = multiprocessing.Process(target=send_worker, args=(i,))
+        p.start()
+        processes.append(p)
+        
+    for p in processes:
+        p.join()
+        
+    # Send EOF to all ports
+    for i in range(data_ports):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _ in range(20):
+            sock.sendto(b'EOF', ('10.0.0.1', 9990 + i))
 PY
 
   wait "$UDP_RECV_PID" || true

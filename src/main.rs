@@ -433,7 +433,7 @@ fn main() {
     let startup_args = parse_startup_args(&args);
 
     if startup_args.stats {
-        let runtime = build_tokio_runtime(1);
+        let runtime = build_tokio_runtime();
         if let Err(e) = runtime.block_on(run_cli_stats()) {
             eprintln!("Error query stats: {}", e);
             std::process::exit(1);
@@ -479,9 +479,7 @@ fn main() {
         },
         RuntimeMode::Server => None,
     };
-    let runtime_threads =
-        runtime_worker_threads(&config, runtime_mode, client_quic_data_port_count);
-    let runtime = build_tokio_runtime(runtime_threads);
+    let runtime = build_tokio_runtime();
     runtime.block_on(run_gateway(
         config,
         interface_name,
@@ -490,11 +488,29 @@ fn main() {
     ));
 }
 
+struct WorkerTask {
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl WorkerTask {
+    fn abort(&self) {
+        // No-op. Process exit terminates all background threads.
+    }
+}
+
+struct WorkerPanicGuard {
+    exit_notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for WorkerPanicGuard {
+    fn drop(&mut self) {
+        self.exit_notify.notify_one();
+    }
+}
+
 #[cfg(not(tarpaulin))]
-fn build_tokio_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads.max(1))
-        .thread_name("new-proxy-data")
+fn build_tokio_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to build Tokio runtime")
@@ -507,7 +523,7 @@ fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<Optio
         return Ok(None);
     }
 
-    let runtime = build_tokio_runtime(1);
+    let runtime = build_tokio_runtime();
     let preflight_count = runtime.block_on(async {
         let mut expected_count = None;
         for peer in &proxy_peers {
@@ -541,6 +557,7 @@ fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<Optio
     }
 }
 
+#[allow(dead_code)]
 fn runtime_worker_threads(
     config: &GatewayConfig,
     runtime_mode: RuntimeMode,
@@ -569,7 +586,9 @@ async fn run_gateway(
 
     let tun_queue_count = match runtime_mode {
         RuntimeMode::Server => effective_server_tun_queues(&config.quic_pool.listen_ports),
-        RuntimeMode::Client => effective_client_tun_queues(fixed_client_quic_data_port_count.unwrap_or(0)),
+        RuntimeMode::Client => {
+            effective_client_tun_queues(fixed_client_quic_data_port_count.unwrap_or(0))
+        }
     };
     let mut peer_telemetries = Vec::new();
     for _ in 0..tun_queue_count {
@@ -602,6 +621,7 @@ async fn run_gateway(
     let client_quic_data_port_baseline: ClientQuicDataPortBaseline =
         Arc::new(parking_lot::Mutex::new(0));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let exit_notify = Arc::new(tokio::sync::Notify::new());
     let l3_registry = match UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
         Ok(registry) => registry,
         Err(e) => {
@@ -697,11 +717,25 @@ async fn run_gateway(
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
             worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
             let l4_data_plane_for_worker = l4_data_plane.clone();
-            let task = tokio::spawn(async move {
-                if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
-                    log::error!("Server RtcWorker loop failed: {}", e);
-                }
-            });
+            let exit_notify_clone = exit_notify.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("new-proxy-server-worker-{}", worker_id))
+                .spawn(move || {
+                    let _panic_guard = WorkerPanicGuard {
+                        exit_notify: exit_notify_clone,
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build server worker local Tokio runtime");
+                    rt.block_on(async {
+                        if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
+                            log::error!("Server RtcWorker loop failed: {}", e);
+                        }
+                    });
+                })
+                .expect("Failed to spawn Server RtcWorker thread");
+            let task = WorkerTask { _thread: thread };
             l3_tasks.push(task);
         }
 
@@ -778,7 +812,12 @@ async fn run_gateway(
             std::process::exit(1);
         }
 
-        wait_for_shutdown().await;
+        tokio::select! {
+            _ = wait_for_shutdown() => {},
+            _ = exit_notify.notified() => {
+                log::error!("A server worker thread exited prematurely; shutting down.");
+            }
+        }
         control_task.abort();
         for task in l3_tasks {
             task.abort();
@@ -943,12 +982,25 @@ async fn run_gateway(
             worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
 
             let l4_data_plane_for_worker = l4_data_plane.clone();
-
-            let handle = tokio::spawn(async move {
-                if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
-                    log::error!("RtcWorker loop failed: {}", e);
-                }
-            });
+            let exit_notify_clone = exit_notify.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("new-proxy-client-worker-{}", worker_id))
+                .spawn(move || {
+                    let _panic_guard = WorkerPanicGuard {
+                        exit_notify: exit_notify_clone,
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build client worker local Tokio runtime");
+                    rt.block_on(async {
+                        if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
+                            log::error!("RtcWorker loop failed: {}", e);
+                        }
+                    });
+                })
+                .expect("Failed to spawn Client RtcWorker thread");
+            let handle = WorkerTask { _thread: thread };
             worker_tasks.push(handle);
         }
 
@@ -957,7 +1009,12 @@ async fn run_gateway(
         log::info!("  All L3 and L4 traffic processed in userspace.       ");
         log::info!("------------------------------------------------------");
 
-        wait_for_shutdown().await;
+        tokio::select! {
+            _ = wait_for_shutdown() => {},
+            _ = exit_notify.notified() => {
+                log::error!("A client worker thread exited prematurely; shutting down.");
+            }
+        }
         for t in worker_tasks {
             t.abort();
         }
@@ -1075,8 +1132,7 @@ mod tests {
             .unwrap();
 
         assert!(!main_source.contains("#[tokio::main]"));
-        assert!(main_source.contains("tokio::runtime::Builder::new_multi_thread()"));
-        assert!(main_source.contains("worker_threads(worker_threads.max(1))"));
+        assert!(main_source.contains("tokio::runtime::Builder::new_current_thread()"));
     }
 
     #[test]
