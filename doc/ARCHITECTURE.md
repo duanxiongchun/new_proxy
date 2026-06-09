@@ -186,6 +186,8 @@ fallback 入站路径相反：服务端 TUN 中的目标回包由服务端 users
 
 写回 TUN、发送外层 UDP 和 QUIC stream 读写均按非阻塞方式推进；当出口暂不可写时，包所有权进入所属 worker 的 pending 队列，并由 TUN/UDP writable 事件唤醒后继续 flush。QUIC bridge 的 `Opening` future、active QUIC stream 读写、smoltcp socket 读写、TUN/UDP I/O 和 timer 都由同一个 worker loop 分片推进，不能读写时立即回到事件循环。QUIC future/stream manual poll 使用 worker-local `Notify` waker；当 Quinn readiness 触发 waker 时会唤醒该 worker，而不是只能等待下一次 timer tick。只有内部 pending 字节数达到上限时才会丢弃或关闭连接，以保护 worker 内存不会无界增长。
 
+为降低数据面在高吞吐、高并发下的系统调度开销，双向流转发热路径（`relay_copy_with_idle`）采用了**零分配的定时器原地复位机制**。该机制在每个转发方向的生命周期内，只在栈上分配并固定（Pin）一个 `tokio::time::sleep(RELAY_IDLE_TIMEOUT)` 定时器实例，每次成功读写后调用 `.reset()` 修改截止时间，实现热路径上的零内存堆分配。同时，去除了应用层的写超时 `RELAY_WRITE_TIMEOUT` 封装，改由底层的 TCP Keepalive 和 QUIC 协议层超时实现死连接自动清理，避免了高负载下频繁的时间轮竞争。
+
 ## 7. 路由配置
 
 虽然绕过了 `iptables`/`TPROXY` 规则的下发，但 `new_proxy` 依然在客户端启动时做如下路由配置（`Table != off`）：
