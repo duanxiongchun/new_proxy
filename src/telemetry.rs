@@ -1,9 +1,26 @@
 use crate::quic_pool::QuicConnSnapshot;
-use crate::relay::PeerL4Stats;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
+pub struct PeerL4Stats {
+    pub tx_bytes: Arc<AtomicU64>,
+    pub rx_bytes: Arc<AtomicU64>,
+    pub active_streams: AtomicU64,
+}
+
+impl Default for PeerL4Stats {
+    fn default() -> Self {
+        Self {
+            tx_bytes: Arc::new(AtomicU64::new(0)),
+            rx_bytes: Arc::new(AtomicU64::new(0)),
+            active_streams: AtomicU64::new(0),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UnifiedTelemetry {
@@ -140,6 +157,32 @@ impl TelemetryRegistry {
 impl Default for TelemetryRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct VirtualTunnelTelemetrySnapshot {
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub control_packets: u64,
+    pub recv_errors: u64,
+}
+
+#[derive(Default)]
+pub struct VirtualTunnelTelemetry {
+    pub rx_packets: AtomicU64,
+    pub rx_bytes: AtomicU64,
+    pub control_packets: AtomicU64,
+    pub recv_errors: AtomicU64,
+}
+
+impl VirtualTunnelTelemetry {
+    pub fn snapshot(&self) -> VirtualTunnelTelemetrySnapshot {
+        VirtualTunnelTelemetrySnapshot {
+            rx_packets: self.rx_packets.load(Ordering::Relaxed),
+            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            control_packets: self.control_packets.load(Ordering::Relaxed),
+            recv_errors: self.recv_errors.load(Ordering::Relaxed),
+        }
     }
 }
 

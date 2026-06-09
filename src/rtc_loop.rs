@@ -1,18 +1,12 @@
-use crate::quic_pool::{QuicConnStats, QuicPoolClient, PeerConnRegistry, QuicConnRecord};
-use crate::buffer_pool::{BufferPool, PooledBuf};
+use crate::quic_pool::PeerConnRegistry;
+use crate::buffer_pool::BufferPool;
 use crate::tun_io::AsyncTunIo;
-use crate::routing::AllowedIPsRouter;
-use quinn::Connection;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::collections::HashMap;
 use tokio::sync::Notify;
 use std::net::IpAddr;
-use parking_lot::{Mutex, RwLock};
+use quinn::Connection;
 
 pub struct RtcWorkerConfig {
-    pub local_ipv4: Option<IpAddr>,
-    pub local_ipv6: Option<IpAddr>,
     pub mtu: usize,
     pub buffer_pool: BufferPool,
 }
@@ -238,10 +232,14 @@ async fn read_any_datagram(conns: &[Connection]) -> Option<bytes::Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic_pool::QuicConnStats;
+    use crate::quic_pool::{QuicConnStats, QuicPoolClient};
+    use crate::routing::AllowedIPsRouter;
     use std::net::SocketAddr;
     use std::os::unix::io::IntoRawFd;
     use std::time::Duration;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    use parking_lot::{Mutex, RwLock};
     use arc_swap::ArcSwap;
 
     static PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(46000);
@@ -322,8 +320,6 @@ mod tests {
             0,
             WorkerRole::Client,
             RtcWorkerConfig {
-                local_ipv4: Some("10.0.0.2".parse().unwrap()),
-                local_ipv6: None,
                 mtu: 1400,
                 buffer_pool,
             },

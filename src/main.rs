@@ -4,30 +4,22 @@ mod buffer_pool;
 mod client_proxy;
 mod config;
 mod control;
-mod proxy_proto;
 mod quic_pool;
-mod relay;
 mod routing;
 pub mod rtc_loop;
+pub mod mss_clamping;
 mod runtime;
-mod mss_clamping;
-mod server_proxy;
 mod socket_mark;
 mod stats_cli;
-mod tcp_util;
 mod telemetry;
 pub mod tun_device;
 pub mod tun_io;
 mod uds_server;
-pub mod userspace_tcp;
-pub mod userspace_wg;
-pub mod virtual_tunnel;
 mod wireguard;
 
 use arc_swap::ArcSwap;
 use client_proxy::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -43,8 +35,6 @@ use quic_pool::{
 };
 use routing::AllowedIPsRouter;
 use runtime::{cleanup_runtime, run_script, setup_routes};
-#[cfg(not(tarpaulin))]
-use server_proxy::build_stream_handler;
 use stats_cli::run_cli_stats;
 use telemetry::TelemetryRegistry;
 
@@ -136,9 +126,7 @@ fn should_enable_userspace_tcp_for_pool_states(
             .all(|state| matches!(state, PoolState::Active))
 }
 
-fn worker_owns_l3_udp_rx_and_timer(worker_id: usize) -> bool {
-    worker_id == 0
-}
+
 
 #[cfg(not(tarpaulin))]
 fn start_userspace_tcp_failover_manager(
@@ -417,38 +405,7 @@ fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
         .collect()
 }
 
-fn smoltcp_ip_cidrs(config: &GatewayConfig) -> Result<Vec<smoltcp::wire::IpCidr>, String> {
-    config
-        .interface
-        .addresses
-        .iter()
-        .map(|addr| {
-            addr.to_string()
-                .parse::<smoltcp::wire::IpCidr>()
-                .map_err(|e| format!("Invalid smoltcp interface address {}: {:?}", addr, e))
-        })
-        .collect()
-}
 
-fn local_stack_ips(config: &GatewayConfig) -> (Option<IpAddr>, Option<IpAddr>) {
-    let local_ipv4 = config
-        .interface
-        .addresses
-        .iter()
-        .find_map(|addr| match addr {
-            ipnet::IpNet::V4(net) => Some(IpAddr::V4(net.addr())),
-            _ => None,
-        });
-    let local_ipv6 = config
-        .interface
-        .addresses
-        .iter()
-        .find_map(|addr| match addr {
-            ipnet::IpNet::V6(net) => Some(IpAddr::V6(net.addr())),
-            _ => None,
-        });
-    (local_ipv4, local_ipv6)
-}
 
 #[cfg(all(unix, not(tarpaulin)))]
 async fn wait_for_shutdown() {
@@ -473,55 +430,9 @@ async fn wait_for_shutdown() {
     log::info!("Received CTRL+C, shutting down...");
 }
 
-const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
 
-fn needs_ipv6_l3_socket(config: &GatewayConfig) -> bool {
-    config
-        .peers
-        .iter()
-        .any(|peer| peer.endpoint.map(|addr| addr.is_ipv6()).unwrap_or(false))
-        || config
-            .interface
-            .addresses
-            .iter()
-            .any(|addr| matches!(addr, ipnet::IpNet::V6(_)))
-}
 
-#[cfg(not(tarpaulin))]
-fn bind_l3_udp_socket(port: u16, require_ipv6: bool) -> Result<std::net::UdpSocket, String> {
-    if require_ipv6 {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV6,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .map_err(|e| format!("failed to create IPv6 UDP socket: {}", e))?;
-        socket
-            .set_only_v6(false)
-            .map_err(|e| format!("failed to enable dual-stack UDP socket: {}", e))?;
-        socket
-            .bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())
-            .map_err(|e| {
-                format!(
-                    "failed to bind dual-stack UDP socket on port {}: {}",
-                    port, e
-                )
-            })?;
-        socket_mark::set_socket2_outer_mark(&socket)?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;
-        Ok(socket.into())
-    } else {
-        let socket = std::net::UdpSocket::bind(("0.0.0.0", port))
-            .map_err(|e| format!("failed to bind IPv4 UDP socket on port {}: {}", port, e))?;
-        socket_mark::set_outer_mark(&socket)?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;
-        Ok(socket)
-    }
-}
+
 
 #[cfg(not(tarpaulin))]
 fn main() {
@@ -668,7 +579,7 @@ async fn run_gateway(
     // 共享遥测注册中心与运行时共享状态初始化
     let telemetry_registry = Arc::new(TelemetryRegistry::new());
     let worker_telemetry_registry = Arc::new(telemetry::WorkerTelemetryRegistry::new());
-    let virtual_tunnel_telemetry = Arc::new(virtual_tunnel::VirtualTunnelTelemetry::default());
+    let virtual_tunnel_telemetry = Arc::new(telemetry::VirtualTunnelTelemetry::default());
 
     let gateway_state = Arc::new(parking_lot::RwLock::new(build_initial_gateway_state(
         config.clone(),
@@ -695,7 +606,7 @@ async fn run_gateway(
         Arc::new(parking_lot::Mutex::new(0));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
     let l3_registry =
-        match userspace_wg::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
+        match wireguard::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
             Ok(registry) => registry,
             Err(e) => {
                 eprintln!("Failed to initialize userspace WireGuard registry: {}", e);
@@ -733,7 +644,7 @@ async fn run_gateway(
         log::info!("         STARTING GATEWAY IN [ SERVER MODE ]         ");
         log::info!("------------------------------------------------------");
 
-        let listen_port = match config.interface.listen_port {
+        let _listen_port = match config.interface.listen_port {
             Some(port) => port,
             None => {
                 log::error!("Server userspace WireGuard L3 requires Interface.ListenPort");
@@ -763,20 +674,6 @@ async fn run_gateway(
             std::process::exit(1);
         }
 
-        let server_udp = match bind_l3_udp_socket(listen_port, needs_ipv6_l3_socket(&config)) {
-            Ok(socket) => socket,
-            Err(e) => {
-                log::error!(
-                    "Failed to bind userspace WireGuard UDP port {}: {}",
-                    listen_port,
-                    e
-                );
-                cleanup_runtime(&config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-        let server_udp_raw = Arc::new(tokio::net::UdpSocket::from_std(server_udp).unwrap());
-        let server_udp = crate::virtual_tunnel::TunnelSocket::Single(server_udp_raw);
         let mut l3_tasks = Vec::new();
         for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -797,8 +694,6 @@ async fn run_gateway(
                     listen_ports: config.quic_pool.listen_ports.clone(),
                 },
                 rtc_loop::RtcWorkerConfig {
-                    local_ipv4: None,
-                    local_ipv6: None,
                     mtu: config.interface.mtu as usize,
                     buffer_pool: worker_buffer_pool,
                 },
@@ -868,8 +763,15 @@ async fn run_gateway(
             auth_nonce_cache.clone(),
         );
         let shared_reg_for_server = shared_quic_registry.clone();
-        let stream_handler_limit = Arc::new(tokio::sync::Semaphore::new(MAX_QUIC_STREAM_HANDLERS));
-        let handler = build_stream_handler(telemetry_registry.clone(), stream_handler_limit);
+        let handler = Arc::new(
+            move |_client_pub: [u8; 32],
+                  _send_mux: quinn::SendStream,
+                  _recv_mux: quinn::RecvStream,
+                  _conn_stat: Arc<quic_pool::QuicConnStats>|
+                  -> quic_pool::ServerFuture {
+                Box::pin(async move {})
+            },
+        );
 
         if let Err(e) = quic_server
             .run_with_registry(quic_certs, quic_key, handler, shared_reg_for_server)
@@ -1021,34 +923,6 @@ async fn run_gateway(
             std::process::exit(1);
         }
 
-        let smoltcp_ip_cidrs = match smoltcp_ip_cidrs(&config) {
-            Ok(addrs) => addrs,
-            Err(e) => {
-                log::error!("{}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-        let (local_ipv4, local_ipv6) = local_stack_ips(&config);
-
-        let client_udp = {
-            let socket = match bind_l3_udp_socket(0, needs_ipv6_l3_socket(&config)) {
-                Ok(socket) => socket,
-                Err(e) => {
-                    log::error!(
-                        "Failed to bind client userspace WireGuard UDP socket: {}",
-                        e
-                    );
-                    let cleanup_config = gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &interface_name);
-                    std::process::exit(1);
-                }
-            };
-            crate::virtual_tunnel::TunnelSocket::Single(Arc::new(
-                tokio::net::UdpSocket::from_std(socket).unwrap(),
-            ))
-        };
         let mut worker_tasks = Vec::new();
         for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -1061,25 +935,12 @@ async fn run_gateway(
 
             let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
             let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
-            let tcp_stack = match userspace_tcp::UserspaceTcpStack::new(
-                smoltcp_ip_cidrs.clone(),
-                config.interface.mtu as usize,
-                worker_buffer_pool.clone(),
-            ) {
-                Ok(stack) => stack,
-                Err(e) => {
-                    log::error!("Failed to initialize userspace TCP stack: {}", e);
-                    std::process::exit(1);
-                }
-            };
 
             let mut worker = rtc_loop::RtcWorker::new(
                 tun_io,
                 worker_id,
                 rtc_loop::WorkerRole::Client,
                 rtc_loop::RtcWorkerConfig {
-                    local_ipv4,
-                    local_ipv6,
                     mtu: config.interface.mtu as usize,
                     buffer_pool: worker_buffer_pool,
                 },
@@ -1224,36 +1085,7 @@ mod tests {
         assert!(main_source.contains("worker_threads(worker_threads.max(1))"));
     }
 
-    #[test]
-    fn l3_udp_receive_and_timer_are_owned_by_worker_zero() {
-        assert!(worker_owns_l3_udp_rx_and_timer(0));
-        assert!(!worker_owns_l3_udp_rx_and_timer(1));
-        assert!(!worker_owns_l3_udp_rx_and_timer(8));
-    }
 
-    #[test]
-    fn server_quic_data_plane_uses_fixed_listeners_and_event_driven_streams() {
-        let quic_pool = include_str!("quic_pool.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
-        let server_proxy = include_str!("server_proxy.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
-        let relay = include_str!("relay.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
-
-        assert_eq!(
-            quic_pool.matches("tokio::spawn").count(),
-            2,
-            "quic_pool should only spawn the client health checker and fixed listener tasks"
-        );
-        assert!(!server_proxy.contains("tokio::spawn"));
-        assert!(!relay.contains("tokio::spawn"));
-    }
 
     #[test]
     fn startup_failed_pool_data_port_count_drives_client_tun_worker_count() {
@@ -1409,27 +1241,5 @@ mod tests {
         assert_eq!(proxy_peers(&config)[0].public_key, l4_peer.public_key);
     }
 
-    #[test]
-    fn smoltcp_ip_cidrs_and_local_stack_ips_follow_interface_addresses() {
-        let config = config_with_peers(Vec::new());
 
-        let cidrs = smoltcp_ip_cidrs(&config).unwrap();
-        let (local_ipv4, local_ipv6) = local_stack_ips(&config);
-
-        assert_eq!(cidrs.len(), 2);
-        assert_eq!(local_ipv4, Some("10.0.0.2".parse().unwrap()));
-        assert_eq!(local_ipv6, Some("fd00::2".parse().unwrap()));
-    }
-
-    #[test]
-    fn needs_ipv6_l3_socket_when_interface_or_peer_uses_ipv6() {
-        let mut config = config_with_peers(Vec::new());
-        assert!(needs_ipv6_l3_socket(&config));
-
-        config.interface.addresses = vec!["10.0.0.2/24".parse().unwrap()];
-        assert!(!needs_ipv6_l3_socket(&config));
-
-        config.peers = vec![peer([2u8; 32], Some("[::1]:51820"), Some(4433))];
-        assert!(needs_ipv6_l3_socket(&config));
-    }
 }
