@@ -1063,9 +1063,9 @@ pub type PeerConnRegistry = Arc<Mutex<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
 
 #[derive(Clone)]
 pub struct QuicConnRecord {
-    id: u64,
+    pub id: u64,
     pub stats: QuicConnStats,
-    conn: Connection,
+    pub conn: Connection,
 }
 
 impl QuicConnRecord {

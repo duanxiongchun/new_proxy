@@ -787,14 +787,30 @@ async fn run_gateway(
                     std::process::exit(1);
                 }
             });
-            let task = tokio::spawn(userspace_wg::run_userspace_wg_loop(
+            let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
+            let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
+            let mut worker = rtc_loop::RtcWorker::new(
                 tun_io,
-                server_udp.clone(),
-                l3_registry.clone(),
-                config.interface.mtu,
-                worker_owns_l3_udp_rx_and_timer(worker_id),
-                worker_owns_l3_udp_rx_and_timer(worker_id),
-            ));
+                worker_id,
+                rtc_loop::WorkerRole::Server {
+                    peer_conn_registry: shared_quic_registry.clone(),
+                    listen_ports: config.quic_pool.listen_ports.clone(),
+                },
+                rtc_loop::RtcWorkerConfig {
+                    local_ipv4: None,
+                    local_ipv6: None,
+                    mtu: config.interface.mtu as usize,
+                    buffer_pool: worker_buffer_pool,
+                },
+            );
+            worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
+            worker.set_peer_telemetry(telemetry_registry.clone());
+            let l4_data_plane_for_worker = l4_data_plane.clone();
+            let task = tokio::spawn(async move {
+                if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
+                    log::error!("Server RtcWorker loop failed: {}", e);
+                }
+            });
             l3_tasks.push(task);
         }
 
@@ -1059,9 +1075,8 @@ async fn run_gateway(
 
             let mut worker = rtc_loop::RtcWorker::new(
                 tun_io,
-                client_udp.clone(),
-                l3_registry.clone(),
-                tcp_stack,
+                worker_id,
+                rtc_loop::WorkerRole::Client,
                 rtc_loop::RtcWorkerConfig {
                     local_ipv4,
                     local_ipv6,
@@ -1071,8 +1086,6 @@ async fn run_gateway(
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
             worker.set_peer_telemetry(telemetry_registry.clone());
-            worker.set_l3_rx_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
-            worker.set_l3_timer_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
 
             let l4_data_plane_for_worker = l4_data_plane.clone();
 
