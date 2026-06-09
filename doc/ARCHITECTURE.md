@@ -151,7 +151,7 @@ Multiqueue 与 worker 模型：
 
 TCP 出站包从客户端 TUN 进入 `RtcWorker` 后按以下条件进入 L4 offload：
 
-- 目标 IP 在 `GatewayState.router` 中命中 proxy peer 的 `AllowedIPs`。
+- 目标 IP 在 worker 当前加载的 `L4DataPlaneSnapshot.router` 中命中 proxy peer 的 `AllowedIPs`。
 - `userspace_tcp_offload_enabled` 为 true。
 - 对应 peer 的 `QuicPoolClient` 存在且状态为 `Active`。
 - 报文是可解析的 IPv4 TCP，或没有 extension header 的 IPv6 TCP。带 IPv6 extension headers 的 TCP 报文直接走 L3 fallback。
@@ -211,7 +211,7 @@ UDS 路径：`/run/new_proxy/<interface>.sock`
 
 - **客户端 L3/L4 均在用户态**，消除任何系统 WireGuard 内核模块及 `iptables` / TPROXY 依赖。
 - **服务端 L3 也在用户态**，不再依赖内核 WireGuard 模块；QUIC 接收池仍直接绑定宿主机 UDP 端口。
-- 动态 peer 管理（`AddPeer` / `RemovePeer`）会更新运行时配置、AllowedIPs L4 router、userspace WireGuard peer registry、路由表和客户端 QUIC pool；已经存在的 `RtcWorker` 不会被热扩容，已有 TCP flow 的 bridge 状态也不会迁移到其他 worker。
+- 动态 peer 管理（`AddPeer` / `RemovePeer`）会更新运行时配置、AllowedIPs L4 router、userspace WireGuard peer registry、路由表和客户端 QUIC pool，并通过 `L4DataPlaneSnapshot` 发布新的 L4 热路径快照；已经存在的 `RtcWorker` 不会被热扩容，已有 TCP flow 的 bridge 状态也不会迁移到其他 worker。
 - userspace WireGuard registry 按 peer 维护共享的 `boringtun` 状态，并通过 AllowedIPs 路由选择出站 peer；入站数据优先使用 receiver index 与 endpoint 索引定位 peer，未知握手包才退回逐 peer 尝试。
 - 为避免未知来源 WireGuard 握手包在多 peer 场景下触发无界 O(N) 扫描，未知 endpoint 的握手/控制类入站包会经过轻量 per-IP token bucket 限速；已建立 receiver index 或已知 endpoint 的数据包不走该限速路径。成功解开的 unknown handshake 不消耗 token，无法解开的 unknown 包才消耗 token；可通过 `NEW_PROXY_UNKNOWN_HANDSHAKE_BURST` 和 `NEW_PROXY_UNKNOWN_HANDSHAKE_REFILL_PER_SEC` 调整阈值，drop 计数会暴露在 UDS telemetry 中。
 - 当前 client/server 启动路径不创建 transparent listener，也不下发 TPROXY iptables 规则。

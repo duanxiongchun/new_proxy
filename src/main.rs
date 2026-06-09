@@ -23,10 +23,10 @@ pub mod userspace_wg;
 pub mod virtual_tunnel;
 mod wireguard;
 
+use arc_swap::ArcSwap;
 use client_proxy::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -48,6 +48,8 @@ use stats_cli::run_cli_stats;
 use telemetry::TelemetryRegistry;
 
 type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
+type L4DataPlane = Arc<ArcSwap<L4DataPlaneSnapshot>>;
+type ClientQuicDataPortBaseline = Arc<parking_lot::Mutex<usize>>;
 
 // 动态网关共享运行时状态 (支持 AllowedIPs 路由基数树热重载)
 pub struct GatewayState {
@@ -56,7 +58,41 @@ pub struct GatewayState {
     pub userspace_tcp_offload_enabled: bool,
 }
 
+pub struct L4DataPlaneSnapshot {
+    pub router: AllowedIPsRouter<[u8; 32]>,
+    pub userspace_tcp_offload_enabled: bool,
+    pub client_quic_pools: HashMap<[u8; 32], Arc<QuicPoolClient>>,
+}
+
 const USERSPACE_TCP_FAILOVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn build_l4_data_plane_snapshot(
+    state: &GatewayState,
+    pools: &HashMap<[u8; 32], Arc<QuicPoolClient>>,
+) -> L4DataPlaneSnapshot {
+    L4DataPlaneSnapshot {
+        router: state.router.clone(),
+        userspace_tcp_offload_enabled: state.userspace_tcp_offload_enabled,
+        client_quic_pools: pools.clone(),
+    }
+}
+
+fn current_l4_data_plane_snapshot(
+    state: &Arc<parking_lot::RwLock<GatewayState>>,
+    pools: &PeerQuicPools,
+) -> L4DataPlaneSnapshot {
+    let state = state.read();
+    let pools = pools.read();
+    build_l4_data_plane_snapshot(&state, &pools)
+}
+
+pub fn publish_l4_data_plane_snapshot(
+    data_plane: &L4DataPlane,
+    state: &Arc<parking_lot::RwLock<GatewayState>>,
+    pools: &PeerQuicPools,
+) {
+    data_plane.store(Arc::new(current_l4_data_plane_snapshot(state, pools)));
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct StartupArgs {
@@ -107,25 +143,23 @@ fn worker_owns_l3_udp_rx_and_timer(worker_id: usize) -> bool {
 fn start_userspace_tcp_failover_manager(
     state: Arc<parking_lot::RwLock<GatewayState>>,
     pools: PeerQuicPools,
+    data_plane: L4DataPlane,
     client_private_key: [u8; 32],
-    client_quic_data_port_baseline: Arc<AtomicUsize>,
+    client_quic_data_port_baseline: ClientQuicDataPortBaseline,
     peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(USERSPACE_TCP_FAILOVER_POLL_INTERVAL).await;
 
-            let (current_enabled, proxy_peers) = {
+            let proxy_peers = {
                 let st = state.read();
-                (
-                    st.userspace_tcp_offload_enabled,
-                    st.config
-                        .peers
-                        .iter()
-                        .filter(|peer| peer_has_l4_proxy(peer))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
+                st.config
+                    .peers
+                    .iter()
+                    .filter(|peer| peer_has_l4_proxy(peer))
+                    .cloned()
+                    .collect::<Vec<_>>()
             };
             if proxy_peers.is_empty() {
                 continue;
@@ -161,7 +195,7 @@ fn start_userspace_tcp_failover_manager(
                         }
                         if let Err(e) = validate_client_quic_data_port_count_matches_baseline(
                             endpoint_count,
-                            client_quic_data_port_baseline.load(Ordering::Relaxed),
+                            *client_quic_data_port_baseline.lock(),
                         ) {
                             pool.shutdown(b"QUIC data port count does not match baseline");
                             log::warn!(
@@ -190,6 +224,8 @@ fn start_userspace_tcp_failover_manager(
                                     &client_quic_data_port_baseline,
                                     endpoint_count,
                                 );
+                                drop(pools_guard);
+                                publish_l4_data_plane_snapshot(&data_plane, &state, &pools);
                                 log::info!(
                                     "Recovered missing QUIC pool for peer {}",
                                     encode_base64_32(&peer.public_key)
@@ -210,6 +246,21 @@ fn start_userspace_tcp_failover_manager(
                 }
             }
 
+            let _mutation_guard = peer_mutation_lock.lock().await;
+            let (current_enabled, proxy_peer_count) = {
+                let st = state.read();
+                (
+                    st.userspace_tcp_offload_enabled,
+                    st.config
+                        .peers
+                        .iter()
+                        .filter(|peer| peer_has_l4_proxy(peer))
+                        .count(),
+                )
+            };
+            if proxy_peer_count == 0 {
+                continue;
+            }
             let pool_states = {
                 let pools = pools.read();
                 pools
@@ -218,12 +269,13 @@ fn start_userspace_tcp_failover_manager(
                     .collect::<Vec<_>>()
             };
             let desired_enabled =
-                should_enable_userspace_tcp_for_pool_states(proxy_peers.len(), &pool_states);
+                should_enable_userspace_tcp_for_pool_states(proxy_peer_count, &pool_states);
             if desired_enabled == current_enabled {
                 continue;
             }
 
             state.write().userspace_tcp_offload_enabled = desired_enabled;
+            publish_l4_data_plane_snapshot(&data_plane, &state, &pools);
             if desired_enabled {
                 log::info!("QUIC pools recovered after cooldown; userspace offload active");
             } else {
@@ -311,25 +363,23 @@ fn validate_client_quic_data_port_count_matches_baseline(
 }
 
 pub fn record_client_quic_data_port_baseline_if_unset(
-    client_quic_data_port_baseline: &AtomicUsize,
+    client_quic_data_port_baseline: &parking_lot::Mutex<usize>,
     candidate_count: usize,
 ) {
     if candidate_count > 0 {
-        let _ = client_quic_data_port_baseline.compare_exchange(
-            0,
-            candidate_count,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let mut baseline = client_quic_data_port_baseline.lock();
+        if *baseline == 0 {
+            *baseline = candidate_count;
+        }
     }
 }
 
 fn record_initial_client_quic_data_port_baseline(
-    client_quic_data_port_baseline: &AtomicUsize,
+    client_quic_data_port_baseline: &parking_lot::Mutex<usize>,
     quic_data_port_count: Option<usize>,
 ) {
     if let Some(count) = quic_data_port_count.filter(|count| *count > 0) {
-        client_quic_data_port_baseline.store(count, Ordering::Relaxed);
+        *client_quic_data_port_baseline.lock() = count;
     }
 }
 
@@ -637,7 +687,11 @@ async fn run_gateway(
     let shared_quic_registry: quic_pool::PeerConnRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     let client_quic_pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-    let client_quic_data_port_baseline = Arc::new(AtomicUsize::new(0));
+    let l4_data_plane: L4DataPlane = Arc::new(ArcSwap::from_pointee(
+        current_l4_data_plane_snapshot(&gateway_state, &client_quic_pools),
+    ));
+    let client_quic_data_port_baseline: ClientQuicDataPortBaseline =
+        Arc::new(parking_lot::Mutex::new(0));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
     let l3_registry =
         match userspace_wg::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
@@ -662,6 +716,7 @@ async fn run_gateway(
                 session_cache: session_cache.clone(),
                 auth_nonce_cache: auth_nonce_cache.clone(),
                 client_quic_pools: client_quic_pools.clone(),
+                l4_data_plane: l4_data_plane.clone(),
                 client_private_key: config.interface.private_key,
                 runtime_mode,
                 peer_mutation_lock: peer_mutation_lock.clone(),
@@ -893,6 +948,7 @@ async fn run_gateway(
                 initial_pool_failures
             );
         }
+        publish_l4_data_plane_snapshot(&l4_data_plane, &gateway_state, &client_quic_pools);
         let quic_data_port_count =
             client_quic_data_port_count(&client_quic_pools, startup_quic_data_port_count);
         let tun_queue_count = effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
@@ -915,6 +971,7 @@ async fn run_gateway(
         let userspace_tcp_failover_task = start_userspace_tcp_failover_manager(
             gateway_state.clone(),
             client_quic_pools.clone(),
+            l4_data_plane.clone(),
             config.interface.private_key,
             client_quic_data_port_baseline.clone(),
             peer_mutation_lock.clone(),
@@ -1016,14 +1073,10 @@ async fn run_gateway(
             worker.set_l3_rx_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
             worker.set_l3_timer_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
 
-            let gateway_state_for_worker = gateway_state.clone();
-            let client_quic_pools_for_worker = client_quic_pools.clone();
+            let l4_data_plane_for_worker = l4_data_plane.clone();
 
             let handle = tokio::spawn(async move {
-                if let Err(e) = worker
-                    .run_loop(gateway_state_for_worker, client_quic_pools_for_worker)
-                    .await
-                {
+                if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
                     log::error!("RtcWorker loop failed: {}", e);
                 }
             });
@@ -1246,21 +1299,21 @@ mod tests {
 
     #[test]
     fn first_dynamic_peer_records_client_quic_data_port_baseline() {
-        let baseline = AtomicUsize::new(0);
+        let baseline = parking_lot::Mutex::new(0);
         record_client_quic_data_port_baseline_if_unset(&baseline, 2);
-        assert_eq!(baseline.load(Ordering::Relaxed), 2);
+        assert_eq!(*baseline.lock(), 2);
         record_client_quic_data_port_baseline_if_unset(&baseline, 4);
-        assert_eq!(baseline.load(Ordering::Relaxed), 2);
+        assert_eq!(*baseline.lock(), 2);
     }
 
     #[test]
     fn missing_startup_peer_does_not_lock_client_quic_data_port_baseline() {
-        let baseline = AtomicUsize::new(0);
+        let baseline = parking_lot::Mutex::new(0);
         record_initial_client_quic_data_port_baseline(&baseline, None);
-        assert_eq!(baseline.load(Ordering::Relaxed), 0);
+        assert_eq!(*baseline.lock(), 0);
 
         record_initial_client_quic_data_port_baseline(&baseline, Some(2));
-        assert_eq!(baseline.load(Ordering::Relaxed), 2);
+        assert_eq!(*baseline.lock(), 2);
     }
 
     #[test]

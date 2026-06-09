@@ -3,7 +3,6 @@ use crate::relay::PeerL4Stats;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -38,31 +37,32 @@ pub struct WorkerTelemetrySnapshot {
     pub current_tcp_flows: u64,
 }
 
-#[derive(Default)]
 pub struct WorkerTelemetry {
-    pub tun_rx_packets: AtomicU64,
-    pub tun_rx_bytes: AtomicU64,
-    pub tcp_offload_packets: AtomicU64,
-    pub tcp_offload_bytes: AtomicU64,
-    pub l3_packets: AtomicU64,
-    pub l3_bytes: AtomicU64,
-    pub new_tcp_flows: AtomicU64,
-    pub current_tcp_flows: AtomicU64,
+    worker_id: usize,
+    snapshot: Mutex<WorkerTelemetrySnapshot>,
 }
 
 impl WorkerTelemetry {
-    pub fn snapshot(&self, worker_id: usize) -> WorkerTelemetrySnapshot {
-        WorkerTelemetrySnapshot {
+    fn new(worker_id: usize) -> Self {
+        Self {
             worker_id,
-            tun_rx_packets: self.tun_rx_packets.load(Ordering::Relaxed),
-            tun_rx_bytes: self.tun_rx_bytes.load(Ordering::Relaxed),
-            tcp_offload_packets: self.tcp_offload_packets.load(Ordering::Relaxed),
-            tcp_offload_bytes: self.tcp_offload_bytes.load(Ordering::Relaxed),
-            l3_packets: self.l3_packets.load(Ordering::Relaxed),
-            l3_bytes: self.l3_bytes.load(Ordering::Relaxed),
-            new_tcp_flows: self.new_tcp_flows.load(Ordering::Relaxed),
-            current_tcp_flows: self.current_tcp_flows.load(Ordering::Relaxed),
+            snapshot: Mutex::new(WorkerTelemetrySnapshot {
+                worker_id,
+                ..WorkerTelemetrySnapshot::default()
+            }),
         }
+    }
+
+    pub fn worker_id(&self) -> usize {
+        self.worker_id
+    }
+
+    pub fn publish(&self, snapshot: &WorkerTelemetrySnapshot) {
+        *self.snapshot.lock() = snapshot.clone();
+    }
+
+    pub fn snapshot(&self) -> WorkerTelemetrySnapshot {
+        self.snapshot.lock().clone()
     }
 }
 
@@ -80,7 +80,7 @@ impl WorkerTelemetryRegistry {
         let mut workers = self.workers.lock();
         workers
             .entry(worker_id)
-            .or_insert_with(|| Arc::new(WorkerTelemetry::default()))
+            .or_insert_with(|| Arc::new(WorkerTelemetry::new(worker_id)))
             .clone()
     }
 
@@ -88,8 +88,8 @@ impl WorkerTelemetryRegistry {
         let mut snapshot = self
             .workers
             .lock()
-            .iter()
-            .map(|(worker_id, worker)| worker.snapshot(*worker_id))
+            .values()
+            .map(|worker| worker.snapshot())
             .collect::<Vec<_>>();
         snapshot.sort_by_key(|worker| worker.worker_id);
         snapshot
@@ -186,9 +186,17 @@ mod tests {
     fn worker_telemetry_registry_snapshots_in_worker_order() {
         let registry = WorkerTelemetryRegistry::new();
         let worker2 = registry.get_or_create(2);
-        worker2.tun_rx_packets.store(20, Ordering::Relaxed);
+        worker2.publish(&WorkerTelemetrySnapshot {
+            worker_id: 2,
+            tun_rx_packets: 20,
+            ..WorkerTelemetrySnapshot::default()
+        });
         let worker1 = registry.get_or_create(1);
-        worker1.tcp_offload_bytes.store(100, Ordering::Relaxed);
+        worker1.publish(&WorkerTelemetrySnapshot {
+            worker_id: 1,
+            tcp_offload_bytes: 100,
+            ..WorkerTelemetrySnapshot::default()
+        });
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 2);

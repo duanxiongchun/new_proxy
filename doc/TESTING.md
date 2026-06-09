@@ -267,7 +267,7 @@ Rust 单元测试覆盖：
 
 需要补齐的回归用例：
 
-- `RtcWorker` TCP 路由选择：目标 IP 命中 router 且 QUIC pool 为 `Active` 时进入 smoltcp；未命中、pool 缺失、`Fallback` 或 `Recovering` 时进入 boringtun L3。
+- `RtcWorker` TCP 路由选择：目标 IP 命中 `L4DataPlaneSnapshot.router` 且 QUIC pool 为 `Active` 时进入 smoltcp；未命中、pool 缺失、`Fallback` 或 `Recovering` 时进入 boringtun L3。
 - 桥接通道：smoltcp socket payload 经 `BridgeChannels` 发往 QUIC handler，QUIC 返回 payload 能写回 smoltcp socket；通道断开时 socket abort 并清理 bridge；QUIC readiness 必须通过 worker-local notify 唤醒 RTC loop，避免只能靠 timer tick 推进。
 - WireGuard timer/UDP 入站：`update_timers()` 产生网络包时写入物理 UDP socket；`decapsulate()` 返回 tunnel 包时写回 TUN；server/client 多 worker 下只有 worker 0 负责外层 UDP receive 和 timer。
 - 多队列启动：server 队列数严格跟随 `QuicPool.ListenPorts` 数量；client 队列数在启动主 runtime 前固定，启动期已知 QUIC data port 数时使用该数量，启动期未知时固定为 1 个 worker。多个 proxy peer 的 data port 数量必须一致；之后动态新增、后台恢复或控制面刷新得到的 data port 数必须匹配固定 baseline，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。client WireGuard L3 路径仍共享单个外层 UDP socket，且只有 worker 0 负责入站 receive/timer。L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。

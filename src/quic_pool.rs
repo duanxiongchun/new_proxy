@@ -394,7 +394,7 @@ pub struct QuicPoolClient {
 struct PoolSlot {
     endpoint: SocketAddr,
     conn: Connection,
-    stats: QuicConnStats,
+    stats: Arc<QuicConnStats>,
 }
 
 impl QuicPoolClient {
@@ -741,7 +741,10 @@ impl QuicPoolClient {
 
         Ok(PoolSlot {
             endpoint: target_addr,
-            stats: QuicConnStats::new(conn.remote_address(), target_addr.port()),
+            stats: Arc::new(QuicConnStats::new(
+                conn.remote_address(),
+                target_addr.port(),
+            )),
             conn,
         })
     }
@@ -764,7 +767,7 @@ impl QuicPoolClient {
                 let idx = self.rr_index.fetch_add(1, Ordering::Relaxed);
                 let i = idx % slots.len();
                 let selected_conn = slots[i].conn.clone();
-                let selected_stat = Arc::new(slots[i].stats.clone());
+                let selected_stat = slots[i].stats.clone();
                 let total = slots.len();
                 (selected_conn, selected_stat, total)
             };
@@ -1899,7 +1902,7 @@ mod tests {
             old_conn.close(0u32.into(), b"simulate dead data port");
             client.slots.store(Arc::new(vec![PoolSlot {
                 endpoint: dead_addr,
-                stats: QuicConnStats::new(dead_addr, dead_port),
+                stats: Arc::new(QuicConnStats::new(dead_addr, dead_port)),
                 conn: old_conn,
             }]));
         }

@@ -2,6 +2,7 @@ use crate::buffer_pool::{BufferPool, PooledBuf};
 use crate::proxy_proto::write_target_addr;
 use crate::quic_pool::{PoolState, QuicConnStats};
 use crate::relay::PeerL4Stats;
+use crate::telemetry::WorkerTelemetrySnapshot;
 use crate::tun_io::AsyncTunIo;
 use crate::userspace_tcp::UserspaceTcpStack;
 use crate::userspace_wg::{UserspaceWgAction, UserspaceWgRegistry};
@@ -99,18 +100,11 @@ fn with_notify_context<R>(notify: &Arc<Notify>, f: impl FnOnce(&mut Context<'_>)
 
 async fn establish_quic_bridge(
     original_dest: SocketAddr,
-    gateway_state: Arc<parking_lot::RwLock<crate::GatewayState>>,
-    client_quic_pools: crate::PeerQuicPools,
+    peer_pub_key: [u8; 32],
+    data_plane: Arc<crate::L4DataPlaneSnapshot>,
     peer_telemetry: Option<Arc<crate::telemetry::TelemetryRegistry>>,
 ) -> Option<ActiveQuicBridge> {
-    let peer_pub_key = {
-        let state = gateway_state.read();
-        state.router.longest_match(original_dest.ip())
-    }?;
-    let quic_pool = {
-        let pools = client_quic_pools.read();
-        pools.get(&peer_pub_key).cloned()
-    }?;
+    let quic_pool = data_plane.client_quic_pools.get(&peer_pub_key).cloned()?;
     if !matches!(quic_pool.get_state(), PoolState::Active) {
         log::warn!(
             "QUIC pool is not active, dropping userspace stream to {}",
@@ -176,6 +170,7 @@ async fn establish_quic_bridge(
 pub struct NatEntry {
     pub original_dst_ip: IpAddr,
     pub original_dst_port: u16,
+    pub peer_pub_key: [u8; 32],
     pub flow_key: FlowKey,
     pub last_seen: Instant,
 }
@@ -492,6 +487,7 @@ pub struct RtcWorker {
     pub l3_registry: UserspaceWgRegistry,
     pub tcp_stack: UserspaceTcpStack,
     pub bridges: HashMap<SocketHandle, BridgeChannels>,
+    pending_bridge_handles: HashSet<SocketHandle>,
     pub nat_map: HashMap<NatKey, NatEntry>,
     pub flow_map: HashMap<FlowKey, u16>,
     used_local_ports: HashSet<u16>,
@@ -506,6 +502,8 @@ pub struct RtcWorker {
     pending_udp_bytes: usize,
     last_housekeeping: Instant,
     worker_stats: Option<Arc<crate::telemetry::WorkerTelemetry>>,
+    worker_stats_local: Option<WorkerTelemetrySnapshot>,
+    worker_stats_dirty: bool,
     peer_telemetry: Option<Arc<crate::telemetry::TelemetryRegistry>>,
     l3_rx_enabled: bool,
     l3_timer_enabled: bool,
@@ -534,6 +532,7 @@ impl RtcWorker {
             l3_registry,
             tcp_stack,
             bridges: HashMap::new(),
+            pending_bridge_handles: HashSet::new(),
             nat_map: HashMap::new(),
             flow_map: HashMap::new(),
             used_local_ports: HashSet::new(),
@@ -548,6 +547,8 @@ impl RtcWorker {
             pending_udp_bytes: 0,
             last_housekeeping: Instant::now(),
             worker_stats: None,
+            worker_stats_local: None,
+            worker_stats_dirty: false,
             peer_telemetry: None,
             l3_rx_enabled: true,
             l3_timer_enabled: true,
@@ -556,7 +557,12 @@ impl RtcWorker {
     }
 
     pub fn set_worker_stats(&mut self, worker_stats: Arc<crate::telemetry::WorkerTelemetry>) {
+        self.worker_stats_local = Some(WorkerTelemetrySnapshot {
+            worker_id: worker_stats.worker_id(),
+            ..WorkerTelemetrySnapshot::default()
+        });
         self.worker_stats = Some(worker_stats);
+        self.worker_stats_dirty = true;
     }
 
     pub fn set_peer_telemetry(&mut self, peer_telemetry: Arc<crate::telemetry::TelemetryRegistry>) {
@@ -571,28 +577,37 @@ impl RtcWorker {
         self.l3_timer_enabled = enabled;
     }
 
-    fn record_tun_rx(&self, bytes: usize) {
-        if let Some(stats) = &self.worker_stats {
-            stats.tun_rx_packets.fetch_add(1, Ordering::Relaxed);
-            stats
-                .tun_rx_bytes
-                .fetch_add(bytes as u64, Ordering::Relaxed);
+    fn publish_worker_stats(&mut self) {
+        if !self.worker_stats_dirty {
+            return;
+        }
+        if let (Some(handle), Some(local)) = (&self.worker_stats, &self.worker_stats_local) {
+            handle.publish(local);
+            self.worker_stats_dirty = false;
         }
     }
 
-    fn record_tcp_offload(&self, bytes: usize) {
-        if let Some(stats) = &self.worker_stats {
-            stats.tcp_offload_packets.fetch_add(1, Ordering::Relaxed);
-            stats
-                .tcp_offload_bytes
-                .fetch_add(bytes as u64, Ordering::Relaxed);
+    fn record_tun_rx(&mut self, bytes: usize) {
+        if let Some(stats) = &mut self.worker_stats_local {
+            stats.tun_rx_packets += 1;
+            stats.tun_rx_bytes += bytes as u64;
+            self.worker_stats_dirty = true;
         }
     }
 
-    fn record_l3_packet(&self, bytes: usize) {
-        if let Some(stats) = &self.worker_stats {
-            stats.l3_packets.fetch_add(1, Ordering::Relaxed);
-            stats.l3_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    fn record_tcp_offload(&mut self, bytes: usize) {
+        if let Some(stats) = &mut self.worker_stats_local {
+            stats.tcp_offload_packets += 1;
+            stats.tcp_offload_bytes += bytes as u64;
+            self.worker_stats_dirty = true;
+        }
+    }
+
+    fn record_l3_packet(&mut self, bytes: usize) {
+        if let Some(stats) = &mut self.worker_stats_local {
+            stats.l3_packets += 1;
+            stats.l3_bytes += bytes as u64;
+            self.worker_stats_dirty = true;
         }
     }
 
@@ -701,17 +716,20 @@ impl RtcWorker {
         }
     }
 
-    fn record_new_tcp_flow(&self) {
-        if let Some(stats) = &self.worker_stats {
-            stats.new_tcp_flows.fetch_add(1, Ordering::Relaxed);
+    fn record_new_tcp_flow(&mut self) {
+        if let Some(stats) = &mut self.worker_stats_local {
+            stats.new_tcp_flows += 1;
+            self.worker_stats_dirty = true;
         }
     }
 
-    fn record_current_tcp_flows(&self) {
-        if let Some(stats) = &self.worker_stats {
-            stats
-                .current_tcp_flows
-                .store(self.flow_map.len() as u64, Ordering::Relaxed);
+    fn record_current_tcp_flows(&mut self) {
+        if let Some(stats) = &mut self.worker_stats_local {
+            let current = self.flow_map.len() as u64;
+            if stats.current_tcp_flows != current {
+                stats.current_tcp_flows = current;
+                self.worker_stats_dirty = true;
+            }
         }
     }
 
@@ -801,6 +819,8 @@ impl RtcWorker {
         self.flush_pending_tun();
         self.flush_pending_udp();
         self.cleanup_stale_flows();
+        self.record_current_tcp_flows();
+        self.publish_worker_stats();
         let now = smoltcp::time::Instant::now();
         self.tcp_stack
             .iface
@@ -821,7 +841,7 @@ impl RtcWorker {
         }
 
         // Handle active TCP bridges
-        self.handle_bridges(None, None);
+        self.handle_bridges(None);
 
         let poll_delay = self
             .tcp_stack
@@ -832,11 +852,7 @@ impl RtcWorker {
     }
 
     #[cfg(not(tarpaulin))]
-    pub async fn run_loop(
-        &mut self,
-        gateway_state: Arc<parking_lot::RwLock<crate::GatewayState>>,
-        client_quic_pools: crate::PeerQuicPools,
-    ) -> Result<(), String> {
+    pub async fn run_loop(&mut self, data_plane: crate::L4DataPlane) -> Result<(), String> {
         let mut tun_buf = self.buffer_pool.get();
         let mut udp_buf = self.buffer_pool.get();
         let mut l3_timer = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -846,6 +862,7 @@ impl RtcWorker {
             self.flush_pending_udp();
             self.cleanup_stale_flows();
             self.record_current_tcp_flows();
+            self.publish_worker_stats();
             let now = smoltcp::time::Instant::now();
             self.tcp_stack
                 .iface
@@ -866,7 +883,7 @@ impl RtcWorker {
                 self.write_or_queue_tun_packet(pkt, "smoltcp");
             }
 
-            self.handle_bridges(Some(&gateway_state), Some(&client_quic_pools));
+            self.handle_bridges(Some(&data_plane));
 
             let poll_delay = self
                 .tcp_stack
@@ -908,24 +925,25 @@ impl RtcWorker {
                             let packet = tun_buf.as_mut_slice();
                             if let Some((src_ip, src_port, dst_ip, dst_port, is_syn)) = parse_tcp_packet(packet) {
                                 let flow_key = (src_ip, src_port, dst_ip, dst_port);
-                                let offload_available_for_new_flow = {
-                                    let peer_pub_key = {
-                                        let state = gateway_state.read();
-                                        state
-                                            .userspace_tcp_offload_enabled
-                                            .then(|| state.router.longest_match(dst_ip))
-                                            .flatten()
-                                    };
-                                    if let Some(peer_pub_key) = peer_pub_key {
-                                        let pools = client_quic_pools.read();
-                                        pools
-                                            .get(&peer_pub_key)
-                                            .map(|pool| matches!(pool.get_state(), crate::quic_pool::PoolState::Active))
-                                            .unwrap_or(false)
-                                    } else {
-                                        false
-                                    }
+                                let existing_flow = self.flow_map.contains_key(&flow_key);
+                                let offload_peer_for_new_flow = if !existing_flow && is_syn {
+                                    let snapshot = data_plane.load();
+                                    snapshot
+                                        .userspace_tcp_offload_enabled
+                                        .then(|| snapshot.router.longest_match(dst_ip))
+                                        .flatten()
+                                        .filter(|peer_pub_key| {
+                                            snapshot
+                                                .client_quic_pools
+                                                .get(peer_pub_key)
+                                                .map(|pool| matches!(pool.get_state(), crate::quic_pool::PoolState::Active))
+                                                .unwrap_or(false)
+                                        })
+                                } else {
+                                    None
                                 };
+                                let offload_available_for_new_flow =
+                                    offload_peer_for_new_flow.is_some();
 
                                 if self.should_route_via_smoltcp(
                                     &flow_key,
@@ -1033,6 +1051,7 @@ impl RtcWorker {
                                                         "Created userspace listening TCP socket on port {}",
                                                         local_port
                                                     );
+                                                    self.pending_bridge_handles.insert(handle);
                                                 }
                                                 Err(e) => {
                                                     self.release_flow_port(&flow_key);
@@ -1052,11 +1071,31 @@ impl RtcWorker {
                                         }
                                     }
 
+                                    let peer_pub_key = offload_peer_for_new_flow
+                                        .or_else(|| {
+                                            self.nat_map
+                                                .get(&(src_ip, src_port, local_port))
+                                                .map(|entry| entry.peer_pub_key)
+                                        });
+                                    let Some(peer_pub_key) = peer_pub_key else {
+                                        log::warn!(
+                                            "No QUIC peer mapping for userspace TCP flow; falling back to userspace WireGuard L3"
+                                        );
+                                        if let Some((endpoint, enc_pkt)) =
+                                            self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                                        {
+                                            self.record_l3_packet(n);
+                                            self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                                        }
+                                        continue;
+                                    };
+
                                     self.nat_map.insert(
                                         (src_ip, src_port, local_port),
                                         NatEntry {
                                             original_dst_ip: dst_ip,
                                             original_dst_port: dst_port,
+                                            peer_pub_key,
                                             flow_key,
                                             last_seen: Instant::now(),
                                         },
@@ -1114,48 +1153,51 @@ impl RtcWorker {
         }
     }
 
-    fn handle_bridges(
-        &mut self,
-        gateway_state: Option<&Arc<parking_lot::RwLock<crate::GatewayState>>>,
-        client_quic_pools: Option<&crate::PeerQuicPools>,
-    ) {
+    fn handle_bridges(&mut self, data_plane: Option<&crate::L4DataPlane>) {
         let mut closed_handles = Vec::new();
 
-        // Check for new connections in smoltcp
         let mut new_connections = Vec::new();
-        for (handle, socket) in self.tcp_stack.sockets.iter_mut() {
-            if let Some(socket) = tcp::Socket::downcast_mut(socket) {
-                if socket.is_active() && !self.bridges.contains_key(&handle) {
-                    if let (Some(local_endpoint), Some(remote_endpoint)) =
-                        (socket.local_endpoint(), socket.remote_endpoint())
-                    {
-                        let client_ip = smoltcp_ip_to_std(remote_endpoint.addr);
-                        let key = (client_ip, remote_endpoint.port, local_endpoint.port);
-                        if let Some(entry) = self.nat_map.get(&key) {
-                            let original_dest =
-                                SocketAddr::new(entry.original_dst_ip, entry.original_dst_port);
-                            new_connections.push((handle, original_dest, key));
-                        } else {
-                            log::warn!(
-                                "No NAT mapping found for userspace TCP socket {}:{} -> local port {}; skipping QUIC bridge",
-                                client_ip,
-                                remote_endpoint.port,
-                                local_endpoint.port
-                            );
-                        }
-                    }
+        let mut checked_handles = Vec::with_capacity(self.pending_bridge_handles.len());
+        checked_handles.extend(self.pending_bridge_handles.iter().copied());
+        for handle in checked_handles {
+            if self.bridges.contains_key(&handle) {
+                self.pending_bridge_handles.remove(&handle);
+                continue;
+            }
+            let socket = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
+            if !socket.is_active() {
+                continue;
+            }
+            if let (Some(local_endpoint), Some(remote_endpoint)) =
+                (socket.local_endpoint(), socket.remote_endpoint())
+            {
+                let client_ip = smoltcp_ip_to_std(remote_endpoint.addr);
+                let key = (client_ip, remote_endpoint.port, local_endpoint.port);
+                if let Some(entry) = self.nat_map.get(&key) {
+                    let original_dest =
+                        SocketAddr::new(entry.original_dst_ip, entry.original_dst_port);
+                    new_connections.push((handle, original_dest, key, entry.peer_pub_key));
+                    self.pending_bridge_handles.remove(&handle);
+                } else {
+                    log::warn!(
+                        "No NAT mapping found for userspace TCP socket {}:{} -> local port {}; skipping QUIC bridge",
+                        client_ip,
+                        remote_endpoint.port,
+                        local_endpoint.port
+                    );
+                    self.pending_bridge_handles.remove(&handle);
                 }
+            } else {
+                self.pending_bridge_handles.remove(&handle);
             }
         }
 
-        for (handle, original_dest, nat_key) in new_connections {
-            if let (Some(gateway_state), Some(client_quic_pools)) =
-                (gateway_state, client_quic_pools)
-            {
+        for (handle, original_dest, nat_key, peer_pub_key) in new_connections {
+            if let Some(data_plane) = data_plane {
                 let opening = establish_quic_bridge(
                     original_dest,
-                    gateway_state.clone(),
-                    client_quic_pools.clone(),
+                    peer_pub_key,
+                    data_plane.load_full(),
                     self.peer_telemetry.clone(),
                 );
                 self.bridges.insert(
@@ -1342,6 +1384,7 @@ impl RtcWorker {
         }
 
         for handle in closed_handles {
+            self.pending_bridge_handles.remove(&handle);
             if let Some(bridge) = self.bridges.remove(&handle) {
                 let _ = self.release_nat_key(&bridge.nat_key);
             }
@@ -1405,6 +1448,7 @@ impl RtcWorker {
             })
             .collect::<Vec<_>>();
         for handle in handles {
+            self.pending_bridge_handles.remove(&handle);
             let socket = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
             socket.abort();
             self.tcp_stack.sockets.remove(handle);
@@ -1741,6 +1785,7 @@ mod tests {
             NatEntry {
                 original_dst_ip: "10.9.0.1".parse().unwrap(),
                 original_dst_port: 443,
+                peer_pub_key: [2u8; 32],
                 flow_key,
                 last_seen: Instant::now() - HALF_OPEN_TIMEOUT - Duration::from_secs(1),
             },
@@ -1782,6 +1827,7 @@ mod tests {
             NatEntry {
                 original_dst_ip: "10.9.0.1".parse().unwrap(),
                 original_dst_port: 443,
+                peer_pub_key: [2u8; 32],
                 flow_key,
                 last_seen: Instant::now(),
             },
@@ -1855,6 +1901,7 @@ mod tests {
             NatEntry {
                 original_dst_ip: "10.9.0.1".parse().unwrap(),
                 original_dst_port: 443,
+                peer_pub_key: [2u8; 32],
                 flow_key,
                 last_seen: Instant::now() - HALF_OPEN_TIMEOUT - Duration::from_secs(1),
             },
@@ -1885,6 +1932,7 @@ mod tests {
             NatEntry {
                 original_dst_ip: "10.9.0.1".parse().unwrap(),
                 original_dst_port: 443,
+                peer_pub_key: [2u8; 32],
                 flow_key,
                 last_seen: Instant::now() - HALF_OPEN_TIMEOUT - Duration::from_secs(1),
             },
@@ -1942,6 +1990,7 @@ mod tests {
                 NatEntry {
                     original_dst_ip: "10.9.0.1".parse().unwrap(),
                     original_dst_port: 443,
+                    peer_pub_key: [2u8; 32],
                     flow_key,
                     last_seen: Instant::now() - HALF_OPEN_TIMEOUT - Duration::from_secs(1),
                 },
