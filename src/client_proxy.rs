@@ -36,6 +36,43 @@ impl fmt::Display for BuildPeerQuicPoolError {
 impl Error for BuildPeerQuicPoolError {}
 
 #[cfg(not(tarpaulin))]
+pub async fn negotiate_peer_quic_data_port_count(
+    private_key: [u8; 32],
+    peer: &config::PeerConfig,
+) -> Result<usize, BuildPeerQuicPoolError> {
+    let endpoint = peer
+        .endpoint
+        .ok_or_else(|| BuildPeerQuicPoolError::new("proxy peer is missing Endpoint", None))?;
+    let proxy_port = peer
+        .proxy_port
+        .ok_or_else(|| BuildPeerQuicPoolError::new("proxy peer is missing ProxyPort", None))?;
+    let control_addr = SocketAddr::new(endpoint.ip(), proxy_port);
+    let control_client = ControlClient::new(private_key, peer.public_key, control_addr);
+
+    log::info!(
+        "Preflighting QUIC data port count for peer {} to {}",
+        encode_base64_32(&peer.public_key),
+        control_addr
+    );
+    let (control_response, _control_socket) = control_client
+        .negotiate_config()
+        .await
+        .map_err(|e| BuildPeerQuicPoolError::new(e, None))?;
+    Ok(control_response.port_pool.len())
+}
+
+#[cfg(tarpaulin)]
+pub async fn negotiate_peer_quic_data_port_count(
+    _private_key: [u8; 32],
+    _peer: &config::PeerConfig,
+) -> Result<usize, BuildPeerQuicPoolError> {
+    Err(BuildPeerQuicPoolError::new(
+        "QUIC data port preflight is excluded from unit coverage",
+        None,
+    ))
+}
+
+#[cfg(not(tarpaulin))]
 pub async fn build_peer_quic_pool(
     private_key: [u8; 32],
     peer: &config::PeerConfig,

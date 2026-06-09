@@ -17,7 +17,8 @@ pub fn build_stream_handler(
         move |client_pub: [u8; 32],
               mut send_mux: quinn::SendStream,
               mut recv_mux: quinn::RecvStream,
-              conn_stat: Arc<QuicConnStats>| {
+              conn_stat: Arc<QuicConnStats>|
+              -> crate::quic_pool::ServerFuture {
             let permit = match stream_handler_limit.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -25,15 +26,14 @@ pub fn build_stream_handler(
                         "QUIC stream handler limit reached; rejecting stream for peer {:?}",
                         client_pub
                     );
-                    tokio::spawn(async move {
+                    return Box::pin(async move {
                         let _ = send_mux.write_all(&[0]).await;
                         let _ = send_mux.shutdown().await;
                     });
-                    return;
                 }
             };
             let stats = telemetry.get_or_create(client_pub);
-            tokio::spawn(async move {
+            Box::pin(async move {
                 let _permit = permit;
                 let target_addr =
                     match timeout(Duration::from_secs(5), read_target_addr(&mut recv_mux)).await {
@@ -82,7 +82,7 @@ pub fn build_stream_handler(
                         let _ = send_mux.write_all(&[0]).await;
                     }
                 }
-            });
+            })
         },
     )
 }

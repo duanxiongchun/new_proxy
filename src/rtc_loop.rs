@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use std::task::{Context, Poll, Wake};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 type NatKey = (IpAddr, u16, u16);
@@ -74,16 +75,24 @@ fn env_usize(name: &str, default: usize, min: usize) -> usize {
         .unwrap_or(default)
 }
 
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-
-    fn wake_by_ref(self: &Arc<Self>) {}
+struct NotifyWake {
+    notify: Arc<Notify>,
 }
 
-fn with_noop_context<R>(f: impl FnOnce(&mut Context<'_>) -> R) -> R {
-    let waker = std::task::Waker::from(Arc::new(NoopWake));
+impl Wake for NotifyWake {
+    fn wake(self: Arc<Self>) {
+        self.notify.notify_one();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notify.notify_one();
+    }
+}
+
+fn with_notify_context<R>(notify: &Arc<Notify>, f: impl FnOnce(&mut Context<'_>) -> R) -> R {
+    let waker = std::task::Waker::from(Arc::new(NotifyWake {
+        notify: notify.clone(),
+    }));
     let mut cx = Context::from_waker(&waker);
     f(&mut cx)
 }
@@ -499,6 +508,8 @@ pub struct RtcWorker {
     worker_stats: Option<Arc<crate::telemetry::WorkerTelemetry>>,
     peer_telemetry: Option<Arc<crate::telemetry::TelemetryRegistry>>,
     l3_rx_enabled: bool,
+    l3_timer_enabled: bool,
+    bridge_notify: Arc<Notify>,
 }
 
 pub struct RtcWorkerConfig {
@@ -539,6 +550,8 @@ impl RtcWorker {
             worker_stats: None,
             peer_telemetry: None,
             l3_rx_enabled: true,
+            l3_timer_enabled: true,
+            bridge_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -552,6 +565,10 @@ impl RtcWorker {
 
     pub fn set_l3_rx_enabled(&mut self, enabled: bool) {
         self.l3_rx_enabled = enabled;
+    }
+
+    pub fn set_l3_timer_enabled(&mut self, enabled: bool) {
+        self.l3_timer_enabled = enabled;
     }
 
     fn record_tun_rx(&self, bytes: usize) {
@@ -822,6 +839,7 @@ impl RtcWorker {
     ) -> Result<(), String> {
         let mut tun_buf = self.buffer_pool.get();
         let mut udp_buf = self.buffer_pool.get();
+        let mut l3_timer = tokio::time::interval(std::time::Duration::from_millis(100));
 
         loop {
             self.flush_pending_tun();
@@ -858,8 +876,11 @@ impl RtcWorker {
             let delay_duration = std::time::Duration::from_millis(poll_delay.total_millis());
             let tun_io_for_writable = self.tun_io.clone();
             let udp_socket_for_writable = self.udp_socket.clone();
+            let bridge_notify = self.bridge_notify.clone();
 
             tokio::select! {
+                _ = bridge_notify.notified(), if !self.bridges.is_empty() => {}
+
                 writable = tun_io_for_writable.writable(), if !self.pending_tun.is_empty() => {
                     if writable.is_ok() {
                         self.flush_pending_tun();
@@ -869,6 +890,13 @@ impl RtcWorker {
                 writable = udp_socket_for_writable.writable(), if !self.pending_udp.is_empty() => {
                     if writable.is_ok() {
                         self.flush_pending_udp();
+                    }
+                }
+
+                _ = l3_timer.tick(), if self.l3_timer_enabled => {
+                    self.udp_socket.tick_control();
+                    for (endpoint, packet) in self.l3_registry.timer_packets(&self.buffer_pool) {
+                        self.send_or_queue_udp_packet(endpoint, packet, "userspace WireGuard timer");
                     }
                 }
 
@@ -1172,7 +1200,7 @@ impl RtcWorker {
             }
 
             if let BridgeQuicState::Opening(opening) = &mut bridge.quic {
-                match with_noop_context(|cx| opening.as_mut().poll(cx)) {
+                match with_notify_context(&self.bridge_notify, |cx| opening.as_mut().poll(cx)) {
                     Poll::Ready(Some(active)) => {
                         bridge.quic = BridgeQuicState::Active(active);
                     }
@@ -1192,7 +1220,7 @@ impl RtcWorker {
                 };
                 let poll_result = {
                     let front = bridge.to_quic_pending.front().expect("front exists");
-                    with_noop_context(|cx| {
+                    with_notify_context(&self.bridge_notify, |cx| {
                         Pin::new(&mut active.send).poll_write(cx, front.as_slice())
                     })
                 };
@@ -1220,7 +1248,7 @@ impl RtcWorker {
                     break;
                 };
                 let mut data = self.buffer_pool.get();
-                let poll_result = with_noop_context(|cx| {
+                let poll_result = with_notify_context(&self.bridge_notify, |cx| {
                     let mut read_buf = ReadBuf::new(data.as_mut_capacity());
                     match Pin::new(&mut active.recv).poll_read(cx, &mut read_buf) {
                         Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),

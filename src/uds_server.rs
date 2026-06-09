@@ -38,7 +38,7 @@ pub struct UdsServerContext {
     pub peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     pub l3_registry: UserspaceWgRegistry,
     pub virtual_tunnel_telemetry: Arc<VirtualTunnelTelemetry>,
-    pub client_worker_count: Arc<AtomicUsize>,
+    pub client_quic_data_port_baseline: Arc<AtomicUsize>,
 }
 
 pub fn bind_listener(interface_name: &str) -> Option<UnixListener> {
@@ -527,9 +527,11 @@ async fn handle_add_peer(
                         return;
                     }
                     if let Err(mismatch) =
-                        crate::validate_client_quic_data_port_count_matches_workers(
+                        crate::validate_client_quic_data_port_count_matches_baseline(
                             data_port_count,
-                            context.client_worker_count.load(Ordering::Relaxed),
+                            context
+                                .client_quic_data_port_baseline
+                                .load(Ordering::Relaxed),
                         )
                     {
                         write_error(stream, framed_response, mismatch).await;
@@ -591,18 +593,16 @@ async fn handle_add_peer(
                 write_error(stream, framed_response, e).await;
                 return;
             }
-            if let Err(e) = crate::validate_client_quic_data_port_count_matches_workers(
+            if let Err(e) = crate::validate_client_quic_data_port_count_matches_baseline(
                 pool.endpoint_count(),
-                context.client_worker_count.load(Ordering::Relaxed),
+                context
+                    .client_quic_data_port_baseline
+                    .load(Ordering::Relaxed),
             ) {
-                pool.shutdown(b"QUIC data port count does not match active workers");
+                pool.shutdown(b"QUIC data port count does not match baseline");
                 write_error(stream, framed_response, e).await;
                 return;
             }
-            crate::record_client_quic_data_port_count_if_unset(
-                &context.client_worker_count,
-                pool.endpoint_count(),
-            );
         }
     }
 
@@ -691,6 +691,11 @@ async fn handle_add_peer(
         let old_pool = {
             let mut pools = context.client_quic_pools.write();
             if let Some(pool) = prepared_client_pool {
+                let endpoint_count = pool.endpoint_count();
+                crate::record_client_quic_data_port_baseline_if_unset(
+                    &context.client_quic_data_port_baseline,
+                    endpoint_count,
+                );
                 pools.insert(parsed_pub_key, pool)
             } else {
                 pools.remove(&parsed_pub_key)
@@ -961,7 +966,7 @@ mod tests {
             peer_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             l3_registry,
             virtual_tunnel_telemetry: Arc::new(VirtualTunnelTelemetry::default()),
-            client_worker_count: Arc::new(AtomicUsize::new(1)),
+            client_quic_data_port_baseline: Arc::new(AtomicUsize::new(1)),
         }
     }
 

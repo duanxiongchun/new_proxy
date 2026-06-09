@@ -59,15 +59,6 @@ struct VirtualTunnelSocketInner {
     active_idx: Arc<AtomicUsize>,
     last_target: Arc<RwLock<Option<SocketAddr>>>,
     telemetry: Arc<VirtualTunnelTelemetry>,
-    abort_handles: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for VirtualTunnelSocketInner {
-    fn drop(&mut self) {
-        for handle in &self.abort_handles {
-            handle.abort();
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -88,7 +79,6 @@ impl VirtualTunnelSocket {
             return Err("VirtualTunnelSocket requires at least one physical socket".to_string());
         }
         let last_target = Arc::new(RwLock::new(None));
-        let mut abort_handles = Vec::new();
         let mut physical_sockets = Vec::new();
 
         for socket in sockets {
@@ -101,59 +91,12 @@ impl VirtualTunnelSocket {
         }
 
         let active_idx = Arc::new(AtomicUsize::new(0));
-        let sockets_for_ping = physical_sockets.clone();
-        let last_target_for_ping = last_target.clone();
-        let active_idx_for_ping = active_idx.clone();
-
-        // Spawn background ping task running every 1 second
-        let ping_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let target = *last_target_for_ping.read();
-
-                if let Some(target_addr) = target {
-                    for p_socket in &sockets_for_ping {
-                        let _ = p_socket.socket.try_send_to(b"PING", target_addr);
-                    }
-                }
-
-                // Evaluate health
-                let now = Instant::now();
-                let prev_idx = active_idx_for_ping.load(Ordering::Relaxed);
-                let mut best_idx = prev_idx;
-                let mut best_time = None;
-                for (i, p_socket) in sockets_for_ping.iter().enumerate() {
-                    let pong_time = *p_socket.last_pong.read();
-                    if let Some(t) = pong_time {
-                        if now.duration_since(t) < Duration::from_secs(5)
-                            && best_time.is_none_or(|bt| t > bt)
-                        {
-                            best_time = Some(t);
-                            best_idx = i;
-                        }
-                    }
-                }
-
-                // Update active index
-                if best_idx != prev_idx {
-                    log::info!(
-                        "Switching active virtual tunnel socket index from {} to {}",
-                        prev_idx,
-                        best_idx
-                    );
-                    active_idx_for_ping.store(best_idx, Ordering::Relaxed);
-                }
-            }
-        });
-        abort_handles.push(ping_handle);
 
         let inner = Arc::new(VirtualTunnelSocketInner {
             sockets: physical_sockets,
             active_idx,
             last_target,
             telemetry,
-            abort_handles,
         });
 
         Ok(Self { inner })
@@ -190,6 +133,40 @@ impl VirtualTunnelSocket {
     pub async fn writable(&self) -> io::Result<()> {
         let active_idx = self.inner.active_idx.load(Ordering::Relaxed);
         self.inner.sockets[active_idx].socket.writable().await
+    }
+
+    pub fn tick_control(&self) {
+        let target = *self.inner.last_target.read();
+        if let Some(target_addr) = target {
+            for physical in &self.inner.sockets {
+                let _ = physical.socket.try_send_to(b"PING", target_addr);
+            }
+        }
+
+        let now = Instant::now();
+        let prev_idx = self.inner.active_idx.load(Ordering::Relaxed);
+        let mut best_idx = prev_idx;
+        let mut best_time = None;
+        for (idx, physical) in self.inner.sockets.iter().enumerate() {
+            let pong_time = *physical.last_pong.read();
+            if let Some(t) = pong_time {
+                if now.duration_since(t) < Duration::from_secs(5)
+                    && best_time.is_none_or(|bt| t > bt)
+                {
+                    best_time = Some(t);
+                    best_idx = idx;
+                }
+            }
+        }
+
+        if best_idx != prev_idx {
+            log::info!(
+                "Switching active virtual tunnel socket index from {} to {}",
+                prev_idx,
+                best_idx
+            );
+            self.inner.active_idx.store(best_idx, Ordering::Relaxed);
+        }
     }
 
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -262,6 +239,12 @@ impl TunnelSocket {
         match self {
             Self::Single(s) => s.writable().await,
             Self::Virtual(s) => s.writable().await,
+        }
+    }
+
+    pub fn tick_control(&self) {
+        if let Self::Virtual(s) = self {
+            s.tick_control();
         }
     }
 
@@ -362,8 +345,52 @@ mod tests {
             *physical.last_pong.write() = Some(Instant::now() - Duration::from_secs(10));
         }
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        vt.tick_control();
 
+        assert_eq!(vt.inner.active_idx.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn virtual_tunnel_has_no_background_task_spawn() {
+        let source = include_str!("virtual_tunnel.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(!source.contains("tokio::spawn"));
+    }
+
+    #[tokio::test]
+    async fn virtual_tunnel_tick_control_sends_ping_and_selects_fresh_pong_socket() {
+        let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = s2.local_addr().unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = server.local_addr().unwrap();
+        let vt = VirtualTunnelSocket::new(vec![s1, s2]).unwrap();
+
+        vt.send_to(b"seed", srv_addr).await.unwrap();
+        vt.tick_control();
+
+        let mut pings = Vec::new();
+        let mut buf = [0u8; 16];
+        for _ in 0..3 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if &buf[..n] == b"PING" {
+                pings.push(from);
+            }
+        }
+        assert_eq!(pings.len(), 2);
+        assert!(pings.contains(&addr2));
+
+        server.send_to(b"PONG", addr2).await.unwrap();
+        let mut recv_buf = [0u8; 16];
+        let _ = tokio::time::timeout(Duration::from_millis(100), vt.recv_from(&mut recv_buf)).await;
+
+        vt.tick_control();
         assert_eq!(vt.inner.active_idx.load(Ordering::Relaxed), 1);
     }
 
