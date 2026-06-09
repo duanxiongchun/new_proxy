@@ -291,9 +291,15 @@ Rust 单元测试覆盖：
 - L3 扩展性：为 UDP/ICMP 和 TCP fallback 增加独立多队列压测，评估当前 shared per-peer `boringtun` 锁竞争；若成为瓶颈，再设计 per-worker WireGuard state。
 - 稳定性脚本：1 小时 nightly/profile、FD 数、CPU 累计时间、失败日志自动打包、机器可读 pass/fail 总结。
 - 安全负向：恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E。
-- **UDP-over-QUIC Stream 代理规划测试**：
-  - **单元测试**：验证 `parse_udp_packet` 头部提取与解析正确性；验证 smoltcp UDP 接口分配和 socket state 正常获取；验证大包分拆与粘包的 2 字节大端长度前缀在 Stream 上的解析可靠性；验证在 `UDP_IDLE_TIMEOUT` (30秒) 周期内无数据活动时，两端的 Pinned Sleep 定时器能准确超时并释放 socket / NAT 表资源。
-  - **E2E 验收测试**：建立命名空间测试拓扑，通过 TUN 匹配 AllowedIPs 拦截 UDP 流量（如 DNS），验证其正确转换为 QUIC stream 并完成端到端通信。通过物理网卡流量捕获校验链路上没有出现明文的 WireGuard UDP（端口 51820）包。
+- **UDP-over-QUIC Stream 代理测试**：
+  - **单元测试**：
+    - `src/rtc_loop.rs::tests::test_parse_udp_packet_ipv4` & `test_parse_udp_packet_ipv6`：验证 UDP 头部源 IP/端口、目的 IP/端口提取和校验和重算的正确性。
+    - `src/userspace_tcp.rs::tests::test_smoltcp_udp_socket_creation`：验证 `UserspaceTcpStack` 对用户态 UDP socket 分配与生命周期状态操作的正确性。
+    - `src/relay.rs::tests::test_udp_stream_framing_roundtrip` & `test_relay_stream_to_udp_success`：验证基于 2 字节大端长度前缀的大包拆分、粘包还原及其在 QUIC stream 上的读写一致性。
+    - `src/rtc_loop.rs::tests::test_client_udp_bridge_and_nat`：验证客户端拦截 UDP 包后，成功分配本地 NAT 端口并创建 smoltcp socket 到 QUIC stream 桥接，数据面 offload 成功走 QUIC 链路。
+  - **E2E 验收测试**：
+    - `script/acceptance/e2e_udp_over_quic.sh`：建立跨 `client_ns`, `router_ns`, `server_ns` 命名空间拓扑，拦截客户端发往 `10.0.0.1:8081` 的 UDP 包，验证其通过 QUIC 传输，查询 Telemetry 统计以确认 L3 WireGuard 数据发送量为 0，而 QUIC stream transfer 增加对应字节数（首部及 framed data），成功完成端到端 UDP 代理通信与自检。
+
 
 
 ## 5. 文档同步规则

@@ -167,20 +167,38 @@ TCP 出站包从客户端 TUN 进入 `RtcWorker` 后按以下条件进入 L4 off
 
 每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有默认上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。TUN/UDP/WireGuard/QUIC bridge 的运行时 packet buffer 默认按 `MTU + 256` 派生，下限 1500、上限 65535，默认 MTU 1400 时为 1656，jumbo MTU 9000 时为 9256。默认上限可通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖，用于不同机器规格和压测场景调参。
 
-### 6.4 userspace WireGuard L3 fallback 路径
+### 6.4 UDP-over-QUIC L4 offload 路径
+
+UDP 出站包从客户端 TUN 进入 `RtcWorker` 后按以下条件进入 L4 offload：
+
+- 目标 IP 在 worker 当前加载的 `L4DataPlaneSnapshot.router` 中命中 proxy peer 的 `AllowedIPs`。
+- `userspace_tcp_offload_enabled` 为 true。
+- 对应 peer 的 `QuicPoolClient` 存在且状态为 `Active`。
+- 报文是可解析的 IPv4 UDP，或没有 extension header 的 IPv6 UDP。
+
+进入 offload 后：
+
+1. 如果没有现有 flow 状态，worker 在本地 `smoltcp` 中创建 UDP socket，绑定分配的本地端口，并记录 NAT 映射（`nat_map`），同时建立 `BridgeChannels`，将其 `quic` 状态设为 `Opening` 并启动 UDP-over-QUIC 桥接。
+2. 数据包的目标 IP 和端口被改写为 worker 本地的 `smoltcp` 地址与本地端口，然后输入 `smoltcp` 协议栈。
+3. `RtcWorker` 异步打开 QUIC stream，并写入 `ProxyTargetHeader`（指定协议类型为 `ProxyProtocol::Udp`）。
+4. 服务端接收并解析 `ProxyTargetHeader`，绑定本地 UDP 套接字，并向客户端写回 1 字节成功/失败状态。成功后，调用 `relay_stream_to_udp` 转发 UDP 套接字与 QUIC stream。UDP 报文通过长度前缀（2字节长度前缀 + 载荷）的流式帧格式在 QUIC stream 上流转。
+5. 客户端 bridge 激活后，`smoltcp socket <-> QUIC stream` 数据流在此方向上以长度前缀帧封装流转，另一方向解析长度前缀帧还原 UDP 数据报并通过 `smoltcp` socket 发送回客户端。
+6. UDP 桥接设置有 30 秒空闲超时（`UDP_IDLE_TIMEOUT` / `bridge.last_seen` 检查），超时未收到或发送任何包将自动清理 NAT 映射、移除 socket 并断开 bridge，以避免泄漏端口与内存。
+
+### 6.5 userspace WireGuard L3 fallback 路径
 
 以下流量进入 L3 fallback：
 
-- 非 TCP 报文，例如 UDP/ICMP。
-- 未命中 proxy peer 的 TCP 报文。
-- QUIC pool 不存在、未 Active、正在 fallback/recovering，或 worker 无法创建本地 TCP socket。
-- 当前 L4 parser 不支持的 TCP 报文形态，例如带 IPv6 extension headers 的 TCP。
+- 非 TCP/UDP 报文，例如 ICMP。
+- 未命中 proxy peer 的 TCP/UDP 报文。
+- QUIC pool 不存在、未 Active、正在 fallback/recovering，或 worker 无法创建本地 TCP/UDP socket。
+- 当前 L4 parser 不支持的报文形态，例如带 IPv6 extension headers 的 TCP/UDP。
 
 fallback 出站路径为 `TUN -> RtcWorker -> UserspaceWgRegistry -> boringtun::Tunn::encapsulate -> marked UDP socket -> physical network`。服务端收到外层 UDP 后通过 `UserspaceWgRegistry` 定位 peer，调用 `boringtun::Tunn::decapsulate`，把解密后的原始 IP 包写入服务端 TUN。
 
 fallback 入站路径相反：服务端 TUN 中的目标回包由服务端 userspace WireGuard loop 封装成外层 UDP 发回客户端；客户端只有 worker 0 负责读取该 UDP socket、解密并写回客户端 TUN。其他 worker 可以发送 fallback 外层 UDP，但不负责入站 receive/timer。
 
-### 6.5 Run-to-Completion 事件循环
+### 6.6 Run-to-Completion 事件循环
 
 每个 `RtcWorker` 的事件循环执行路径遵循 **Run-to-Completion** 模式：包从所属 TUN queue 读入该 worker 的 `PooledBuf` 后，尽量通过所有权转移在 worker 内继续流转，避免中间 `Vec` 分配和 payload copy。必须发生的 copy 只保留在内核 syscall 边界、加解密输出边界和协议库不可避免的内部缓冲边界。
 

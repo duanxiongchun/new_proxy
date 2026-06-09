@@ -68,6 +68,7 @@ bash_scripts=(
   "script/acceptance/e2e_userspace_wg_fallback.sh"
   "script/acceptance/e2e_full_tunnel_bypass.sh"
   "script/acceptance/e2e_udp_icmp_tunnel.sh"
+  "script/acceptance/e2e_udp_over_quic.sh"
   "script/acceptance/stability_stress_test.sh"
   "script/perf/perf_smoke.sh"
   "script/perf/perf_cores_scalability.sh"
@@ -101,6 +102,7 @@ TESTS=(
   "e2e_userspace_wg_fallback"
   "e2e_full_tunnel_bypass"
   "e2e_udp_icmp_tunnel"
+  "e2e_udp_over_quic"
 )
 
 if [ "${RUN_STABILITY:-0}" = "1" ]; then
