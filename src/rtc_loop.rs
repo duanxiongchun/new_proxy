@@ -68,9 +68,6 @@ impl RtcWorker {
         self.peer_telemetry = Some(telemetry);
     }
 
-    pub fn set_l3_rx_enabled(&mut self, _val: bool) {}
-    pub fn set_l3_timer_enabled(&mut self, _val: bool) {}
-
     fn get_active_connection(
         &self,
         data_plane: &crate::L4DataPlaneSnapshot,
