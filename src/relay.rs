@@ -302,8 +302,24 @@ pub async fn write_framed_packet<W: AsyncWrite + Unpin>(
 pub async fn read_framed_packet<R: AsyncRead + Unpin>(
     r: &mut R,
     buf: &mut [u8],
-) -> std::io::Result<usize> {
-    let len = r.read_u16().await? as usize;
+) -> std::io::Result<Option<usize>> {
+    let mut len_buf = [0u8; 2];
+    let mut bytes_read = 0;
+    while bytes_read < 2 {
+        let n = r.read(&mut len_buf[bytes_read..2]).await?;
+        if n == 0 {
+            if bytes_read == 0 {
+                return Ok(None);
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated framed packet length header",
+                ));
+            }
+        }
+        bytes_read += n;
+    }
+    let len = u16::from_be_bytes(len_buf) as usize;
     if len > buf.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -311,7 +327,7 @@ pub async fn read_framed_packet<R: AsyncRead + Unpin>(
         ));
     }
     r.read_exact(&mut buf[..len]).await?;
-    Ok(len)
+    Ok(Some(len))
 }
 
 pub async fn relay_stream_to_udp<R, W>(
@@ -355,15 +371,16 @@ where
     let client_to_server = async {
         let mut buf = vec![0u8; 65536];
         loop {
-            let len = read_framed_packet(quic_recv, &mut buf).await?;
-            if len == 0 {
-                break;
-            }
-            udp_socket.send(&buf[..len]).await?;
-            activity_c2s.store(true, Ordering::Relaxed);
-            stats.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
-            if let Some(cs) = &conn_stat {
-                cs.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+            match read_framed_packet(quic_recv, &mut buf).await? {
+                Some(len) => {
+                    udp_socket.send(&buf[..len]).await?;
+                    activity_c2s.store(true, Ordering::Relaxed);
+                    stats.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                    if let Some(cs) = &conn_stat {
+                        cs.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                    }
+                }
+                None => break,
             }
         }
         Ok::<(), std::io::Error>(())
@@ -373,9 +390,6 @@ where
         let mut buf = vec![0u8; 65536];
         loop {
             let len = udp_socket.recv(&mut buf).await?;
-            if len == 0 {
-                break;
-            }
             write_framed_packet(quic_send, &buf[..len]).await?;
             activity_s2c.store(true, Ordering::Relaxed);
             stats.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
@@ -383,6 +397,7 @@ where
                 cs.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
             }
         }
+        #[allow(unreachable_code)]
         Ok::<(), std::io::Error>(())
     };
 
@@ -546,7 +561,7 @@ mod tests {
         let write_fut = write_framed_packet(&mut client, test_data);
         let read_fut = async {
             let mut read_buf = vec![0u8; 100];
-            let len = read_framed_packet(&mut server, &mut read_buf).await.unwrap();
+            let len = read_framed_packet(&mut server, &mut read_buf).await.unwrap().unwrap();
             assert_eq!(&read_buf[..len], test_data);
         };
 
@@ -585,7 +600,7 @@ mod tests {
         target_udp.send_to(b"reply from target", src).await.unwrap();
 
         let mut client_buf = vec![0u8; 100];
-        let len = read_framed_packet(&mut client_stream, &mut client_buf).await.unwrap();
+        let len = read_framed_packet(&mut client_stream, &mut client_buf).await.unwrap().unwrap();
         assert_eq!(&client_buf[..len], b"reply from target");
 
         // Cleanup: drop client stream to end the relay task

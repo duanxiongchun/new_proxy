@@ -90,6 +90,7 @@ pub async fn write_target_addr<W: AsyncWrite + Unpin>(
     header.write_to(w).await
 }
 
+#[allow(dead_code)]
 pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<SocketAddr> {
     let header = ProxyTargetHeader::read_from(r).await?;
     Ok(SocketAddr::new(header.dst_ip, header.dst_port))
