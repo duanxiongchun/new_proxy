@@ -35,7 +35,7 @@ cargo test
 - `src/userspace_wg.rs`：boringtun tunnel 状态初始化。
 - `src/virtual_tunnel.rs`：空物理 socket 集拒绝、RTC receive path 不预取业务包、调用方 buffer 直接接收、双物理 UDP socket 直接 readiness 接收、发送使用当前 active socket。
 - `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、旧 QUIC data port 不可达后的控制面刷新恢复、控制面刷新拒绝 data port 数变化、QUIC pool fallback/recovering/active 状态、控制面刷新触发条件和退避。
-- `src/main.rs`：userspace TCP failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TCP offload，所有 pool active 后才允许回切；启动期 QUIC data 连接失败但控制面已返回 data port 数时，client worker 数使用协商端口数，并拒绝多个 peer 间不一致的启动期端口数。
+- `src/main.rs`：userspace TCP failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TCP offload，所有 pool active 后才允许回切；启动期 QUIC data 连接失败但控制面已返回 data port 数时，client worker 数使用协商端口数，并拒绝多个 peer 间不一致的启动期端口数；启动期未知 data port 数时保持 QUIC data port 基准未设置，允许第一个动态 peer 确定基准。
 - `src/relay.rs`：双向 relay、计数 reader。
 - `src/routing.rs`：AllowedIPs longest-prefix matching。
 - `src/uds_server.rs`：真实 UDS server 的 `Stats`、`Dump`、非法请求响应和 remove-peer 缓存清理。
@@ -256,7 +256,7 @@ Rust 单元测试覆盖：
 - `RtcWorker` TCP 路由选择：目标 IP 命中 router 且 QUIC pool 为 `Active` 时进入 smoltcp；未命中、pool 缺失、`Fallback` 或 `Recovering` 时进入 boringtun L3。
 - 桥接通道：smoltcp socket payload 经 `BridgeChannels` 发往 QUIC handler，QUIC 返回 payload 能写回 smoltcp socket；通道断开时 socket abort 并清理 bridge。
 - WireGuard timer/UDP 入站：`update_timers()` 产生网络包时写入物理 UDP socket；`decapsulate()` 返回 tunnel 包时写回 TUN。
-- 多队列启动：server 队列数严格跟随 `QuicPool.ListenPorts` 数量；client 队列数在启动时固定为已建立 QUIC pool 的 data port 数量，若控制面已返回 data port 数但 data 连接失败，则使用协商端口数启动 worker。多个 proxy peer 的 data port 数量必须一致，动态新增、后台恢复或控制面刷新得到的 data port 数必须匹配当前已启动 worker 数，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。client WireGuard L3 路径仍共享单个外层 UDP socket，且只有 worker 0 负责入站 receive/timer。L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。
+- 多队列启动：server 队列数严格跟随 `QuicPool.ListenPorts` 数量；client 队列数在启动时固定，启动期已知 QUIC data port 数时使用该数量，启动期未知时先使用 1 个 worker。多个 proxy peer 的 data port 数量必须一致；启动期未知时第一个动态新增或后台恢复成功的 proxy peer 可以确定 data port 基准，之后动态新增、后台恢复或控制面刷新得到的 data port 数必须匹配该基准，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。client WireGuard L3 路径仍共享单个外层 UDP socket，且只有 worker 0 负责入站 receive/timer。L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。
 - 多 peer userspace WireGuard：每个 proxy peer 拥有共享的 per-peer `boringtun` 状态和 UDP endpoint，并按 `AllowedIPs` 选择 L3 fallback 目标；需要覆盖多 worker 并发 fallback 时不会死锁或明显退化。
 - E2E：补齐 UDP/ICMP 经 TUN -> boringtun -> server TUN 闭环。
 - 性能：`script/perf/perf_cores_scalability.sh` 在具备 root、release binary、`ip`、`python3`、`curl`、`taskset`、`awk` 和可用 CPU cpuset 的环境下运行真实 HTTP 吞吐；工具、CPU 或拓扑缺失时必须失败，不能生成模拟性能数据。脚本还必须强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 QUIC data port 数。
