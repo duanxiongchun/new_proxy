@@ -324,6 +324,15 @@ pub fn record_client_quic_data_port_baseline_if_unset(
     }
 }
 
+fn record_initial_client_quic_data_port_baseline(
+    client_quic_data_port_baseline: &AtomicUsize,
+    quic_data_port_count: Option<usize>,
+) {
+    if let Some(count) = quic_data_port_count.filter(|count| *count > 0) {
+        client_quic_data_port_baseline.store(count, Ordering::Relaxed);
+    }
+}
+
 fn build_initial_gateway_state(config: GatewayConfig) -> GatewayState {
     let router = rebuild_l4_router(&config.peers);
     GatewayState {
@@ -509,7 +518,7 @@ fn main() {
 
     let client_quic_data_port_count = match runtime_mode {
         RuntimeMode::Client => match preflight_client_quic_data_port_count(&config) {
-            Ok(count) => Some(count),
+            Ok(count) => count,
             Err(e) => {
                 eprintln!("{}", e);
                 std::process::exit(1);
@@ -539,10 +548,10 @@ fn build_tokio_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
 }
 
 #[cfg(not(tarpaulin))]
-fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<usize, String> {
+fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<Option<usize>, String> {
     let proxy_peers = proxy_peers(config);
     if proxy_peers.is_empty() {
-        return Ok(1);
+        return Ok(None);
     }
 
     let runtime = build_tokio_runtime(1);
@@ -569,12 +578,12 @@ fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<usize
     })?;
 
     match preflight_count {
-        Some(count) if count > 0 => Ok(count),
+        Some(count) if count > 0 => Ok(Some(count)),
         Some(_) | None => {
             log::warn!(
                 "No QUIC proxy peer reported a data port count during startup preflight; fixing client topology to one queue until restart"
             );
-            Ok(1)
+            Ok(Some(1))
         }
     }
 }
@@ -887,7 +896,10 @@ async fn run_gateway(
         let quic_data_port_count =
             client_quic_data_port_count(&client_quic_pools, startup_quic_data_port_count);
         let tun_queue_count = effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
-        client_quic_data_port_baseline.store(tun_queue_count, Ordering::Relaxed);
+        record_initial_client_quic_data_port_baseline(
+            &client_quic_data_port_baseline,
+            quic_data_port_count,
+        );
         match quic_data_port_count {
             Some(count) => log::info!(
                 "Client TUN queue count follows negotiated QUIC data port count: data_ports {}, using {}",
@@ -1238,6 +1250,16 @@ mod tests {
         record_client_quic_data_port_baseline_if_unset(&baseline, 2);
         assert_eq!(baseline.load(Ordering::Relaxed), 2);
         record_client_quic_data_port_baseline_if_unset(&baseline, 4);
+        assert_eq!(baseline.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn missing_startup_peer_does_not_lock_client_quic_data_port_baseline() {
+        let baseline = AtomicUsize::new(0);
+        record_initial_client_quic_data_port_baseline(&baseline, None);
+        assert_eq!(baseline.load(Ordering::Relaxed), 0);
+
+        record_initial_client_quic_data_port_baseline(&baseline, Some(2));
         assert_eq!(baseline.load(Ordering::Relaxed), 2);
     }
 
