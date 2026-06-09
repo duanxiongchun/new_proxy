@@ -399,6 +399,7 @@ pub struct BridgeChannels {
     pub nat_key: NatKey,
     pub quic: BridgeQuicState,
     pub recv_buf: PooledBuf,
+    pub quic_recv_buf: PooledBuf,
     pub to_quic_pending: VecDeque<PooledBuf>,
     pub from_quic_pending: VecDeque<PooledBuf>,
     pub to_quic_pending_bytes: usize,
@@ -752,15 +753,7 @@ impl RtcWorker {
             if self.used_local_ports.contains(&port) {
                 continue;
             }
-            let socket_port_in_use = self.tcp_stack.sockets.iter().any(|(_, socket)| {
-                tcp::Socket::downcast(socket)
-                    .and_then(|socket| socket.local_endpoint())
-                    .map(|endpoint| endpoint.port == port)
-                    .unwrap_or(false)
-            });
-            if !socket_port_in_use {
-                return Some(port);
-            }
+            return Some(port);
         }
         None
     }
@@ -1206,6 +1199,7 @@ impl RtcWorker {
                         nat_key,
                         quic: BridgeQuicState::Opening(Box::pin(opening)),
                         recv_buf: self.buffer_pool.get(),
+                        quic_recv_buf: self.buffer_pool.get(),
                         to_quic_pending: VecDeque::new(),
                         from_quic_pending: VecDeque::new(),
                         to_quic_pending_bytes: 0,
@@ -1220,6 +1214,7 @@ impl RtcWorker {
                         nat_key,
                         quic: BridgeQuicState::Inactive,
                         recv_buf: self.buffer_pool.get(),
+                        quic_recv_buf: self.buffer_pool.get(),
                         to_quic_pending: VecDeque::new(),
                         from_quic_pending: VecDeque::new(),
                         to_quic_pending_bytes: 0,
@@ -1289,9 +1284,8 @@ impl RtcWorker {
                 let BridgeQuicState::Active(active) = &mut bridge.quic else {
                     break;
                 };
-                let mut data = self.buffer_pool.get();
                 let poll_result = with_notify_context(&self.bridge_notify, |cx| {
-                    let mut read_buf = ReadBuf::new(data.as_mut_capacity());
+                    let mut read_buf = ReadBuf::new(bridge.quic_recv_buf.as_mut_capacity());
                     match Pin::new(&mut active.recv).poll_read(cx, &mut read_buf) {
                         Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
                         Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -1305,6 +1299,8 @@ impl RtcWorker {
                             .conn_stat
                             .rx_bytes
                             .fetch_add(n as u64, Ordering::Relaxed);
+                        let mut data =
+                            std::mem::replace(&mut bridge.quic_recv_buf, self.buffer_pool.get());
                         data.set_len(n);
                         if !bridge.push_from_quic_pending(data) {
                             log::warn!("Userspace TCP bridge from-QUIC queue byte limit reached; closing bridge");
@@ -1565,6 +1561,7 @@ mod tests {
             nat_key: ("10.0.0.2".parse().unwrap(), 40000, 49152),
             quic: BridgeQuicState::Inactive,
             recv_buf: pool.get(),
+            quic_recv_buf: pool.get(),
             to_quic_pending: VecDeque::new(),
             from_quic_pending: VecDeque::new(),
             to_quic_pending_bytes: 0,
@@ -1797,6 +1794,7 @@ mod tests {
                 nat_key,
                 quic: BridgeQuicState::Inactive,
                 recv_buf: worker.buffer_pool.get(),
+                quic_recv_buf: worker.buffer_pool.get(),
                 to_quic_pending: VecDeque::new(),
                 from_quic_pending: VecDeque::new(),
                 to_quic_pending_bytes: 0,
