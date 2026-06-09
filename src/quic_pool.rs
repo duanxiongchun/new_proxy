@@ -5,12 +5,16 @@ use rand::Rng;
 use rustls::client::ServerCertVerified;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -142,8 +146,134 @@ fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoi
     }
 }
 
-pub type StreamHandler =
-    Arc<dyn Fn([u8; 32], quinn::SendStream, quinn::RecvStream, Arc<QuicConnStats>) + Send + Sync>;
+pub type ServerFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+pub type StreamHandler = Arc<
+    dyn Fn([u8; 32], quinn::SendStream, quinn::RecvStream, Arc<QuicConnStats>) -> ServerFuture
+        + Send
+        + Sync,
+>;
+
+const SERVER_FUTURES_POLL_BUDGET: usize = 128;
+
+#[derive(Clone, Copy)]
+struct ReadyKey {
+    index: usize,
+    generation: u64,
+}
+
+struct ReadyWake {
+    key: ReadyKey,
+    queued: Arc<AtomicBool>,
+    queue: Arc<parking_lot::Mutex<VecDeque<ReadyKey>>>,
+    waiter: Arc<parking_lot::Mutex<Option<Waker>>>,
+}
+
+impl Wake for ReadyWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            self.queue.lock().push_back(self.key);
+        }
+        if let Some(waiter) = self.waiter.lock().as_ref() {
+            waiter.wake_by_ref();
+        }
+    }
+}
+
+struct ServerTask {
+    future: ServerFuture,
+    queued: Arc<AtomicBool>,
+    generation: u64,
+}
+
+struct ServerFutures {
+    tasks: Vec<Option<ServerTask>>,
+    free: Vec<usize>,
+    ready: Arc<parking_lot::Mutex<VecDeque<ReadyKey>>>,
+    waiter: Arc<parking_lot::Mutex<Option<Waker>>>,
+    live: usize,
+    next_generation: u64,
+}
+
+impl ServerFutures {
+    fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            free: Vec::new(),
+            ready: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
+            waiter: Arc::new(parking_lot::Mutex::new(None)),
+            live: 0,
+            next_generation: 1,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    fn push(&mut self, future: ServerFuture) {
+        let index = self.free.pop().unwrap_or_else(|| {
+            self.tasks.push(None);
+            self.tasks.len() - 1
+        });
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let queued = Arc::new(AtomicBool::new(true));
+        self.tasks[index] = Some(ServerTask {
+            future,
+            queued: queued.clone(),
+            generation,
+        });
+        self.ready.lock().push_back(ReadyKey { index, generation });
+        self.live += 1;
+    }
+
+    fn poll_ready(&mut self) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            let mut progressed = false;
+            *self.waiter.lock() = Some(cx.waker().clone());
+            let ready_count = self.ready.lock().len().min(SERVER_FUTURES_POLL_BUDGET);
+            for _ in 0..ready_count {
+                let Some(key) = self.ready.lock().pop_front() else {
+                    break;
+                };
+                let Some(Some(task)) = self.tasks.get_mut(key.index) else {
+                    continue;
+                };
+                if task.generation != key.generation {
+                    continue;
+                };
+                task.queued.store(false, Ordering::Release);
+                let waker = std::task::Waker::from(Arc::new(ReadyWake {
+                    key,
+                    queued: task.queued.clone(),
+                    queue: self.ready.clone(),
+                    waiter: self.waiter.clone(),
+                }));
+                let mut cx = Context::from_waker(&waker);
+                match task.future.as_mut().poll(&mut cx) {
+                    Poll::Ready(()) => {
+                        self.tasks[key.index] = None;
+                        self.free.push(key.index);
+                        self.live -= 1;
+                    }
+                    Poll::Pending => {}
+                }
+                progressed = true;
+            }
+
+            if progressed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+}
 
 // 1. QUIC 隧道内应用层 PSK 认证报文
 #[derive(Serialize, Deserialize, Debug)]
@@ -957,6 +1087,224 @@ impl QuicPoolServer {
         }
     }
 
+    async fn drive_quic_listener(
+        port: u16,
+        endpoint: Endpoint,
+        session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
+        auth_nonce_cache: Arc<Mutex<HashMap<[u8; 32], crate::control::NonceCache>>>,
+        handler: StreamHandler,
+        peer_conn_registry: PeerConnRegistry,
+        connection_limit: Arc<tokio::sync::Semaphore>,
+    ) {
+        let mut connections = ServerFutures::new();
+        log::info!("QUIC Pool Listener running on UDP port {}", port);
+
+        loop {
+            tokio::select! {
+                connecting = endpoint.accept() => {
+                    let Some(connecting) = connecting else {
+                        break;
+                    };
+                    let permit = match connection_limit.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            log::warn!("QUIC incoming connection limit reached on port {}; dropping connection", port);
+                            continue;
+                        }
+                    };
+                    connections.push(Box::pin(Self::drive_quic_connection(
+                        port,
+                        connecting,
+                        permit,
+                        session_cache.clone(),
+                        auth_nonce_cache.clone(),
+                        handler.clone(),
+                        peer_conn_registry.clone(),
+                    )) as ServerFuture);
+                }
+
+                _ = connections.poll_ready(), if !connections.is_empty() => {}
+            }
+        }
+    }
+
+    async fn drive_quic_connection(
+        port: u16,
+        connecting: quinn::Connecting,
+        permit: OwnedSemaphorePermit,
+        session_cache: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
+        auth_nonce_cache: Arc<Mutex<HashMap<[u8; 32], crate::control::NonceCache>>>,
+        handler: StreamHandler,
+        peer_conn_registry: PeerConnRegistry,
+    ) {
+        let _permit = permit;
+        let conn = match timeout(CONNECT_TIMEOUT, connecting).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                log::warn!("QUIC incoming connection handshake failed: {}", e);
+                return;
+            }
+            Err(_) => {
+                log::warn!("QUIC incoming connection handshake timed out");
+                return;
+            }
+        };
+
+        let remote_addr = conn.remote_address();
+        log::info!("New incoming QUIC connection from {}", remote_addr);
+
+        let (mut send, mut recv) = match timeout(AUTH_TIMEOUT, conn.accept_bi()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => {
+                conn.close(0u32.into(), b"No auth stream");
+                return;
+            }
+            Err(_) => {
+                conn.close(0u32.into(), b"Auth stream timeout");
+                return;
+            }
+        };
+
+        let auth_len = match timeout(AUTH_TIMEOUT, recv.read_u16()).await {
+            Ok(Ok(len)) => len as usize,
+            Ok(Err(_)) => {
+                conn.close(0u32.into(), b"Auth read failed");
+                return;
+            }
+            Err(_) => {
+                conn.close(0u32.into(), b"Auth read timeout");
+                return;
+            }
+        };
+        if auth_len == 0 || auth_len > MAX_AUTH_PACKET_LEN {
+            conn.close(0u32.into(), b"Invalid auth packet length");
+            return;
+        }
+
+        let mut buf = vec![0u8; auth_len];
+        match timeout(AUTH_TIMEOUT, recv.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                conn.close(0u32.into(), b"Auth read failed");
+                return;
+            }
+            Err(_) => {
+                conn.close(0u32.into(), b"Auth read timeout");
+                return;
+            }
+        };
+
+        let auth_packet: QuicAuthPacket = match serde_json::from_slice(&buf) {
+            Ok(p) => p,
+            Err(_) => {
+                conn.close(0u32.into(), b"Invalid auth packet");
+                return;
+            }
+        };
+
+        let authenticated_psk = {
+            let cache = session_cache.read();
+            if let Some(psk) = cache.get(&auth_packet.client_public_key) {
+                if crate::control::verify_mac(psk, &auth_packet.nonce, &auth_packet.mac) {
+                    Some(*psk)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let connection_psk = match authenticated_psk {
+            Some(psk) => psk,
+            None => {
+                log::warn!(
+                    "PSK Authentication FAILED for QUIC connection from {}",
+                    remote_addr
+                );
+                conn.close(0u32.into(), b"Auth failed");
+                return;
+            }
+        };
+
+        {
+            let mut cache = auth_nonce_cache.lock();
+            let peer_cache = cache
+                .entry(auth_packet.client_public_key)
+                .or_insert_with(|| crate::control::NonceCache::new(4096));
+            if !peer_cache.insert(auth_packet.nonce) {
+                log::warn!("Replayed QUIC auth nonce from {}", remote_addr);
+                conn.close(0u32.into(), b"Auth replay");
+                return;
+            }
+        }
+
+        log::info!(
+            "PSK Authentication SUCCESSFUL for peer: {:?}",
+            auth_packet.client_public_key
+        );
+        if send.write_all(b"OK").await.is_err() {
+            return;
+        }
+        let _ = send.shutdown().await;
+
+        let client_pub_key = auth_packet.client_public_key;
+        let record_id = NEXT_QUIC_CONN_RECORD_ID.fetch_add(1, Ordering::Relaxed);
+        let conn_stat = Arc::new(QuicConnStats::new(remote_addr, port));
+        {
+            let mut registry = peer_conn_registry.lock();
+            registry
+                .entry(client_pub_key)
+                .or_default()
+                .push(QuicConnRecord {
+                    id: record_id,
+                    stats: (*conn_stat).clone(),
+                    conn: conn.clone(),
+                });
+        }
+
+        let _guard = TelemetryRegistryGuard {
+            registry: peer_conn_registry.clone(),
+            client_pub_key,
+            record_id,
+        };
+
+        let mut streams = ServerFutures::new();
+        loop {
+            tokio::select! {
+                stream = conn.accept_bi() => {
+                    let Ok((send_mux, recv_mux)) = stream else {
+                        break;
+                    };
+                    let still_authorized = {
+                        let cache = session_cache.read();
+                        cache
+                            .get(&client_pub_key)
+                            .map(|psk| *psk == connection_psk)
+                            .unwrap_or(false)
+                    };
+                    if !still_authorized {
+                        log::warn!(
+                            "Closing QUIC connection from removed or rotated peer {:?}",
+                            client_pub_key
+                        );
+                        conn.close(0u32.into(), b"Peer removed or session rotated");
+                        break;
+                    }
+                    streams.push(handler(
+                        client_pub_key,
+                        send_mux,
+                        recv_mux,
+                        conn_stat.clone(),
+                    ));
+                }
+
+                _ = streams.poll_ready(), if !streams.is_empty() => {}
+            }
+        }
+        log::info!("QUIC connection from {} closed", remote_addr);
+    }
+
     // 启动服务端 QUIC 引擎（使用外部传入的 registry，用于与 UDS 层共享统计数据）
     pub async fn run_with_registry(
         self,
@@ -992,197 +1340,22 @@ impl QuicPoolServer {
 
         // 为端口池中的每个物理 UDP 端口拉起一个异步接收 Endpoint
         for (port, endpoint) in listeners {
-            let session_cache_clone = self.session_cache.clone();
-            let auth_nonce_cache_clone = self.auth_nonce_cache.clone();
-            let handler_clone = handler.clone();
-            // 使用外部传入的 registry（与 UDS stats 层共享同一个 Arc）
+            let session_cache = self.session_cache.clone();
+            let auth_nonce_cache = self.auth_nonce_cache.clone();
+            let handler = handler.clone();
             let peer_conn_registry = external_registry.clone();
             let connection_limit = connection_limit.clone();
-
             tokio::spawn(async move {
-                log::info!("QUIC Pool Listener running on UDP port {}", port);
-
-                while let Some(connecting) = endpoint.accept().await {
-                    let permit = match connection_limit.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            log::warn!("QUIC incoming connection limit reached on port {}; dropping connection", port);
-                            continue;
-                        }
-                    };
-                    let session_cache = session_cache_clone.clone();
-                    let auth_nonce_cache = auth_nonce_cache_clone.clone();
-                    let handler = handler_clone.clone();
-                    let peer_conn_registry = peer_conn_registry.clone();
-
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let conn = match timeout(CONNECT_TIMEOUT, connecting).await {
-                            Ok(Ok(c)) => c,
-                            Ok(Err(e)) => {
-                                log::warn!("QUIC incoming connection handshake failed: {}", e);
-                                return;
-                            }
-                            Err(_) => {
-                                log::warn!("QUIC incoming connection handshake timed out");
-                                return;
-                            }
-                        };
-
-                        let remote_addr = conn.remote_address();
-                        log::info!("New incoming QUIC connection from {}", remote_addr);
-
-                        // 1. 等待第一条流，执行 PSK 强认证
-                        let (mut send, mut recv) =
-                            match timeout(AUTH_TIMEOUT, conn.accept_bi()).await {
-                                Ok(Ok(stream)) => stream,
-                                Ok(Err(_)) => {
-                                    conn.close(0u32.into(), b"No auth stream");
-                                    return;
-                                }
-                                Err(_) => {
-                                    conn.close(0u32.into(), b"Auth stream timeout");
-                                    return;
-                                }
-                            };
-
-                        let auth_len = match timeout(AUTH_TIMEOUT, recv.read_u16()).await {
-                            Ok(Ok(len)) => len as usize,
-                            Ok(Err(_)) => {
-                                conn.close(0u32.into(), b"Auth read failed");
-                                return;
-                            }
-                            Err(_) => {
-                                conn.close(0u32.into(), b"Auth read timeout");
-                                return;
-                            }
-                        };
-                        if auth_len == 0 || auth_len > MAX_AUTH_PACKET_LEN {
-                            conn.close(0u32.into(), b"Invalid auth packet length");
-                            return;
-                        }
-
-                        let mut buf = vec![0u8; auth_len];
-                        match timeout(AUTH_TIMEOUT, recv.read_exact(&mut buf)).await {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(_)) => {
-                                conn.close(0u32.into(), b"Auth read failed");
-                                return;
-                            }
-                            Err(_) => {
-                                conn.close(0u32.into(), b"Auth read timeout");
-                                return;
-                            }
-                        };
-
-                        let auth_packet: QuicAuthPacket = match serde_json::from_slice(&buf) {
-                            Ok(p) => p,
-                            Err(_) => {
-                                conn.close(0u32.into(), b"Invalid auth packet");
-                                return;
-                            }
-                        };
-
-                        // 查找临时协商的 PSK 缓存
-                        let authenticated_psk = {
-                            let cache = session_cache.read();
-                            if let Some(psk) = cache.get(&auth_packet.client_public_key) {
-                                if crate::control::verify_mac(
-                                    psk,
-                                    &auth_packet.nonce,
-                                    &auth_packet.mac,
-                                ) {
-                                    Some(*psk)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        };
-
-                        let connection_psk = match authenticated_psk {
-                            Some(psk) => psk,
-                            None => {
-                                log::warn!(
-                                    "PSK Authentication FAILED for QUIC connection from {}",
-                                    remote_addr
-                                );
-                                conn.close(0u32.into(), b"Auth failed");
-                                return;
-                            }
-                        };
-
-                        {
-                            let mut cache = auth_nonce_cache.lock();
-                            let peer_cache = cache
-                                .entry(auth_packet.client_public_key)
-                                .or_insert_with(|| crate::control::NonceCache::new(4096));
-                            if !peer_cache.insert(auth_packet.nonce) {
-                                log::warn!("Replayed QUIC auth nonce from {}", remote_addr);
-                                conn.close(0u32.into(), b"Auth replay");
-                                return;
-                            }
-                        }
-
-                        // 验证成功，回复 OK
-                        log::info!(
-                            "PSK Authentication SUCCESSFUL for peer: {:?}",
-                            auth_packet.client_public_key
-                        );
-                        if send.write_all(b"OK").await.is_err() {
-                            return;
-                        }
-                        let _ = send.shutdown().await;
-
-                        // 2. 为这条物理连接创建统计句柄，注册到 peer_conn_registry
-                        let client_pub_key = auth_packet.client_public_key;
-                        let record_id = NEXT_QUIC_CONN_RECORD_ID.fetch_add(1, Ordering::Relaxed);
-                        let conn_stat = Arc::new(QuicConnStats::new(remote_addr, port));
-                        {
-                            let mut registry = peer_conn_registry.lock();
-                            registry
-                                .entry(client_pub_key)
-                                .or_default()
-                                .push(QuicConnRecord {
-                                    id: record_id,
-                                    stats: (*conn_stat).clone(),
-                                    conn: conn.clone(),
-                                });
-                        }
-
-                        let _guard = TelemetryRegistryGuard {
-                            registry: peer_conn_registry.clone(),
-                            client_pub_key,
-                            record_id,
-                        };
-
-                        // 3. 进入多路复用流接收循环
-                        while let Ok((send_mux, recv_mux)) = conn.accept_bi().await {
-                            let still_authorized = {
-                                let cache = session_cache.read();
-                                cache
-                                    .get(&client_pub_key)
-                                    .map(|psk| *psk == connection_psk)
-                                    .unwrap_or(false)
-                            };
-                            if !still_authorized {
-                                log::warn!(
-                                    "Closing QUIC connection from removed or rotated peer {:?}",
-                                    client_pub_key
-                                );
-                                conn.close(0u32.into(), b"Peer removed or session rotated");
-                                break;
-                            }
-                            let handler = handler.clone();
-                            let stat_clone = conn_stat.clone();
-                            tokio::spawn(async move {
-                                handler(client_pub_key, send_mux, recv_mux, stat_clone);
-                            });
-                        }
-                        log::info!("QUIC connection from {} closed", remote_addr);
-                    });
-                }
+                Self::drive_quic_listener(
+                    port,
+                    endpoint,
+                    session_cache,
+                    auth_nonce_cache,
+                    handler,
+                    peer_conn_registry,
+                    connection_limit,
+                )
+                .await;
             });
         }
 
@@ -1214,11 +1387,190 @@ mod tests {
     use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::Ordering;
+    use std::task::Waker;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     fn unused_udp_port() -> u16 {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.local_addr().unwrap().port()
+    }
+
+    struct CountingPendingFuture {
+        polls: Arc<AtomicUsize>,
+        waker: Arc<parking_lot::Mutex<Option<Waker>>>,
+    }
+
+    impl Future for CountingPendingFuture {
+        type Output = ();
+
+        fn poll(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            *self.waker.lock() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn server_futures_only_repolls_woken_futures() {
+        let polls_a = Arc::new(AtomicUsize::new(0));
+        let polls_b = Arc::new(AtomicUsize::new(0));
+        let waker_a = Arc::new(parking_lot::Mutex::new(None));
+        let waker_b = Arc::new(parking_lot::Mutex::new(None));
+        let mut futures = ServerFutures::new();
+
+        futures.push(Box::pin(CountingPendingFuture {
+            polls: polls_a.clone(),
+            waker: waker_a.clone(),
+        }));
+        futures.push(Box::pin(CountingPendingFuture {
+            polls: polls_b.clone(),
+            waker: waker_b,
+        }));
+
+        futures.poll_ready().await;
+        assert_eq!(polls_a.load(Ordering::Relaxed), 1);
+        assert_eq!(polls_b.load(Ordering::Relaxed), 1);
+
+        waker_a.lock().as_ref().unwrap().wake_by_ref();
+        futures.poll_ready().await;
+        assert_eq!(polls_a.load(Ordering::Relaxed), 2);
+        assert_eq!(polls_b.load(Ordering::Relaxed), 1);
+    }
+
+    struct SelfWakingPendingFuture {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Future for SelfWakingPendingFuture {
+        type Output = ();
+
+        fn poll(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn server_futures_defers_self_wake_until_next_poll_ready_round() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut futures = ServerFutures::new();
+
+        futures.push(Box::pin(SelfWakingPendingFuture {
+            polls: polls.clone(),
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), futures.poll_ready())
+            .await
+            .unwrap();
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), futures.poll_ready())
+            .await
+            .unwrap();
+        assert_eq!(polls.load(Ordering::Relaxed), 2);
+    }
+
+    struct ReadyFuture;
+
+    impl Future for ReadyFuture {
+        type Output = ();
+
+        fn poll(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Ready(())
+        }
+    }
+
+    #[tokio::test]
+    async fn server_futures_reuses_completed_slots() {
+        let mut futures = ServerFutures::new();
+
+        for _ in 0..1024 {
+            futures.push(Box::pin(ReadyFuture));
+            futures.poll_ready().await;
+            assert!(futures.is_empty());
+        }
+
+        assert_eq!(futures.tasks.len(), 1);
+        assert_eq!(futures.free.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn server_futures_limits_each_poll_ready_round() {
+        let mut futures = ServerFutures::new();
+        let mut poll_counts = Vec::new();
+
+        for _ in 0..(SERVER_FUTURES_POLL_BUDGET + 5) {
+            let polls = Arc::new(AtomicUsize::new(0));
+            poll_counts.push(polls.clone());
+            futures.push(Box::pin(CountingPendingFuture {
+                polls,
+                waker: Arc::new(parking_lot::Mutex::new(None)),
+            }));
+        }
+
+        futures.poll_ready().await;
+        let first_round_polls: usize = poll_counts
+            .iter()
+            .map(|polls| polls.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(first_round_polls, SERVER_FUTURES_POLL_BUDGET);
+
+        futures.poll_ready().await;
+        let second_round_polls: usize = poll_counts
+            .iter()
+            .map(|polls| polls.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(second_round_polls, SERVER_FUTURES_POLL_BUDGET + 5);
+    }
+
+    struct CaptureAndCompleteFuture {
+        waker: Arc<parking_lot::Mutex<Option<Waker>>>,
+    }
+
+    impl Future for CaptureAndCompleteFuture {
+        type Output = ();
+
+        fn poll(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            *self.waker.lock() = Some(cx.waker().clone());
+            std::task::Poll::Ready(())
+        }
+    }
+
+    #[tokio::test]
+    async fn server_futures_ignores_stale_wake_after_slot_reuse() {
+        let stale_waker = Arc::new(parking_lot::Mutex::new(None));
+        let new_future_polls = Arc::new(AtomicUsize::new(0));
+        let mut futures = ServerFutures::new();
+
+        futures.push(Box::pin(CaptureAndCompleteFuture {
+            waker: stale_waker.clone(),
+        }));
+        futures.poll_ready().await;
+
+        futures.push(Box::pin(CountingPendingFuture {
+            polls: new_future_polls.clone(),
+            waker: Arc::new(parking_lot::Mutex::new(None)),
+        }));
+        futures.poll_ready().await;
+        assert_eq!(new_future_polls.load(Ordering::Relaxed), 1);
+
+        stale_waker.lock().as_ref().unwrap().wake_by_ref();
+        let result = tokio::time::timeout(Duration::from_millis(50), futures.poll_ready()).await;
+        assert!(result.is_err());
+        assert_eq!(new_future_polls.load(Ordering::Relaxed), 1);
     }
 
     async fn start_echo_quic_server(
@@ -1240,9 +1592,10 @@ mod tests {
             move |_pub_key: [u8; 32],
                   mut send: quinn::SendStream,
                   mut recv: quinn::RecvStream,
-                  stat: Arc<QuicConnStats>| {
+                  stat: Arc<QuicConnStats>|
+                  -> ServerFuture {
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                Box::pin(async move {
                     let mut buf = vec![0u8; 1024];
                     if let Ok(Some(n)) = recv.read(&mut buf).await {
                         buf.truncate(n);
@@ -1253,7 +1606,7 @@ mod tests {
                         let _ = send.finish().await;
                         let _ = tx.send(buf).await;
                     }
-                });
+                })
             },
         );
 
@@ -1299,9 +1652,10 @@ mod tests {
             move |_pub_key: [u8; 32],
                   mut send: quinn::SendStream,
                   mut recv: quinn::RecvStream,
-                  stat: Arc<QuicConnStats>| {
+                  stat: Arc<QuicConnStats>|
+                  -> ServerFuture {
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                Box::pin(async move {
                     // 模拟接收数据并增加 rx 计数
                     let mut buf = vec![0u8; 1024];
                     if let Ok(Some(n)) = recv.read(&mut buf).await {
@@ -1314,7 +1668,7 @@ mod tests {
                         let _ = send.finish().await;
                         let _ = tx.send(buf).await;
                     }
-                });
+                })
             },
         );
 

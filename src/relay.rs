@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const RELAY_COPY_YIELD_BUDGET_BYTES: usize = 64 * 1024;
 
 // 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
 pub struct PeerL4Stats {
@@ -155,11 +156,29 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     QW: AsyncWrite + Send + Unpin + 'static,
     QR: AsyncRead + Send + Unpin + 'static,
 {
+    struct ActiveStreamGuard {
+        stats: Arc<PeerL4Stats>,
+        conn_stat: Option<Arc<QuicConnStats>>,
+    }
+
+    impl Drop for ActiveStreamGuard {
+        fn drop(&mut self) {
+            self.stats.active_streams.fetch_sub(1, Ordering::Relaxed);
+            if let Some(cs) = &self.conn_stat {
+                cs.active_streams.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     // 1. 累加活跃流计数器（聚合 + 单连接）
     stats.active_streams.fetch_add(1, Ordering::Relaxed);
     if let Some(cs) = &conn_stat {
         cs.active_streams.fetch_add(1, Ordering::Relaxed);
     }
+    let _active_stream_guard = ActiveStreamGuard {
+        stats: stats.clone(),
+        conn_stat: conn_stat.clone(),
+    };
 
     // Keep L4 rx/tx aligned with WireGuard peer semantics:
     // rx = bytes received from the remote peer over QUIC, tx = bytes sent to it.
@@ -173,66 +192,45 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     let counting_tcp_read = CountingReader::new(tcp_read, tx_counters);
     let counting_quic_read = CountingReader::new(quic_recv, rx_counters);
 
-    // 3. 并发双向流复制，流结束时传播半关闭 (FIN)
-    let client_to_server = tokio::spawn(async move {
+    let client_to_server = async move {
         let mut reader = counting_tcp_read;
         let mut writer = quic_send;
         if let Err(e) = relay_copy_with_idle(&mut reader, &mut writer).await {
             log::debug!("Client→Server relay error: {}", e);
         }
         let _ = writer.shutdown().await;
-    });
+    };
 
-    let server_to_client = tokio::spawn(async move {
+    let server_to_client = async move {
         let mut reader = counting_quic_read;
         let mut writer = tcp_write;
         if let Err(e) = relay_copy_with_idle(&mut reader, &mut writer).await {
             log::debug!("Server→Client relay error: {}", e);
         }
         let _ = writer.shutdown().await;
-    });
+    };
 
-    // 4. 并发等待双方关闭，配合 10 秒优雅半关闭超时机制，彻底根治死锁/连接悬挂泄露
-    let mut c2s = client_to_server;
-    let mut s2c = server_to_client;
+    // 4. 并发等待双方关闭，配合 10 秒优雅半关闭超时机制，避免连接悬挂。
+    let mut c2s = Box::pin(client_to_server);
+    let mut s2c = Box::pin(server_to_client);
 
     tokio::select! {
-        res = &mut c2s => {
-            if let Err(e) = res {
-                log::error!("Client→Server relay worker task panicked or failed: {:?}", e);
-            }
+        _ = &mut c2s => {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    s2c.abort();
+                    log::debug!("Server→Client relay half-close grace period expired");
                 }
-                res2 = &mut s2c => {
-                    if let Err(e) = res2 {
-                        log::error!("Server→Client relay worker task panicked or failed: {:?}", e);
-                    }
-                }
+                _ = &mut s2c => {}
             }
         }
-        res = &mut s2c => {
-            if let Err(e) = res {
-                log::error!("Server→Client relay worker task panicked or failed: {:?}", e);
-            }
+        _ = &mut s2c => {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    c2s.abort();
+                    log::debug!("Client→Server relay half-close grace period expired");
                 }
-                res2 = &mut c2s => {
-                    if let Err(e) = res2 {
-                        log::error!("Client→Server relay worker task panicked or failed: {:?}", e);
-                    }
-                }
+                _ = &mut c2s => {}
             }
         }
-    }
-
-    // 5. 流结束后递减活跃计数
-    stats.active_streams.fetch_sub(1, Ordering::Relaxed);
-    if let Some(cs) = &conn_stat {
-        cs.active_streams.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -243,6 +241,7 @@ where
 {
     let mut buf = PooledBuffer::new();
     let mut copied = 0u64;
+    let mut copied_since_yield = 0usize;
     loop {
         let n = match tokio::time::timeout(RELAY_IDLE_TIMEOUT, reader.read(&mut buf[..])).await {
             Ok(res) => res?,
@@ -266,6 +265,11 @@ where
             }
         }
         copied += n as u64;
+        copied_since_yield += n;
+        if copied_since_yield >= RELAY_COPY_YIELD_BUDGET_BYTES {
+            copied_since_yield = 0;
+            tokio::task::yield_now().await;
+        }
     }
 }
 

@@ -3,10 +3,131 @@
 ## 测试概览
 
 - 项目版本：`new_proxy v5.0.0`
-- 报告日期：2026-06-08
+- 报告日期：2026-06-09
 - 主要测试对象：配置冲突校验、UDS API/server、TUN/smoltcp TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer 并发/冲突防护、聚合遥测、稳定性与 perf smoke
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
+
+## 2026-06-09 ServerFutures event-base 修复验证
+
+本次补充修复覆盖：
+
+- 服务端 QUIC connection 内 accepted stream 使用 connection-local `ServerFutures` 推进，不再为每条 stream 创建 `tokio::spawn`。
+- `ServerFutures` 槽位改为 generation + free-list，完成任务后的槽位可复用，旧 waker 在槽位复用后会被忽略，避免高 churn 短连接/短 stream 导致 tombstone 长期积累。
+- `ServerFutures::poll_ready()` 每轮有固定 ready poll 预算，避免一次 drain 大量 ready stream 导致 accept/status 路径抖动。
+- relay 每方向连续复制达到 64 KiB 后主动 `yield_now()`，降低长下载 stream 对同 connection 短 stream 的调度影响。
+- 删除无调用的旧 `run_userspace_wg_timer_loop()`，保持 userspace WireGuard UDP receive/timer 只归属 worker 0 的架构不变量。
+- 文档同步当前 event-base server stream 模型，不再描述 per-stream handler task。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release --bins
+sudo bash script/perf/perf_cores_scalability.sh
+```
+
+结果：**通过。** 默认高并发 perf artifact `/tmp/new_proxy_cores_scalability_20260609_105333`：
+
+```text
+data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,32,2,4096,43.011465,95.230,1.000,65
+2,32,2,4096,18.570266,220.568,2.316,30|35
+3,32,2,4096,13.937299,293.888,3.086,19|26|20
+4,32,2,4096,8.931285,458.613,4.816,18|17|12|18
+```
+
+## 2026-06-09 Client topology 门禁补充验证
+
+本次补充覆盖：
+
+- 新增 `script/acceptance/e2e_client_topology_gate.sh`，并纳入 `script/acceptance/run_acceptance.sh` 默认 E2E 列表和语法门禁。
+- 用两个真实 server daemon 验证 client 启动前预协商 QUIC data port 数：server1 发布 4 个 data ports，client 启动后 UDS `dump` 必须出现 4 个 worker telemetry 行。
+- 移除原始 4-port peer 后，当前 QUIC pool 为空但 baseline 仍固定为 4；动态添加 1-port proxy peer 必须被拒绝，错误信息包含 `established baseline uses 4`。
+- 拒绝 mismatched peer 后，worker 拓扑保持 4；重新添加原始 4-port peer 后，业务 TCP 仍可通过 TUN/smoltcp/QUIC 成功。
+
+执行命令：
+
+```bash
+bash -n script/acceptance/e2e_client_topology_gate.sh
+bash -n script/acceptance/run_acceptance.sh
+cargo test runtime_worker_threads_follow_fixed_data_plane_width
+cargo build --bins
+sudo bash script/acceptance/e2e_client_topology_gate.sh
+```
+
+结果：**通过。** 新增 E2E 产物目录为 `/tmp/new_proxy_client_topology_20260609_100440`。
+
+## 2026-06-09 QUIC stream 调度性能修复验证
+
+问题定位：
+
+- `script/perf/perf_cores_scalability.sh` 修复前在默认 `PERF_PARALLEL=32` 下，1-port 组可完成但 2-port 组超时失败。
+- 降低到 `PERF_PARALLEL=8 PERF_BLOB_MIB=32` 后，2-port 组仍超时失败。
+- client 日志显示大量 `Timed out waiting for userspace target proxy status`，随后 QUIC pool 进入 fallback/recovery。
+- 根因是 server 侧 accepted stream handler 和长生命周期 relay future 被放在 connection loop 的 `ServerFutures` 内一起推进；大文件下载 relay 会拖慢同一 QUIC connection 上后续 stream 的 target status 写回。
+
+最终修复：
+
+- server QUIC connection loop 负责 `accept_bi()`、session authorization 和 stream handler future 推进。
+- 每条 accepted stream 在接收时受 `MAX_QUIC_STREAM_HANDLERS` semaphore 限流，但不创建 per-stream task。
+- `ServerFutures` 只 poll ready future，并带槽位复用、旧 waker generation 校验和每轮 ready poll 预算。
+- relay copy 增加 64 KiB cooperative yield 预算，避免长 relay 在 event-base loop 中独占过久。
+
+执行命令：
+
+```bash
+cargo fmt
+cargo check
+cargo test
+cargo build --release --bins
+sudo env PERF_PARALLEL=8 PERF_ROUNDS=2 PERF_BLOB_MIB=32 bash script/perf/perf_cores_scalability.sh
+sudo bash script/perf/perf_cores_scalability.sh
+```
+
+结果：**通过。**
+
+低并发复测，artifact `/tmp/new_proxy_cores_scalability_20260609_102146`：
+
+```text
+data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,8,2,512,3.216713,159.169,1.000,17
+2,8,2,512,1.625278,315.023,1.979,11|6
+3,8,2,512,1.143402,447.787,2.813,5|5|7
+4,8,2,512,0.972662,526.390,3.307,5|6|2|4
+```
+
+默认高并发复测，artifact `/tmp/new_proxy_cores_scalability_20260609_102234`：
+
+```text
+data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+1,32,2,4096,34.855698,117.513,1.000,65
+2,32,2,4096,16.303492,251.235,2.138,36|29
+3,32,2,4096,12.778437,320.540,2.728,25|17|23
+4,32,2,4096,10.225614,400.563,3.409,25|12|12|16
+```
+
+## 2026-06-09 数据面线程模型修复验证
+
+本次修复覆盖：
+
+- server/client userspace WireGuard 外层 UDP receive 和 timer 均收敛到 worker 0；其他 worker 只处理各自 TUN queue 的出站封装。
+- 进程入口改为显式创建 Tokio runtime，worker thread 数由配置推导的数据面宽度限制。
+- 服务端 QUIC data port listener 保持每 data port 一个固定 task；连接认证和 stream accept 保持轻量，accepted stream 由 connection-local `ServerFutures` 推进，relay 带 cooperative yield 预算，避免长 relay 阻塞新 stream 建立。
+- server-side TCP relay 的双向复制改为单 future 内 `select` 推进，不再为每个方向创建额外 task。
+- `VirtualTunnelSocket` 删除后台 ping task，改由调用方 timer 通过 `tick_control()` 驱动物理 socket 探测和 active socket 选择。
+- 补充单元回归：验证 L3 UDP receive/timer ownership 只属于 worker 0、runtime worker thread 数受配置宽度限制、入口不再使用 `#[tokio::main]`、server QUIC ready queue 只重新 poll 被唤醒 future、VirtualTunnelSocket 不创建后台 task 且 `tick_control()` 能发送 PING/处理 PONG 切换 active socket，并用源码级 guard 限制 server QUIC 数据面 spawn 点。
+
+执行命令：
+
+```bash
+cargo test
+```
+
+结果：**通过。** `cargo test` 当前为 CLI 10 个测试、主程序 128 个测试全部通过。本轮未执行需要 root/network namespace 的全量 E2E、稳定性和 perf 实测。
 
 ## 2026-06-08 严格 Review 后二次修复验证
 
@@ -16,9 +137,9 @@
 - TUN/UDP/WireGuard/QUIC bridge 运行时 packet buffer 改为按 MTU 派生，默认 `MTU + 256`，下限 1500、上限 65535，并支持 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖；默认 MTU 1400 时不再为每个 worker 固定分配 65535 字节 buffer。
 - 修复 `client_quic_data_port_count()` 的 Clippy `filter_next` 门禁问题，`script/acceptance/run_acceptance.sh` 中的 Clippy 硬门禁可通过。
 - client 初始 QUIC data 连接失败但控制面已返回端口池时，worker 数使用协商 data port 数，避免 cold-start fallback 后恢复阶段因“多 data port、单 worker”被拒绝；多个 peer 的启动期协商端口数不一致时直接拒绝启动。
-- client 启动后记录实际已启动 worker 数；后台恢复或 UDS 动态新增 QUIC pool 时，如果 peer data port 数与当前 worker 数不一致，则拒绝该 pool，避免进入“多 data port、少 worker”的静默降级状态。
+- client 启动后记录 QUIC data port 基准；后台恢复或 UDS 动态新增 QUIC pool 时，如果 peer data port 数与既有基准不一致，则拒绝该 pool。2026-06-09 后启动期未知时基准固定为 1，动态新增 peer 不能改变已启动拓扑。
 - `QuicPoolClient` 控制面刷新保留同数量换端口能力，但拒绝 data port 数变化；需要改变 client worker 拓扑时必须重启客户端。
-- 架构和测试文档同步当前真实语义：client worker 数启动时固定，后续不支持热扩容 TUN multiqueue worker。
+- 架构和测试文档同步当前真实语义：client TUN worker 数启动时固定，后续不支持热扩容 TUN multiqueue worker；QUIC data port 基准与 TUN worker 数分离。
 
 执行命令：
 
@@ -438,7 +559,7 @@ git diff --check: PASS
 - `PreScript` 执行失败时启动立即失败，不再只记录 warning 后继续启动；`PostScript` 仍保持 cleanup best-effort。
 - `RtcWorker` IPv4 TCP parser 拒绝非法 IHL、过短 total length 和截断 packet，避免 malformed TUN packet 被误分类。
 - `script/perf/perf_cores_scalability.sh` 删除模拟吞吐 fallback，缺 root、release binary、必需系统工具、可用 CPU 或 benchmark 拓扑时失败，不再生成可误读的性能数据；脚本强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 QUIC data port 数。
-- 架构和测试文档同步当前真实语义：server worker 数严格跟随 QUIC listen port 数，client worker 数启动时固定为已建立 QUIC pool 的 data port 数量；多个 proxy peer 的 data port 数量必须一致，且后续新增、恢复或控制面刷新得到的 data port 数必须匹配当前 worker 数。L4 proxy 多 worker 正确性依赖 Linux TUN multiqueue 的 flow queue affinity。
+- 架构和测试文档同步当前真实语义：server worker 数严格跟随 QUIC listen port 数，client TUN worker 数启动时固定；多个 proxy peer 的 data port 数量必须一致，且后续新增、恢复或控制面刷新得到的 data port 数必须匹配 QUIC data port 基准。L4 proxy 多 worker 正确性依赖 Linux TUN multiqueue 的 flow queue affinity。
 - 取消 L4 proxy client 强制单 TUN 队列，proxy E2E/perf smoke 入口不再传 daemon worker 参数，worker 数由 QUIC data port 数决定。
 
 执行命令：
@@ -490,7 +611,7 @@ sudo script/acceptance/e2e_dynamic_client_peer.sh: PASS
 - 使用 release binary：`cargo build --release --bins`
 - 使用 Linux network namespace 搭建 `scale_work_ns -> scale_client_ns -> scale_router_ns -> scale_server_ns`
 - server 分别运行 1、2、3、4 个 QUIC data ports：从 `40001` 起连续分配
-- client worker 数在启动时跟随控制面协商得到的 QUIC data port 数
+- client TUN worker 数在启动时跟随控制面协商得到的 QUIC data port 数
 - 每组 client 使用当前允许 cpuset 的前 N 个 CPU 运行，支持 `PERF_CPU_LIST` 覆盖
 - 每组先 warmup 一次 64 MiB HTTP 下载，再运行并发 HTTP 下载同一 64 MiB 对象
 - 统计来自 client UDS dump 的 `worker:` 行：`new_flows` 表示每个 worker 新建 TCP flow 数

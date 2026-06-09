@@ -23,7 +23,7 @@ pub mod userspace_wg;
 pub mod virtual_tunnel;
 mod wireguard;
 
-use client_proxy::build_peer_quic_pool;
+use client_proxy::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,12 +99,17 @@ fn should_enable_userspace_tcp_for_pool_states(
             .all(|state| matches!(state, PoolState::Active))
 }
 
+fn worker_owns_l3_udp_rx_and_timer(worker_id: usize) -> bool {
+    worker_id == 0
+}
+
 #[cfg(not(tarpaulin))]
 fn start_userspace_tcp_failover_manager(
     state: Arc<parking_lot::RwLock<GatewayState>>,
     pools: PeerQuicPools,
     client_private_key: [u8; 32],
-    client_worker_count: Arc<AtomicUsize>,
+    client_quic_data_port_baseline: Arc<AtomicUsize>,
+    peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -142,8 +147,9 @@ fn start_userspace_tcp_failover_manager(
                 );
                 match build_peer_quic_pool(client_private_key, &peer).await {
                     Ok(pool) => {
-                        if let Err(e) =
-                            validate_client_quic_data_port_count(&pools, pool.endpoint_count())
+                        let _mutation_guard = peer_mutation_lock.lock().await;
+                        let endpoint_count = pool.endpoint_count();
+                        if let Err(e) = validate_client_quic_data_port_count(&pools, endpoint_count)
                         {
                             pool.shutdown(b"QUIC data port count mismatch");
                             log::warn!(
@@ -153,11 +159,11 @@ fn start_userspace_tcp_failover_manager(
                             );
                             continue;
                         }
-                        if let Err(e) = validate_client_quic_data_port_count_matches_workers(
-                            pool.endpoint_count(),
-                            client_worker_count.load(Ordering::Relaxed),
+                        if let Err(e) = validate_client_quic_data_port_count_matches_baseline(
+                            endpoint_count,
+                            client_quic_data_port_baseline.load(Ordering::Relaxed),
                         ) {
-                            pool.shutdown(b"QUIC data port count does not match active workers");
+                            pool.shutdown(b"QUIC data port count does not match baseline");
                             log::warn!(
                                 "Rejected recovered QUIC pool for peer {}: {}",
                                 encode_base64_32(&peer.public_key),
@@ -165,10 +171,6 @@ fn start_userspace_tcp_failover_manager(
                             );
                             continue;
                         }
-                        record_client_quic_data_port_count_if_unset(
-                            &client_worker_count,
-                            pool.endpoint_count(),
-                        );
                         let still_configured = {
                             let st = state.read();
                             st.config.peers.iter().any(|configured| {
@@ -184,6 +186,10 @@ fn start_userspace_tcp_failover_manager(
                         match pools_guard.entry(peer.public_key) {
                             std::collections::hash_map::Entry::Vacant(entry) => {
                                 entry.insert(pool);
+                                record_client_quic_data_port_baseline_if_unset(
+                                    &client_quic_data_port_baseline,
+                                    endpoint_count,
+                                );
                                 log::info!(
                                     "Recovered missing QUIC pool for peer {}",
                                     encode_base64_32(&peer.public_key)
@@ -290,31 +296,40 @@ fn validate_client_quic_data_port_count(
     }
 }
 
-fn validate_client_quic_data_port_count_matches_workers(
+fn validate_client_quic_data_port_count_matches_baseline(
     candidate_count: usize,
-    active_worker_count: usize,
+    baseline_count: usize,
 ) -> Result<(), String> {
-    if active_worker_count == 0 || candidate_count == active_worker_count {
+    if baseline_count == 0 || candidate_count == baseline_count {
         Ok(())
     } else {
         Err(format!(
-            "QUIC data port count mismatch: active client workers use {}, peer uses {}; restart the client with this peer available to change worker topology",
-            active_worker_count, candidate_count
+            "QUIC data port count mismatch: established baseline uses {}, peer uses {}; restart the client with a consistent proxy peer set to change worker topology",
+            baseline_count, candidate_count
         ))
     }
 }
 
-pub fn record_client_quic_data_port_count_if_unset(
-    client_worker_count: &AtomicUsize,
+pub fn record_client_quic_data_port_baseline_if_unset(
+    client_quic_data_port_baseline: &AtomicUsize,
     candidate_count: usize,
 ) {
     if candidate_count > 0 {
-        let _ = client_worker_count.compare_exchange(
+        let _ = client_quic_data_port_baseline.compare_exchange(
             0,
             candidate_count,
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+    }
+}
+
+fn record_initial_client_quic_data_port_baseline(
+    client_quic_data_port_baseline: &AtomicUsize,
+    quic_data_port_count: Option<usize>,
+) {
+    if let Some(count) = quic_data_port_count.filter(|count| *count > 0) {
+        client_quic_data_port_baseline.store(count, Ordering::Relaxed);
     }
 }
 
@@ -457,18 +472,16 @@ fn bind_l3_udp_socket(port: u16, require_ipv6: bool) -> Result<std::net::UdpSock
     }
 }
 
-#[tokio::main]
 #[cfg(not(tarpaulin))]
-async fn main() {
-    // 初始化日志系统
+fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
     let startup_args = parse_startup_args(&args);
 
-    // CLI 遥测展示
     if startup_args.stats {
-        if let Err(e) = run_cli_stats().await {
+        let runtime = build_tokio_runtime(1);
+        if let Err(e) = runtime.block_on(run_cli_stats()) {
             eprintln!("Error query stats: {}", e);
             std::process::exit(1);
         }
@@ -503,6 +516,96 @@ async fn main() {
         }
     };
 
+    let client_quic_data_port_count = match runtime_mode {
+        RuntimeMode::Client => match preflight_client_quic_data_port_count(&config) {
+            Ok(count) => count,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        },
+        RuntimeMode::Server => None,
+    };
+    let runtime_threads =
+        runtime_worker_threads(&config, runtime_mode, client_quic_data_port_count);
+    let runtime = build_tokio_runtime(runtime_threads);
+    runtime.block_on(run_gateway(
+        config,
+        interface_name,
+        runtime_mode,
+        client_quic_data_port_count,
+    ));
+}
+
+#[cfg(not(tarpaulin))]
+fn build_tokio_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads.max(1))
+        .thread_name("new-proxy-data")
+        .enable_all()
+        .build()
+        .expect("failed to build Tokio runtime")
+}
+
+#[cfg(not(tarpaulin))]
+fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<Option<usize>, String> {
+    let proxy_peers = proxy_peers(config);
+    if proxy_peers.is_empty() {
+        return Ok(None);
+    }
+
+    let runtime = build_tokio_runtime(1);
+    let preflight_count = runtime.block_on(async {
+        let mut expected_count = None;
+        for peer in &proxy_peers {
+            match negotiate_peer_quic_data_port_count(config.interface.private_key, peer).await {
+                Ok(data_port_count) => {
+                    record_startup_quic_data_port_count(&mut expected_count, data_port_count)?;
+                }
+                Err(e) => {
+                    if let Some(data_port_count) = e.data_port_count() {
+                        record_startup_quic_data_port_count(&mut expected_count, data_port_count)?;
+                    }
+                    log::warn!(
+                        "Failed to preflight QUIC data port count for peer {}; using fallback topology if no other peer reports a count: {}",
+                        encode_base64_32(&peer.public_key),
+                        e
+                    );
+                }
+            }
+        }
+        Ok::<Option<usize>, String>(expected_count)
+    })?;
+
+    match preflight_count {
+        Some(count) if count > 0 => Ok(Some(count)),
+        Some(_) | None => {
+            log::warn!(
+                "No QUIC proxy peer reported a data port count during startup preflight; fixing client topology to one queue until restart"
+            );
+            Ok(Some(1))
+        }
+    }
+}
+
+fn runtime_worker_threads(
+    config: &GatewayConfig,
+    runtime_mode: RuntimeMode,
+    client_quic_data_port_count: Option<usize>,
+) -> usize {
+    match runtime_mode {
+        RuntimeMode::Server => effective_server_tun_queues(&config.quic_pool.listen_ports),
+        RuntimeMode::Client => client_quic_data_port_count.unwrap_or(1).max(1),
+    }
+}
+
+#[cfg(not(tarpaulin))]
+async fn run_gateway(
+    config: GatewayConfig,
+    interface_name: String,
+    runtime_mode: RuntimeMode,
+    fixed_client_quic_data_port_count: Option<usize>,
+) {
     // 执行 PreScript 脚本
     if let Some(ref pre_script) = config.interface.pre_script {
         if let Err(e) = run_script(pre_script) {
@@ -534,7 +637,7 @@ async fn main() {
     let shared_quic_registry: quic_pool::PeerConnRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     let client_quic_pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-    let client_worker_count = Arc::new(AtomicUsize::new(0));
+    let client_quic_data_port_baseline = Arc::new(AtomicUsize::new(0));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
     let l3_registry =
         match userspace_wg::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
@@ -564,7 +667,7 @@ async fn main() {
                 peer_mutation_lock: peer_mutation_lock.clone(),
                 l3_registry: l3_registry.clone(),
                 virtual_tunnel_telemetry: virtual_tunnel_telemetry.clone(),
-                client_worker_count: client_worker_count.clone(),
+                client_quic_data_port_baseline: client_quic_data_port_baseline.clone(),
             },
         );
     }
@@ -619,7 +722,7 @@ async fn main() {
         let server_udp_raw = Arc::new(tokio::net::UdpSocket::from_std(server_udp).unwrap());
         let server_udp = crate::virtual_tunnel::TunnelSocket::Single(server_udp_raw);
         let mut l3_tasks = Vec::new();
-        for fd in tun_fds {
+        for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
                 Ok(io) => io,
                 Err(e) => {
@@ -633,14 +736,11 @@ async fn main() {
                 server_udp.clone(),
                 l3_registry.clone(),
                 config.interface.mtu,
+                worker_owns_l3_udp_rx_and_timer(worker_id),
+                worker_owns_l3_udp_rx_and_timer(worker_id),
             ));
             l3_tasks.push(task);
         }
-        let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
-            server_udp.clone(),
-            l3_registry.clone(),
-            config.interface.mtu,
-        ));
 
         let Some(listen_control_port) = config.interface.listen_control_port else {
             log::error!("Server config validation failed to enforce ListenControlPort");
@@ -712,7 +812,6 @@ async fn main() {
 
         wait_for_shutdown().await;
         control_task.abort();
-        l3_timer_task.abort();
         for task in l3_tasks {
             task.abort();
         }
@@ -727,7 +826,7 @@ async fn main() {
         }
 
         let mut initial_pool_failures = 0usize;
-        let mut startup_quic_data_port_count = None;
+        let mut startup_quic_data_port_count = fixed_client_quic_data_port_count;
         for peer in &proxy_peers {
             match build_peer_quic_pool(config.interface.private_key, peer).await {
                 Ok(pool) => {
@@ -794,17 +893,13 @@ async fn main() {
                 initial_pool_failures
             );
         }
-        let userspace_tcp_failover_task = start_userspace_tcp_failover_manager(
-            gateway_state.clone(),
-            client_quic_pools.clone(),
-            config.interface.private_key,
-            client_worker_count.clone(),
-        );
-
         let quic_data_port_count =
             client_quic_data_port_count(&client_quic_pools, startup_quic_data_port_count);
         let tun_queue_count = effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
-        client_worker_count.store(quic_data_port_count.unwrap_or(0), Ordering::Relaxed);
+        record_initial_client_quic_data_port_baseline(
+            &client_quic_data_port_baseline,
+            quic_data_port_count,
+        );
         match quic_data_port_count {
             Some(count) => log::info!(
                 "Client TUN queue count follows negotiated QUIC data port count: data_ports {}, using {}",
@@ -816,6 +911,14 @@ async fn main() {
                 tun_queue_count
             ),
         }
+
+        let userspace_tcp_failover_task = start_userspace_tcp_failover_manager(
+            gateway_state.clone(),
+            client_quic_pools.clone(),
+            config.interface.private_key,
+            client_quic_data_port_baseline.clone(),
+            peer_mutation_lock.clone(),
+        );
 
         log::info!(
             "Opening userspace multiqueue TUN device: {} with {} queues",
@@ -872,12 +975,6 @@ async fn main() {
                 tokio::net::UdpSocket::from_std(socket).unwrap(),
             ))
         };
-        let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
-            client_udp.clone(),
-            l3_registry.clone(),
-            config.interface.mtu,
-        ));
-
         let mut worker_tasks = Vec::new();
         for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -916,7 +1013,8 @@ async fn main() {
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
             worker.set_peer_telemetry(telemetry_registry.clone());
-            worker.set_l3_rx_enabled(worker_id == 0);
+            worker.set_l3_rx_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
+            worker.set_l3_timer_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
 
             let gateway_state_for_worker = gateway_state.clone();
             let client_quic_pools_for_worker = client_quic_pools.clone();
@@ -941,7 +1039,6 @@ async fn main() {
         for t in worker_tasks {
             t.abort();
         }
-        l3_timer_task.abort();
         userspace_tcp_failover_task.abort();
     }
 
@@ -1026,7 +1123,73 @@ mod tests {
     }
 
     #[test]
-    fn startup_failed_pool_data_port_count_drives_client_worker_count() {
+    fn runtime_worker_threads_follow_fixed_data_plane_width() {
+        let mut server = config_with_peers(Vec::new());
+        server.quic_pool.listen_ports = vec![40001, 40002, 40003];
+        assert_eq!(
+            runtime_worker_threads(&server, RuntimeMode::Server, None),
+            3
+        );
+
+        let client = config_with_peers(vec![
+            peer([2u8; 32], Some("127.0.0.1:51820"), Some(40000)),
+            peer([3u8; 32], Some("127.0.0.1:51821"), Some(40000)),
+        ]);
+        assert_eq!(
+            runtime_worker_threads(&client, RuntimeMode::Client, Some(4)),
+            4
+        );
+        assert_eq!(
+            runtime_worker_threads(&client, RuntimeMode::Client, None),
+            1
+        );
+    }
+
+    #[test]
+    fn gateway_entrypoint_uses_explicit_bounded_runtime() {
+        let main_source = include_str!("main.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+
+        assert!(!main_source.contains("#[tokio::main]"));
+        assert!(main_source.contains("tokio::runtime::Builder::new_multi_thread()"));
+        assert!(main_source.contains("worker_threads(worker_threads.max(1))"));
+    }
+
+    #[test]
+    fn l3_udp_receive_and_timer_are_owned_by_worker_zero() {
+        assert!(worker_owns_l3_udp_rx_and_timer(0));
+        assert!(!worker_owns_l3_udp_rx_and_timer(1));
+        assert!(!worker_owns_l3_udp_rx_and_timer(8));
+    }
+
+    #[test]
+    fn server_quic_data_plane_uses_fixed_listeners_and_event_driven_streams() {
+        let quic_pool = include_str!("quic_pool.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let server_proxy = include_str!("server_proxy.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let relay = include_str!("relay.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            quic_pool.matches("tokio::spawn").count(),
+            2,
+            "quic_pool should only spawn the client health checker and fixed listener tasks"
+        );
+        assert!(!server_proxy.contains("tokio::spawn"));
+        assert!(!relay.contains("tokio::spawn"));
+    }
+
+    #[test]
+    fn startup_failed_pool_data_port_count_drives_client_tun_worker_count() {
         let pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         assert_eq!(client_quic_data_port_count(&pools, Some(4)), Some(4));
     }
@@ -1072,22 +1235,32 @@ mod tests {
     }
 
     #[test]
-    fn client_quic_data_port_count_must_match_active_workers() {
-        assert!(validate_client_quic_data_port_count_matches_workers(2, 2).is_ok());
-        assert!(validate_client_quic_data_port_count_matches_workers(2, 0).is_ok());
-        let err = validate_client_quic_data_port_count_matches_workers(4, 1).unwrap_err();
-        assert!(err.contains("active client workers use 1"));
+    fn client_quic_data_port_count_must_match_established_baseline() {
+        assert!(validate_client_quic_data_port_count_matches_baseline(2, 2).is_ok());
+        assert!(validate_client_quic_data_port_count_matches_baseline(2, 0).is_ok());
+        let err = validate_client_quic_data_port_count_matches_baseline(4, 1).unwrap_err();
+        assert!(err.contains("established baseline uses 1"));
         assert!(err.contains("peer uses 4"));
         assert!(err.contains("restart"));
     }
 
     #[test]
-    fn first_dynamic_peer_records_client_quic_data_port_count() {
-        let worker_count = AtomicUsize::new(0);
-        record_client_quic_data_port_count_if_unset(&worker_count, 2);
-        assert_eq!(worker_count.load(Ordering::Relaxed), 2);
-        record_client_quic_data_port_count_if_unset(&worker_count, 4);
-        assert_eq!(worker_count.load(Ordering::Relaxed), 2);
+    fn first_dynamic_peer_records_client_quic_data_port_baseline() {
+        let baseline = AtomicUsize::new(0);
+        record_client_quic_data_port_baseline_if_unset(&baseline, 2);
+        assert_eq!(baseline.load(Ordering::Relaxed), 2);
+        record_client_quic_data_port_baseline_if_unset(&baseline, 4);
+        assert_eq!(baseline.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn missing_startup_peer_does_not_lock_client_quic_data_port_baseline() {
+        let baseline = AtomicUsize::new(0);
+        record_initial_client_quic_data_port_baseline(&baseline, None);
+        assert_eq!(baseline.load(Ordering::Relaxed), 0);
+
+        record_initial_client_quic_data_port_baseline(&baseline, Some(2));
+        assert_eq!(baseline.load(Ordering::Relaxed), 2);
     }
 
     #[test]

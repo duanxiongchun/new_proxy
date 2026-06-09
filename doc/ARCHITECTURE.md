@@ -34,7 +34,7 @@ Client mode 支持：
 - **用户态混合代理**：TCP 流量匹配 proxy peer 的 `AllowedIPs` 最长前缀后卸载到用户态 QUIC 连接池中；UDP/ICMP 以及 QUIC 不可用时的 TCP fallback 通过 `boringtun` 在用户态进行 WireGuard 加密封装。
 - proxy peer 需要同时配置 `Endpoint` 和 `ProxyPort`。`ProxyPort` 是控制面 UDP 端口；`Endpoint` 和 `ProxyPort` 必须成对出现。
 - `TProxyPort` 是旧 TPROXY 路径遗留配置，当前用户态 TUN client 不再需要它。
-- 客户端 TUN worker 数在启动时固定：如果启动期已知道 QUIC data port 数，则 worker 数跟随该数量；如果启动期未知，则先使用 1 个 worker。QUIC data port 数还有一个独立的兼容性基准：启动期已知时由启动期 peer/控制面结果确定；启动期未知时保持未设置，允许第一个动态新增或后台恢复成功的 proxy peer 用自己的 data port 数设置基准。之后多个 proxy peer、后台恢复和控制面刷新得到的 data port 数必须与该基准一致，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。需要改变已经确定的 data port 基准或启动期 TUN worker 拓扑时必须重启客户端。服务端 worker 数严格跟随 `QuicPool.ListenPorts` 数量。L4 proxy 模式下每个 worker 拥有独立的 `smoltcp`、NAT 映射和桥接状态；L3 userspace WireGuard 状态按 peer 共享，并通过内部锁串行访问。
+- 客户端 TUN worker 数在启动时固定：如果启动期已知道 QUIC data port 数，则 worker 数跟随该数量；如果启动期未知，则固定为 1 个 worker。QUIC data port 数还有一个兼容性基准：启动主 runtime 前先做控制面预协商，启动期已知时由控制面结果确定，启动期未知时固定为 1。之后多个 proxy peer、后台恢复和控制面刷新得到的 data port 数必须与该基准一致，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。需要改变已经确定的 data port 基准或启动期 TUN worker 拓扑时必须重启客户端。服务端 worker 数严格跟随 `QuicPool.ListenPorts` 数量。L4 proxy 模式下每个 worker 拥有独立的 `smoltcp`、NAT 映射和桥接状态；L3 userspace WireGuard 状态按 peer 共享，并通过内部锁串行访问。
 
 ## 3. WireGuard 后端
 
@@ -135,17 +135,17 @@ flowchart LR
 客户端有两个容易混淆但语义不同的数量：
 
 - **TUN worker 数**：启动时一次性打开 TUN FD 并创建 `RtcWorker`。如果启动期已知道 QUIC data port 数，则创建相同数量的 worker；如果启动期不知道 data port 数，则创建 1 个 worker。运行中不热扩容 TUN worker。
-- **QUIC data port 基准**：用于保证同一个客户端上多个 proxy peer 的 QUIC 物理连接池拓扑一致。启动期已知时由启动期 peer 或控制面结果确定；启动期未知时保持未设置，第一个动态新增或后台恢复成功的 proxy peer 可以用自己的 data port 数设置基准。基准一旦设置，后续 proxy peer、后台恢复和控制面刷新必须返回相同 data port 数，否则拒绝该 QUIC pool 并继续使用 userspace WireGuard L3 fallback。
+- **QUIC data port 基准**：用于保证同一个客户端上多个 proxy peer 的 QUIC 物理连接池拓扑一致。启动主 runtime 前先做控制面预协商；启动期已知时由控制面结果确定，启动期未知时固定为 1。基准一旦设置，后续 proxy peer、后台恢复和控制面刷新必须返回相同 data port 数，否则拒绝该 QUIC pool 并继续使用 userspace WireGuard L3 fallback。
 
-这意味着“启动时没有 proxy peer，之后动态添加第一个双 data port peer”是合法的：实际 TUN worker 仍是启动期的 1 个，但 `QuicPoolClient` 会维护 2 条物理 QUIC data connection，并在打开业务 stream 时在连接池内轮询选择连接。若希望 TUN worker 数也与 2 个 data port 对齐，需要把该 peer 放进启动配置并重启客户端。
+这意味着“启动时没有可用 proxy peer，之后动态添加第一个双 data port peer”会被拒绝：实际 TUN worker 和 runtime worker 已经固定为 1。若希望 TUN worker 数与 2 个 data port 对齐，需要让启动期控制面可达并重启客户端。
 
 Multiqueue 与 worker 模型：
 
 - **出站流量**：Linux TUN multiqueue 按 flow 选择队列，单个 TCP flow 的后续包应保持队列亲和；不同 flow 可被分散到不同队列 FD。
 - **L4 TCP offload 出站流量**：接收某个 TCP flow 的 `RtcWorker` 持有该 flow 的 `smoltcp` socket、NAT 映射和桥接通道。
 - **固定 worker**：worker 数在启动时确定，不随连接数增长。每个 worker 绑定一个 TUN 队列 FD，拥有自己的 L4 TCP 用户态协议状态、NAT 映射和数据面 packet buffer pool；数据面热路径不使用跨 worker 的共享大池，避免全局锁竞争。
-- **线程模型**：所有连接状态都由所属 `RtcWorker` 的事件循环驱动，不能按连接创建新的数据面线程或长期 task。当前实现固定 worker 数，smoltcp RX/TX 队列使用 worker 内 `PooledBuf` 流转，QUIC stream 句柄也保存在 worker 的 bridge 状态中。
-- **L3 外层 UDP**：客户端 WireGuard L3 路径流量较小，当前共享单个外层 UDP socket 和共享 per-peer `boringtun::Tunn` 状态；只有 worker 0 负责该 UDP socket 的入站 receive 与 timer 包，其他 worker 只在 TCP fallback/UDP/ICMP 出站时发送。`VirtualTunnelSocket` 保留为多底层 UDP socket readiness 聚合器：它不后台预取业务包、不维护中间接收队列，调用方 `recv_from` 时直接把 ready socket 的数据读入调用方 buffer；发送使用当前 active 底层 UDP socket。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
+- **线程模型**：client 侧连接状态由所属 `RtcWorker` 的事件循环驱动，不能按 TCP flow 创建新的数据面线程或长期 task。进程启动时显式创建 Tokio runtime，并把 worker thread 数限制在启动期固定的数据面宽度内。当前实现固定 worker 数，smoltcp RX/TX 队列使用 worker 内 `PooledBuf` 流转，QUIC stream 句柄也保存在 worker 的 bridge 状态中。服务端 QUIC 每个 data port 只有一个固定 listener task；listener 内部用 `ServerFutures` 事件驱动连接认证和已接受 stream。每条 stream 在接受时受全局 semaphore 限流，handler future 不再创建 per-stream task；relay 每方向连续复制达到预算后主动 yield，避免长下载 relay 饿死同一 QUIC connection 上的新 stream 建立。
+- **L3 外层 UDP**：客户端 WireGuard L3 路径流量较小，当前共享单个外层 UDP socket 和共享 per-peer `boringtun::Tunn` 状态；只有 worker 0 负责该 UDP socket 的入站 receive 与 timer 包，其他 worker 只在 TCP fallback/UDP/ICMP 出站时发送。服务端 userspace WireGuard 多 TUN queue 也只有 worker 0 负责外层 UDP receive 与 timer，其他 worker 只处理各自 TUN queue 的出站封装。`VirtualTunnelSocket` 保留为多底层 UDP socket readiness 聚合器：它不后台预取业务包、不维护中间接收队列，也不创建后台 health-check task；调用方 `recv_from` 时直接把 ready socket 的数据读入调用方 buffer，调用方 timer 通过 `tick_control()` 驱动物理 socket 探测和 active socket 选择。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
 
 ### 6.3 TCP L4 offload 路径
 
@@ -162,7 +162,7 @@ TCP 出站包从客户端 TUN 进入 `RtcWorker` 后按以下条件进入 L4 off
 2. `nat_map` 记录原始五元组和原始目标地址；TUN 包目标地址/端口被改写成本 worker 的 `smoltcp` 本地地址/端口。
 3. 改写后的包进入 `smoltcp`。`smoltcp` 产出的回包再通过 `nat_map` 反向改写源地址/端口并写回 TUN。
 4. 当 `smoltcp` socket 进入 active 状态，worker 创建 `BridgeChannels`。bridge 先进入 `Opening` 状态，异步打开 QUIC bidirectional stream，并写入 `proxy_proto` target address header。
-5. 服务端 `QuicPoolServer` 校验连接认证后把业务 stream 交给 stream handler；handler 读取 target address header，连接目标 TCP 服务，向客户端回写 1 字节成功/失败状态，然后用 `relay_connections_with_conn_stat` 转发 TCP socket 与 QUIC stream。
+5. 服务端 `QuicPoolServer` 校验连接认证后把业务 stream 放入 connection-local `ServerFutures`。stream handler 在同一个事件驱动循环内读取 target address header，连接目标 TCP 服务，向客户端回写 1 字节成功/失败状态，然后用 `relay_connections_with_conn_stat` 转发 TCP socket 与 QUIC stream。relay 双向复制在同一个 future 内用 `select` 推进，不为每个方向或每条 stream 创建额外 task。
 6. 客户端 bridge 切换到 `Active` 后，在同一个 `RtcWorker` 事件循环内推进 `smoltcp socket <-> QUIC stream` 双向读写。没有为每条连接创建长期数据面 task。
 
 每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有默认上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。TUN/UDP/WireGuard/QUIC bridge 的运行时 packet buffer 默认按 `MTU + 256` 派生，下限 1500、上限 65535，默认 MTU 1400 时为 1656，jumbo MTU 9000 时为 9256。默认上限可通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖，用于不同机器规格和压测场景调参。
@@ -184,7 +184,7 @@ fallback 入站路径相反：服务端 TUN 中的目标回包由服务端 users
 
 每个 `RtcWorker` 的事件循环执行路径遵循 **Run-to-Completion** 模式：包从所属 TUN queue 读入该 worker 的 `PooledBuf` 后，尽量通过所有权转移在 worker 内继续流转，避免中间 `Vec` 分配和 payload copy。必须发生的 copy 只保留在内核 syscall 边界、加解密输出边界和协议库不可避免的内部缓冲边界。
 
-写回 TUN、发送外层 UDP 和 QUIC stream 读写均按非阻塞方式推进；当出口暂不可写时，包所有权进入所属 worker 的 pending 队列，并由 TUN/UDP writable 事件唤醒后继续 flush。QUIC bridge 的 `Opening` future、active QUIC stream 读写、smoltcp socket 读写、TUN/UDP I/O 和 timer 都由同一个 worker loop 分片推进，不能读写时立即回到事件循环。只有内部 pending 字节数达到上限时才会丢弃或关闭连接，以保护 worker 内存不会无界增长。
+写回 TUN、发送外层 UDP 和 QUIC stream 读写均按非阻塞方式推进；当出口暂不可写时，包所有权进入所属 worker 的 pending 队列，并由 TUN/UDP writable 事件唤醒后继续 flush。QUIC bridge 的 `Opening` future、active QUIC stream 读写、smoltcp socket 读写、TUN/UDP I/O 和 timer 都由同一个 worker loop 分片推进，不能读写时立即回到事件循环。QUIC future/stream manual poll 使用 worker-local `Notify` waker；当 Quinn readiness 触发 waker 时会唤醒该 worker，而不是只能等待下一次 timer tick。只有内部 pending 字节数达到上限时才会丢弃或关闭连接，以保护 worker 内存不会无界增长。
 
 ## 7. 路由配置
 

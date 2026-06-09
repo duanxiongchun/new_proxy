@@ -647,6 +647,8 @@ pub async fn run_userspace_wg_loop(
     udp_socket: crate::virtual_tunnel::TunnelSocket,
     registry: UserspaceWgRegistry,
     mtu: u16,
+    udp_rx_enabled: bool,
+    timer_enabled: bool,
 ) -> Result<(), String> {
     let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(mtu);
     let buffer_pool = BufferPool::new(packet_buffer_size);
@@ -656,6 +658,7 @@ pub async fn run_userspace_wg_loop(
     let mut pending_udp = VecDeque::new();
     let mut pending_tun_bytes = 0usize;
     let mut pending_udp_bytes = 0usize;
+    let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
 
     loop {
         flush_pending_tun(&tun_io, &mut pending_tun, &mut pending_tun_bytes);
@@ -700,7 +703,21 @@ pub async fn run_userspace_wg_loop(
                 }
             }
 
-            udp_res = udp_socket.recv_from(udp_buf.as_mut_capacity()) => {
+            _ = timer.tick(), if timer_enabled => {
+                udp_socket.tick_control();
+                for (endpoint, packet) in registry.timer_packets(&buffer_pool) {
+                    send_or_queue_udp_packet(
+                        &udp_socket,
+                        endpoint,
+                        packet,
+                        &mut pending_udp,
+                        &mut pending_udp_bytes,
+                        "userspace WireGuard timer",
+                    );
+                }
+            }
+
+            udp_res = udp_socket.recv_from(udp_buf.as_mut_capacity()), if udp_rx_enabled => {
                 let Ok((n, endpoint)) = udp_res else {
                     continue;
                 };
@@ -750,42 +767,6 @@ pub async fn run_userspace_wg_loop(
                 }
             }
 
-        }
-    }
-}
-
-#[cfg(not(tarpaulin))]
-pub async fn run_userspace_wg_timer_loop(
-    udp_socket: crate::virtual_tunnel::TunnelSocket,
-    registry: UserspaceWgRegistry,
-    mtu: u16,
-) {
-    let buffer_pool = BufferPool::new(crate::config::packet_buffer_size_for_mtu(mtu));
-    let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
-    let mut pending_udp = VecDeque::new();
-    let mut pending_udp_bytes = 0usize;
-    loop {
-        flush_pending_udp(&udp_socket, &mut pending_udp, &mut pending_udp_bytes);
-        let udp_socket_for_writable = udp_socket.clone();
-        tokio::select! {
-            _ = timer.tick() => {
-                for (endpoint, packet) in registry.timer_packets(&buffer_pool) {
-                    send_or_queue_udp_packet(
-                        &udp_socket,
-                        endpoint,
-                        packet,
-                        &mut pending_udp,
-                        &mut pending_udp_bytes,
-                        "userspace WireGuard timer",
-                    );
-                }
-            }
-
-            writable = udp_socket_for_writable.writable(), if !pending_udp.is_empty() => {
-                if writable.is_ok() {
-                    flush_pending_udp(&udp_socket, &mut pending_udp, &mut pending_udp_bytes);
-                }
-            }
         }
     }
 }
