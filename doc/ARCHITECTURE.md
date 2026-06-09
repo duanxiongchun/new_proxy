@@ -1,219 +1,157 @@
-# new_proxy 当前架构说明
+# new_proxy 架构说明（Pure L3 IP-over-QUIC Datagram 架构）
 
-本文档描述当前代码实现，不描述规划能力。若架构设计发生变化，先更新本文档，再补对应测试。
+本文档描述 `new_proxy` 的全新纯 L3 IP-over-QUIC Datagram 数据面架构。所有数据包（TCP、UDP、ICMP）均通过无状态、无延迟的 QUIC Datagram 进行传输，并依托多队列网卡实现对称多核并行处理。
+
+---
 
 ## 1. 总体模型
 
-`new_proxy` 是一个混合 L3/L4 网关：
+`new_proxy` 是一个纯粹的 **L3 IP-over-QUIC 隧道网关**，完全运行在用户态，通过 QUIC 协议栈提供安全加密的 VPN 功能：
 
-- **L3 数据面**：
-  - **服务端**：打开 TUN 设备并通过内建 `boringtun` 处理 WireGuard 风格 L3 加解密；配置 `Table = auto` 时会为 peer AllowedIPs 下发指向 TUN 的路由。
-  - **客户端**：采用用户态协议栈。启动时如果已有 proxy peer 成功建立 QUIC pool，或控制面已返回 data port 数但 QUIC data 连接暂时失败，TUN 队列数按该 data port 数创建；如果启动时没有任何已知 QUIC data port 数，则先创建 1 个 TUN 队列作为最小可用数据面。随后程序配置该 TUN 的地址和 AllowedIPs 路由；在进程内通过 `boringtun`（用户态 WireGuard 协议库）对 UDP/ICMP 报文和 TCP fallback 报文进行加密封装，并发送至宿主机物理网卡。客户端不再同步 peer 到内核 WireGuard 设备，但创建 TUN 和配置路由仍需要相应系统权限（通常是 `CAP_NET_ADMIN` 或 root）。
-- **L4 TCP 路径**：
-  - **服务端**：通过物理 QUIC 连接池接收并解密来自客户端的透明流。
-  - **客户端**：通过 TUN 拦截 TCP 流量，由各 TUN 队列对应的 `RtcWorker` 内部 `smoltcp` 用户态协议栈接管。建立连接后，通过在进程内桥接 `smoltcp` 套接字与对应的 QUIC 复用连接流（Quinn）进行转发，从而完全免除了内核 iptables 和 TPROXY 的防火墙规则依赖。同一 TCP flow 的状态保存在接收该 flow 的 worker 中，当前实现依赖 Linux TUN multiqueue 的 flow queue affinity。
-- **控制面**：独立的 UDP 报文协议，使用 WireGuard 密钥材料派生 X25519 shared secret，并用 HMAC-SHA256 认证 JSON 请求/响应。
-- **QUIC 数据面**：使用服务端自签证书，服务端在已认证控制面响应中下发证书 SHA-256 指纹，客户端只接受该指纹对应证书。
-- **运行期 API**：通过 Unix Domain Socket 提供 `Stats`、`Dump`、`AddPeer`、`RemovePeer` API。
+* **纯 L3 隧道数据面**：
+  * **客户端**：创建多队列 TUN 网卡，截获所有发往 Peer `AllowedIPs` 的 IP 数据包（IPv4/IPv6）。代理不解析应用层协议，直接将 IP 报文封装进 QUIC Datagram 帧中发送。
+  * **服务端**：同样建立多队列 TUN 网卡。接收到 QUIC Datagram 后，解出原始 IP 数据包，直接写入服务端的 TUN 网卡，由系统内核完成最终的路由和转发。回程流量通过相同路径镜像传回。
+  * **去 WireGuard / smoltcp 化**：新架构完全移除了原有的用户态 WireGuard 协议栈（`boringtun`）和用户态 TCP/IP 协议栈（`smoltcp`），极大地简化了数据路径，并消除了流代理机制下的队头阻塞（Head-of-Line Blocking）和 TCP-over-TCP 拥塞冲突。
+* **控制面**：独立的 UDP 报文协议，使用协商好的私钥/公钥材料派生 X25519 共享密钥，并用 HMAC-SHA256 对 JSON 格式的配置交换进行签名和认证。
+* **运行期 API**：通过 Unix Domain Socket 提供运行时 `Stats`、`Dump`、`AddPeer` 和 `RemovePeer` 等 API 支持。
 
-## 2. 运行模式
+---
 
-启动模式由配置决定：
+## 2. 物理拓扑与运行配置
 
-- Server mode：`ListenControlPort` 存在，或 `[QUICPool].ListenPorts` 非空。
-- Client mode：非 server mode，且至少有一个 `[Peer]`。
+### 2.1 控制面预协商与线程基准建立
+* 客户端启动时，首先通过服务端的管控端口（Control Port）发起预协商。
+* 协商交互中，客户端获取服务端配置的**数据面端口列表**（共 $N$ 个端口，例如 `[40001, ..., 40001+N-1]`）。
+* **首个 Peer 基准**：客户端以第一个成功建立连接的 Peer 返回的端口数量 $N$ 作为本地静态基准：
+  1. 在本地初始化拥有 $N$ 个通道队列的多队列 TUN 设备（Multiqueue TUN）。
+  2. 显式创建并绑定 $N$ 个独立的工作线程（Workers）。
+  3. 后续添加的所有 Peer 其数据面端口数必须等于 $N$，否则将被拒绝，以保证本地静态工作线程和网卡队列拓扑的对等一致。
 
-Server mode 要求：
+### 2.2 线程与物理通道的一一对称映射
+* **客户端工作线程 $i$**（$i \in [0, N-1]$）：绑定独立的客户端 UDP socket，直接建立并拥有指向服务端数据端口 `40000+i` 的 **QUIC 连接 $i$**，并独占读写客户端 **TUN 队列 $i$**。
+* **服务端监听线程 $i$**：监听 UDP 端口 `40000+i`，接受来自客户端的 **QUIC 连接 $i$**，并独占读写服务端 **TUN 队列 $i$**。
 
-- `ListenControlPort` 必须存在。
-- `[QUICPool].ListenPorts` 至少一个端口。
-- peer 可以只配置 `PublicKey` 和 `AllowedIPs`，用于接受控制面协商与 L3 遥测展示。
+---
 
-Client mode 支持：
+## 3. 数据流调度与内核对称哈希
 
-- **用户态混合代理**：TCP 流量匹配 proxy peer 的 `AllowedIPs` 最长前缀后卸载到用户态 QUIC 连接池中；UDP/ICMP 以及 QUIC 不可用时的 TCP fallback 通过 `boringtun` 在用户态进行 WireGuard 加密封装。
-- proxy peer 需要同时配置 `Endpoint` 和 `ProxyPort`。`ProxyPort` 是控制面 UDP 端口；`Endpoint` 和 `ProxyPort` 必须成对出现。
-- `TProxyPort` 是旧 TPROXY 路径遗留配置，当前用户态 TUN client 不再需要它。
-- 客户端 TUN worker 数在启动时固定：如果启动期已知道 QUIC data port 数，则 worker 数跟随该数量；如果启动期未知，则固定为 1 个 worker。QUIC data port 数还有一个兼容性基准：启动主 runtime 前先做控制面预协商，启动期已知时由控制面结果确定，启动期未知时固定为 1。之后多个 proxy peer、后台恢复和控制面刷新得到的 data port 数必须与该基准一致，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。需要改变已经确定的 data port 基准或启动期 TUN worker 拓扑时必须重启客户端。服务端 worker 数严格跟随 `QuicPool.ListenPorts` 数量。L4 proxy 模式下每个 worker 拥有独立的 `smoltcp`、NAT 映射和桥接状态；L3 userspace WireGuard 状态按 peer 共享，并通过内部锁串行访问。
+借助于 Linux 内核多队列网卡（`IFF_MULTI_QUEUE`）的对称流哈希（Symmetric Flow Hashing），`new_proxy` 实现了零锁竞争的高效数据转发：
 
-## 3. WireGuard 后端
-
-client/server 都使用内建的 `boringtun` 模块。程序作为库直接调用 `boringtun::noise::Tunn` 进行解密/加密，不再创建 kernel WireGuard 设备，也不再依赖 generic netlink 或外部 `wireguard-go` 进程；但 TUN 创建、接口地址和路由配置仍需要系统网络管理权限。
-
-## 4. 控制面
-
-控制面位于服务端 `ListenControlPort`，客户端从 peer 的 `Endpoint.ip()` 与 `ProxyPort` 拼出控制面地址。
-
-协商流程：
-
-1. 客户端用本地私钥和服务端公钥计算 X25519 shared secret。
-2. 客户端发送 `ControlRequest`，包含客户端派生公钥和随机 `client_nonce`，外层 `SignedPacket` 用 HMAC-SHA256 保护。
-3. 服务端按 peer 公钥查找预计算 shared secret，校验 HMAC 和 nonce replay cache。
-4. 服务端生成 `server_nonce`，派生 `session_psk`，缓存到 `session_cache[client_public_key]`。
-5. 服务端返回 QUIC 端口池、公网 IPv4/IPv6 可选地址、`client_nonce`、`server_nonce`、`quic_cert_sha256`，响应同样用 HMAC-SHA256 保护。
-6. 客户端校验响应 HMAC 和 `client_nonce`，派生同一 `session_psk`。
-
-控制面重试每次生成新的 `client_nonce`，避免响应丢包后旧 nonce 被服务端 replay cache 拒绝。
-
-## 5. QUIC 数据面
-
-服务端启动时生成一组自签证书和私钥：
-
-- QUIC listener 绑定 `[QUICPool].ListenPorts`。
-- 证书 SHA-256 指纹由控制面下发给客户端。
-- 客户端使用 pinned certificate verifier，不再接受任意自签证书。
-
-客户端启动每个 proxy peer 时：
-
-1. 先完成控制面协商。
-2. 从控制面响应中选择 QUIC endpoint IP（IPv6 优先使用 `PublicIPv6`，IPv4 优先使用 `PublicIPv4`，未配置时回退到 `Endpoint.ip()`）。
-3. 对端口池中每个端口建立一条物理 QUIC 连接。
-4. 每条连接打开认证流，发送 `QuicAuthPacket { client_public_key, nonce, mac }`。
-5. 服务端用 `session_cache` 中的 `session_psk` 校验 QUIC auth HMAC。
-
-服务端在每次接受业务 stream 前会检查该连接使用的 `session_psk` 是否仍与 `session_cache` 一致。peer 被删除或重新协商后，旧连接会被关闭。
-
-客户端 `QuicPoolClient` 有后台健康检查：
-
-- 已关闭连接会按原 endpoint 重连。
-- 缺失 endpoint 会补建连接。
-- pool 状态分为 `Active`、`Fallback`、`Recovering`。
-- 重连失败后支持控制面重新协商，并替换连接池与指纹。
-
-## 6. 用户态拦截与 RtcWorker 事件循环
-
-在客户端模式下，程序放弃了基于 `iptables` Mangle 和 `TPROXY` 规则的流量捕获，改为用 TUN 路由把业务包送入进程，并在进程内完成 TCP L4 offload、WireGuard L3 fallback、QUIC stream 桥接和遥测统计。服务端同时提供两条数据面入口：QUIC stream 用于 TCP offload，userspace WireGuard UDP 用于 L3 包。
-
-### 6.1 数据面泳道图
-
-```mermaid
-flowchart LR
-    subgraph CAPP[Client application lane]
-        App[业务进程]
-        Route[AllowedIPs / policy route]
-    end
-
-    subgraph COS[Client kernel lane]
-        CTun[client TUN]
-        MarkedUdp[marked outer UDP socket]
-    end
-
-    subgraph CNP[new_proxy client lane]
-        Worker[RtcWorker]
-        Smol[per-worker smoltcp]
-        Bridge[per-flow BridgeChannels]
-        Pool[QuicPoolClient]
-        CWg[UserspaceWgRegistry / boringtun]
-    end
-
-    subgraph WAN[Physical network lane]
-        QuicConn[QUIC data connection pool]
-        WgUdp[WireGuard-style UDP packet]
-    end
-
-    subgraph SNP[new_proxy server lane]
-        QServer[QuicPoolServer]
-        Handler[stream handler]
-        SWg[UserspaceWgRegistry / boringtun]
-        STun[server TUN]
-    end
-
-    subgraph TGT[Target network lane]
-        TargetTcp[target TCP service]
-        TargetIp[target IP stack]
-    end
-
-    App --> Route --> CTun --> Worker
-    Worker -->|TCP + active QUIC pool| Smol --> Bridge --> Pool --> QuicConn --> QServer --> Handler --> TargetTcp
-    TargetTcp --> Handler --> QServer --> QuicConn --> Pool --> Bridge --> Smol --> Worker --> CTun --> App
-    Worker -->|UDP / ICMP / TCP fallback| CWg --> MarkedUdp --> WgUdp --> SWg --> STun --> TargetIp
-    TargetIp --> STun --> SWg --> WgUdp --> MarkedUdp --> CWg --> Worker --> CTun --> App
+```
+客户端业务包 ---> [Client TUN MQ] 
+                     | (内核对称 Hash 选队列 i)
+                     v
+             [工作线程 i (RTC Loop)]
+                     | (无锁读取，封装)
+                     v
+             [QUIC 连接 i (Datagram)]
+                     | (公网传输至对应端口 40000+i)
+                     v
+             [监听线程 i (RTC Loop)]
+                     | (无锁接收，解密)
+                     v
+客户端回程包 <--- [Server TUN MQ] <--- 目标网络回包
 ```
 
-### 6.2 TUN worker 与 QUIC data port 基准
+* **流队列亲和性**：一个网络连接流（例如 `ClientIP:54321 -> TargetIP:80`）的数据包会被内核固定路由至客户端 TUN 队列 $i$。
+* **回程对称匹配**：当远端目标服务回包时（`TargetIP:80 -> ClientIP:54321`），服务端内核对称地将其路由至服务端 TUN 队列 $i$，并通过对应的 QUIC 连接 $i$ 传回。
+* **零竞争（Zero-Contention）**：每个工作线程或监听线程在数据面上只处理自己专属的网卡队列和 QUIC 连接，**线程之间不存在任何全局锁、哈希表或共享状态的同步**，实现多核性能的完全线性扩展。
 
-客户端有两个容易混淆但语义不同的数量：
+---
 
-- **TUN worker 数**：启动时一次性打开 TUN FD 并创建 `RtcWorker`。如果启动期已知道 QUIC data port 数，则创建相同数量的 worker；如果启动期不知道 data port 数，则创建 1 个 worker。运行中不热扩容 TUN worker。
-- **QUIC data port 基准**：用于保证同一个客户端上多个 proxy peer 的 QUIC 物理连接池拓扑一致。启动主 runtime 前先做控制面预协商；启动期已知时由控制面结果确定，启动期未知时固定为 1。基准一旦设置，后续 proxy peer、后台恢复和控制面刷新必须返回相同 data port 数，否则拒绝该 QUIC pool 并继续使用 userspace WireGuard L3 fallback。
+## 4. MTU 与 TCP MSS 夹紧（MSS Clamping）
 
-这意味着“启动时没有可用 proxy peer，之后动态添加第一个双 data port peer”会被拒绝：实际 TUN worker 和 runtime worker 已经固定为 1。若希望 TUN worker 数与 2 个 data port 对齐，需要让启动期控制面可达并重启客户端。
+为防止大尺寸的 IP 数据包在通过底层的 QUIC 隧道（运行在 UDP 上）时发生 **IP 层的分片（Fragmentation）** 从而导致性能大幅劣化，系统采取以下策略：
 
-Multiqueue 与 worker 模型：
+1. **TUN 物理 MTU 限制**：将客户端 TUN 网卡的 MTU 强制限制在较安全的值（例如 `1200` 字节，可根据 QUIC 的最大 datagram 大小动态调整）。
+2. **TCP MSS 夹紧**：工作线程在从 TUN 网卡读取 IP 数据包时，会对其中的 TCP 握手包（SYN / SYN-ACK）进行即时解析。如果包中含有 TCP MSS 选项，工作线程会强行改写该字段值，将其限制在 `1160` 字节以下。
+3. **效果**：客户端与目标服务器的操作系统内核在握手阶段即协商出较小的 TCP Segment 大小，生成的所有 TCP 包天然契合单个 QUIC Datagram 报文的大小，彻底消除了 IP 拆包与组包的 CPU 开销。
 
-- **出站流量**：Linux TUN multiqueue 按 flow 选择队列，单个 TCP flow 的后续包应保持队列亲和；不同 flow 可被分散到不同队列 FD。
-- **L4 TCP offload 出站流量**：接收某个 TCP flow 的 `RtcWorker` 持有该 flow 的 `smoltcp` socket、NAT 映射和桥接通道。
-- **固定 worker**：worker 数在启动时确定，不随连接数增长。每个 worker 绑定一个 TUN 队列 FD，拥有自己的 L4 TCP 用户态协议状态、NAT 映射和数据面 packet buffer pool；数据面热路径不使用跨 worker 的共享大池，避免全局锁竞争。
-- **线程模型**：client 侧连接状态由所属 `RtcWorker` 的事件循环驱动，不能按 TCP flow 创建新的数据面线程或长期 task。进程启动时显式创建 Tokio runtime，并把 worker thread 数限制在启动期固定的数据面宽度内。当前实现固定 worker 数，smoltcp RX/TX 队列使用 worker 内 `PooledBuf` 流转，QUIC stream 句柄也保存在 worker 的 bridge 状态中。服务端 QUIC 每个 data port 只有一个固定 listener task；listener 内部用 `ServerFutures` 事件驱动连接认证和已接受 stream。每条 stream 在接受时受全局 semaphore 限流，handler future 不再创建 per-stream task；relay 每方向连续复制达到预算后主动 yield，避免长下载 relay 饿死同一 QUIC connection 上的新 stream 建立。
-- **L3 外层 UDP**：客户端 WireGuard L3 路径流量较小，当前共享单个外层 UDP socket 和共享 per-peer `boringtun::Tunn` 状态；只有 worker 0 负责该 UDP socket 的入站 receive 与 timer 包，其他 worker 只在 TCP fallback/UDP/ICMP 出站时发送。服务端 userspace WireGuard 多 TUN queue 也只有 worker 0 负责外层 UDP receive 与 timer，其他 worker 只处理各自 TUN queue 的出站封装。`VirtualTunnelSocket` 保留为多底层 UDP socket readiness 聚合器：它不后台预取业务包、不维护中间接收队列，也不创建后台 health-check task；调用方 `recv_from` 时直接把 ready socket 的数据读入调用方 buffer，调用方 timer 通过 `tick_control()` 驱动物理 socket 探测和 active socket 选择。该并行模型依赖 Linux TUN multiqueue 的 flow queue affinity，不声明其他平台具备相同行为。
+---
 
-### 6.3 TCP L4 offload 路径
+## 5. Run-to-Completion (RTC) 事件循环
 
-TCP 出站包从客户端 TUN 进入 `RtcWorker` 后按以下条件进入 L4 offload：
+`new_proxy` 的数据面设计遵循严苛的 **Run-to-Completion (RTC)** 模型，旨在消除任何非必要的 CPU 上下文切换与延迟调度抖动：
 
-- 目标 IP 在 worker 当前加载的 `L4DataPlaneSnapshot.router` 中命中 proxy peer 的 `AllowedIPs`。
-- `userspace_tcp_offload_enabled` 为 true。
-- 对应 peer 的 `QuicPoolClient` 存在且状态为 `Active`。
-- 报文是可解析的 IPv4 TCP，或没有 extension header 的 IPv6 TCP。带 IPv6 extension headers 的 TCP 报文直接走 L3 fallback。
+### 5.1 静态线程与零动态任务创建
+* 所有的工作线程在启动时即一次性 spawn 完毕，运行期绝对不会为单个数据包或新流量动态创建新的异步任务（禁用数据面上的 `tokio::spawn`）。
+* 每个线程运行一个紧凑的非阻塞同步 `poll` 事件循环：
+  * **出站**：非阻塞 Polling 本地 TUN 队列 $\rightarrow$ 读出报文 $\rightarrow$ 塞入 `send_datagram()` 发送。
+  * **入站**：非阻塞 Polling QUIC 连接 $\rightarrow$ 读出 Datagram $\rightarrow$ 解密还原为原始 IP 包 $\rightarrow$ 直接写入 TUN 队列。
+  * 若无数据可读写，线程通过 `epoll` 挂起（Park）等待事件唤醒，不占用额外 CPU 周期。
 
-进入 offload 后：
+### 5.2 线程局部内存池与零碎片（Zero Fragmentation）
+* **固定大小内存块**：每个工作线程都拥有一个完全隔离的 `BufferPool`，内存池中仅包含固定大小的包缓冲区（例如 2048 或 16384 字节，匹配 MTU 基准）。
+* **本地无锁循环**：所有数据包缓冲区仅在所属线程内部进行借用和归还，没有跨线程竞争，避免了全局内存分配器（`malloc` / `free`）的并发锁瓶颈。
+* **零碎片保证**：数据面所有包内存都在启动时静态分配，不随时间动态扩张，彻底杜绝了长期运行下可能会出现的堆内存碎片（Heap Fragmentation）问题。
 
-1. SYN 首包如果没有现有 flow 状态，worker 在本地 `smoltcp` 中创建 Listen socket，并分配一个本地端口。
-2. `nat_map` 记录原始五元组和原始目标地址；TUN 包目标地址/端口被改写成本 worker 的 `smoltcp` 本地地址/端口。
-3. 改写后的包进入 `smoltcp`。`smoltcp` 产出的回包再通过 `nat_map` 反向改写源地址/端口并写回 TUN。
-4. 当 `smoltcp` socket 进入 active 状态，worker 创建 `BridgeChannels`。bridge 先进入 `Opening` 状态，异步打开 QUIC bidirectional stream，并写入 `proxy_proto` target address header。
-5. 服务端 `QuicPoolServer` 校验连接认证后把业务 stream 放入 connection-local `ServerFutures`。stream handler 在同一个事件驱动循环内读取 target address header，连接目标 TCP 服务，向客户端回写 1 字节成功/失败状态，然后用 `relay_connections_with_conn_stat` 转发 TCP socket 与 QUIC stream。relay 双向复制在同一个 future 内用 `select` 推进，不为每个方向或每条 stream 创建额外 task。
-6. 客户端 bridge 切换到 `Active` 后，在同一个 `RtcWorker` 事件循环内推进 `smoltcp socket <-> QUIC stream` 双向读写。没有为每条连接创建长期数据面 task。
+---
 
-每个 worker 的 TCP flow 数、单 socket buffer、bridge pending 包数和 pending 字节数都有默认上限；达到上限的新 flow 或慢读写 bridge 会被降级或关闭，优先保护进程内存稳定性。TUN/UDP/WireGuard/QUIC bridge 的运行时 packet buffer 默认按 `MTU + 256` 派生，下限 1500、上限 65535，默认 MTU 1400 时为 1656，jumbo MTU 9000 时为 9256。默认上限可通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖，用于不同机器规格和压测场景调参。
+## 6. 管控面单线程与控制面/数据面隔离
 
-### 6.4 userspace WireGuard L3 fallback 路径
+为了避免低频的管控任务（如配置查询、心跳检测、故障倒换、API 调用等）干扰高频数据面（RTC 转发环路）的吞吐量与极低延迟要求，`new_proxy` 在主入口中采用了严格的控制面/数据面物理线程隔离设计：
 
-以下流量进入 L3 fallback：
+### 6.1 单线程主运行时（Single-Threaded Control Plane）
+* **主 Runtime 设计**：进程主入口抛弃了传统的 `new_multi_thread()` 多线程 Tokio 运行时，使用 `tokio::runtime::Builder::new_current_thread()` 显式创建单线程异步运行时。
+* **集约化管控面任务**：在该单线程 Runtime 中，集约推进所有的异步控制面逻辑：
+  * **UDS API 服务器**：用于响应管理 CLI 提起的查询、配置下发和 peer 增删命令。
+  * **控制面预协商通道**：基于非加密 UDP 传输的 pre-negotiation 服务。
+  * **健康检查与故障恢复（Health Checker）**：定时扫描数据面 QUIC socket 健康状态，触发失效 Slot 局部重连。
+  * **路由及进程自愈**：响应底层接口变化及网卡配置刷新。
+* **低调度开销**：控制面全部任务都在一个 OS 线程（主线程）中顺序、协作式推进，不存在任何跨核心调度切换与锁竞争。
 
-- 非 TCP 报文，例如 UDP/ICMP。
-- 未命中 proxy peer 的 TCP 报文。
-- QUIC pool 不存在、未 Active、正在 fallback/recovering，或 worker 无法创建本地 TCP socket。
-- 当前 L4 parser 不支持的 TCP 报文形态，例如带 IPv6 extension headers 的 TCP。
+### 6.2 数据面专用工作线程 (Dedicated Data Workers)
+* **OS 线程独立绑定**：每个 RTC 转发 Worker 都在主 Runtime 之外，通过 `std::thread::Builder` 显式创建并派生独立的 OS 物理线程（命名为 `new-proxy-client-worker-i` 或 `new-proxy-server-worker-i`）。
+* **专用 Local Runtime**：每个 Worker 线程均在内部创建一个专属的单线程 Local Tokio Runtime。这确保了每个数据通道（网卡多队列接口 $i$ + 物理 QUIC 连接 $i$）拥有其完全专有的事件循环调度上下文。
+* **物理级隔离**：这实现了控制面和数据面转发流量在物理 CPU 核心上的完美隔离：控制面任务卡顿（如 DNS 解析延迟或 UDS 慢查询）绝不会干扰或剥夺数据面 Worker 的 CPU 调度执行权，最大程度保证了高吞吐下转发速率的近线性度。
 
-fallback 出站路径为 `TUN -> RtcWorker -> UserspaceWgRegistry -> boringtun::Tunn::encapsulate -> marked UDP socket -> physical network`。服务端收到外层 UDP 后通过 `UserspaceWgRegistry` 定位 peer，调用 `boringtun::Tunn::decapsulate`，把解密后的原始 IP 包写入服务端 TUN。
+---
 
-fallback 入站路径相反：服务端 TUN 中的目标回包由服务端 userspace WireGuard loop 封装成外层 UDP 发回客户端；客户端只有 worker 0 负责读取该 UDP socket、解密并写回客户端 TUN。其他 worker 可以发送 fallback 外层 UDP，但不负责入站 receive/timer。
+## 7. 路由与策略配置
 
-### 6.5 Run-to-Completion 事件循环
+在 `Table != off` 的配置下，`new_proxy` 客户端在启动和运行中会自动执行以下系统路由操作：
+1. 配置本地 TUN 接口的 IP 地址（对应 `Address` 声明）。
+2. 配置 TUN 网卡接口的 MTU 值为协商的 MTU（默认 `1200` 字节左右），并将网卡状态置为 UP。
+3. 针对 peer 配置的 `AllowedIPs` 规则，将系统路由指向该 TUN 网卡设备。
 
-每个 `RtcWorker` 的事件循环执行路径遵循 **Run-to-Completion** 模式：包从所属 TUN queue 读入该 worker 的 `PooledBuf` 后，尽量通过所有权转移在 worker 内继续流转，避免中间 `Vec` 分配和 payload copy。必须发生的 copy 只保留在内核 syscall 边界、加解密输出边界和协议库不可避免的内部缓冲边界。
+为了规避全网代理（如 `0.0.0.0/0`）下外层 UDP 加密数据包再次递归进入 TUN 网卡的死循环，系统使用 `SO_MARK` 标记：所有外层加密 UDP 套接字发出的流量都会被打上特定的 fwmark 标签，配合系统的策略路由规则（`not fwmark <mark> lookup <table>`），保证加密包直接走宿主机的真实物理路由。
 
-写回 TUN、发送外层 UDP 和 QUIC stream 读写均按非阻塞方式推进；当出口暂不可写时，包所有权进入所属 worker 的 pending 队列，并由 TUN/UDP writable 事件唤醒后继续 flush。QUIC bridge 的 `Opening` future、active QUIC stream 读写、smoltcp socket 读写、TUN/UDP I/O 和 timer 都由同一个 worker loop 分片推进，不能读写时立即回到事件循环。QUIC future/stream manual poll 使用 worker-local `Notify` waker；当 Quinn readiness 触发 waker 时会唤醒该 worker，而不是只能等待下一次 timer tick。只有内部 pending 字节数达到上限时才会丢弃或关闭连接，以保护 worker 内存不会无界增长。
+---
 
-为降低数据面在高吞吐、高并发下的系统调度开销，双向流转发热路径（`relay_copy_with_idle`）采用了**零分配的定时器原地复位机制**。该机制在每个转发方向的生命周期内，只在栈上分配并固定（Pin）一个 `tokio::time::sleep(RELAY_IDLE_TIMEOUT)` 定时器实例，每次成功读写后调用 `.reset()` 修改截止时间，实现热路径上的零内存堆分配。同时，去除了应用层的写超时 `RELAY_WRITE_TIMEOUT` 封装，改由底层的 TCP Keepalive 和 QUIC 协议层超时实现死连接自动清理，避免了高负载下频繁的时间轮竞争。
+## 8. 安全与生存状态管理
 
-## 7. 路由配置
+* **TLS 1.3 通道加密**：所有的 QUIC Datagram 均通过 QUIC 的安全握手上下文进行加密与认证（基于 TLS 1.3 派生出的 AEAD 对称密钥）。
+* **握手会话缓存验证**：客户端在连接时发送经 `session_psk` 签名的认证包，服务端验证通过后方允许 Datagram 传输。
+* **单 Slot 局部重连与保活**：连接池自带后台健康检测。如果其中第 $i$ 个数据面物理 QUIC 连接由于网络抖动中断，只有该 Slot 对应的 Worker 线程会触发控制面预协商和链路重连，其他活跃 Worker 线程的数据转发不受任何干扰，最大程度保障了高吞吐连接的稳定性。
 
-虽然绕过了 `iptables`/`TPROXY` 规则的下发，但 `new_proxy` 依然在客户端启动时做如下路由配置（`Table != off`）：
+---
 
-1. 配置 TUN 接口的 IP 地址（对应配置文件中 `Address` 声明）。
-2. 将 TUN 接口的 MTU 设为配置值（默认 `1420`），并启用网卡（`ip link set dev <interface> up`）。
-3. 针对每个 peer 声明的 `AllowedIPs`，自动添加指向该 TUN 设备的系统路由规则（`ip route replace <allowed_ip> dev <interface>`）。
+## 9. 纯 L3 IP-over-QUIC Datagram 隧道设计规约细节
 
-为避免 full-tunnel `AllowedIPs = 0.0.0.0/0` 或 `::/0` 递归捕获 QUIC / control / userspace WireGuard 外层 UDP，程序采用 WireGuard 风格的 `SO_MARK` + policy routing：所有外层 UDP socket 自动设置固定 mark，`Table = auto` 时 peer `AllowedIPs` 被安装到专用 routing table，并添加 `lookup main suppress_prefixlength 0` 与 `not fwmark <mark> lookup <table>` 规则。这样未标记业务流量命中 full-tunnel table 进入 TUN，已标记外层流量和主表中的直连/更具体物理路由不会递归进入 TUN；动态 `AddPeer` 只需更新专用 table 中的 peer route，不再学习或缓存 endpoint host route。
+### 8.1 概述与设计目标
+本节定义了代理库从“混合 L4 SOCKS/QUIC 流 + L3 WireGuard 降级回退”架构转向**纯 L3 IP-over-QUIC Datagram 隧道**的设计细节。
+通过直接在 IP 层使用 QUIC Datagrams（无连接状态、无序的不可靠数据帧），完全移除了用户态 TCP/IP 协议栈（如 `smoltcp`）并摆脱了对 WireGuard（`boringtun`）的依赖。从而实现了具有对称多核扩展能力的低延迟、高吞吐量隧道。
 
-## 8. 遥测与 API
+* **移除 WireGuard**：所有的 L3/L4 流量（TCP、UDP、ICMP）均完全在 QUIC 物理通道上运行。
+* **Run-to-Completion (RTC)**：确保所有数据面工作循环均为非阻塞、静态分配，并且绝对不动态创建线程或任务。
+* **对称多端口映射**：启动时动态协商数据端口，并使客户端与服务端的线程 1对1 对齐，避免跨线程锁竞争。
+* **零堆内存分配**：采用线程隔离的缓冲区池，在数据转发热路径上复用数据包缓冲区，避免垃圾回收和堆内存分配带来的抖动。
 
-UDS 路径：`/run/new_proxy/<interface>.sock`
+### 8.2 报文封装与传输规约
+* 所有从 TUN 接口读取的 IP 报文（IPv4/IPv6）都直接封装到 QUIC Datagram 帧中。
+* **封装格式**：因为 QUIC Datagram 本身保留了数据包的边界，因此帧的载荷（Payload）就是原始 IP 报文本身，不需要任何长度前缀或额外的封装报头。
+* **MSS 夹紧**：工作线程在从 TUN 读取包时，如果检测到 TCP SYN/SYN-ACK 报文，会直接就地改写其 Maximum Segment Size (MSS) 选项值为 `1160` 字节以下，强制操作系统 TCP 协议栈生成适配单个 QUIC 帧 of 报文，消除 IP 分片开销。
 
-遥测指标含义与方向：
+### 8.3 对称线程映射与控制面端口协商流程
+1. **控制通道建立**：客户端首先发起与服务端控制端口（Control Port）的 UDP 连接。
+2. **协商查询**：客户端发出查询请求。
+3. **下发端口列表**：服务端验证通过后，返回活跃的数据端口列表（共 $N$ 个，例如 `[40001, ..., 40001+N-1]`）。
+4. **客户端对称基准建立**：
+   * 客户端以获取的 $N$ 个端口在本地拉起拥有 $N$ 个队列通道的多队列 TUN 网卡。
+   * 开启恰好 $N$ 个工作线程，每个线程绑定一个对应的本地 UDP Socket 和服务端端口 `40000+i` 的 QUIC 连接。
+   * 随后的 Peer 必须符合相同的 $N$ 端口配置约束，否则予以拒绝。
 
-- `rx` / `received`：从该 peer 收到的字节。
-- `tx` / `sent`：发给该 peer 的字节。
-- 用户态协议栈收发数据同样使用该语义：数据经 `QUIC -> smoltcp -> TUN` 计为 `rx`，经 `TUN -> smoltcp -> QUIC` 计为 `tx`。
-- `dump` 输出包含 `virtual_tunnel` 行；仅启用 `VirtualTunnelSocket` 时，`rx=<packets>:<bytes>` 表示经虚拟 UDP socket 直接交给调用方的业务包，`control=<packets>` 表示 PING/PONG 健康探测控制包，`errors=<count>` 表示底层 UDP receive 错误数。当前 client WireGuard L3 使用单 UDP socket，因此该行通常为 0。
-
-## 9. 已知架构边界
-
-- **客户端 L3/L4 均在用户态**，消除任何系统 WireGuard 内核模块及 `iptables` / TPROXY 依赖。
-- **服务端 L3 也在用户态**，不再依赖内核 WireGuard 模块；QUIC 接收池仍直接绑定宿主机 UDP 端口。
-- 动态 peer 管理（`AddPeer` / `RemovePeer`）会更新运行时配置、AllowedIPs L4 router、userspace WireGuard peer registry、路由表和客户端 QUIC pool，并通过 `L4DataPlaneSnapshot` 发布新的 L4 热路径快照；已经存在的 `RtcWorker` 不会被热扩容，已有 TCP flow 的 bridge 状态也不会迁移到其他 worker。
-- userspace WireGuard registry 按 peer 维护共享的 `boringtun` 状态，并通过 AllowedIPs 路由选择出站 peer；入站数据优先使用 receiver index 与 endpoint 索引定位 peer，未知握手包才退回逐 peer 尝试。
-- 为避免未知来源 WireGuard 握手包在多 peer 场景下触发无界 O(N) 扫描，未知 endpoint 的握手/控制类入站包会经过轻量 per-IP token bucket 限速；已建立 receiver index 或已知 endpoint 的数据包不走该限速路径。成功解开的 unknown handshake 不消耗 token，无法解开的 unknown 包才消耗 token；可通过 `NEW_PROXY_UNKNOWN_HANDSHAKE_BURST` 和 `NEW_PROXY_UNKNOWN_HANDSHAKE_REFILL_PER_SEC` 调整阈值，drop 计数会暴露在 UDS telemetry 中。
-- 当前 client/server 启动路径不创建 transparent listener，也不下发 TPROXY iptables 规则。
+### 8.4 安全与自愈机制
+* **TLS 1.3 安全通道**：所有的 Datagram 数据均由 TLS 1.3 派生的 QUIC AEAD 加密上下文进行就地加密和完整性校验。
+* **PSK 握手绑定**：数据面连接必须携带由 `session_psk` 签名 of 认证包，由服务端进行 nonce 防重放校验。
+* **Slot 断线重连自愈**：客户端后台健康检查（Health Checker）循环检测各物理 Slot 状态。若 Slot $i$ 的连接中断，会单独触发该 Slot 的控制面预协商和链路重连，期间其他 $N-1$ 个 Slot 依然在高速转发数据，避免全链路抖动。

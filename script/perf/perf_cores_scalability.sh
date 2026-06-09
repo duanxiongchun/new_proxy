@@ -10,9 +10,9 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 
 DATA_PORT_COUNTS="${PERF_DATA_PORT_COUNTS:-1 2 3 4}"
-PARALLEL="${PERF_PARALLEL:-32}"
+PARALLEL="${PERF_PARALLEL:-16}"
 ROUNDS="${PERF_ROUNDS:-2}"
-BLOB_MIB="${PERF_BLOB_MIB:-64}"
+BLOB_MIB="${PERF_BLOB_MIB:-16}"
 ARTIFACT_DIR="${PERF_ARTIFACT_DIR:-/tmp/new_proxy_cores_scalability_$(date +%Y%m%d_%H%M%S)}"
 RESULTS_CSV="$ARTIFACT_DIR/results.csv"
 
@@ -171,7 +171,7 @@ PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
-Table = off
+Table = auto
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
@@ -179,7 +179,7 @@ ListenPorts = ${listen_ports}
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
-AllowedIPs = 10.0.0.2/32
+AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 EOF_CONF
 }
 
@@ -199,16 +199,12 @@ ip link set vs-w netns scale_work_ns
 ip link set vs-cw netns scale_client_ns
 
 ip netns exec scale_server_ns ip addr add 10.0.2.2/24 dev vs-s
-ip netns exec scale_server_ns ip addr add 10.0.0.1/32 dev lo
 ip netns exec scale_server_ns ip link set vs-s up
 ip netns exec scale_server_ns ip link set lo up
 ip netns exec scale_server_ns ip route add default via 10.0.2.1
-ip netns exec scale_server_ns ip route add 10.0.0.1/32 dev lo scope host
-ip netns exec scale_server_ns ip route add 10.0.0.2/32 via 10.0.2.1
 
 ip netns exec scale_client_ns ip addr add 10.0.1.2/24 dev vs-c
 ip netns exec scale_client_ns ip addr add 10.0.4.1/24 dev vs-cw
-ip netns exec scale_client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec scale_client_ns ip link set vs-c up
 ip netns exec scale_client_ns ip link set vs-cw up
 ip netns exec scale_client_ns ip link set lo up
@@ -230,20 +226,27 @@ ip netns exec scale_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec scale_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count="$BLOB_MIB" status=none
-ip netns exec scale_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
-HTTP_PID=$!
 
 run_group() {
   local data_ports="$1"
   local cpus
+  local server_cpus
+  local loader_cpus="8-15"
+  local target_cpus="16-23"
   local server_conf="$ARTIFACT_DIR/server_${data_ports}.conf"
   local server_log="$ARTIFACT_DIR/server_${data_ports}.log"
   local client_log="$ARTIFACT_DIR/client_${data_ports}.log"
   local worker_dump="$ARTIFACT_DIR/client_${data_ports}_dump.txt"
   cpus="$(cpus_for_data_ports "$data_ports")"
+  server_cpus="$(python3 - "$data_ports" <<'PY'
+import sys
+dp = int(sys.argv[1])
+print(",".join(str(4 + i) for i in range(dp)))
+PY
+)"
   write_server_conf "$data_ports" "$server_conf"
 
-  ip netns exec scale_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$server_conf" > "$server_log" 2>&1 &
+  ip netns exec scale_server_ns taskset -c "$server_cpus" "$ROOT_DIR/target/release/new_proxy" -config "$server_conf" > "$server_log" 2>&1 &
   SERVER_PID=$!
   sleep 2
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -251,6 +254,17 @@ run_group() {
     cat "$server_log" >&2
     exit 1
   fi
+
+  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$ARTIFACT_DIR" <<'PY' > "$ARTIFACT_DIR/http.log" 2>&1 &
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import sys
+import os
+
+os.chdir(sys.argv[1])
+server = ThreadingHTTPServer(('10.0.0.1', 8080), SimpleHTTPRequestHandler)
+server.serve_forever()
+PY
+  HTTP_PID=$!
 
   ip netns exec scale_client_ns taskset -c "$cpus" "$ROOT_DIR/target/release/new_proxy" -config "$CLIENT_CONF" > "$client_log" 2>&1 &
   CLIENT_PID=$!
@@ -264,7 +278,7 @@ run_group() {
   ip netns exec scale_work_ns curl -fsS --connect-timeout 5 --max-time 30 -o /dev/null "http://10.0.0.1:8080/blob.bin"
 
   local line
-  if ! line="$(ip netns exec scale_work_ns python3 - "$data_ports" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
+  if ! line="$(ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$data_ports" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
 import concurrent.futures
 import subprocess
 import sys
@@ -303,6 +317,139 @@ PY
     exit 1
   fi
 
+  # Run UDP benchmark
+  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$data_ports" "$target_cpus" <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
+import socket
+import sys
+import time
+import multiprocessing
+
+data_ports = int(sys.argv[1])
+cpu_str = sys.argv[2]
+target_cpus = []
+for part in cpu_str.split(','):
+    part = part.strip()
+    if not part:
+        continue
+    if '-' in part:
+        start, end = part.split('-')
+        target_cpus.extend(range(int(start), int(end) + 1))
+    else:
+        target_cpus.append(int(part))
+
+def recv_worker(port, cpu, conn):
+    try:
+        import os
+        if hasattr(os, 'sched_setaffinity'):
+            os.sched_setaffinity(0, {cpu})
+    except:
+        pass
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    sock.bind(('10.0.0.1', port))
+    sock.settimeout(5.0)
+    
+    bytes_received = 0
+    start = None
+    last_packet_time = None
+    
+    try:
+        while True:
+            data, addr = sock.recvfrom(65535)
+            if not data:
+                break
+            if start is None:
+                start = time.monotonic()
+            if data == b'EOF':
+                break
+            bytes_received += len(data)
+        last_packet_time = time.monotonic()
+    except socket.timeout:
+        last_packet_time = time.monotonic()
+        
+    duration = last_packet_time - start if (start and last_packet_time) else 0.001
+    conn.send((bytes_received, duration))
+
+if __name__ == '__main__':
+    processes = []
+    pipes = []
+    for i in range(data_ports):
+        port = 9990 + i
+        cpu = target_cpus[i % len(target_cpus)]
+        parent_conn, child_conn = multiprocessing.Pipe()
+        p = multiprocessing.Process(target=recv_worker, args=(port, cpu, child_conn))
+        p.start()
+        processes.append(p)
+        pipes.append(parent_conn)
+        
+    total_bytes = 0
+    max_duration = 0.001
+    for i, p in enumerate(processes):
+        p.join()
+        bytes_rec, duration = pipes[i].recv()
+        total_bytes += bytes_rec
+        if duration > max_duration:
+            max_duration = duration
+            
+    print(f"{total_bytes},{max_duration:.6f}")
+PY
+  UDP_RECV_PID=$!
+  sleep 1
+
+  ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$PARALLEL" "$data_ports" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
+import socket
+import sys
+import multiprocessing
+
+parallel = int(sys.argv[1])
+data_ports = int(sys.argv[2])
+total_to_send = 128 * 1024 * 1024
+per_thread = total_to_send // parallel
+chunk_size = 1100
+data = b'X' * chunk_size
+
+def send_worker(thread_idx):
+    import time
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    port = 9990 + (thread_idx % data_ports)
+    dest = ('10.0.0.1', port)
+    sent = 0
+    packet_interval = 0.000080
+    while sent < per_thread:
+        t0 = time.monotonic()
+        sock.sendto(data, dest)
+        sent += chunk_size
+        while time.monotonic() - t0 < packet_interval:
+            pass
+
+if __name__ == '__main__':
+    processes = []
+    for i in range(parallel):
+        p = multiprocessing.Process(target=send_worker, args=(i,))
+        p.start()
+        processes.append(p)
+        
+    for p in processes:
+        p.join()
+        
+    # Send EOF to all ports
+    for i in range(data_ports):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _ in range(20):
+            sock.sendto(b'EOF', ('10.0.0.1', 9990 + i))
+PY
+
+  wait "$UDP_RECV_PID" || true
+  local udp_line
+  udp_line="$(cat "$ARTIFACT_DIR/udp_recv_${data_ports}.log")"
+  local udp_bytes
+  local udp_secs
+  udp_bytes="$(echo "$udp_line" | cut -d',' -f1)"
+  udp_secs="$(echo "$udp_line" | cut -d',' -f2)"
+  local udp_mib_s
+  udp_mib_s="$(python3 -c "print('{:.3f}'.format(int($udp_bytes) / 1024 / 1024 / float($udp_secs)))" 2>/dev/null || echo "0.000")"
+
   ip netns exec scale_client_ns "$ROOT_DIR/target/release/new-proxy-cli" --interface client dump > "$worker_dump"
   kill "$CLIENT_PID" 2>/dev/null || true
   wait "$CLIENT_PID" 2>/dev/null || true
@@ -310,14 +457,17 @@ PY
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
   SERVER_PID=""
+  kill "$HTTP_PID" 2>/dev/null || true
+  wait "$HTTP_PID" 2>/dev/null || true
+  HTTP_PID=""
 
-  printf "%s" "$line"
+  printf "%s,%s" "$line" "$udp_mib_s"
 }
 
 echo "Artifact directory: $ARTIFACT_DIR"
 RAW_RESULTS_CSV="$ARTIFACT_DIR/results.raw.csv"
-echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,worker_new_flows" > "$RAW_RESULTS_CSV"
-echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,linear_efficiency,worker_new_flows" > "$RESULTS_CSV"
+echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,udp_mib_per_s,worker_new_flows" > "$RAW_RESULTS_CSV"
+echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,udp_mib_per_s,relative_to_1,linear_efficiency,worker_new_flows" > "$RESULTS_CSV"
 for data_ports in $DATA_PORT_COUNTS; do
   if ! line="$(run_group "$data_ports")"; then
     exit 1
@@ -350,11 +500,11 @@ awk -F, -v base="$base_rate" '
   {
     relative = ($6 / base)
     efficiency = ($1 > 0) ? (relative / $1) : 0
-    printf "%s,%s,%s,%s,%s,%s,%.3f,%.3f,%s\n", $1, $2, $3, $4, $5, $6, relative, efficiency, $7
+    printf "%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%s\n", $1, $2, $3, $4, $5, $6, $7, relative, efficiency, $8
   }
 ' "$RAW_RESULTS_CSV" > "$RESULTS_CSV.tmp"
 {
-  echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,linear_efficiency,worker_new_flows"
+  echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,udp_mib_per_s,relative_to_1,linear_efficiency,worker_new_flows"
   cat "$RESULTS_CSV.tmp"
 } | tee "$RESULTS_CSV"
 rm -f "$RESULTS_CSV.tmp"

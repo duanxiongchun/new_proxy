@@ -1,9 +1,26 @@
 use crate::quic_pool::QuicConnSnapshot;
-use crate::relay::PeerL4Stats;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+// 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
+pub struct PeerL4Stats {
+    pub tx_bytes: Arc<AtomicU64>,
+    pub rx_bytes: Arc<AtomicU64>,
+    pub active_streams: AtomicU64,
+}
+
+impl Default for PeerL4Stats {
+    fn default() -> Self {
+        Self {
+            tx_bytes: Arc::new(AtomicU64::new(0)),
+            rx_bytes: Arc::new(AtomicU64::new(0)),
+            active_streams: AtomicU64::new(0),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UnifiedTelemetry {
@@ -142,6 +159,32 @@ impl Default for TelemetryRegistry {
         Self::new()
     }
 }
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct VirtualTunnelTelemetrySnapshot {
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub control_packets: u64,
+    pub recv_errors: u64,
+}
+
+#[derive(Default)]
+pub struct VirtualTunnelTelemetry {
+    pub rx_packets: AtomicU64,
+    pub rx_bytes: AtomicU64,
+    pub control_packets: AtomicU64,
+    pub recv_errors: AtomicU64,
+}
+
+impl VirtualTunnelTelemetry {
+    pub fn snapshot(&self) -> VirtualTunnelTelemetrySnapshot {
+        VirtualTunnelTelemetrySnapshot {
+            rx_packets: self.rx_packets.load(Ordering::Relaxed),
+            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            control_packets: self.control_packets.load(Ordering::Relaxed),
+            recv_errors: self.recv_errors.load(Ordering::Relaxed),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -204,5 +247,65 @@ mod tests {
         assert_eq!(snapshot[0].tcp_offload_bytes, 100);
         assert_eq!(snapshot[1].worker_id, 2);
         assert_eq!(snapshot[1].tun_rx_packets, 20);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WgPeerStats {
+    pub allowed_ips: Vec<String>,
+    pub endpoint: Option<String>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub last_handshake: u64,
+    pub unknown_handshake_drops: u64,
+}
+
+#[derive(Clone)]
+pub struct UserspaceWgRegistry {
+    peers: Arc<parking_lot::RwLock<HashMap<[u8; 32], crate::config::PeerConfig>>>,
+}
+
+impl UserspaceWgRegistry {
+    pub fn new(
+        _private_key: [u8; 32],
+        peers: &[crate::config::PeerConfig],
+    ) -> Result<Self, String> {
+        let mut map = HashMap::new();
+        for peer in peers {
+            map.insert(peer.public_key, peer.clone());
+        }
+        Ok(Self {
+            peers: Arc::new(parking_lot::RwLock::new(map)),
+        })
+    }
+
+    pub fn snapshot(&self) -> HashMap<[u8; 32], WgPeerStats> {
+        let peers = self.peers.read();
+        let mut map = HashMap::new();
+        for (&pub_key, peer) in peers.iter() {
+            map.insert(
+                pub_key,
+                WgPeerStats {
+                    allowed_ips: peer.allowed_ips.iter().map(|ip| ip.to_string()).collect(),
+                    endpoint: peer.endpoint.map(|ep| ep.to_string()),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    last_handshake: 0,
+                    unknown_handshake_drops: 0,
+                },
+            );
+        }
+        map
+    }
+
+    pub fn add_or_replace_peer(&self, peer: crate::config::PeerConfig) -> Result<(), String> {
+        let mut peers = self.peers.write();
+        peers.insert(peer.public_key, peer);
+        Ok(())
+    }
+
+    pub fn remove_peer(&self, pub_key: &[u8; 32]) {
+        let mut peers = self.peers.write();
+        peers.remove(pub_key);
     }
 }

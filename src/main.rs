@@ -4,29 +4,21 @@ mod buffer_pool;
 mod client_proxy;
 mod config;
 mod control;
-mod proxy_proto;
+pub mod mss_clamping;
 mod quic_pool;
-mod relay;
 mod routing;
 pub mod rtc_loop;
 mod runtime;
-mod server_proxy;
 mod socket_mark;
 mod stats_cli;
-mod tcp_util;
 mod telemetry;
 pub mod tun_device;
 pub mod tun_io;
 mod uds_server;
-pub mod userspace_tcp;
-pub mod userspace_wg;
-pub mod virtual_tunnel;
-mod wireguard;
 
 use arc_swap::ArcSwap;
 use client_proxy::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -42,10 +34,8 @@ use quic_pool::{
 };
 use routing::AllowedIPsRouter;
 use runtime::{cleanup_runtime, run_script, setup_routes};
-#[cfg(not(tarpaulin))]
-use server_proxy::build_stream_handler;
 use stats_cli::run_cli_stats;
-use telemetry::TelemetryRegistry;
+use telemetry::{TelemetryRegistry, UserspaceWgRegistry};
 
 type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
 type L4DataPlane = Arc<ArcSwap<L4DataPlaneSnapshot>>;
@@ -133,10 +123,6 @@ fn should_enable_userspace_tcp_for_pool_states(
         && states
             .iter()
             .all(|state| matches!(state, PoolState::Active))
-}
-
-fn worker_owns_l3_udp_rx_and_timer(worker_id: usize) -> bool {
-    worker_id == 0
 }
 
 #[cfg(not(tarpaulin))]
@@ -416,39 +402,6 @@ fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
         .collect()
 }
 
-fn smoltcp_ip_cidrs(config: &GatewayConfig) -> Result<Vec<smoltcp::wire::IpCidr>, String> {
-    config
-        .interface
-        .addresses
-        .iter()
-        .map(|addr| {
-            addr.to_string()
-                .parse::<smoltcp::wire::IpCidr>()
-                .map_err(|e| format!("Invalid smoltcp interface address {}: {:?}", addr, e))
-        })
-        .collect()
-}
-
-fn local_stack_ips(config: &GatewayConfig) -> (Option<IpAddr>, Option<IpAddr>) {
-    let local_ipv4 = config
-        .interface
-        .addresses
-        .iter()
-        .find_map(|addr| match addr {
-            ipnet::IpNet::V4(net) => Some(IpAddr::V4(net.addr())),
-            _ => None,
-        });
-    let local_ipv6 = config
-        .interface
-        .addresses
-        .iter()
-        .find_map(|addr| match addr {
-            ipnet::IpNet::V6(net) => Some(IpAddr::V6(net.addr())),
-            _ => None,
-        });
-    (local_ipv4, local_ipv6)
-}
-
 #[cfg(all(unix, not(tarpaulin)))]
 async fn wait_for_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -472,56 +425,6 @@ async fn wait_for_shutdown() {
     log::info!("Received CTRL+C, shutting down...");
 }
 
-const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
-
-fn needs_ipv6_l3_socket(config: &GatewayConfig) -> bool {
-    config
-        .peers
-        .iter()
-        .any(|peer| peer.endpoint.map(|addr| addr.is_ipv6()).unwrap_or(false))
-        || config
-            .interface
-            .addresses
-            .iter()
-            .any(|addr| matches!(addr, ipnet::IpNet::V6(_)))
-}
-
-#[cfg(not(tarpaulin))]
-fn bind_l3_udp_socket(port: u16, require_ipv6: bool) -> Result<std::net::UdpSocket, String> {
-    if require_ipv6 {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV6,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .map_err(|e| format!("failed to create IPv6 UDP socket: {}", e))?;
-        socket
-            .set_only_v6(false)
-            .map_err(|e| format!("failed to enable dual-stack UDP socket: {}", e))?;
-        socket
-            .bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())
-            .map_err(|e| {
-                format!(
-                    "failed to bind dual-stack UDP socket on port {}: {}",
-                    port, e
-                )
-            })?;
-        socket_mark::set_socket2_outer_mark(&socket)?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;
-        Ok(socket.into())
-    } else {
-        let socket = std::net::UdpSocket::bind(("0.0.0.0", port))
-            .map_err(|e| format!("failed to bind IPv4 UDP socket on port {}: {}", port, e))?;
-        socket_mark::set_outer_mark(&socket)?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to set UDP socket nonblocking: {}", e))?;
-        Ok(socket)
-    }
-}
-
 #[cfg(not(tarpaulin))]
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -530,7 +433,7 @@ fn main() {
     let startup_args = parse_startup_args(&args);
 
     if startup_args.stats {
-        let runtime = build_tokio_runtime(1);
+        let runtime = build_tokio_runtime();
         if let Err(e) = runtime.block_on(run_cli_stats()) {
             eprintln!("Error query stats: {}", e);
             std::process::exit(1);
@@ -576,9 +479,7 @@ fn main() {
         },
         RuntimeMode::Server => None,
     };
-    let runtime_threads =
-        runtime_worker_threads(&config, runtime_mode, client_quic_data_port_count);
-    let runtime = build_tokio_runtime(runtime_threads);
+    let runtime = build_tokio_runtime();
     runtime.block_on(run_gateway(
         config,
         interface_name,
@@ -587,11 +488,29 @@ fn main() {
     ));
 }
 
+struct WorkerTask {
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl WorkerTask {
+    fn abort(&self) {
+        // No-op. Process exit terminates all background threads.
+    }
+}
+
+struct WorkerPanicGuard {
+    exit_notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for WorkerPanicGuard {
+    fn drop(&mut self) {
+        self.exit_notify.notify_one();
+    }
+}
+
 #[cfg(not(tarpaulin))]
-fn build_tokio_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads.max(1))
-        .thread_name("new-proxy-data")
+fn build_tokio_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to build Tokio runtime")
@@ -604,7 +523,7 @@ fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<Optio
         return Ok(None);
     }
 
-    let runtime = build_tokio_runtime(1);
+    let runtime = build_tokio_runtime();
     let preflight_count = runtime.block_on(async {
         let mut expected_count = None;
         for peer in &proxy_peers {
@@ -638,6 +557,7 @@ fn preflight_client_quic_data_port_count(config: &GatewayConfig) -> Result<Optio
     }
 }
 
+#[allow(dead_code)]
 fn runtime_worker_threads(
     config: &GatewayConfig,
     runtime_mode: RuntimeMode,
@@ -664,10 +584,18 @@ async fn run_gateway(
         }
     }
 
-    // 共享遥测注册中心与运行时共享状态初始化
-    let telemetry_registry = Arc::new(TelemetryRegistry::new());
+    let tun_queue_count = match runtime_mode {
+        RuntimeMode::Server => effective_server_tun_queues(&config.quic_pool.listen_ports),
+        RuntimeMode::Client => {
+            effective_client_tun_queues(fixed_client_quic_data_port_count.unwrap_or(0))
+        }
+    };
+    let mut peer_telemetries = Vec::new();
+    for _ in 0..tun_queue_count {
+        peer_telemetries.push(Arc::new(TelemetryRegistry::new()));
+    }
     let worker_telemetry_registry = Arc::new(telemetry::WorkerTelemetryRegistry::new());
-    let virtual_tunnel_telemetry = Arc::new(virtual_tunnel::VirtualTunnelTelemetry::default());
+    let virtual_tunnel_telemetry = Arc::new(telemetry::VirtualTunnelTelemetry::default());
 
     let gateway_state = Arc::new(parking_lot::RwLock::new(build_initial_gateway_state(
         config.clone(),
@@ -685,7 +613,7 @@ async fn run_gateway(
     // - server 模式下由 QuicPoolServer.run_with_registry 填充
     // - client 模式下不使用，始终为空
     let shared_quic_registry: quic_pool::PeerConnRegistry =
-        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     let client_quic_pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let l4_data_plane: L4DataPlane = Arc::new(ArcSwap::from_pointee(
         current_l4_data_plane_snapshot(&gateway_state, &client_quic_pools),
@@ -693,20 +621,20 @@ async fn run_gateway(
     let client_quic_data_port_baseline: ClientQuicDataPortBaseline =
         Arc::new(parking_lot::Mutex::new(0));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
-    let l3_registry =
-        match userspace_wg::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
-            Ok(registry) => registry,
-            Err(e) => {
-                eprintln!("Failed to initialize userspace WireGuard registry: {}", e);
-                std::process::exit(1);
-            }
-        };
+    let exit_notify = Arc::new(tokio::sync::Notify::new());
+    let l3_registry = match UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
+        Ok(registry) => registry,
+        Err(e) => {
+            eprintln!("Failed to initialize userspace WireGuard registry: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     if let Some(listener) = uds_server::bind_listener(&interface_name) {
         uds_server::start(
             listener,
             uds_server::UdsServerContext {
-                telemetry: telemetry_registry.clone(),
+                peer_telemetries: peer_telemetries.clone(),
                 worker_telemetry: worker_telemetry_registry.clone(),
                 state: gateway_state.clone(),
                 peer_secrets: peer_secrets.clone(),
@@ -732,7 +660,7 @@ async fn run_gateway(
         log::info!("         STARTING GATEWAY IN [ SERVER MODE ]         ");
         log::info!("------------------------------------------------------");
 
-        let listen_port = match config.interface.listen_port {
+        let _listen_port = match config.interface.listen_port {
             Some(port) => port,
             None => {
                 log::error!("Server userspace WireGuard L3 requires Interface.ListenPort");
@@ -762,20 +690,6 @@ async fn run_gateway(
             std::process::exit(1);
         }
 
-        let server_udp = match bind_l3_udp_socket(listen_port, needs_ipv6_l3_socket(&config)) {
-            Ok(socket) => socket,
-            Err(e) => {
-                log::error!(
-                    "Failed to bind userspace WireGuard UDP port {}: {}",
-                    listen_port,
-                    e
-                );
-                cleanup_runtime(&config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-        let server_udp_raw = Arc::new(tokio::net::UdpSocket::from_std(server_udp).unwrap());
-        let server_udp = crate::virtual_tunnel::TunnelSocket::Single(server_udp_raw);
         let mut l3_tasks = Vec::new();
         for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -786,14 +700,42 @@ async fn run_gateway(
                     std::process::exit(1);
                 }
             });
-            let task = tokio::spawn(userspace_wg::run_userspace_wg_loop(
+            let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
+            let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
+            let mut worker = rtc_loop::RtcWorker::new(
                 tun_io,
-                server_udp.clone(),
-                l3_registry.clone(),
-                config.interface.mtu,
-                worker_owns_l3_udp_rx_and_timer(worker_id),
-                worker_owns_l3_udp_rx_and_timer(worker_id),
-            ));
+                worker_id,
+                rtc_loop::WorkerRole::Server {
+                    peer_conn_registry: shared_quic_registry.clone(),
+                    listen_ports: config.quic_pool.listen_ports.clone(),
+                },
+                rtc_loop::RtcWorkerConfig {
+                    mtu: config.interface.mtu as usize,
+                    buffer_pool: worker_buffer_pool,
+                },
+            );
+            worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
+            worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
+            let l4_data_plane_for_worker = l4_data_plane.clone();
+            let exit_notify_clone = exit_notify.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("new-proxy-server-worker-{}", worker_id))
+                .spawn(move || {
+                    let _panic_guard = WorkerPanicGuard {
+                        exit_notify: exit_notify_clone,
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build server worker local Tokio runtime");
+                    rt.block_on(async {
+                        if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
+                            log::error!("Server RtcWorker loop failed: {}", e);
+                        }
+                    });
+                })
+                .expect("Failed to spawn Server RtcWorker thread");
+            let task = WorkerTask { _thread: thread };
             l3_tasks.push(task);
         }
 
@@ -851,8 +793,13 @@ async fn run_gateway(
             auth_nonce_cache.clone(),
         );
         let shared_reg_for_server = shared_quic_registry.clone();
-        let stream_handler_limit = Arc::new(tokio::sync::Semaphore::new(MAX_QUIC_STREAM_HANDLERS));
-        let handler = build_stream_handler(telemetry_registry.clone(), stream_handler_limit);
+        let handler = Arc::new(
+            move |_client_pub: [u8; 32],
+                  _send_mux: quinn::SendStream,
+                  _recv_mux: quinn::RecvStream,
+                  _conn_stat: Arc<quic_pool::QuicConnStats>|
+                  -> quic_pool::ServerFuture { Box::pin(async move {}) },
+        );
 
         if let Err(e) = quic_server
             .run_with_registry(quic_certs, quic_key, handler, shared_reg_for_server)
@@ -865,7 +812,12 @@ async fn run_gateway(
             std::process::exit(1);
         }
 
-        wait_for_shutdown().await;
+        tokio::select! {
+            _ = wait_for_shutdown() => {},
+            _ = exit_notify.notified() => {
+                log::error!("A server worker thread exited prematurely; shutting down.");
+            }
+        }
         control_task.abort();
         for task in l3_tasks {
             task.abort();
@@ -1004,34 +956,6 @@ async fn run_gateway(
             std::process::exit(1);
         }
 
-        let smoltcp_ip_cidrs = match smoltcp_ip_cidrs(&config) {
-            Ok(addrs) => addrs,
-            Err(e) => {
-                log::error!("{}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-        let (local_ipv4, local_ipv6) = local_stack_ips(&config);
-
-        let client_udp = {
-            let socket = match bind_l3_udp_socket(0, needs_ipv6_l3_socket(&config)) {
-                Ok(socket) => socket,
-                Err(e) => {
-                    log::error!(
-                        "Failed to bind client userspace WireGuard UDP socket: {}",
-                        e
-                    );
-                    let cleanup_config = gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &interface_name);
-                    std::process::exit(1);
-                }
-            };
-            crate::virtual_tunnel::TunnelSocket::Single(Arc::new(
-                tokio::net::UdpSocket::from_std(socket).unwrap(),
-            ))
-        };
         let mut worker_tasks = Vec::new();
         for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -1044,42 +968,39 @@ async fn run_gateway(
 
             let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
             let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
-            let tcp_stack = match userspace_tcp::UserspaceTcpStack::new(
-                smoltcp_ip_cidrs.clone(),
-                config.interface.mtu as usize,
-                worker_buffer_pool.clone(),
-            ) {
-                Ok(stack) => stack,
-                Err(e) => {
-                    log::error!("Failed to initialize userspace TCP stack: {}", e);
-                    std::process::exit(1);
-                }
-            };
 
             let mut worker = rtc_loop::RtcWorker::new(
                 tun_io,
-                client_udp.clone(),
-                l3_registry.clone(),
-                tcp_stack,
+                worker_id,
+                rtc_loop::WorkerRole::Client,
                 rtc_loop::RtcWorkerConfig {
-                    local_ipv4,
-                    local_ipv6,
                     mtu: config.interface.mtu as usize,
                     buffer_pool: worker_buffer_pool,
                 },
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
-            worker.set_peer_telemetry(telemetry_registry.clone());
-            worker.set_l3_rx_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
-            worker.set_l3_timer_enabled(worker_owns_l3_udp_rx_and_timer(worker_id));
+            worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
 
             let l4_data_plane_for_worker = l4_data_plane.clone();
-
-            let handle = tokio::spawn(async move {
-                if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
-                    log::error!("RtcWorker loop failed: {}", e);
-                }
-            });
+            let exit_notify_clone = exit_notify.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("new-proxy-client-worker-{}", worker_id))
+                .spawn(move || {
+                    let _panic_guard = WorkerPanicGuard {
+                        exit_notify: exit_notify_clone,
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build client worker local Tokio runtime");
+                    rt.block_on(async {
+                        if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
+                            log::error!("RtcWorker loop failed: {}", e);
+                        }
+                    });
+                })
+                .expect("Failed to spawn Client RtcWorker thread");
+            let handle = WorkerTask { _thread: thread };
             worker_tasks.push(handle);
         }
 
@@ -1088,7 +1009,12 @@ async fn run_gateway(
         log::info!("  All L3 and L4 traffic processed in userspace.       ");
         log::info!("------------------------------------------------------");
 
-        wait_for_shutdown().await;
+        tokio::select! {
+            _ = wait_for_shutdown() => {},
+            _ = exit_notify.notified() => {
+                log::error!("A client worker thread exited prematurely; shutting down.");
+            }
+        }
         for t in worker_tasks {
             t.abort();
         }
@@ -1206,39 +1132,7 @@ mod tests {
             .unwrap();
 
         assert!(!main_source.contains("#[tokio::main]"));
-        assert!(main_source.contains("tokio::runtime::Builder::new_multi_thread()"));
-        assert!(main_source.contains("worker_threads(worker_threads.max(1))"));
-    }
-
-    #[test]
-    fn l3_udp_receive_and_timer_are_owned_by_worker_zero() {
-        assert!(worker_owns_l3_udp_rx_and_timer(0));
-        assert!(!worker_owns_l3_udp_rx_and_timer(1));
-        assert!(!worker_owns_l3_udp_rx_and_timer(8));
-    }
-
-    #[test]
-    fn server_quic_data_plane_uses_fixed_listeners_and_event_driven_streams() {
-        let quic_pool = include_str!("quic_pool.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
-        let server_proxy = include_str!("server_proxy.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
-        let relay = include_str!("relay.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
-
-        assert_eq!(
-            quic_pool.matches("tokio::spawn").count(),
-            2,
-            "quic_pool should only spawn the client health checker and fixed listener tasks"
-        );
-        assert!(!server_proxy.contains("tokio::spawn"));
-        assert!(!relay.contains("tokio::spawn"));
+        assert!(main_source.contains("tokio::runtime::Builder::new_current_thread()"));
     }
 
     #[test]
@@ -1355,17 +1249,22 @@ mod tests {
     }
 
     #[test]
-    fn build_initial_gateway_state_only_routes_l4_proxy_peers() {
-        let l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
-        let wg_only_peer = peer([3u8; 32], None, None);
-        let config = config_with_peers(vec![l4_peer.clone(), wg_only_peer]);
+    fn build_initial_gateway_state_routes_all_peers() {
+        let mut l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
+        l4_peer.allowed_ips = vec!["10.10.1.0/24".parse().unwrap()];
+        let mut wg_only_peer = peer([3u8; 32], None, None);
+        wg_only_peer.allowed_ips = vec!["10.10.2.0/24".parse().unwrap()];
+        let config = config_with_peers(vec![l4_peer.clone(), wg_only_peer.clone()]);
 
         let state = build_initial_gateway_state(config);
 
-        assert!(state.userspace_tcp_offload_enabled);
         assert_eq!(
             state.router.longest_match("10.10.1.2".parse().unwrap()),
             Some(l4_peer.public_key)
+        );
+        assert_eq!(
+            state.router.longest_match("10.10.2.2".parse().unwrap()),
+            Some(wg_only_peer.public_key)
         );
     }
 
@@ -1387,35 +1286,11 @@ mod tests {
     }
 
     #[test]
-    fn proxy_peers_filters_wireguard_only_peers() {
+    fn proxy_peers_filters_peers_without_outbound_endpoints() {
         let l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
         let config = config_with_peers(vec![l4_peer.clone(), peer([3u8; 32], None, None)]);
 
         assert_eq!(proxy_peers(&config).len(), 1);
         assert_eq!(proxy_peers(&config)[0].public_key, l4_peer.public_key);
-    }
-
-    #[test]
-    fn smoltcp_ip_cidrs_and_local_stack_ips_follow_interface_addresses() {
-        let config = config_with_peers(Vec::new());
-
-        let cidrs = smoltcp_ip_cidrs(&config).unwrap();
-        let (local_ipv4, local_ipv6) = local_stack_ips(&config);
-
-        assert_eq!(cidrs.len(), 2);
-        assert_eq!(local_ipv4, Some("10.0.0.2".parse().unwrap()));
-        assert_eq!(local_ipv6, Some("fd00::2".parse().unwrap()));
-    }
-
-    #[test]
-    fn needs_ipv6_l3_socket_when_interface_or_peer_uses_ipv6() {
-        let mut config = config_with_peers(Vec::new());
-        assert!(needs_ipv6_l3_socket(&config));
-
-        config.interface.addresses = vec!["10.0.0.2/24".parse().unwrap()];
-        assert!(!needs_ipv6_l3_socket(&config));
-
-        config.peers = vec![peer([2u8; 32], Some("[::1]:51820"), Some(4433))];
-        assert!(needs_ipv6_l3_socket(&config));
     }
 }

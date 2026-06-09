@@ -8,9 +8,10 @@ use crate::config::{self, decode_base64_32};
 use crate::control::NonceCache;
 use crate::quic_pool;
 use crate::runtime::{cleanup_peer_routes, run_blocking_command, setup_peer_routes};
-use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry, WorkerTelemetryRegistry};
-use crate::userspace_wg::UserspaceWgRegistry;
-use crate::virtual_tunnel::VirtualTunnelTelemetry;
+use crate::telemetry::{
+    TelemetryRegistry, UnifiedTelemetry, UserspaceWgRegistry, VirtualTunnelTelemetry,
+    WorkerTelemetryRegistry,
+};
 use crate::{ClientQuicDataPortBaseline, GatewayState, L4DataPlane, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -23,7 +24,7 @@ const MAX_UDS_CLIENTS: usize = 1024;
 
 #[derive(Clone)]
 pub struct UdsServerContext {
-    pub telemetry: Arc<TelemetryRegistry>,
+    pub peer_telemetries: Vec<Arc<TelemetryRegistry>>,
     pub worker_telemetry: Arc<WorkerTelemetryRegistry>,
     pub state: Arc<RwLock<GatewayState>>,
     pub peer_secrets: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
@@ -155,6 +156,31 @@ pub fn start(listener: UnixListener, context: UdsServerContext) {
     });
 }
 
+fn combine_peer_telemetries(
+    peer_telemetries: &[Arc<crate::telemetry::TelemetryRegistry>],
+) -> HashMap<[u8; 32], Arc<crate::telemetry::PeerL4Stats>> {
+    let mut combined = HashMap::new();
+    for registry in peer_telemetries {
+        let snap = registry.snapshot();
+        for (pub_key, stats) in snap {
+            let combined_stats = combined
+                .entry(pub_key)
+                .or_insert_with(|| Arc::new(crate::telemetry::PeerL4Stats::default()));
+            combined_stats
+                .rx_bytes
+                .fetch_add(stats.rx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            combined_stats
+                .tx_bytes
+                .fetch_add(stats.tx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            combined_stats.active_streams.fetch_add(
+                stats.active_streams.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+    }
+    combined
+}
+
 fn quic_connection_snapshots(
     quic_registry: &HashMap<[u8; 32], Vec<quic_pool::QuicConnRecord>>,
     client_quic_pools: &PeerQuicPools,
@@ -189,8 +215,8 @@ async fn handle_stats(
             st.config.peers.clone()
         };
         let sources = telemetry_sources(&peers, &l3_stats);
-        let registry_map = context.telemetry.snapshot();
-        let quic_registry = context.shared_quic_registry.lock();
+        let registry_map = combine_peer_telemetries(&context.peer_telemetries);
+        let quic_registry = context.shared_quic_registry.read();
 
         for peer in peers {
             let pub_key = peer.public_key;
@@ -330,8 +356,8 @@ async fn handle_dump(
 ) {
     let l3_stats = context.l3_registry.snapshot();
     let response = {
-        let telemetry = context.telemetry.snapshot();
-        let quic_registry = context.shared_quic_registry.lock();
+        let telemetry = combine_peer_telemetries(&context.peer_telemetries);
+        let quic_registry = context.shared_quic_registry.read();
         let peers = {
             let state = context.state.read();
             state.config.peers.clone()
@@ -708,6 +734,12 @@ async fn handle_add_peer(
             &context.state,
             &context.client_quic_pools,
         );
+    } else {
+        if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
+            for conn in conns {
+                conn.close(b"Peer replaced");
+            }
+        }
     }
 
     let message = if quic_pool_unavailable {
@@ -779,14 +811,16 @@ async fn handle_remove_peer(
     context.peer_secrets.write().remove(&parsed_pub_key);
     context.session_cache.write().remove(&parsed_pub_key);
     context.auth_nonce_cache.lock().remove(&parsed_pub_key);
-    context.telemetry.remove(&parsed_pub_key);
+    for registry in &context.peer_telemetries {
+        registry.remove(&parsed_pub_key);
+    }
 
     if context.runtime_mode == RuntimeMode::Client {
         if let Some(pool) = context.client_quic_pools.write().remove(&parsed_pub_key) {
             pool.shutdown(b"Peer removed");
         }
     }
-    if let Some(conns) = context.shared_quic_registry.lock().remove(&parsed_pub_key) {
+    if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
         for conn in conns {
             conn.close(b"Peer removed");
         }
@@ -965,12 +999,12 @@ mod tests {
         ));
 
         UdsServerContext {
-            telemetry,
+            peer_telemetries: vec![telemetry],
             worker_telemetry,
             state,
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             server_secret: StaticSecret::from([1u8; 32]),
-            shared_quic_registry: Arc::new(Mutex::new(HashMap::new())),
+            shared_quic_registry: Arc::new(RwLock::new(HashMap::new())),
             interface_name: "nonexistent_interface".to_string(),
             session_cache: Arc::new(RwLock::new(HashMap::new())),
             auth_nonce_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1233,8 +1267,7 @@ mod tests {
             .auth_nonce_cache
             .lock()
             .contains_key(&[2u8; 32]));
-        assert!(!context_for_assert
-            .telemetry
+        assert!(!context_for_assert.peer_telemetries[0]
             .snapshot()
             .contains_key(&[2u8; 32]));
 

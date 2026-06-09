@@ -701,6 +701,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(tarpaulin))]
     fn run_script_reports_failures() {
         assert!(run_script("exit 0").is_ok());
         let err = run_script("echo pre-script-failed >&2; exit 7").unwrap_err();

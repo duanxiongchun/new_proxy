@@ -54,7 +54,7 @@ PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
-Table = off
+Table = auto
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
@@ -62,7 +62,7 @@ ListenPorts = 40001, 40002, 40003, 40004
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
-AllowedIPs = 10.0.0.2/32
+AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 EOF_CONF
 
 cat > "$ARTIFACT_DIR/client_perf.conf" <<EOF_CONF
@@ -95,12 +95,9 @@ ip link set vp-w netns perf_work_ns
 ip link set vp-c-w netns perf_client_ns
 
 ip netns exec perf_server_ns ip addr add 10.0.2.2/24 dev vp-s
-ip netns exec perf_server_ns ip addr add 10.0.0.1/32 dev lo
 ip netns exec perf_server_ns ip link set vp-s up
 ip netns exec perf_server_ns ip link set lo up
 ip netns exec perf_server_ns ip route add default via 10.0.2.1
-ip netns exec perf_server_ns ip route add 10.0.0.1/32 dev lo scope host
-ip netns exec perf_server_ns ip route add 10.0.0.2/32 via 10.0.2.1
 
 ip netns exec perf_client_ns ip addr add 10.0.1.2/24 dev vp-c
 ip netns exec perf_client_ns ip addr add 10.0.4.1/24 dev vp-c-w
@@ -126,8 +123,6 @@ ip netns exec perf_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec perf_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count=8 status=none
-ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
-HTTP_PID=$!
 ip netns exec perf_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
@@ -136,6 +131,8 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   cat "$ARTIFACT_DIR/server.log"
   exit 1
 fi
+ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
+HTTP_PID=$!
 ip netns exec perf_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
