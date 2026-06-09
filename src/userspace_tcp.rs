@@ -128,6 +128,19 @@ impl UserspaceTcpStack {
         Ok(self.sockets.add(socket))
     }
 
+    pub fn create_udp_socket(
+        &mut self,
+        rx_buffer_size: usize,
+        tx_buffer_size: usize,
+    ) -> Result<SocketHandle, String> {
+        let rx_metadata = vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
+        let tx_metadata = vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
+        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(rx_metadata, vec![0; rx_buffer_size]);
+        let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(tx_metadata, vec![0; tx_buffer_size]);
+        let socket = smoltcp::socket::udp::Socket::new(rx_buffer, tx_buffer);
+        Ok(self.sockets.add(socket))
+    }
+
     pub fn get_socket_state(&self, handle: SocketHandle) -> Result<(), String> {
         let _socket = self.sockets.get::<tcp::Socket>(handle);
         Ok(())
@@ -158,5 +171,14 @@ mod tests {
     #[test]
     fn test_smoltcp_stack_requires_configured_addresses() {
         assert!(UserspaceTcpStack::new(Vec::new(), 1400, BufferPool::new(1656)).is_err());
+    }
+
+    #[test]
+    fn test_smoltcp_udp_socket_creation() {
+        let ip_cidr = IpCidr::from_str("10.0.0.2/24").unwrap();
+        let mut stack = UserspaceTcpStack::new(vec![ip_cidr], 1400, BufferPool::new(1656)).unwrap();
+        let handle = stack.create_udp_socket(1024, 1024).unwrap();
+        let socket = stack.sockets.get::<smoltcp::socket::udp::Socket>(handle);
+        assert!(!socket.is_open());
     }
 }
