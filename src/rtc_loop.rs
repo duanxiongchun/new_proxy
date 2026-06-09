@@ -259,6 +259,64 @@ pub fn parse_tcp_packet(packet: &[u8]) -> Option<(IpAddr, u16, IpAddr, u16, bool
     }
 }
 
+pub fn parse_udp_packet(packet: &[u8]) -> Option<(IpAddr, u16, IpAddr, u16)> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    match version {
+        4 => {
+            let proto = packet[9];
+            if proto != 17 {
+                return None;
+            }
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            if ihl < 20 {
+                return None;
+            }
+            let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+            if total_len < ihl + 8 || packet.len() < total_len {
+                return None;
+            }
+            let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                packet[12], packet[13], packet[14], packet[15],
+            ));
+            let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                packet[16], packet[17], packet[18], packet[19],
+            ));
+
+            let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+            let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+            Some((src_ip, src_port, dst_ip, dst_port))
+        }
+        6 => {
+            if packet.len() < 48 {
+                return None;
+            }
+            let proto = packet[6];
+            if proto != 17 {
+                return None;
+            }
+            let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+            if packet.len() < 40 + payload_len {
+                return None;
+            }
+            let mut src_bytes = [0u8; 16];
+            src_bytes.copy_from_slice(&packet[8..24]);
+            let src_ip = IpAddr::V6(std::net::Ipv6Addr::from(src_bytes));
+
+            let mut dst_bytes = [0u8; 16];
+            dst_bytes.copy_from_slice(&packet[24..40]);
+            let dst_ip = IpAddr::V6(std::net::Ipv6Addr::from(dst_bytes));
+
+            let src_port = u16::from_be_bytes([packet[40], packet[41]]);
+            let dst_port = u16::from_be_bytes([packet[42], packet[43]]);
+            Some((src_ip, src_port, dst_ip, dst_port))
+        }
+        _ => None,
+    }
+}
+
 fn smoltcp_ip_to_std(addr: smoltcp::wire::IpAddress) -> IpAddr {
     match addr {
         smoltcp::wire::IpAddress::Ipv4(a) => IpAddr::V4(a),
@@ -2003,5 +2061,45 @@ mod tests {
             let result = worker.run_one_iteration().await;
             assert!(result.is_ok());
         });
+    }
+
+    #[test]
+    fn test_parse_udp_packet_ipv4() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Construct mock IPv4 UDP packet
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45; // Version 4, IHL 20
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes()); // IPv4 Total Length
+        pkt[9] = 17;   // UDP Protocol
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]); // Src IP
+        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);  // Dst IP
+        pkt[20..22].copy_from_slice(&53000u16.to_be_bytes()); // Src Port
+        pkt[22..24].copy_from_slice(&53u16.to_be_bytes());    // Dst Port
+
+        let res = parse_udp_packet(&pkt).unwrap();
+        assert_eq!(res.0, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(res.1, 53000);
+        assert_eq!(res.2, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(res.3, 53);
+    }
+
+    #[test]
+    fn test_parse_udp_packet_ipv6() {
+        use std::net::{IpAddr, Ipv6Addr};
+        // Construct mock IPv6 UDP packet
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60; // Version 6
+        pkt[6] = 17;   // UDP Protocol
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes()); // Payload Length (UDP header only)
+        pkt[8..24].copy_from_slice(&[0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,2]); // Src IP
+        pkt[24..40].copy_from_slice(&[0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,3]); // Dst IP
+        pkt[40..42].copy_from_slice(&53000u16.to_be_bytes()); // Src Port
+        pkt[42..44].copy_from_slice(&53u16.to_be_bytes());    // Dst Port
+
+        let res = parse_udp_packet(&pkt).unwrap();
+        assert_eq!(res.0, IpAddr::V6(Ipv6Addr::new(1, 0, 0, 0, 0, 0, 0, 2)));
+        assert_eq!(res.1, 53000);
+        assert_eq!(res.2, IpAddr::V6(Ipv6Addr::new(2, 0, 0, 0, 0, 0, 0, 3)));
+        assert_eq!(res.3, 53);
     }
 }
