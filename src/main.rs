@@ -15,7 +15,6 @@ mod telemetry;
 pub mod tun_device;
 pub mod tun_io;
 mod uds_server;
-mod wireguard;
 
 use arc_swap::ArcSwap;
 use client_proxy::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
@@ -36,7 +35,7 @@ use quic_pool::{
 use routing::AllowedIPsRouter;
 use runtime::{cleanup_runtime, run_script, setup_routes};
 use stats_cli::run_cli_stats;
-use telemetry::TelemetryRegistry;
+use telemetry::{TelemetryRegistry, UserspaceWgRegistry};
 
 type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
 type L4DataPlane = Arc<ArcSwap<L4DataPlaneSnapshot>>;
@@ -597,14 +596,13 @@ async fn run_gateway(
     let client_quic_data_port_baseline: ClientQuicDataPortBaseline =
         Arc::new(parking_lot::Mutex::new(0));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
-    let l3_registry =
-        match wireguard::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
-            Ok(registry) => registry,
-            Err(e) => {
-                eprintln!("Failed to initialize userspace WireGuard registry: {}", e);
-                std::process::exit(1);
-            }
-        };
+    let l3_registry = match UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
+        Ok(registry) => registry,
+        Err(e) => {
+            eprintln!("Failed to initialize userspace WireGuard registry: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     if let Some(listener) = uds_server::bind_listener(&interface_name) {
         uds_server::start(

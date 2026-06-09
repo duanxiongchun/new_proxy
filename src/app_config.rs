@@ -1,7 +1,7 @@
 use crate::config::{self, GatewayConfig};
 use crate::control;
 use crate::routing::AllowedIPsRouter;
-use crate::wireguard::WgPeerStats;
+use crate::telemetry::WgPeerStats;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
