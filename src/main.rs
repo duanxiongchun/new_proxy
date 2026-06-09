@@ -4,10 +4,10 @@ mod buffer_pool;
 mod client_proxy;
 mod config;
 mod control;
+pub mod mss_clamping;
 mod quic_pool;
 mod routing;
 pub mod rtc_loop;
-pub mod mss_clamping;
 mod runtime;
 mod socket_mark;
 mod stats_cli;
@@ -125,8 +125,6 @@ fn should_enable_userspace_tcp_for_pool_states(
             .iter()
             .all(|state| matches!(state, PoolState::Active))
 }
-
-
 
 #[cfg(not(tarpaulin))]
 fn start_userspace_tcp_failover_manager(
@@ -405,8 +403,6 @@ fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
         .collect()
 }
 
-
-
 #[cfg(all(unix, not(tarpaulin)))]
 async fn wait_for_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -429,10 +425,6 @@ async fn wait_for_shutdown() {
         .expect("failed to listen for ctrl_c");
     log::info!("Received CTRL+C, shutting down...");
 }
-
-
-
-
 
 #[cfg(not(tarpaulin))]
 fn main() {
@@ -768,9 +760,7 @@ async fn run_gateway(
                   _send_mux: quinn::SendStream,
                   _recv_mux: quinn::RecvStream,
                   _conn_stat: Arc<quic_pool::QuicConnStats>|
-                  -> quic_pool::ServerFuture {
-                Box::pin(async move {})
-            },
+                  -> quic_pool::ServerFuture { Box::pin(async move {}) },
         );
 
         if let Err(e) = quic_server
@@ -1085,8 +1075,6 @@ mod tests {
         assert!(main_source.contains("worker_threads(worker_threads.max(1))"));
     }
 
-
-
     #[test]
     fn startup_failed_pool_data_port_count_drives_client_tun_worker_count() {
         let pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
@@ -1201,17 +1189,22 @@ mod tests {
     }
 
     #[test]
-    fn build_initial_gateway_state_only_routes_l4_proxy_peers() {
-        let l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
-        let wg_only_peer = peer([3u8; 32], None, None);
-        let config = config_with_peers(vec![l4_peer.clone(), wg_only_peer]);
+    fn build_initial_gateway_state_routes_all_peers() {
+        let mut l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
+        l4_peer.allowed_ips = vec!["10.10.1.0/24".parse().unwrap()];
+        let mut wg_only_peer = peer([3u8; 32], None, None);
+        wg_only_peer.allowed_ips = vec!["10.10.2.0/24".parse().unwrap()];
+        let config = config_with_peers(vec![l4_peer.clone(), wg_only_peer.clone()]);
 
         let state = build_initial_gateway_state(config);
 
-        assert!(state.userspace_tcp_offload_enabled);
         assert_eq!(
             state.router.longest_match("10.10.1.2".parse().unwrap()),
             Some(l4_peer.public_key)
+        );
+        assert_eq!(
+            state.router.longest_match("10.10.2.2".parse().unwrap()),
+            Some(wg_only_peer.public_key)
         );
     }
 
@@ -1233,13 +1226,11 @@ mod tests {
     }
 
     #[test]
-    fn proxy_peers_filters_wireguard_only_peers() {
+    fn proxy_peers_filters_peers_without_outbound_endpoints() {
         let l4_peer = peer([2u8; 32], Some("127.0.0.1:51820"), Some(4433));
         let config = config_with_peers(vec![l4_peer.clone(), peer([3u8; 32], None, None)]);
 
         assert_eq!(proxy_peers(&config).len(), 1);
         assert_eq!(proxy_peers(&config)[0].public_key, l4_peer.public_key);
     }
-
-
 }

@@ -179,7 +179,7 @@ pub fn peer_has_l4_proxy(peer: &config::PeerConfig) -> bool {
 
 pub fn rebuild_l4_router(peers: &[config::PeerConfig]) -> AllowedIPsRouter<[u8; 32]> {
     let mut router = AllowedIPsRouter::new();
-    for peer in peers.iter().filter(|peer| peer_has_l4_proxy(peer)) {
+    for peer in peers {
         for &allowed_ip in &peer.allowed_ips {
             router.insert(allowed_ip, peer.public_key);
         }
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_l4_router_only_contains_proxy_peers() {
+    fn test_l4_router_contains_all_peers() {
         let proxy_peer = PeerConfig {
             public_key: [1u8; 32],
             allowed_ips: vec!["10.10.0.0/16".parse().unwrap()],
@@ -286,7 +286,10 @@ mod tests {
             router.longest_match("10.10.1.1".parse().unwrap()),
             Some([1u8; 32])
         );
-        assert_eq!(router.longest_match("10.20.1.1".parse().unwrap()), None);
+        assert_eq!(
+            router.longest_match("10.20.1.1".parse().unwrap()),
+            Some([2u8; 32])
+        );
     }
 
     #[test]
