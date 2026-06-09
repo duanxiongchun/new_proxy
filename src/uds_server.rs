@@ -8,7 +8,9 @@ use crate::config::{self, decode_base64_32};
 use crate::control::NonceCache;
 use crate::quic_pool;
 use crate::runtime::{cleanup_peer_routes, run_blocking_command, setup_peer_routes};
-use crate::telemetry::{TelemetryRegistry, UnifiedTelemetry, WorkerTelemetryRegistry, VirtualTunnelTelemetry};
+use crate::telemetry::{
+    TelemetryRegistry, UnifiedTelemetry, VirtualTunnelTelemetry, WorkerTelemetryRegistry,
+};
 use crate::wireguard::UserspaceWgRegistry;
 use crate::{ClientQuicDataPortBaseline, GatewayState, L4DataPlane, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};

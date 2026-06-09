@@ -2,8 +2,8 @@ use crate::quic_pool::QuicConnSnapshot;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
 pub struct PeerL4Stats {

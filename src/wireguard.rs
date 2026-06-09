@@ -32,14 +32,17 @@ impl UserspaceWgRegistry {
         let peers = self.peers.read();
         let mut map = HashMap::new();
         for (&pub_key, peer) in peers.iter() {
-            map.insert(pub_key, WgPeerStats {
-                allowed_ips: peer.allowed_ips.iter().map(|ip| ip.to_string()).collect(),
-                endpoint: peer.endpoint.map(|ep| ep.to_string()),
-                rx_bytes: 0,
-                tx_bytes: 0,
-                last_handshake: 0,
-                unknown_handshake_drops: 0,
-            });
+            map.insert(
+                pub_key,
+                WgPeerStats {
+                    allowed_ips: peer.allowed_ips.iter().map(|ip| ip.to_string()).collect(),
+                    endpoint: peer.endpoint.map(|ep| ep.to_string()),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    last_handshake: 0,
+                    unknown_handshake_drops: 0,
+                },
+            );
         }
         map
     }

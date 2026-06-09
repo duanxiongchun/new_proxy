@@ -1,10 +1,10 @@
-use crate::quic_pool::PeerConnRegistry;
 use crate::buffer_pool::BufferPool;
+use crate::quic_pool::PeerConnRegistry;
 use crate::tun_io::AsyncTunIo;
+use quinn::Connection;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use std::net::IpAddr;
-use quinn::Connection;
 
 pub struct RtcWorkerConfig {
     pub mtu: usize,
@@ -62,7 +62,11 @@ impl RtcWorker {
     pub fn set_l3_rx_enabled(&mut self, _val: bool) {}
     pub fn set_l3_timer_enabled(&mut self, _val: bool) {}
 
-    fn get_active_connection(&self, data_plane: &crate::L4DataPlaneSnapshot, dst_ip: IpAddr) -> Option<Connection> {
+    fn get_active_connection(
+        &self,
+        data_plane: &crate::L4DataPlaneSnapshot,
+        dst_ip: IpAddr,
+    ) -> Option<Connection> {
         match &self.role {
             WorkerRole::Client => {
                 let peer_pub_key = data_plane.router.longest_match(dst_ip)?;
@@ -74,7 +78,10 @@ impl RtcWorker {
                     None
                 }
             }
-            WorkerRole::Server { peer_conn_registry, listen_ports } => {
+            WorkerRole::Server {
+                peer_conn_registry,
+                listen_ports,
+            } => {
                 let peer_pub_key = data_plane.router.longest_match(dst_ip)?;
                 let local_port = listen_ports.get(self.worker_id).copied().unwrap_or(0);
                 if local_port == 0 {
@@ -83,7 +90,8 @@ impl RtcWorker {
                 let registry = peer_conn_registry.lock();
                 let records = registry.get(&peer_pub_key)?;
                 for record in records {
-                    if record.stats.local_port == local_port && record.conn.close_reason().is_none() {
+                    if record.stats.local_port == local_port && record.conn.close_reason().is_none()
+                    {
                         return Some(record.conn.clone());
                     }
                 }
@@ -92,7 +100,10 @@ impl RtcWorker {
         }
     }
 
-    fn get_all_active_connections(&self, data_plane: &crate::L4DataPlaneSnapshot) -> Vec<Connection> {
+    fn get_all_active_connections(
+        &self,
+        data_plane: &crate::L4DataPlaneSnapshot,
+    ) -> Vec<Connection> {
         let mut conns = Vec::new();
         match &self.role {
             WorkerRole::Client => {
@@ -104,13 +115,18 @@ impl RtcWorker {
                     }
                 }
             }
-            WorkerRole::Server { peer_conn_registry, listen_ports } => {
+            WorkerRole::Server {
+                peer_conn_registry,
+                listen_ports,
+            } => {
                 let local_port = listen_ports.get(self.worker_id).copied().unwrap_or(0);
                 if local_port > 0 {
                     let registry = peer_conn_registry.lock();
                     for records in registry.values() {
                         for record in records {
-                            if record.stats.local_port == local_port && record.conn.close_reason().is_none() {
+                            if record.stats.local_port == local_port
+                                && record.conn.close_reason().is_none()
+                            {
                                 conns.push(record.conn.clone());
                             }
                         }
@@ -213,11 +229,10 @@ async fn read_any_datagram(conns: &[Connection]) -> Option<bytes::Bytes> {
         return None;
     }
 
-    let futures = conns.iter().map(|conn| {
-        Box::pin(async move {
-            conn.read_datagram().await
-        })
-    }).collect::<Vec<_>>();
+    let futures = conns
+        .iter()
+        .map(|conn| Box::pin(async move { conn.read_datagram().await }))
+        .collect::<Vec<_>>();
 
     let (res, _, _) = futures::future::select_all(futures).await;
     match res {
@@ -234,13 +249,13 @@ mod tests {
     use super::*;
     use crate::quic_pool::{QuicConnStats, QuicPoolClient};
     use crate::routing::AllowedIPsRouter;
+    use arc_swap::ArcSwap;
+    use parking_lot::{Mutex, RwLock};
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::os::unix::io::IntoRawFd;
-    use std::time::Duration;
-    use std::collections::HashMap;
     use std::sync::atomic::Ordering;
-    use parking_lot::{Mutex, RwLock};
-    use arc_swap::ArcSwap;
+    use std::time::Duration;
 
     static PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(46000);
 
@@ -264,7 +279,11 @@ mod tests {
         session_cache.write().insert(client_pub_key, session_psk);
 
         let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
-        let server = crate::quic_pool::QuicPoolServer::new(vec![port], session_cache.clone(), auth_nonce_cache);
+        let server = crate::quic_pool::QuicPoolServer::new(
+            vec![port],
+            session_cache.clone(),
+            auth_nonce_cache,
+        );
         let (certs, key) = crate::quic_pool::generate_self_signed_cert().unwrap();
         let cert_fingerprint = crate::quic_pool::cert_sha256(&certs).unwrap();
 
@@ -273,9 +292,7 @@ mod tests {
                   _send: quinn::SendStream,
                   _recv: quinn::RecvStream,
                   _stat: Arc<QuicConnStats>|
-                  -> crate::quic_pool::ServerFuture {
-                Box::pin(async move {})
-            },
+                  -> crate::quic_pool::ServerFuture { Box::pin(async move {}) },
         );
 
         server
@@ -334,17 +351,21 @@ mod tests {
         // Build mock IPv4 TCP SYN to 10.0.0.1 with MSS=1460 (0x05B4)
         let mut test_packet = vec![0u8; 44];
         test_packet[0] = 0x45;
-        test_packet[2] = 0x00; test_packet[3] = 44;
+        test_packet[2] = 0x00;
+        test_packet[3] = 44;
         test_packet[9] = 0x06; // TCP
         test_packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
         test_packet[16..20].copy_from_slice(&[10, 0, 0, 1]);
-        test_packet[20] = 0x30; test_packet[21] = 0x39; // Src Port
-        test_packet[22] = 0x00; test_packet[23] = 0x50; // Dst Port
+        test_packet[20] = 0x30;
+        test_packet[21] = 0x39; // Src Port
+        test_packet[22] = 0x00;
+        test_packet[23] = 0x50; // Dst Port
         test_packet[32] = 0x60; // Data offset
         test_packet[33] = 0x02; // Flags: SYN
         test_packet[40] = 2; // Kind: MSS
         test_packet[41] = 4; // Length: 4
-        test_packet[42] = 0x05; test_packet[43] = 0xB4; // MSS Value: 1460
+        test_packet[42] = 0x05;
+        test_packet[43] = 0xB4; // MSS Value: 1460
 
         let mut writer = sock2.try_clone().unwrap();
         std::io::Write::write_all(&mut writer, &test_packet).unwrap();
@@ -364,7 +385,9 @@ mod tests {
 
         // 2. Test Inbound Packet (QUIC Datagram -> TUN)
         let inbound_payload = vec![9u8; 20];
-        server_conn.send_datagram(bytes::Bytes::copy_from_slice(&inbound_payload)).unwrap();
+        server_conn
+            .send_datagram(bytes::Bytes::copy_from_slice(&inbound_payload))
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut reader = sock2;

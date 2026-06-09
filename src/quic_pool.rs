@@ -491,9 +491,14 @@ impl QuicPoolClient {
             .collect()
     }
 
-    pub fn get_connection_by_slot(&self, slot_idx: usize) -> Option<(Connection, Arc<QuicConnStats>)> {
+    pub fn get_connection_by_slot(
+        &self,
+        slot_idx: usize,
+    ) -> Option<(Connection, Arc<QuicConnStats>)> {
         let slots = self.slots.load();
-        slots.get(slot_idx).map(|slot| (slot.conn.clone(), slot.stats.clone()))
+        slots
+            .get(slot_idx)
+            .map(|slot| (slot.conn.clone(), slot.stats.clone()))
     }
 
     pub fn enter_fallback(&self, reason: &str) {
@@ -1783,9 +1788,7 @@ mod tests {
                   _send: quinn::SendStream,
                   _recv: quinn::RecvStream,
                   _stat: Arc<QuicConnStats>|
-                  -> ServerFuture {
-                Box::pin(async move {})
-            },
+                  -> ServerFuture { Box::pin(async move {}) },
         );
 
         server
