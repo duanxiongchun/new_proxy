@@ -599,6 +599,10 @@ async fn handle_add_peer(
                 write_error(stream, framed_response, e).await;
                 return;
             }
+            crate::record_client_quic_data_port_count_if_unset(
+                &context.client_worker_count,
+                pool.endpoint_count(),
+            );
         }
     }
 

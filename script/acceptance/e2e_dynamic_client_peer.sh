@@ -54,7 +54,7 @@ Table = off
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
-ListenPorts = 40001
+ListenPorts = 40001, 40002
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}

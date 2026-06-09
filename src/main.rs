@@ -165,6 +165,10 @@ fn start_userspace_tcp_failover_manager(
                             );
                             continue;
                         }
+                        record_client_quic_data_port_count_if_unset(
+                            &client_worker_count,
+                            pool.endpoint_count(),
+                        );
                         let still_configured = {
                             let st = state.read();
                             st.config.peers.iter().any(|configured| {
@@ -234,14 +238,13 @@ fn effective_client_tun_queues(quic_data_port_count: usize) -> usize {
 fn client_quic_data_port_count(
     pools: &PeerQuicPools,
     startup_expected_count: Option<usize>,
-) -> usize {
+) -> Option<usize> {
     pools
         .read()
         .values()
         .map(|pool| pool.endpoint_count())
         .find(|count| *count > 0)
         .or(startup_expected_count)
-        .unwrap_or(1)
 }
 
 fn record_startup_quic_data_port_count(
@@ -291,13 +294,27 @@ fn validate_client_quic_data_port_count_matches_workers(
     candidate_count: usize,
     active_worker_count: usize,
 ) -> Result<(), String> {
-    if candidate_count == active_worker_count {
+    if active_worker_count == 0 || candidate_count == active_worker_count {
         Ok(())
     } else {
         Err(format!(
             "QUIC data port count mismatch: active client workers use {}, peer uses {}; restart the client with this peer available to change worker topology",
             active_worker_count, candidate_count
         ))
+    }
+}
+
+pub fn record_client_quic_data_port_count_if_unset(
+    client_worker_count: &AtomicUsize,
+    candidate_count: usize,
+) {
+    if candidate_count > 0 {
+        let _ = client_worker_count.compare_exchange(
+            0,
+            candidate_count,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -786,13 +803,19 @@ async fn main() {
 
         let quic_data_port_count =
             client_quic_data_port_count(&client_quic_pools, startup_quic_data_port_count);
-        let tun_queue_count = effective_client_tun_queues(quic_data_port_count);
-        client_worker_count.store(tun_queue_count, Ordering::Relaxed);
-        log::info!(
-            "Client TUN queue count follows negotiated QUIC data port count: data_ports {}, using {}",
-            quic_data_port_count,
-            tun_queue_count
-        );
+        let tun_queue_count = effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
+        client_worker_count.store(quic_data_port_count.unwrap_or(0), Ordering::Relaxed);
+        match quic_data_port_count {
+            Some(count) => log::info!(
+                "Client TUN queue count follows negotiated QUIC data port count: data_ports {}, using {}",
+                count,
+                tun_queue_count
+            ),
+            None => log::info!(
+                "Client TUN queue count has no negotiated QUIC data port count yet; using {} initial queue",
+                tun_queue_count
+            ),
+        }
 
         log::info!(
             "Opening userspace multiqueue TUN device: {} with {} queues",
@@ -1005,7 +1028,13 @@ mod tests {
     #[test]
     fn startup_failed_pool_data_port_count_drives_client_worker_count() {
         let pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-        assert_eq!(client_quic_data_port_count(&pools, Some(4)), 4);
+        assert_eq!(client_quic_data_port_count(&pools, Some(4)), Some(4));
+    }
+
+    #[test]
+    fn missing_startup_peer_leaves_client_quic_data_port_count_unset() {
+        let pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        assert_eq!(client_quic_data_port_count(&pools, None), None);
     }
 
     #[test]
@@ -1045,10 +1074,20 @@ mod tests {
     #[test]
     fn client_quic_data_port_count_must_match_active_workers() {
         assert!(validate_client_quic_data_port_count_matches_workers(2, 2).is_ok());
+        assert!(validate_client_quic_data_port_count_matches_workers(2, 0).is_ok());
         let err = validate_client_quic_data_port_count_matches_workers(4, 1).unwrap_err();
         assert!(err.contains("active client workers use 1"));
         assert!(err.contains("peer uses 4"));
         assert!(err.contains("restart"));
+    }
+
+    #[test]
+    fn first_dynamic_peer_records_client_quic_data_port_count() {
+        let worker_count = AtomicUsize::new(0);
+        record_client_quic_data_port_count_if_unset(&worker_count, 2);
+        assert_eq!(worker_count.load(Ordering::Relaxed), 2);
+        record_client_quic_data_port_count_if_unset(&worker_count, 4);
+        assert_eq!(worker_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]
