@@ -1,11 +1,29 @@
-# new_proxy 测试说明与缺口清单
+# new_proxy 测试说明与覆盖矩阵（Pure L3 IP-over-QUIC Datagram 架构）
 
-本文档按当前代码和脚本维护测试现状。已实现测试列入覆盖矩阵；未实现能力放在 backlog。
+本文档详细描述了 `new_proxy` 纯 L3 IP-over-QUIC Datagram 隧道网关架构下的测试体系。所有单元测试、端到端测试（E2E）、性能测试和稳定性测试均围绕此全新设计展开，废弃原有的 `boringtun` (WireGuard) 和 `smoltcp` (流代理) 相关测试。
 
-## 1. 当前测试入口
+---
 
-### Rust 静态与单元测试
+## 1. 测试体系概览
 
+由于系统采用无状态的 **L3 原始 IP 报文直接封装至 QUIC Datagram 传输**，测试重点从原来的“应用层流协议模拟与状态管理”转移到了**“网卡级报文吞吐、TCP MSS 夹紧（MSS Clamping）、多队列线程亲和度、零分配内存池与极致稳定性”**。
+
+```
++-------------------------------------------------------+
+|                       测试金字塔                      |
+|                                                       |
+|   [稳定性与压力] --> 长期高吞吐、RSS/FD 增长硬门禁     |
+|   [性能与线性度] --> 1, 2, 3, 4 核心吞吐线性与零分配   |
+|   [E2E 场景测试] --> 双栈透明、对称映射、连接自愈、MSS |
+|   [Rust 单元测试] --> 报文改写、控制面协商、内存回收   |
++-------------------------------------------------------+
+```
+
+---
+
+## 2. Rust 单元与集成测试
+
+运行命令：
 ```bash
 cargo fmt --check
 cargo check
@@ -13,300 +31,119 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-当前单元测试分布：
+### 2.1 单元测试分布及核心校验点
 
-- `src/api.rs`：UDS API command/response 类型和 raw/framed 兼容读写。
-- `src/app_config.rs`：runtime mode/config validation、interface/socket path、L4 router rebuild、telemetry source 合并、base64 helper。
-- `src/client_proxy.rs`：client QUIC pool 构建与 userspace stream bridge；主要由 `main`、`uds_server` 和 `quic_pool` 测试间接覆盖。
-- `src/cli.rs`：CLI 输出格式、UDS 命令编码、CLI 错误返回。
-- `src/config.rs`：配置解析、base64 key 解析、非法地址。
-- `src/control.rs`：HMAC roundtrip、控制面协商、错误 HMAC、请求重放、stale `client_nonce` 响应拒绝。
-- `src/main.rs`：mock peer sync 跨模块状态同步。
-- `src/proxy_proto.rs`：QUIC mux 目标地址头部 IPv4/IPv6 编解码。
-- `src/rtc_loop.rs`：RTC packet classification、IPv6 短 TCP 包拒绝、`RtcWorker` 创建、smoltcp 出站包回写 TUN、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限、QUIC bridge 原始目标地址反查、QUIC bridge 使用 worker-local `Notify` waker 唤醒 RTC loop、QUIC 不可用时 TCP fallback 到 userspace WireGuard。
-- `src/runtime.rs`：TUN 地址、peer 路由、endpoint bypass route、pre/post script runtime setup/cleanup。
-- `src/server_proxy.rs`：server-side QUIC mux stream 目标 TCP connect、状态回写和 relay。
-- `src/stats_cli.rs`：`new_proxy stats` 内置 telemetry table 输出、byte formatter。
-- `src/tcp_util.rs`：TCP keepalive socket option helper。
-- `src/telemetry.rs`：统一 telemetry DTO 和 sharded L4 telemetry registry。
-- `src/tun_device.rs`：Linux TUN 打开、单队列/多队列权限失败边界。
-- `src/tun_io.rs`：基于 `AsyncFd` 的 TUN 异步读写。
-- `src/userspace_tcp.rs`：smoltcp 用户态 TCP/IP 栈创建、socket buffer 与 socket handle 生命周期。
-- `src/userspace_wg.rs`：boringtun tunnel 状态初始化。
-- `src/virtual_tunnel.rs`：空物理 socket 集拒绝、RTC receive path 不预取业务包、调用方 buffer 直接接收、双物理 UDP socket 直接 readiness 接收、发送使用当前 active socket、不创建后台 task，并验证 `tick_control()` 发送 PING/处理 PONG 后切换 active socket。
-- `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、旧 QUIC data port 不可达后的控制面刷新恢复、控制面刷新拒绝 data port 数变化、QUIC pool fallback/recovering/active 状态、控制面刷新触发条件和退避；server-side data port listener 使用 ready queue 推进 connection/stream future，并验证只重新 poll 被唤醒 future、self-wake 延迟到下一轮、完成任务槽位复用、旧 waker 不会误唤醒复用后的槽位、每轮 ready poll 有预算上限。
-- `src/main.rs`：userspace TCP failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TCP offload，所有 pool active 后才允许回切；client 启动主 runtime 前预协商 QUIC data port 数，TUN worker、Tokio runtime worker 和 QUIC data port baseline 使用同一个固定宽度；多个 proxy peer 的启动期协商端口数不一致时拒绝启动，启动期无法获知端口数时固定为单队列 baseline，后续动态新增或后台恢复不能改变拓扑；WireGuard UDP receive/timer 只归属 worker 0；服务端 QUIC 数据面只允许 client health checker 和固定 listener task，业务 stream 由 event-driven `ServerFutures` 推进；入口不使用 `#[tokio::main]` 默认 runtime。
-- `src/relay.rs`：双向 relay、计数 reader；双向 relay 在单个 future 内推进，不为两个方向创建额外 task；并针对 `relay_copy_with_idle` 原地复位与超时到期设计了高精度的虚拟时钟单元测试。
-- `src/routing.rs`：AllowedIPs longest-prefix matching。
-- `src/uds_server.rs`：真实 UDS server 的 `Stats`、`Dump`、非法请求响应和 remove-peer 缓存清理。
-- `src/wireguard.rs`：当前仅保留 `WgPeerStats` DTO，内核 WireGuard generic netlink 路径已移除。
+* **`src/app_config.rs` & `src/config.rs`**：
+  * 校验基础配置、Base64 密钥材料解析以及 AllowedIPs 路由解析。
+  * 验证非法地址、不合规端口范围的边界防御。
+* **`src/control.rs`**：
+  * **HMAC 双向校验**：控制面请求与响应的 HMAC-SHA256 生成与合法性判定。
+  * **防重放攻击**：利用 nonce replay cache 校验 `client_nonce`。
+  * **端口下发与验证**：验证服务端动态生成的 $N$ 个数据面端口列表，以及客户端对端口列表结构完整性的校验。
+* **`src/quic_pool.rs`**：
+  * **Datagram 协商机制**：验证 QUIC 握手期间的 Datagram 传输特性启用。
+  * **多 Connection 插槽分配**：验证 $N$ 个 QUIC 物理连接槽位（`PoolSlot`）的建立、缓存与状态切换。
+  * **链接断线自愈**：测试模拟其中某一个 Slot 的物理 QUIC 链接中断，健康检查后台异步触发单独 Slot 的控制面预协商和重连，不干扰其他活跃 Slot。
+* **`src/rtc_loop.rs`（RtcWorker 事件循环）**：
+  * **网卡多队列读写**：验证工作线程 $i$ 对 TUN 队列 $i$ 的独占非阻塞轮询。
+  * **Datagram 封装与解封装**：验证从 TUN 读出 IP 数据包后，直接作为 Payload 塞入 QUIC Datagram 发送，以及反向解析 Datagram 直接写回 TUN 的正确性（IP 头部必须完全保留）。
+  * **TCP MSS 夹紧（MSS Clamping）**：
+    * 识别 TCP SYN 包和 SYN-ACK 包的 IP 数据包。
+    * 解析并改写 TCP Option 中的 MSS 字段。
+    * 重新计算 IP 校验和与 TCP 校验和。
+    * **测试用例**：输入 1500 字节 MTU 配置下的 TCP SYN，断言改写后的 MSS 是否被夹紧至 `1160`（或根据 QUIC datagram 最大容量动态夹紧），并验证 checksum 重新计算后的合法性。
+  * **线程局部 BufferPool 循环**：
+    * 验证数据面转发逻辑中，所有报文缓冲区（`PooledBuf`）全部在当前工作线程的本地 BufferPool 内借用和释放。
+    * **测试用例**：通过内存分配追踪，确保包转发热路径上没有发生任何全局堆内存分配（`malloc` / `free`），实现 100% 内存静态化。
+* **`src/runtime.rs` & `src/main.rs`**：
+  * **对称宽度校验门禁**：验证客户端启动时的协商端口数 $N$ 建立基准，若后续 Peer 配置的端口数不为 $N$，必须拒绝初始化并报错。
+  * **策略路由下发**：验证 `SO_MARK` 策略路由规则的安装，确保外层 UDP 报文不会递归回环。
+* **`src/uds_server.rs` & `src/stats_cli.rs`**：
+  * 校验 UDS API 的 `Stats` 和 `Dump` 命令。
+  * 断言导出的遥测指标（如 `sent_datagrams`、`recv_datagrams`、`dropped_packets`、`active_connections`）数值准确。
 
-### Acceptance / E2E 脚本
+---
 
-这些脚本需要 root、Linux network namespace、`iproute2`、`iptables`/`ip6tables`、`curl`、`python3`。
+## 3. 端到端（E2E）验收脚本
 
+验收测试需要在支持 Linux Network Namespace 的环境下运行，使用 `ip` 网络空间隔离并模拟真实的网络公网延迟与物理包传输。
+
+运行所有 E2E 脚本：
 ```bash
-sudo bash script/acceptance/e2e_test_dualstack.sh
-sudo bash script/acceptance/e2e_scenarios.sh
-sudo bash script/acceptance/e2e_multi_client.sh
-sudo bash script/acceptance/e2e_dynamic_client_peer.sh
-sudo bash script/acceptance/e2e_client_topology_gate.sh
-sudo bash script/acceptance/e2e_userspace_wg_fallback.sh
-sudo bash script/acceptance/e2e_full_tunnel_bypass.sh
-sudo STABILITY_DURATION=60 STABILITY_SAMPLE_INTERVAL=10 bash script/acceptance/stability_stress_test.sh
-cargo build --release --bins
-sudo bash script/perf/perf_smoke.sh
-sudo bash script/perf/perf_cores_scalability.sh
+sudo bash script/acceptance/run_all_e2e.sh
 ```
 
-语法检查：
-
-```bash
-bash -n script/acceptance/e2e_test_dualstack.sh \
-  script/acceptance/e2e_scenarios.sh \
-  script/acceptance/e2e_multi_client.sh \
-  script/acceptance/e2e_dynamic_client_peer.sh \
-  script/acceptance/e2e_client_topology_gate.sh \
-  script/acceptance/e2e_userspace_wg_fallback.sh \
-  script/acceptance/e2e_full_tunnel_bypass.sh \
-  script/acceptance/stability_stress_test.sh \
-  script/perf/perf_smoke.sh \
-  script/perf/perf_cores_scalability.sh
-python3 -m py_compile \
-  script/acceptance/stability_report.py \
-  script/acceptance/stability_server.py \
-  script/acceptance/stability_long_tcp.py
-```
-
-## 2. 当前覆盖情况
-
-| 层级 | 已覆盖 | 主要缺口 |
-| --- | --- | --- |
-| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限、VirtualTunnel drop/failover 边界、worker flow limit fallback 判断、`relay_copy_with_idle` 零分配原地 Deadline 复位与超时到期机制 | QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
-| E2E | 双栈 WAN、IPv6 HTTP over TUN/smoltcp/QUIC、TUN/smoltcp->QUIC、QUIC 被阻断时新 TCP 经 userspace WireGuard fallback、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy + direct L3 baseline、动态 client proxy peer add/remove 生命周期、client 启动前 data-port 预协商驱动 4 worker 拓扑、移除所有 pool 后仍拒绝 1-port 动态 peer 改变固定 baseline、full-tunnel endpoint bypass 与动态 full-tunnel peer replacement、server 主动访问 client 后端的物理路径保持可达 | UDP/ICMP 经 userspace boringtun 的 namespace 闭环、服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
-| 稳定性 | 多 client、两条独立 proxy peer、direct L3 baseline、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV；crash、短/长 TCP、UDP、ping、QUIC CV 为硬门禁，RSS 默认 WARN、`STABILITY_ENFORCE_RSS=1` 时为硬门禁 | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要；还缺高 stream churn 后 `ServerFutures` RSS/FD 斜率门禁 |
-| 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 QUIC data port 数 `1..4` 同步重启 server/client，并用 `taskset` 约束 client CPU，默认 32 并发输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator；还缺长下载与短请求混跑的 p95/p99 TTFB 门禁；L3 userspace WireGuard 仍是 per-peer shared state，需单独评估 UDP/ICMP/fallback 扩展性 |
-| 弱网/混沌 | 无正式脚本 | 缺丢包、端口阻断、服务端重启、session rotation、控制面丢包场景 |
-| 安全负向 | 控制面坏 HMAC/重放/stale nonce、QUIC 证书 pinning、空 endpoint pool | 缺恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E |
-
-## 3. 已补的重点测试
-
-### 3.1 动态 client proxy peer 生命周期
-
-`script/acceptance/e2e_dynamic_client_peer.sh` 覆盖：
-
-1. client 以非 proxy `AllowedIPs` 配置启动。
-2. 添加前 workload namespace 访问目标 TCP 失败。
-3. 调用 client UDS `add-peer <server_pub> <allowed_ips> <endpoint> <proxy_port>`。
-4. 验证 client 创建 QUIC pool，workload TCP 经 TUN/smoltcp 成功走 QUIC。
-5. server namespace 通过物理路由主动访问 client 后端 workload 服务，验证非代理物理路径仍可达。
-6. 调用 client UDS `remove-peer`。
-7. 验证后续 TCP 不再进入 QUIC。
-
-### 3.2 Client data-plane topology 门禁
-
-`script/acceptance/e2e_client_topology_gate.sh` 覆盖：
-
-1. 两个 server daemon 同时运行：server1 发布 4 个 QUIC data ports，server2 只发布 1 个 QUIC data port。
-2. client 只配置 server1 proxy peer 启动，必须在主 runtime 前预协商出 4-port 宽度。
-3. 通过 client UDS `dump` 验证 worker telemetry 行数为 4，并检查启动日志记录 `data_ports 4, using 4`。
-4. 验证原始 4-port peer 业务 TCP 可通过 TUN/smoltcp/QUIC 成功。
-5. 移除原始 peer，使当前 QUIC pool 为空但固定 baseline 仍为 4。
-6. 动态添加 server2 这个 1-port proxy peer，必须被拒绝，错误信息包含 `established baseline uses 4`。
-7. 验证拒绝不会改变 worker 拓扑，再重新添加原始 4-port peer 并验证业务恢复。
-
-### 3.3 控制面负向与重试
-
-Rust 单元测试覆盖：
-
-- 控制面响应 `client_nonce` 不匹配必须被拒绝。
-- 重放相同 `ControlRequest` 无响应。
-- 错误 HMAC 控制请求无响应。
-- 非法 `PublicIPv4`/`PublicIPv6` 导致 client 明确失败。
-- 空 QUIC endpoint pool 导致 pool 构建失败。
-
-### 3.4 Userspace TCP 与 WireGuard-only 边界
-
-当前覆盖：
-
-- `rebuild_l4_router()` 只纳入同时配置 `Endpoint` 和 `ProxyPort` 的 peer。
-- 同一 client 配置中同时存在 proxy peer 和 WireGuard-only peer。
-- 访问 proxy peer `AllowedIPs` 走 QUIC。
-- 访问 WireGuard-only peer `AllowedIPs` 不走 QUIC。
-- client gateway 不再依赖 TPROXY 规则；server 主动访问 client 后端的物理路径不会被 userspace TCP offload 误接管。
-
-### 3.5 UDS server 模块拆分
-
-Rust 单元测试覆盖：
-
-- UDS raw JSON request 与 framed request 的兼容读写。
-- 非法 framed payload length 被拒绝。
-- 独立 `uds_server` 启动后可基于 `UdsServerContext` 返回 `Stats` 聚合 telemetry。
-- 独立 `uds_server` 启动后可返回 `Dump` 文本快照。
-- 非法 JSON request 返回 `ApiResponse { status: "Error" }`。
-- remove-peer 相关 peer secrets、session cache、nonce cache 同步清理。
-
-### 3.6 IPv6 真实业务闭环
-
-`script/acceptance/e2e_test_dualstack.sh` 覆盖：
-
-- IPv6 HTTP server 监听。
-- IPv6 `AllowedIPs` 命中 client namespace TUN route。
-- router namespace 使用 `curl -g http://[fd00::1]:8080/` 发起真实 TCP。
-- server telemetry 中出现 QUIC L4 字节。
-
-### 3.7 Userspace WireGuard TCP fallback 闭环
-
-`script/acceptance/e2e_userspace_wg_fallback.sh` 覆盖：
-
-1. server/client 两端均 `Table = auto`，由 new_proxy 创建并配置各自 TUN。
-2. server HTTP 服务绑定在 server TUN 地址 `10.40.0.1`。
-3. server namespace 丢弃 QUIC data ports `40001,40002`，但保留控制面 UDP `51821` 和 userspace WireGuard UDP `51820`。
-4. client 初始 QUIC pool 失败后禁用 userspace TCP offload。
-5. client 发起新 TCP 到 `10.40.0.1:8080`，经 TUN -> boringtun -> server TUN 成功闭环。
-6. server telemetry 显示 WireGuard 字节非零且 QUIC inactive。
-
-### 3.8 服务端重启后的客户端自动恢复
-
-`script/acceptance/e2e_scenarios.sh` 覆盖 namespace 级真实进程恢复：
-
-1. client/server daemon 先完成 TUN/smoltcp -> QUIC 业务流量。
-2. 测试 kill server daemon 并重新启动 server daemon，触发新自签证书和新 session cache。
-3. 等待 client health checker 自愈。
-4. 从 router namespace 发起新 TCP 请求，验证业务恢复。
-5. 通过 server UDS stats 检查 `quic: active`。
-
-`src/quic_pool.rs::test_health_checker_refreshes_control_config_after_server_restart` 额外覆盖 pool 层控制面刷新细节：
-
-1. 客户端先使用旧 `session_psk`、旧 QUIC 证书指纹和旧端口建立连接。
-2. 测试模拟服务端重启后旧 session 失效，并关闭旧物理连接。
-3. 健康检查按旧配置重连失败后重新走控制面协商。
-4. 客户端获得新的 `session_psk`、QUIC 证书指纹和端口池，替换本地 runtime config 与连接池。
-5. 新业务 stream 在新 QUIC 服务端上成功 echo。
-
-### 3.9 QUIC 故障后的 userspace WireGuard fallback 与延迟回切
-
-当前代码路径：
-
-1. QUIC stream 打开失败时，client 将对应 pool 标记为 `Fallback`。
-2. client failover manager 观察所有 proxy pool 状态。
-3. 任意 pool 为 `Fallback` 或 `Recovering` 时，manager 将 `userspace_tcp_offload_enabled` 置为 false。
-4. 后续从 TUN 读到的新 TCP 包不再投递给本地 `smoltcp`，而是通过 `boringtun` 走用户态 WireGuard L3 fallback。
-5. 启动时缺失 QUIC pool 不再导致 client 退出；manager 周期性重建缺失 pool。
-6. QUIC 连接恢复后先进入 `Recovering` cooldown，cooldown 结束并回到 `Active` 后，manager 重新启用 userspace TCP offload。
-
-当前 client 启动路径不再下发 TPROXY iptables 规则；`runtime.rs` 只负责 TUN 地址、peer 路由和 endpoint bypass route。
-
-Rust 单元测试覆盖：
-
-- `src/main.rs::test_userspace_tcp_failover_policy_requires_all_pools_active`：确认只有所有 pool 都是 `Active` 时才允许恢复 userspace TCP offload；`Fallback` 和 `Recovering` 都保持 WireGuard fallback。
-
-### 3.10 稳定性与负载均衡测试设计
-
-`script/acceptance/stability_stress_test.sh` 是长稳测试入口，目标覆盖物理 QUIC 连接池、TUN/smoltcp 用户态并发转发和双轨聚合遥测。
-
-核心成功标准：
-
-- 测试期间 client/server daemon 无 panic、无意外退出、无 crash。
-- 长连接 TCP 与短连接 `curl` 业务请求应持续成功。
-- 多物理 QUIC 连接的流量分布应接近均匀；稳定性报告按各连接总流量计算变异系数 CV。
-- warmup 后 RSS 不应持续线性增长，避免 OOM 或明显泄漏。
-
-流量模型：
-
-- 多线程长 TCP：后台线程持续建立到目标 HTTP 服务的 TCP 连接并发送数据，断线后自动重连。
-- 高频短 TCP：周期性发起 `curl` 短连接，压测 QUIC stream 分配和回收。
-- 背景 UDP/ICMP：通过非 proxy 路径保持 L3 活跃，辅助观察 WireGuard 与 QUIC 分层遥测。
-
-采样与报告：
-
-- 脚本周期性采集 daemon 存活、CPU、RSS、UDS/CLI dump、QUIC connection 本地端口、rx/tx bytes 和 active streams。
-- 采样数据写入 artifact 目录的 JSON Lines 文件。
-- `stability_report.py` 汇总资源趋势、流量成功率和 QUIC 物理连接分布。
-
-### 3.11 部署验证
-
-部署包验证分三层：
-
-- 构建层：`make package` 生成本机架构包；交叉包使用 `ARCH=<deb_arch> CARGO_TARGET=<rust_target>`，并用 `file`/`dpkg-deb -f` 确认二进制架构和 Debian `Architecture` 匹配。
-- 安装层：远端 `dpkg -i` 后确认 `dpkg -s new-proxy` 为 `install ok installed`，二进制和 systemd unit 属主为 `root:root`。
-- 运行层：`systemctl restart new_proxy@<instance>` 后检查服务为 `active (running)`，再通过 `new-proxy-cli --interface <instance> show` 验证 UDS 可连接、peer source/handshake/QUIC 状态符合预期。
-
-客户端隧道自举机器部署必须使用本机 rollback 机制：
-
-1. 在客户端本地把当前安装内容打成 rollback deb。
-2. 安装新 deb 前启动 watchdog。
-3. 新包安装并重启服务后，在限定时间内确认 systemd active、UDS CLI 可查询、peer 非 `latest handshake: Never`。
-4. 若健康确认未写入，watchdog 自动 `dpkg -i` rollback deb 并重启原服务。
-
-### 3.12 用户态客户端协议栈测试
-
-用户态客户端改动的测试用例统一维护在本节，不再散落到临时实施计划文档。
-
-已实现的单元级覆盖：
-
-- `src/tun_device.rs::test_open_tun_device`：验证 TUN opener 能返回 FD；在无权限环境下接受 `Permission denied` / `Operation not permitted`，避免普通开发环境误报。
-- `src/tun_io.rs::test_async_tun_io`：用 Unix socketpair 模拟 FD，验证 `AsyncTunIo` 的异步读写路径。
-- `src/userspace_wg.rs::test_boringtun_state`：验证 boringtun `Tunn` 状态可以由本地私钥和 peer 公钥初始化。
-- `src/userspace_tcp.rs::test_smoltcp_stack_creation`：验证 smoltcp interface、socket set 和 TCP socket handle 创建。
-- `src/rtc_loop.rs::test_packet_classification`：验证 IPv4 TCP 报文协议号识别。
-- `src/rtc_loop.rs::parse_ipv6_tcp_rejects_short_header_without_panicking`：验证 IPv6 TCP 短包不会越界 panic。
-- `src/rtc_loop.rs::rewrites_repair_ipv4_tcp_checksums` / `rewrites_repair_ipv6_tcp_checksums`：验证 NAT 改写后校验和会被重算。
-- `src/rtc_loop.rs::bridge_pending_queues_are_capped_by_bytes`：验证 bridge 慢读/慢写 pending 队列存在字节上限。
-- `src/rtc_loop.rs::new_syn_falls_back_when_worker_flow_limit_is_reached`：验证 worker TCP flow 数达到上限时，新 SYN 会被判定为 fallback，而已有 flow 不受影响。
-- `src/rtc_loop.rs::allocate_local_port_can_use_final_ephemeral_port`：验证 userspace TCP 本地端口分配覆盖完整 ephemeral 范围。
-- `src/rtc_loop.rs::cleanup_stale_flows_removes_half_open_socket_for_local_port`：验证 stale flow 清理会移除半开 smoltcp socket 并释放本地端口索引。
-- `src/rtc_loop.rs::insert_flow_port_rejects_duplicate_port_in_debug_builds`：验证本地端口索引 helper 在 debug/test 构建中拒绝重复端口误用。
-- `src/rtc_loop.rs::test_rtc_worker_creation`：验证 `RtcWorker` 组合 `AsyncTunIo`、UDP socket、boringtun 和 smoltcp 后可执行一次 poll/flush 迭代。
-- `src/virtual_tunnel.rs::virtual_tunnel_socket_rejects_empty_physical_socket_set`：验证虚拟 UDP socket 不接受空物理 socket 集。
-- `src/virtual_tunnel.rs::virtual_tunnel_sequential_recv_uses_caller_buffer_without_queue`：验证 RTC receive path 直接使用调用方 buffer 连续收包，不经过中间接收队列。
-- `src/virtual_tunnel.rs::virtual_tunnel_does_not_consume_business_packets_before_recv`：验证虚拟 UDP socket 不用后台任务预取业务包，只有 RTC worker 调用 `recv_from` 时才收包。
-- `src/virtual_tunnel.rs::virtual_tunnel_recv_reads_directly_from_multiple_physical_sockets`：验证多个物理 UDP socket 任一 ready 时都能直接读入调用方 buffer。
-- `src/virtual_tunnel.rs::virtual_tunnel_keeps_active_socket_when_all_pongs_are_stale`：验证所有物理路径健康探测都过期时不会强制回切到 socket 0。
-- `src/virtual_tunnel.rs::virtual_tunnel_send_uses_active_physical_socket`：验证发送使用当前 active 底层 UDP socket。
-
-### 3.13 数据面超时机制与定时器优化单元测试
-
-`src/relay.rs::test_relay_copy_with_idle_timeout` 覆盖：
-
-1. **虚拟时钟 Mock 测试**：通过 `tokio::time::pause()` 暂停真实时间，使用 `tokio::time::advance()` 精确前进虚拟时间，排除外部墙上时钟抖动引起的 flaky test。
-2. **连接活跃度复位（Reset）验证**：建立两端 duplex 流并在 `tokio::spawn` 异步任务中启动 `relay_copy_with_idle`。先向流写入数据，前进一半超时时间（`RELAY_IDLE_TIMEOUT / 2`），再次写入数据触发原地 `.reset()`。接着再前进另一半超时时间，验证虽然累计时间达到了 `RELAY_IDLE_TIMEOUT`，但由于原地复位，流没有超时且数据被正确转发。
-3. **空闲到期超时（TimedOut）验证**：流停止数据传输后，将虚拟时钟一次性推移超过 `RELAY_IDLE_TIMEOUT`，验证 `relay_copy_with_idle` 准确返回 `std::io::ErrorKind::TimedOut` 错误。
-
-需要补齐的回归用例：
-
-- `RtcWorker` TCP 路由选择：目标 IP 命中 `L4DataPlaneSnapshot.router` 且 QUIC pool 为 `Active` 时进入 smoltcp；未命中、pool 缺失、`Fallback` 或 `Recovering` 时进入 boringtun L3。
-- 桥接通道：smoltcp socket payload 经 `BridgeChannels` 发往 QUIC handler，QUIC 返回 payload 能写回 smoltcp socket；通道断开时 socket abort 并清理 bridge；QUIC readiness 必须通过 worker-local notify 唤醒 RTC loop，避免只能靠 timer tick 推进。
-- WireGuard timer/UDP 入站：`update_timers()` 产生网络包时写入物理 UDP socket；`decapsulate()` 返回 tunnel 包时写回 TUN；server/client 多 worker 下只有 worker 0 负责外层 UDP receive 和 timer。
-- 多队列启动：server 队列数严格跟随 `QuicPool.ListenPorts` 数量；client 队列数在启动主 runtime 前固定，启动期已知 QUIC data port 数时使用该数量，启动期未知时固定为 1 个 worker。多个 proxy peer 的 data port 数量必须一致；之后动态新增、后台恢复或控制面刷新得到的 data port 数必须匹配固定 baseline，不一致时拒绝该 QUIC pool 并继续走 userspace WireGuard L3 fallback。client WireGuard L3 路径仍共享单个外层 UDP socket，且只有 worker 0 负责入站 receive/timer。L4 proxy client 下必须验证多并发 TCP flow 能在多 worker 下正常完成；失败时清理 runtime。
-- 多 peer userspace WireGuard：每个 proxy peer 拥有共享的 per-peer `boringtun` 状态和 UDP endpoint，并按 `AllowedIPs` 选择 L3 fallback 目标；需要覆盖多 worker 并发 fallback 时不会死锁或明显退化。
-- E2E：补齐 UDP/ICMP 经 TUN -> boringtun -> server TUN 闭环。
-- 性能：`script/perf/perf_cores_scalability.sh` 在具备 root、release binary、`ip`、`python3`、`curl`、`taskset`、`awk` 和可用 CPU cpuset 的环境下运行真实 HTTP 吞吐；工具、CPU 或拓扑缺失时必须失败，不能生成模拟性能数据。脚本还必须强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 QUIC data port 数。
-
-## 4. Backlog
-
-- 服务端 session rotation / peer removal E2E：建立长 TCP 流，server `remove-peer`，验证旧 QUIC 连接关闭、新 stream 失败，重新 `add-peer` 后新 TCP 成功。
-- 弱网脚本：对单个 QUIC UDP port 下发 `DROP`，验证新 stream 继续使用其他健康 port；控制面 UDP 丢第一包后重试新 nonce 成功。
-- 性能脚本：正式 throughput、TTFB、CPU/RSS、连接建立耗时、并发 1k/4k/8k 阶梯压测，并将 `perf_cores_scalability.sh` 的 curl/Python HTTP 负载替换为 iperf3 或专用 Rust traffic generator。
-- L3 扩展性：为 UDP/ICMP 和 TCP fallback 增加独立多队列压测，评估当前 shared per-peer `boringtun` 锁竞争；若成为瓶颈，再设计 per-worker WireGuard state。
-- 稳定性脚本：1 小时 nightly/profile、FD 数、CPU 累计时间、失败日志自动打包、机器可读 pass/fail 总结。
-- 安全负向：恶意响应、错误端口池、超大 UDS payload、未授权 peer 的 E2E。
-- **UDP-over-QUIC Stream 代理测试**：
-  - **单元测试**：
-    - `src/rtc_loop.rs::tests::test_parse_udp_packet_ipv4` & `test_parse_udp_packet_ipv6`：验证 UDP 头部源 IP/端口、目的 IP/端口提取和校验和重算的正确性。
-    - `src/userspace_tcp.rs::tests::test_smoltcp_udp_socket_creation`：验证 `UserspaceTcpStack` 对用户态 UDP socket 分配与生命周期状态操作的正确性。
-    - `src/relay.rs::tests::test_udp_stream_framing_roundtrip` & `test_relay_stream_to_udp_success`：验证基于 2 字节大端长度前缀的大包拆分、粘包还原及其在 QUIC stream 上的读写一致性。
-    - `src/rtc_loop.rs::tests::test_client_udp_bridge_and_nat`：验证客户端拦截 UDP 包后，成功分配本地 NAT 端口并创建 smoltcp socket 到 QUIC stream 桥接，数据面 offload 成功走 QUIC 链路。
-  - **E2E 验收测试**：
-    - `script/acceptance/e2e_udp_over_quic.sh`：建立跨 `client_ns`, `router_ns`, `server_ns` 命名空间拓扑，拦截客户端发往 `10.0.0.1:8081` 的 UDP 包，验证其通过 QUIC 传输，查询 Telemetry 统计以确认 L3 WireGuard 数据发送量为 0，而 QUIC stream transfer 增加对应字节数（首部及 framed data），成功完成端到端 UDP 代理通信与自检。
-
-
-
-## 5. 文档同步规则
-
-以后改架构时至少同步：
-
-- `doc/ARCHITECTURE.md`：只写当前代码真实行为。
-- `doc/TESTING.md`：更新覆盖矩阵和缺口。
-- `doc/TEST_REPORT.md`：只记录已经执行过的命令、日期、环境和结果。
-- README：只保留用户安装、配置和运行需要知道的信息。
+### 3.1 核心 E2E 测试场景清单
+
+#### 1. 双栈 L3 Datagram 透明转发 (`e2e_pure_l3_dualstack.sh`)
+* **拓扑**：建立 `client_ns` $\leftrightarrow$ `router_ns` $\leftrightarrow$ `server_ns` 三层空间。
+* **验证点**：
+  * 通过客户端 TUN 网卡注入 TCP、UDP、ICMP（IPv4 及 IPv6）流量。
+  * 验证所有流量直接被打包为 QUIC Datagram 发送，服务端解包后转发给目标真实服务。
+  * 目标服务应能成功响应。**通过 ICMP 测试断言 Ping 能够完美双向闭环**。
+  * 检查 UDS Stats，断言 QUIC Datagram 收发字节与包计数非零，且无 stream 开启。
+
+#### 2. TCP MSS 夹紧有效性与零分片 (`e2e_mss_clamping.sh`)
+* **验证点**：
+  * 将客户端 TUN 的 MTU 设为 1200。
+  * 在客户端空间中启动大文件传输（如通过 HTTP `curl` 下载 64 MiB 的 blob 文件）。
+  * 在 `router_ns` 物理链路上使用 `tcpdump` 抓取底层传输的 UDP (QUIC) 报文。
+  * **硬性断言**：
+    1. 抓包中绝对不能出现任何 IP 层的分片包（Fragmentation）。
+    2. 大文件能以极高的吞吐顺利传输完毕。
+    3. 握手阶段的 SYN 包 MSS 选项值已被强行修改为符合 QUIC 承载上限的安全值。
+
+#### 3. 对称多队列与流亲和度测试 (`e2e_multi_port_symmetric.sh`)
+* **验证点**：
+  * 配置服务端开启 4 个数据面端口，客户端自动协商并拉起 4 个 Worker 线程和 4 个网卡队列。
+  * 发起 32 个并发不同的 TCP/UDP 连接流量。
+  * **硬性断言**：
+    1. 验证 4 个 Worker 线程的 telemetry 指标。
+    2. 依赖内核的 `IFF_MULTI_QUEUE` 哈希，所有流被大体均匀地分配到 4 个队列上。
+    3. 数据流在其双向链路上始终绑定在同一个工作线程 ID $i$ 上（对称亲和度验证）。
+
+#### 4. 链路故障自愈与 Slot 隔离 (`e2e_reconnection_robustness.sh`)
+* **验证点**：
+  * 在 4 端口并发流量传输过程中，人为利用 `iptables` 阻断其中第 2 个物理数据端口（`40002`）的 UDP 通信。
+  * **硬性断言**：
+    1. 只有分配在该 Slot 上的流量触发重连或 fallback 丢包。
+    2. 运行在其他 3 个端口（`40001`、`40003`、`40004`）上的业务流量完全不受任何影响，吞吐量保持平稳（Slot 级强隔离）。
+    3. 撤销阻断后，健康检查自动通过控制面重协商，自动恢复该 Slot 的 QUIC 连接。
+
+---
+
+## 4. 性能与线性度测试
+
+### 4.1 多核心线性度测试 (`perf_cores_scalability.sh`)
+* **执行方式**：
+  * 通过 `taskset` 约束客户端进程可使用的 CPU 核心数量（`1`、`2`、`3`、`4`）。
+  * 相应地配置 $N$（`1..4`）个数据端口和队列进行多进程高并发压力测试。
+* **线性度衡量指标**：
+  * **TCP Throughput (MiB/s)**：在 CPU 资源成倍增加时，TCP 吞吐量应呈接近 **$1:1$** 的线性增长（核心效率 $\ge 95\%$）。
+  * **UDP Loss Rate**：因为 UDP 走 Datagram，随着可用核心和网卡队列增加，处理能力线性提升，在发送端速率恒定的情况下，**接收丢包率必须随核心数增加呈线性下降**，直至在 3-4 核时丢包率接近 0%。
+
+### 4.2 热路径零分配校验 (Zero Heap Allocation Check)
+* **执行方式**：
+  * 在测试环境中使用 `valgrind --tool=massif` 或 `heaptrack` 启动代理进程。
+  * 进行 10 万个小包或高并发压力传输。
+* **成功标准**：
+  * **热路径硬门禁**：在连接建立成功并进入稳定转发状态后，massif 报告的分配曲线必须是一条水平线。任何由于包分发、解密、改写或写入 TUN 导致的堆分配（Heap Allocation）都被视为缺陷并阻断编译。
+
+---
+
+## 5. 长期稳定性测试 (`stability_stress_test.sh`)
+
+用于验证长期高负荷运行下系统资源的稳定性和无碎片内存回收表现。
+
+### 5.1 流量负载模型
+* **持续时间**：1 小时或更长（CI 自动触发）。
+* **负载混合比**：
+  * **60% TCP 并发大文件下载**：持续消耗带宽，验证 MSS 夹紧在大流下的表现。
+  * **30% UDP 洪水包传输**：通过 Datagram 压力通道，考验 TUN 队列的积压和丢包处理。
+  * **10% 周期性 ICMP Ping**：监测抖动和底层健康状态。
+
+### 5.2 资源增长门禁指标 (Strict Resource Thresholds)
+在稳定性测试结束时，进行如下监控断言，若不满足则测试失败：
+* **内存碎片与泄漏**：由于全部数据包均复用线程专属的固定大小 BufferPool，**物理内存（RSS）自 Warmup 阶段结束起，在后续运行中增长斜率必须为 0**（波动 $\le 3\%$）。严禁出现因动态内存碎片累积导致的 RSS 缓慢攀升。
+* **文件描述符（FD）**：FD 数量必须保持静态恒定，不允许存在任何因临时连接销毁失败引起的 FD 泄漏。
+* **CPU 稳定性**：CPU 负载与吞吐量成正比，不允许在流量平稳时出现 CPU 占用率线性抬升的情况。
