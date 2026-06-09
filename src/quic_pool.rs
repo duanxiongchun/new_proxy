@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
@@ -346,8 +347,8 @@ pub struct QuicConnSnapshot {
 }
 
 // 控制面通过已认证 HMAC 响应下发 QUIC 证书指纹；数据面只接受该证书。
-struct PinnedCertVerifier {
-    expected_sha256: [u8; 32],
+pub struct PinnedCertVerifier {
+    pub expected_sha256: [u8; 32],
 }
 
 impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
@@ -498,6 +499,22 @@ impl QuicPoolClient {
 
     pub fn endpoint_count(&self) -> usize {
         self.data_port_count
+    }
+
+    pub fn session_psk(&self) -> [u8; 32] {
+        self.runtime_config.read().session_psk
+    }
+
+    pub fn server_cert_sha256(&self) -> [u8; 32] {
+        self.runtime_config.read().server_cert_sha256
+    }
+
+    pub fn endpoints(&self) -> Vec<SocketAddr> {
+        self.runtime_config.read().endpoints.clone()
+    }
+
+    pub fn client_public_key(&self) -> [u8; 32] {
+        self.client_public_key
     }
 
     pub fn connection_snapshots(&self) -> Vec<QuicConnSnapshot> {
