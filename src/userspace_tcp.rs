@@ -135,8 +135,10 @@ impl UserspaceTcpStack {
     ) -> Result<SocketHandle, String> {
         let rx_metadata = vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
         let tx_metadata = vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
-        let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(rx_metadata, vec![0; rx_buffer_size]);
-        let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(tx_metadata, vec![0; tx_buffer_size]);
+        let rx_buffer =
+            smoltcp::socket::udp::PacketBuffer::new(rx_metadata, vec![0; rx_buffer_size]);
+        let tx_buffer =
+            smoltcp::socket::udp::PacketBuffer::new(tx_metadata, vec![0; tx_buffer_size]);
         let socket = smoltcp::socket::udp::Socket::new(rx_buffer, tx_buffer);
         Ok(self.sockets.add(socket))
     }

@@ -35,18 +35,22 @@ pub fn build_stream_handler(
             let stats = telemetry.get_or_create(client_pub);
             Box::pin(async move {
                 let _permit = permit;
-                let header =
-                    match timeout(Duration::from_secs(5), ProxyTargetHeader::read_from(&mut recv_mux)).await {
-                        Ok(Ok(h)) => h,
-                        Ok(Err(e)) => {
-                            log::debug!("Failed to read target proxy address header: {}", e);
-                            return;
-                        }
-                        Err(_) => {
-                            log::debug!("Timed out reading target proxy address header");
-                            return;
-                        }
-                    };
+                let header = match timeout(
+                    Duration::from_secs(5),
+                    ProxyTargetHeader::read_from(&mut recv_mux),
+                )
+                .await
+                {
+                    Ok(Ok(h)) => h,
+                    Ok(Err(e)) => {
+                        log::debug!("Failed to read target proxy address header: {}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        log::debug!("Timed out reading target proxy address header");
+                        return;
+                    }
+                };
 
                 let target_addr = std::net::SocketAddr::new(header.dst_ip, header.dst_port);
 
@@ -64,7 +68,10 @@ pub fn build_stream_handler(
                         {
                             Ok(Ok(tcp_socket)) => {
                                 if let Err(e) = set_tcp_keepalive(&tcp_socket) {
-                                    log::warn!("Failed to set TCP Keep-Alive on target TCP stream: {}", e);
+                                    log::warn!(
+                                        "Failed to set TCP Keep-Alive on target TCP stream: {}",
+                                        e
+                                    );
                                 }
                                 if send_mux.write_all(&[1]).await.is_ok() {
                                     relay::relay_connections_with_conn_stat(
@@ -99,7 +106,11 @@ pub fn build_stream_handler(
                         match tokio::net::UdpSocket::bind(bind_addr).await {
                             Ok(udp_socket) => {
                                 if let Err(e) = udp_socket.connect(target_addr).await {
-                                    log::warn!("Failed to connect UDP socket to {}: {}", target_addr, e);
+                                    log::warn!(
+                                        "Failed to connect UDP socket to {}: {}",
+                                        target_addr,
+                                        e
+                                    );
                                     let _ = send_mux.write_all(&[0]).await;
                                     return;
                                 }
@@ -113,7 +124,8 @@ pub fn build_stream_handler(
                                         stats,
                                         Some(conn_stat),
                                     )
-                                    .await {
+                                    .await
+                                    {
                                         log::debug!("UDP relay error: {}", e);
                                     }
                                 }

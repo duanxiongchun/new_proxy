@@ -561,7 +561,10 @@ mod tests {
         let write_fut = write_framed_packet(&mut client, test_data);
         let read_fut = async {
             let mut read_buf = vec![0u8; 100];
-            let len = read_framed_packet(&mut server, &mut read_buf).await.unwrap().unwrap();
+            let len = read_framed_packet(&mut server, &mut read_buf)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(&read_buf[..len], test_data);
         };
 
@@ -590,7 +593,9 @@ mod tests {
 
         // 1. Client send framed packet to stream -> UDP target should receive it
         let test_data = b"hello udp target";
-        write_framed_packet(&mut client_stream, test_data).await.unwrap();
+        write_framed_packet(&mut client_stream, test_data)
+            .await
+            .unwrap();
 
         let mut udp_buf = vec![0u8; 100];
         let (n, src) = target_udp.recv_from(&mut udp_buf).await.unwrap();
@@ -600,7 +605,10 @@ mod tests {
         target_udp.send_to(b"reply from target", src).await.unwrap();
 
         let mut client_buf = vec![0u8; 100];
-        let len = read_framed_packet(&mut client_stream, &mut client_buf).await.unwrap().unwrap();
+        let len = read_framed_packet(&mut client_stream, &mut client_buf)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&client_buf[..len], b"reply from target");
 
         // Cleanup: drop client stream to end the relay task
@@ -608,4 +616,3 @@ mod tests {
         let _ = relay_task.await.unwrap();
     }
 }
-
