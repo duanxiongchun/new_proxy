@@ -1,11 +1,12 @@
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::buffer_pool::{BufferPool, PooledBuf};
 use crate::config::PeerConfig;
 use crate::routing::AllowedIPsRouter;
 use crate::tun_io::AsyncTunIo;
@@ -286,17 +287,19 @@ impl UserspaceWgRegistry {
     pub fn encapsulate_tunnel_packet(
         &self,
         packet: &[u8],
-        wg_buf: &mut [u8],
-    ) -> Option<(SocketAddr, Vec<u8>)> {
+        pool: &BufferPool,
+    ) -> Option<(SocketAddr, PooledBuf)> {
         let peer = self.peer_for_tunnel_packet(packet)?;
         let endpoint = (*peer.endpoint.read())?;
-        let enc_packet = {
+        let mut enc_packet = pool.get();
+        let enc_len = {
             let mut tunn = peer.tunn.lock();
-            match tunn.encapsulate(packet, wg_buf) {
-                TunnResult::WriteToNetwork(enc_pkt) => Some(enc_pkt.to_vec()),
+            match tunn.encapsulate(packet, enc_packet.as_mut_capacity()) {
+                TunnResult::WriteToNetwork(enc_pkt) => Some(enc_pkt.len()),
                 _ => None,
             }
         }?;
+        enc_packet.set_len(enc_len);
         peer.tx_bytes
             .fetch_add(packet.len() as u64, Ordering::Relaxed);
         Some((endpoint, enc_packet))
@@ -306,7 +309,7 @@ impl UserspaceWgRegistry {
         &self,
         endpoint: SocketAddr,
         incoming: &[u8],
-        wg_buf: &mut [u8],
+        pool: &BufferPool,
     ) -> Option<(SocketAddr, Vec<UserspaceWgAction>)> {
         let receiver_index = Self::receiver_index(incoming);
         if let Some(receiver_index) = receiver_index {
@@ -320,7 +323,7 @@ impl UserspaceWgRegistry {
             };
             if let Some((public_key, peer)) = indexed_peer {
                 if let Some(action) =
-                    self.decapsulate_with_peer(public_key, peer, endpoint, incoming, wg_buf)
+                    self.decapsulate_with_peer(public_key, peer, endpoint, incoming, pool)
                 {
                     self.remember_receiver_index(receiver_index, public_key);
                     return Some((endpoint, action));
@@ -334,7 +337,7 @@ impl UserspaceWgRegistry {
         };
         if let Some((public_key, peer)) = endpoint_peer {
             if let Some(action) =
-                self.decapsulate_with_peer(public_key, peer, endpoint, incoming, wg_buf)
+                self.decapsulate_with_peer(public_key, peer, endpoint, incoming, pool)
             {
                 if let Some(receiver_index) = receiver_index {
                     self.remember_receiver_index(receiver_index, public_key);
@@ -365,7 +368,7 @@ impl UserspaceWgRegistry {
             .collect::<Vec<_>>()
         {
             if let Some(action) =
-                self.decapsulate_with_peer(public_key, peer, endpoint, incoming, wg_buf)
+                self.decapsulate_with_peer(public_key, peer, endpoint, incoming, pool)
             {
                 if let Some(receiver_index) = receiver_index {
                     self.remember_receiver_index(receiver_index, public_key);
@@ -384,29 +387,34 @@ impl UserspaceWgRegistry {
         peer: Arc<UserspaceWgPeer>,
         endpoint: SocketAddr,
         incoming: &[u8],
-        wg_buf: &mut [u8],
+        pool: &BufferPool,
     ) -> Option<Vec<UserspaceWgAction>> {
         let actions = {
             let mut tunn = peer.tunn.lock();
             let mut actions = Vec::new();
             let mut first = true;
             loop {
+                let mut out = pool.get();
                 let result = if first {
                     first = false;
-                    tunn.decapsulate(Some(endpoint.ip()), incoming, wg_buf)
+                    tunn.decapsulate(Some(endpoint.ip()), incoming, out.as_mut_capacity())
                 } else {
-                    tunn.decapsulate(None, &[], wg_buf)
+                    tunn.decapsulate(None, &[], out.as_mut_capacity())
                 };
-                match result {
+                let action = match result {
                     TunnResult::WriteToTunnelV4(packet, _)
-                    | TunnResult::WriteToTunnelV6(packet, _) => {
-                        actions.push(UserspaceWgAction::WriteToTunnel(packet.to_vec()))
-                    }
-                    TunnResult::WriteToNetwork(response) => {
-                        actions.push(UserspaceWgAction::WriteToNetwork(response.to_vec()))
-                    }
+                    | TunnResult::WriteToTunnelV6(packet, _) => Some((true, packet.len())),
+                    TunnResult::WriteToNetwork(response) => Some((false, response.len())),
                     TunnResult::Done => break,
                     TunnResult::Err(_) => break,
+                };
+                if let Some((write_to_tunnel, len)) = action {
+                    out.set_len(len);
+                    if write_to_tunnel {
+                        actions.push(UserspaceWgAction::WriteToTunnel(out));
+                    } else {
+                        actions.push(UserspaceWgAction::WriteToNetwork(out));
+                    }
                 }
             }
             (!actions.is_empty()).then_some(actions)
@@ -445,21 +453,23 @@ impl UserspaceWgRegistry {
         None
     }
 
-    pub fn timer_packets(&self, wg_buf: &mut [u8]) -> Vec<(SocketAddr, Vec<u8>)> {
+    pub fn timer_packets(&self, pool: &BufferPool) -> Vec<(SocketAddr, PooledBuf)> {
         let mut packets = Vec::new();
         for peer in self.peer_list() {
             let endpoint = *peer.endpoint.read();
             let Some(endpoint) = endpoint else {
                 continue;
             };
-            let packet = {
+            let mut packet = pool.get();
+            let packet_len = {
                 let mut tunn = peer.tunn.lock();
-                match tunn.update_timers(wg_buf) {
-                    TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
+                match tunn.update_timers(packet.as_mut_capacity()) {
+                    TunnResult::WriteToNetwork(packet) => Some(packet.len()),
                     _ => None,
                 }
             };
-            if let Some(packet) = packet {
+            if let Some(packet_len) = packet_len {
+                packet.set_len(packet_len);
                 packets.push((endpoint, packet));
             }
         }
@@ -468,8 +478,8 @@ impl UserspaceWgRegistry {
 }
 
 pub enum UserspaceWgAction {
-    WriteToTunnel(Vec<u8>),
-    WriteToNetwork(Vec<u8>),
+    WriteToTunnel(PooledBuf),
+    WriteToNetwork(PooledBuf),
 }
 
 fn now_unix_secs() -> u64 {
@@ -487,30 +497,202 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn push_pending_udp(
+    pending: &mut VecDeque<(SocketAddr, PooledBuf)>,
+    pending_bytes: &mut usize,
+    endpoint: SocketAddr,
+    packet: PooledBuf,
+    context: &str,
+) {
+    if pending_bytes.saturating_add(packet.len()) > 64 * 1024 {
+        log::warn!(
+            "{} UDP pending byte limit reached for {}; dropping packet",
+            context,
+            endpoint
+        );
+        return;
+    }
+    *pending_bytes += packet.len();
+    pending.push_back((endpoint, packet));
+}
+
+fn push_pending_tun(
+    pending: &mut VecDeque<PooledBuf>,
+    pending_bytes: &mut usize,
+    packet: PooledBuf,
+    context: &str,
+) {
+    if pending_bytes.saturating_add(packet.len()) > 64 * 1024 {
+        log::warn!(
+            "{} TUN pending byte limit reached; dropping packet",
+            context
+        );
+        return;
+    }
+    *pending_bytes += packet.len();
+    pending.push_back(packet);
+}
+
+fn send_or_queue_udp_packet(
+    udp_socket: &crate::virtual_tunnel::TunnelSocket,
+    endpoint: SocketAddr,
+    packet: PooledBuf,
+    pending: &mut VecDeque<(SocketAddr, PooledBuf)>,
+    pending_bytes: &mut usize,
+    context: &str,
+) {
+    match udp_socket.try_send_to(packet.as_slice(), endpoint) {
+        Ok(n) if n == packet.len() => {}
+        Ok(n) => {
+            log::warn!(
+                "{} sent short UDP datagram to {}: {} of {} bytes",
+                context,
+                endpoint,
+                n,
+                packet.len()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            push_pending_udp(pending, pending_bytes, endpoint, packet, context);
+        }
+        Err(e) => {
+            log::warn!(
+                "{} failed to send UDP packet to {}: {}",
+                context,
+                endpoint,
+                e
+            );
+        }
+    }
+}
+
+fn write_or_queue_tun_packet(
+    tun_io: &AsyncTunIo,
+    packet: PooledBuf,
+    pending: &mut VecDeque<PooledBuf>,
+    pending_bytes: &mut usize,
+    context: &str,
+) {
+    match tun_io.try_write_packet(packet.as_slice()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            push_pending_tun(pending, pending_bytes, packet, context);
+        }
+        Err(e) => {
+            log::warn!("{} failed to write packet to TUN: {}", context, e);
+        }
+    }
+}
+
+fn flush_pending_udp(
+    udp_socket: &crate::virtual_tunnel::TunnelSocket,
+    pending: &mut VecDeque<(SocketAddr, PooledBuf)>,
+    pending_bytes: &mut usize,
+) {
+    while let Some((endpoint, packet)) = pending.pop_front() {
+        *pending_bytes = pending_bytes.saturating_sub(packet.len());
+        match udp_socket.try_send_to(packet.as_slice(), endpoint) {
+            Ok(n) if n == packet.len() => {}
+            Ok(n) => {
+                log::warn!(
+                    "pending userspace WireGuard UDP sent short datagram to {}: {} of {} bytes",
+                    endpoint,
+                    n,
+                    packet.len()
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                *pending_bytes += packet.len();
+                pending.push_front((endpoint, packet));
+                break;
+            }
+            Err(e) => {
+                log::warn!(
+                    "pending userspace WireGuard UDP failed to send packet to {}: {}",
+                    endpoint,
+                    e
+                );
+            }
+        }
+    }
+}
+
+fn flush_pending_tun(
+    tun_io: &AsyncTunIo,
+    pending: &mut VecDeque<PooledBuf>,
+    pending_bytes: &mut usize,
+) {
+    while let Some(packet) = pending.pop_front() {
+        *pending_bytes = pending_bytes.saturating_sub(packet.len());
+        match tun_io.try_write_packet(packet.as_slice()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                *pending_bytes += packet.len();
+                pending.push_front(packet);
+                break;
+            }
+            Err(e) => {
+                log::warn!(
+                    "pending userspace WireGuard TUN failed to write packet: {}",
+                    e
+                );
+            }
+        }
+    }
+}
+
 #[cfg(not(tarpaulin))]
 pub async fn run_userspace_wg_loop(
     tun_io: Arc<AsyncTunIo>,
     udp_socket: crate::virtual_tunnel::TunnelSocket,
     registry: UserspaceWgRegistry,
+    mtu: u16,
 ) -> Result<(), String> {
-    let mut tun_buf = vec![0u8; 65535];
-    let mut udp_buf = vec![0u8; 65535];
-    let mut wg_buf = vec![0u8; 65535];
+    let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(mtu);
+    let buffer_pool = BufferPool::new(packet_buffer_size);
+    let mut tun_buf = buffer_pool.get();
+    let mut udp_buf = buffer_pool.get();
+    let mut pending_tun = VecDeque::new();
+    let mut pending_udp = VecDeque::new();
+    let mut pending_tun_bytes = 0usize;
+    let mut pending_udp_bytes = 0usize;
 
     loop {
+        flush_pending_tun(&tun_io, &mut pending_tun, &mut pending_tun_bytes);
+        flush_pending_udp(&udp_socket, &mut pending_udp, &mut pending_udp_bytes);
+        let tun_io_for_writable = tun_io.clone();
+        let udp_socket_for_writable = udp_socket.clone();
         tokio::select! {
-            read_res = tun_io.read(&mut tun_buf) => {
+            writable = tun_io_for_writable.writable(), if !pending_tun.is_empty() => {
+                if writable.is_ok() {
+                    flush_pending_tun(&tun_io, &mut pending_tun, &mut pending_tun_bytes);
+                }
+            }
+
+            writable = udp_socket_for_writable.writable(), if !pending_udp.is_empty() => {
+                if writable.is_ok() {
+                    flush_pending_udp(&udp_socket, &mut pending_udp, &mut pending_udp_bytes);
+                }
+            }
+
+            read_res = tun_io.read(tun_buf.as_mut_capacity()) => {
                 let Ok(n) = read_res else {
                     continue;
                 };
                 if n == 0 {
                     continue;
                 }
-                match registry.encapsulate_tunnel_packet(&tun_buf[..n], &mut wg_buf) {
+                tun_buf.set_len(n);
+                match registry.encapsulate_tunnel_packet(tun_buf.as_slice(), &buffer_pool) {
                     Some((endpoint, enc_packet)) => {
-                        if let Err(e) = udp_socket.send_to(&enc_packet, endpoint).await {
-                            log::warn!("Failed to send userspace WireGuard packet to {}: {}", endpoint, e);
-                        }
+                        send_or_queue_udp_packet(
+                            &udp_socket,
+                            endpoint,
+                            enc_packet,
+                            &mut pending_udp,
+                            &mut pending_udp_bytes,
+                            "userspace WireGuard",
+                        );
                     }
                     None => {
                         log::debug!("No userspace WireGuard peer route or endpoint for TUN packet");
@@ -518,31 +700,50 @@ pub async fn run_userspace_wg_loop(
                 }
             }
 
-            udp_res = udp_socket.recv_from(&mut udp_buf) => {
+            udp_res = udp_socket.recv_from(udp_buf.as_mut_capacity()) => {
                 let Ok((n, endpoint)) = udp_res else {
                     continue;
                 };
                 if n == 0 {
                     continue;
                 }
-                if n >= 4 && &udp_buf[..4] == b"PING" {
-                    let _ = udp_socket.send_to(b"PONG", endpoint).await;
+                udp_buf.set_len(n);
+                if n >= 4 && &udp_buf.as_slice()[..4] == b"PING" {
+                    if let Some(pong) = buffer_pool.copy_from_slice(b"PONG") {
+                        send_or_queue_udp_packet(
+                            &udp_socket,
+                            endpoint,
+                            pong,
+                            &mut pending_udp,
+                            &mut pending_udp_bytes,
+                            "userspace WireGuard PONG",
+                        );
+                    }
                     continue;
                 }
                 if let Some((reply_endpoint, actions)) =
-                    registry.decapsulate_network_packet(endpoint, &udp_buf[..n], &mut wg_buf)
+                    registry.decapsulate_network_packet(endpoint, udp_buf.as_slice(), &buffer_pool)
                 {
                     for action in actions {
                         match action {
                             UserspaceWgAction::WriteToTunnel(packet) => {
-                                if let Err(e) = tun_io.write_packet(&packet).await {
-                                    log::warn!("Failed to write userspace WireGuard packet to TUN: {}", e);
-                                }
+                                write_or_queue_tun_packet(
+                                    &tun_io,
+                                    packet,
+                                    &mut pending_tun,
+                                    &mut pending_tun_bytes,
+                                    "userspace WireGuard",
+                                );
                             }
                             UserspaceWgAction::WriteToNetwork(packet) => {
-                                if let Err(e) = udp_socket.send_to(&packet, reply_endpoint).await {
-                                    log::warn!("Failed to send userspace WireGuard response to {}: {}", reply_endpoint, e);
-                                }
+                                send_or_queue_udp_packet(
+                                    &udp_socket,
+                                    reply_endpoint,
+                                    packet,
+                                    &mut pending_udp,
+                                    &mut pending_udp_bytes,
+                                    "userspace WireGuard response",
+                                );
                             }
                         }
                     }
@@ -557,18 +758,33 @@ pub async fn run_userspace_wg_loop(
 pub async fn run_userspace_wg_timer_loop(
     udp_socket: crate::virtual_tunnel::TunnelSocket,
     registry: UserspaceWgRegistry,
+    mtu: u16,
 ) {
-    let mut wg_buf = vec![0u8; 65535];
+    let buffer_pool = BufferPool::new(crate::config::packet_buffer_size_for_mtu(mtu));
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut pending_udp = VecDeque::new();
+    let mut pending_udp_bytes = 0usize;
     loop {
-        timer.tick().await;
-        for (endpoint, packet) in registry.timer_packets(&mut wg_buf) {
-            if let Err(e) = udp_socket.send_to(&packet, endpoint).await {
-                log::warn!(
-                    "Failed to send userspace WireGuard timer packet to {}: {}",
-                    endpoint,
-                    e
-                );
+        flush_pending_udp(&udp_socket, &mut pending_udp, &mut pending_udp_bytes);
+        let udp_socket_for_writable = udp_socket.clone();
+        tokio::select! {
+            _ = timer.tick() => {
+                for (endpoint, packet) in registry.timer_packets(&buffer_pool) {
+                    send_or_queue_udp_packet(
+                        &udp_socket,
+                        endpoint,
+                        packet,
+                        &mut pending_udp,
+                        &mut pending_udp_bytes,
+                        "userspace WireGuard timer",
+                    );
+                }
+            }
+
+            writable = udp_socket_for_writable.writable(), if !pending_udp.is_empty() => {
+                if writable.is_ok() {
+                    flush_pending_udp(&udp_socket, &mut pending_udp, &mut pending_udp_bytes);
+                }
             }
         }
     }
@@ -725,10 +941,10 @@ mod tests {
         let private_key = StaticSecret::from([1u8; 32]);
         let public_key = PublicKey::from(&private_key).to_bytes();
         let registry = UserspaceWgRegistry::new(private_key.to_bytes(), &[]).unwrap();
-        let mut wg_buf = vec![0u8; 2048];
+        let pool = BufferPool::new(2048);
 
         assert!(registry
-            .encapsulate_tunnel_packet(&ipv4_packet_to([10, 0, 0, 10]), &mut wg_buf)
+            .encapsulate_tunnel_packet(&ipv4_packet_to([10, 0, 0, 10]), &pool)
             .is_none());
 
         registry
@@ -740,7 +956,7 @@ mod tests {
             })
             .unwrap();
         assert!(registry
-            .encapsulate_tunnel_packet(&ipv4_packet_to([10, 0, 0, 10]), &mut wg_buf)
+            .encapsulate_tunnel_packet(&ipv4_packet_to([10, 0, 0, 10]), &pool)
             .is_none());
     }
 
@@ -755,9 +971,9 @@ mod tests {
             proxy_port: None,
         };
         let registry = UserspaceWgRegistry::new(private_key.to_bytes(), &[peer]).unwrap();
-        let mut wg_buf = vec![0u8; 2048];
+        let pool = BufferPool::new(2048);
 
-        assert!(registry.timer_packets(&mut wg_buf).is_empty());
+        assert!(registry.timer_packets(&pool).is_empty());
     }
 
     #[test]
@@ -791,15 +1007,15 @@ mod tests {
         .unwrap();
 
         let original = ipv4_packet([10, 40, 0, 2], [10, 40, 0, 1]);
-        let mut client_buf = vec![0u8; 2048];
-        let mut server_buf = vec![0u8; 2048];
+        let client_pool = BufferPool::new(2048);
+        let server_pool = BufferPool::new(2048);
         let (endpoint, handshake_init) = client
-            .encapsulate_tunnel_packet(&original, &mut client_buf)
+            .encapsulate_tunnel_packet(&original, &client_pool)
             .unwrap();
         assert_eq!(endpoint, server_endpoint);
 
         let (_, server_actions) = server
-            .decapsulate_network_packet(client_endpoint, &handshake_init, &mut server_buf)
+            .decapsulate_network_packet(client_endpoint, handshake_init.as_slice(), &server_pool)
             .unwrap();
         let handshake_response = server_actions
             .into_iter()
@@ -810,7 +1026,11 @@ mod tests {
             .unwrap();
 
         let (_, client_actions) = client
-            .decapsulate_network_packet(server_endpoint, &handshake_response, &mut client_buf)
+            .decapsulate_network_packet(
+                server_endpoint,
+                handshake_response.as_slice(),
+                &client_pool,
+            )
             .unwrap();
         let network_packets = client_actions
             .into_iter()
@@ -827,7 +1047,7 @@ mod tests {
         let mut delivered = None;
         for packet in network_packets {
             if let Some((_, actions)) =
-                server.decapsulate_network_packet(client_endpoint, &packet, &mut server_buf)
+                server.decapsulate_network_packet(client_endpoint, packet.as_slice(), &server_pool)
             {
                 for action in actions {
                     if let UserspaceWgAction::WriteToTunnel(packet) = action {
@@ -836,6 +1056,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(delivered.as_deref(), Some(original.as_slice()));
+        assert_eq!(
+            delivered.map(|packet| packet.as_slice().to_vec()),
+            Some(original)
+        );
     }
 }

@@ -14,7 +14,7 @@ use crate::virtual_tunnel::VirtualTunnelTelemetry;
 use crate::{GatewayState, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -38,6 +38,7 @@ pub struct UdsServerContext {
     pub peer_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     pub l3_registry: UserspaceWgRegistry,
     pub virtual_tunnel_telemetry: Arc<VirtualTunnelTelemetry>,
+    pub client_worker_count: Arc<AtomicUsize>,
 }
 
 pub fn bind_listener(interface_name: &str) -> Option<UnixListener> {
@@ -362,11 +363,11 @@ async fn handle_dump(
         }
         let virtual_tunnel = context.virtual_tunnel_telemetry.snapshot();
         lines.push(format!(
-            "virtual_tunnel\tqueue={}:{}\tdrops={}:{}",
-            virtual_tunnel.queued_packets,
-            virtual_tunnel.queued_bytes,
-            virtual_tunnel.dropped_packets,
-            virtual_tunnel.dropped_bytes,
+            "virtual_tunnel\trx={}:{}\tcontrol={}\terrors={}",
+            virtual_tunnel.rx_packets,
+            virtual_tunnel.rx_bytes,
+            virtual_tunnel.control_packets,
+            virtual_tunnel.recv_errors,
         ));
         for key in keys {
             let configured = peer_map.get(&key).copied();
@@ -517,6 +518,24 @@ async fn handle_add_peer(
         match build_peer_quic_pool(context.client_private_key, &new_peer).await {
             Ok(pool) => Some(pool),
             Err(e) => {
+                if let Some(data_port_count) = e.data_port_count() {
+                    if let Err(mismatch) = crate::validate_client_quic_data_port_count(
+                        &context.client_quic_pools,
+                        data_port_count,
+                    ) {
+                        write_error(stream, framed_response, mismatch).await;
+                        return;
+                    }
+                    if let Err(mismatch) =
+                        crate::validate_client_quic_data_port_count_matches_workers(
+                            data_port_count,
+                            context.client_worker_count.load(Ordering::Relaxed),
+                        )
+                    {
+                        write_error(stream, framed_response, mismatch).await;
+                        return;
+                    }
+                }
                 log::warn!(
                         "Failed to establish QUIC pool for dynamically added peer {}; adding peer in WireGuard L3 fallback mode and retrying in background: {}",
                         encode_base64_32(&parsed_pub_key),
@@ -560,6 +579,31 @@ async fn handle_add_peer(
         }
         write_error(stream, framed_response, conflict).await;
         return;
+    }
+
+    if context.runtime_mode == RuntimeMode::Client {
+        if let Some(pool) = prepared_client_pool.as_ref() {
+            if let Err(e) = crate::validate_client_quic_data_port_count(
+                &context.client_quic_pools,
+                pool.endpoint_count(),
+            ) {
+                pool.shutdown(b"QUIC data port count mismatch");
+                write_error(stream, framed_response, e).await;
+                return;
+            }
+            if let Err(e) = crate::validate_client_quic_data_port_count_matches_workers(
+                pool.endpoint_count(),
+                context.client_worker_count.load(Ordering::Relaxed),
+            ) {
+                pool.shutdown(b"QUIC data port count does not match active workers");
+                write_error(stream, framed_response, e).await;
+                return;
+            }
+            crate::record_client_quic_data_port_count_if_unset(
+                &context.client_worker_count,
+                pool.endpoint_count(),
+            );
+        }
     }
 
     if !table_off {
@@ -917,6 +961,7 @@ mod tests {
             peer_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             l3_registry,
             virtual_tunnel_telemetry: Arc::new(VirtualTunnelTelemetry::default()),
+            client_worker_count: Arc::new(AtomicUsize::new(1)),
         }
     }
 
@@ -1006,7 +1051,7 @@ mod tests {
         assert!(dump.contains("150"));
         assert!(dump.contains("worker:1"));
         assert!(dump.contains("tun_rx=42:0"));
-        assert!(dump.contains("virtual_tunnel\tqueue=0:0\tdrops=0:0"));
+        assert!(dump.contains("virtual_tunnel\trx=0:0\tcontrol=0\terrors=0"));
 
         let _ = fs::remove_file(path);
     }

@@ -3,6 +3,11 @@ use ipnet::IpNet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+const DEFAULT_PACKET_BUFFER_OVERHEAD: usize = 256;
+const MIN_PACKET_BUFFER_BYTES: usize = 1500;
+const MAX_PACKET_BUFFER_BYTES: usize = 65535;
+const PACKET_BUFFER_BYTES_ENV: &str = "NEW_PROXY_PACKET_BUFFER_BYTES";
+
 #[derive(Debug, Clone)]
 pub struct InterfaceConfig {
     pub private_key: [u8; 32],
@@ -35,6 +40,24 @@ pub struct GatewayConfig {
     pub interface: InterfaceConfig,
     pub peers: Vec<PeerConfig>,
     pub quic_pool: QUICPoolConfig,
+}
+
+pub fn packet_buffer_size_for_mtu(mtu: u16) -> usize {
+    let override_bytes = std::env::var(PACKET_BUFFER_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (MIN_PACKET_BUFFER_BYTES..=MAX_PACKET_BUFFER_BYTES).contains(value));
+    packet_buffer_size_for_mtu_with_override(mtu, override_bytes)
+}
+
+fn packet_buffer_size_for_mtu_with_override(mtu: u16, override_bytes: Option<usize>) -> usize {
+    if let Some(value) = override_bytes {
+        return value;
+    }
+
+    (mtu as usize)
+        .saturating_add(DEFAULT_PACKET_BUFFER_OVERHEAD)
+        .clamp(MIN_PACKET_BUFFER_BYTES, MAX_PACKET_BUFFER_BYTES)
 }
 
 // 极其高效轻量的内置 Base64 解码器 (免引入额外 Base64 库)
@@ -271,6 +294,17 @@ mod tests {
         let test_key = "q8vLy8vLy8s=";
         let decoded = decode_base64_32(test_key);
         assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn packet_buffer_size_follows_mtu_with_headroom() {
+        assert_eq!(packet_buffer_size_for_mtu_with_override(1400, None), 1656);
+        assert_eq!(packet_buffer_size_for_mtu_with_override(1280, None), 1536);
+        assert_eq!(packet_buffer_size_for_mtu_with_override(9000, None), 9256);
+        assert_eq!(
+            packet_buffer_size_for_mtu_with_override(9000, Some(12000)),
+            12000
+        );
     }
 
     #[test]

@@ -3,16 +3,81 @@
 ## 测试概览
 
 - 项目版本：`new_proxy v5.0.0`
-- 报告日期：2026-06-05
+- 报告日期：2026-06-08
 - 主要测试对象：配置冲突校验、UDS API/server、TUN/smoltcp TCP 分流、QUIC 物理连接池、控制面 HMAC/nonce、防重放、动态 peer 并发/冲突防护、聚合遥测、稳定性与 perf smoke
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
+
+## 2026-06-08 严格 Review 后二次修复验证
+
+本次修复覆盖：
+
+- `RtcWorker::new` 构造参数收敛为 `RtcWorkerConfig`，恢复 `cargo clippy --all-targets -- -D warnings` 门禁。
+- TUN/UDP/WireGuard/QUIC bridge 运行时 packet buffer 改为按 MTU 派生，默认 `MTU + 256`，下限 1500、上限 65535，并支持 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖；默认 MTU 1400 时不再为每个 worker 固定分配 65535 字节 buffer。
+- 修复 `client_quic_data_port_count()` 的 Clippy `filter_next` 门禁问题，`script/acceptance/run_acceptance.sh` 中的 Clippy 硬门禁可通过。
+- client 初始 QUIC data 连接失败但控制面已返回端口池时，worker 数使用协商 data port 数，避免 cold-start fallback 后恢复阶段因“多 data port、单 worker”被拒绝；多个 peer 的启动期协商端口数不一致时直接拒绝启动。
+- client 启动后记录实际已启动 worker 数；后台恢复或 UDS 动态新增 QUIC pool 时，如果 peer data port 数与当前 worker 数不一致，则拒绝该 pool，避免进入“多 data port、少 worker”的静默降级状态。
+- `QuicPoolClient` 控制面刷新保留同数量换端口能力，但拒绝 data port 数变化；需要改变 client worker 拓扑时必须重启客户端。
+- 架构和测试文档同步当前真实语义：client worker 数启动时固定，后续不支持热扩容 TUN multiqueue worker。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+```
+
+结果：**通过。** `cargo test` 当前为 CLI 10 个测试、主程序 119 个测试全部通过。本轮未执行需要 root/network namespace 的全量 E2E、稳定性和 perf 实测。
+
+## 2026-06-08 严格 Review 后问题修复验证
+
+本次修复覆盖：
+
+- `bridge_userspace_stream_to_quic` 恢复 QUIC pool `Active` 状态预检，避免 `Fallback` / `Recovering` 状态下的新 userspace TCP bridge 继续尝试 QUIC。
+- `RtcWorker` 本地端口分配修正为完整覆盖 `49152..=65535`，并补充最终端口 `65535` 可分配的边界测试。
+- `RtcWorker` 本地端口分配改为只依赖 `used_local_ports` 索引，避免按 `nat_map` 做重复线性扫描。
+- `RtcWorker` 半开 flow 清理补充 socket 移除断言，避免 stale smoltcp socket 长期占用端口/内存。
+- `VirtualTunnelSocket` 入站包复制移到队列锁外，缩短多物理 UDP socket 并发入队时的临界区。
+- `VirtualTunnelSocket` 改为 RTC readiness receive path，不再后台预取业务 UDP 包或维护中间接收队列。
+- `VirtualTunnelSocket` 发送使用当前 active 底层 UDP socket，接收仍由事件 readiness 驱动。
+- client WireGuard L3 继续使用单 UDP socket，但只有 worker 0 负责入站 receive/timer，避免多 worker 同时等待同一个 UDP socket。
+- `QuicPoolClient` 控制面刷新触发条件覆盖认证/证书错误以及全端点 QUIC connect timeout/transport failure，并由现有指数退避限制刷新频率。
+- `QuicPoolClient` 补充旧 QUIC data port 不可达、部分旧 data port 不可达、control port 下发新端口池后的自动恢复测试。
+- `RtcWorker` 本地端口索引 helper 在 debug/test 构建中拒绝重复端口误用。
+- `script/acceptance/run_acceptance.sh` 的语法门禁纳入稳定性、性能脚本和 Python helper；稳定性与性能实测可通过 `RUN_STABILITY=1`、`RUN_PERF=1` 显式开启，`RUN_PERF=1` 会先构建 release binaries。
+- 同步测试报告日期和当前单元测试数量。
+
+执行命令：
+
+```bash
+cargo fmt --check
+cargo check --quiet
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+bash -n script/acceptance/e2e_test_dualstack.sh \
+  script/acceptance/e2e_scenarios.sh \
+  script/acceptance/e2e_multi_client.sh \
+  script/acceptance/e2e_dynamic_client_peer.sh \
+  script/acceptance/e2e_userspace_wg_fallback.sh \
+  script/acceptance/e2e_full_tunnel_bypass.sh \
+  script/acceptance/stability_stress_test.sh \
+  script/perf/perf_smoke.sh \
+  script/perf/perf_cores_scalability.sh
+python3 -m py_compile \
+  script/acceptance/stability_report.py \
+  script/acceptance/stability_server.py \
+  script/acceptance/stability_long_tcp.py
+```
+
+结果：**通过。** `cargo test` 当时为 CLI 10 个测试、主程序 114 个测试全部通过。本轮未执行需要 root/network namespace 的全量 E2E、稳定性和 perf 实测。
 
 ## 2026-06-08 Review 后稳定性边界补充验证
 
 本次修复覆盖：
 
-- `VirtualTunnelSocket` 入站队列满时累计 drop packets/bytes，并在 UDS `dump` 的 `virtual_tunnel` 行输出当前队列和累计丢弃量。
+- `VirtualTunnelSocket` 业务 UDP 入站由 RTC worker 直接读取，并在 UDS `dump` 的 `virtual_tunnel` 行输出 direct rx、control 包和 receive error 计数。
 - 物理 UDP socket 健康探测没有任何新鲜 PONG 时保持当前 active socket，不再强制回切到 socket 0。
 - L4 userspace TCP 资源预算保留默认值，同时支持通过 `NEW_PROXY_MAX_WORKER_TCP_FLOWS`、`NEW_PROXY_TCP_SOCKET_BUFFER_BYTES`、`NEW_PROXY_BRIDGE_PENDING_LIMIT`、`NEW_PROXY_BRIDGE_PENDING_BYTES_LIMIT` 和 `NEW_PROXY_BRIDGE_CHANNEL_CAPACITY` 覆盖。
 - 补充 `VirtualTunnelSocket` drop/failover 边界和 `RtcWorker` flow limit fallback 单元测试。
@@ -40,13 +105,13 @@ python3 -m py_compile \
 sudo bash script/acceptance/e2e_userspace_wg_fallback.sh
 ```
 
-结果：**通过。** `cargo test` 当前为 CLI 10 个测试、主程序 103 个测试全部通过。`e2e_userspace_wg_fallback.sh` 产物目录为 `/tmp/new_proxy_userspace_wg_fallback_20260608_154552`，验证 QUIC 阻断后新 TCP 仍可经 userspace WireGuard fallback 成功闭环。本轮未执行其余 root/network namespace E2E、稳定性和 perf 脚本。
+结果：**通过。** `cargo test` 当时为 CLI 10 个测试、主程序 103 个测试全部通过。`e2e_userspace_wg_fallback.sh` 产物目录为 `/tmp/new_proxy_userspace_wg_fallback_20260608_154552`，验证 QUIC 阻断后新 TCP 仍可经 userspace WireGuard fallback 成功闭环。本轮未执行其余 root/network namespace E2E、稳定性和 perf 脚本。
 
 ## 2026-06-08 Review 后静态与单元验证
 
 本次修复覆盖：
 
-- `VirtualTunnelSocket` 物理 UDP 入站改为有界内存队列，队列满时丢弃新入站包，避免 mpsc 大队列和跨 `await` receiver 锁造成 RSS 与并发风险。
+- `VirtualTunnelSocket` 物理 UDP 入站改为 RTC readiness receive path，避免后台预取、包复制和中间接收队列。
 - L4 userspace TCP 默认资源预算下调：降低单 worker flow 上限、单 socket buffer、bridge pending 队列容量。
 - `RtcWorker` 在 SYN offload 的 socket 创建或 listen 失败时回滚 flow 状态并立即走 userspace WireGuard L3 fallback。
 - 修复 fmt/clippy 门禁问题，并补充 `virtual_tunnel` 空 socket 集和并发接收 waiter 单元测试。
@@ -268,7 +333,7 @@ throughput: 22.0617 MiB/s
 
 sudo bash script/perf/perf_cores_scalability.sh: PASS
 artifact: /tmp/new_proxy_cores_scalability_20260605_215751
-threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
 1,16,2,2048,10.770592,190.147,1.000,33
 2,16,2,2048,6.391580,320.422,1.685,14|19
 3,16,2,2048,4.567963,448.340,2.358,8|15|10
@@ -372,9 +437,9 @@ git diff --check: PASS
 
 - `PreScript` 执行失败时启动立即失败，不再只记录 warning 后继续启动；`PostScript` 仍保持 cleanup best-effort。
 - `RtcWorker` IPv4 TCP parser 拒绝非法 IHL、过短 total length 和截断 packet，避免 malformed TUN packet 被误分类。
-- `script/perf/perf_cores_scalability.sh` 删除模拟吞吐 fallback，缺 root、release binary、必需系统工具、可用 CPU 或 benchmark 拓扑时失败，不再生成可误读的性能数据；脚本强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 `--threads`。
-- 架构和测试文档同步当前真实语义：client 按 `--threads` 使用多队列；L4 proxy 多 worker 正确性依赖 Linux TUN multiqueue 的 flow queue affinity。
-- 取消 L4 proxy client 强制单 TUN 队列，已有 proxy E2E/perf smoke 入口改为使用 `--threads 4` 启动 client。
+- `script/perf/perf_cores_scalability.sh` 删除模拟吞吐 fallback，缺 root、release binary、必需系统工具、可用 CPU 或 benchmark 拓扑时失败，不再生成可误读的性能数据；脚本强制采集 per-worker telemetry，并验证 `worker:` 行数匹配 QUIC data port 数。
+- 架构和测试文档同步当前真实语义：server worker 数严格跟随 QUIC listen port 数，client worker 数启动时固定为已建立 QUIC pool 的 data port 数量；多个 proxy peer 的 data port 数量必须一致，且后续新增、恢复或控制面刷新得到的 data port 数必须匹配当前 worker 数。L4 proxy 多 worker 正确性依赖 Linux TUN multiqueue 的 flow queue affinity。
+- 取消 L4 proxy client 强制单 TUN 队列，proxy E2E/perf smoke 入口不再传 daemon worker 参数，worker 数由 QUIC data port 数决定。
 
 执行命令：
 
@@ -410,23 +475,23 @@ cargo test:
 bash -n acceptance/perf scripts: PASS
 python3 -m py_compile stability helpers: PASS
 sudo script/acceptance/e2e_dynamic_client_peer.sh: PASS
-  - client daemon uses --threads 4
+  - client daemon starts with worker count derived from negotiated QUIC data port count
   - artifact: /tmp/new_proxy_dynamic_peer_20260605_200459
 ```
 
-结论：**Review 修复后的格式、编译、Clippy、单元测试、脚本语法检查和 `--threads 4` 动态 client proxy peer E2E 通过；本轮未重新执行其他需要 root/network namespace 的 E2E、稳定性和性能脚本。**
+结论：**Review 修复后的格式、编译、Clippy、单元测试、脚本语法检查和动态 client proxy peer E2E 通过；本轮未重新执行其他需要 root/network namespace 的 E2E、稳定性和性能脚本。**
 
 ## 2026-06-05 L4 Proxy 多队列扩展实测
 
-测试目标：确认取消 L4 proxy 单队列限制后，`--threads 1..4` 是否真实开启对应 TUN queue，观察 TCP over QUIC 吞吐扩展，并通过 per-worker telemetry 判断 flow 是否分散到多个 `RtcWorker`。
+测试目标：确认取消 L4 proxy 单队列限制后，QUIC data port 数 `1..4` 是否真实开启对应 TUN queue，观察 TCP over QUIC 吞吐扩展，并通过 per-worker telemetry 判断 flow 是否分散到多个 `RtcWorker`。
 
 测试方法：
 
 - 使用 release binary：`cargo build --release --bins`
 - 使用 Linux network namespace 搭建 `scale_work_ns -> scale_client_ns -> scale_router_ns -> scale_server_ns`
-- server 运行 4 个 QUIC data ports：`40001..40004`
-- client 分别以 `--threads 1`、`--threads 2`、`--threads 3`、`--threads 4` 启动
-- 每组 client 使用当前允许 cpuset 的前 N 个 CPU 运行，支持 `PERF_CPU_LIST` 覆盖，`--threads=N`
+- server 分别运行 1、2、3、4 个 QUIC data ports：从 `40001` 起连续分配
+- client worker 数在启动时跟随控制面协商得到的 QUIC data port 数
+- 每组 client 使用当前允许 cpuset 的前 N 个 CPU 运行，支持 `PERF_CPU_LIST` 覆盖
 - 每组先 warmup 一次 64 MiB HTTP 下载，再运行并发 HTTP 下载同一 64 MiB 对象
 - 统计来自 client UDS dump 的 `worker:` 行：`new_flows` 表示每个 worker 新建 TCP flow 数
 
@@ -434,7 +499,7 @@ sudo script/acceptance/e2e_dynamic_client_peer.sh: PASS
 
 ```text
 artifact: /tmp/new_proxy_cores_scalability_20260605_202207
-threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
 1,16,2,2048,10.534491,194.409,1.000,33
 2,16,2,2048,6.294708,325.353,1.674,15|18
 3,16,2,2048,4.682595,437.364,2.250,13|10|10
@@ -445,14 +510,14 @@ threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flo
 
 ```text
 artifact: /tmp/new_proxy_cores_scalability_20260605_202329
-threads,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
+data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows
 1,64,1,4096,49.274695,83.126,1.000,65
 2,64,1,4096,20.422916,200.559,2.413,37|28
 3,64,1,4096,14.139338,289.688,3.485,22|22|21
 4,64,1,4096,11.392930,359.521,4.325,17|16|19|13
 ```
 
-worker dump 示例显示 4 threads 下流量进入全部 worker，且没有 L3 fallback：
+worker dump 示例显示 4 个 data ports 下流量进入全部 worker，且没有 L3 fallback：
 
 ```text
 worker:0 tun_rx=103907:4157015 tcp_offload=103907:4157015 l3=0:0 new_flows=7 current_flows=0
@@ -461,7 +526,7 @@ worker:2 tun_rx=183794:7352931 tcp_offload=183792:7352835 l3=0:0 new_flows=11 cu
 worker:3 tun_rx=122252:4890920 tcp_offload=122252:4890920 l3=0:0 new_flows=8 current_flows=0
 ```
 
-结论：**L4 proxy 多队列改动已生效，flow 确实分散到多个 worker。16 并发下 4 threads 为 2.946x，不是严格线性；64 并发下相对扩展达到 4.325x，但绝对吞吐下降，说明 curl/Python HTTP/连接调度引入了额外测试瓶颈。本测试能证明多 worker 参与转发和吞吐随 worker 增长，但还不能作为最终性能基准。正式结论仍需要 iperf3 或专用 Rust traffic generator、多轮 median、CPU/RSS/worker 分布联合报告。**
+结论：**L4 proxy 多队列改动已生效，flow 确实分散到多个 worker。16 并发下 4 个 data ports 为 2.946x，不是严格线性；64 并发下相对扩展达到 4.325x，但绝对吞吐下降，说明 curl/Python HTTP/连接调度引入了额外测试瓶颈。本测试能证明多 worker 参与转发和吞吐随 worker 增长，但还不能作为最终性能基准。正式结论仍需要 iperf3 或专用 Rust traffic generator、多轮 median、CPU/RSS/worker 分布联合报告。**
 
 ## 2026-06-05 文档与用户态 client 路径复查
 

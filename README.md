@@ -140,6 +140,8 @@ ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32, fd00::1/128
 ```
 
+运行时 packet buffer 默认按 `MTU + 256` 分配，并限制在 `1500..65535` 字节；默认 `MTU = 1400` 时 buffer 为 `1656` 字节，jumbo MTU `9000` 时为 `9256` 字节。需要特殊调参时可用环境变量 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖。
+
 启动客户端：
 
 ```bash

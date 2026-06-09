@@ -1,5 +1,6 @@
 mod api;
 mod app_config;
+mod buffer_pool;
 mod client_proxy;
 mod config;
 mod control;
@@ -25,6 +26,7 @@ mod wireguard;
 use client_proxy::build_peer_quic_pool;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -59,14 +61,12 @@ const USERSPACE_TCP_FAILOVER_POLL_INTERVAL: std::time::Duration = std::time::Dur
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct StartupArgs {
     config_path: String,
-    num_threads: usize,
     stats: bool,
 }
 
 fn parse_startup_args(args: &[String]) -> StartupArgs {
     let mut parsed = StartupArgs {
         config_path: "proxy.conf".to_string(),
-        num_threads: 1,
         stats: false,
     };
 
@@ -79,11 +79,6 @@ fn parse_startup_args(args: &[String]) -> StartupArgs {
     while i < args.len() {
         if args[i] == "-config" && i + 1 < args.len() {
             parsed.config_path = args[i + 1].clone();
-            i += 2;
-        } else if args[i] == "--threads" && i + 1 < args.len() {
-            if let Ok(threads) = args[i + 1].parse::<usize>() {
-                parsed.num_threads = threads.max(1);
-            }
             i += 2;
         } else {
             i += 1;
@@ -109,6 +104,7 @@ fn start_userspace_tcp_failover_manager(
     state: Arc<parking_lot::RwLock<GatewayState>>,
     pools: PeerQuicPools,
     client_private_key: [u8; 32],
+    client_worker_count: Arc<AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -146,6 +142,33 @@ fn start_userspace_tcp_failover_manager(
                 );
                 match build_peer_quic_pool(client_private_key, &peer).await {
                     Ok(pool) => {
+                        if let Err(e) =
+                            validate_client_quic_data_port_count(&pools, pool.endpoint_count())
+                        {
+                            pool.shutdown(b"QUIC data port count mismatch");
+                            log::warn!(
+                                "Rejected recovered QUIC pool for peer {}: {}",
+                                encode_base64_32(&peer.public_key),
+                                e
+                            );
+                            continue;
+                        }
+                        if let Err(e) = validate_client_quic_data_port_count_matches_workers(
+                            pool.endpoint_count(),
+                            client_worker_count.load(Ordering::Relaxed),
+                        ) {
+                            pool.shutdown(b"QUIC data port count does not match active workers");
+                            log::warn!(
+                                "Rejected recovered QUIC pool for peer {}: {}",
+                                encode_base64_32(&peer.public_key),
+                                e
+                            );
+                            continue;
+                        }
+                        record_client_quic_data_port_count_if_unset(
+                            &client_worker_count,
+                            pool.endpoint_count(),
+                        );
                         let still_configured = {
                             let st = state.read();
                             st.config.peers.iter().any(|configured| {
@@ -204,8 +227,95 @@ fn start_userspace_tcp_failover_manager(
     })
 }
 
-fn effective_client_tun_queues(requested: usize) -> usize {
-    requested.max(1)
+fn effective_server_tun_queues(listen_ports: &[u16]) -> usize {
+    listen_ports.len().max(1)
+}
+
+fn effective_client_tun_queues(quic_data_port_count: usize) -> usize {
+    quic_data_port_count.max(1)
+}
+
+fn client_quic_data_port_count(
+    pools: &PeerQuicPools,
+    startup_expected_count: Option<usize>,
+) -> Option<usize> {
+    pools
+        .read()
+        .values()
+        .map(|pool| pool.endpoint_count())
+        .find(|count| *count > 0)
+        .or(startup_expected_count)
+}
+
+fn record_startup_quic_data_port_count(
+    expected_count: &mut Option<usize>,
+    candidate_count: usize,
+) -> Result<(), String> {
+    if candidate_count == 0 {
+        return Ok(());
+    }
+    match *expected_count {
+        Some(existing_count) if existing_count != candidate_count => Err(format!(
+            "QUIC data port count mismatch during startup: previous peers use {}, this peer uses {}",
+            existing_count, candidate_count
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *expected_count = Some(candidate_count);
+            Ok(())
+        }
+    }
+}
+
+fn validate_client_quic_data_port_count(
+    pools: &PeerQuicPools,
+    candidate_count: usize,
+) -> Result<(), String> {
+    let Some(existing_count) = pools
+        .read()
+        .values()
+        .map(|pool| pool.endpoint_count())
+        .find(|count| *count > 0)
+    else {
+        return Ok(());
+    };
+
+    if candidate_count == existing_count {
+        Ok(())
+    } else {
+        Err(format!(
+            "QUIC data port count mismatch: existing peers use {}, new peer uses {}",
+            existing_count, candidate_count
+        ))
+    }
+}
+
+fn validate_client_quic_data_port_count_matches_workers(
+    candidate_count: usize,
+    active_worker_count: usize,
+) -> Result<(), String> {
+    if active_worker_count == 0 || candidate_count == active_worker_count {
+        Ok(())
+    } else {
+        Err(format!(
+            "QUIC data port count mismatch: active client workers use {}, peer uses {}; restart the client with this peer available to change worker topology",
+            active_worker_count, candidate_count
+        ))
+    }
+}
+
+pub fn record_client_quic_data_port_count_if_unset(
+    client_worker_count: &AtomicUsize,
+    candidate_count: usize,
+) {
+    if candidate_count > 0 {
+        let _ = client_worker_count.compare_exchange(
+            0,
+            candidate_count,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
 }
 
 fn build_initial_gateway_state(config: GatewayConfig) -> GatewayState {
@@ -298,7 +408,6 @@ async fn wait_for_shutdown() {
 }
 
 const MAX_QUIC_STREAM_HANDLERS: usize = 8192;
-const MAX_CLIENT_USERSPACE_TCP_BRIDGES: usize = 1024;
 
 fn needs_ipv6_l3_socket(config: &GatewayConfig) -> bool {
     config
@@ -425,6 +534,7 @@ async fn main() {
     let shared_quic_registry: quic_pool::PeerConnRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     let client_quic_pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let client_worker_count = Arc::new(AtomicUsize::new(0));
     let peer_mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
     let l3_registry =
         match userspace_wg::UserspaceWgRegistry::new(config.interface.private_key, &config.peers) {
@@ -454,6 +564,7 @@ async fn main() {
                 peer_mutation_lock: peer_mutation_lock.clone(),
                 l3_registry: l3_registry.clone(),
                 virtual_tunnel_telemetry: virtual_tunnel_telemetry.clone(),
+                client_worker_count: client_worker_count.clone(),
             },
         );
     }
@@ -472,7 +583,13 @@ async fn main() {
             }
         };
 
-        let tun_fds = match tun_device::open_tun(&interface_name, startup_args.num_threads) {
+        let tun_queue_count = effective_server_tun_queues(&config.quic_pool.listen_ports);
+        log::info!(
+            "Server TUN queue count follows QUIC listen port count: using {}",
+            tun_queue_count
+        );
+
+        let tun_fds = match tun_device::open_tun(&interface_name, tun_queue_count) {
             Ok(fds) => fds,
             Err(e) => {
                 log::error!("Failed to open server TUN device: {}", e);
@@ -515,12 +632,14 @@ async fn main() {
                 tun_io,
                 server_udp.clone(),
                 l3_registry.clone(),
+                config.interface.mtu,
             ));
             l3_tasks.push(task);
         }
         let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
             server_udp.clone(),
             l3_registry.clone(),
+            config.interface.mtu,
         ));
 
         let Some(listen_control_port) = config.interface.listen_control_port else {
@@ -608,13 +727,58 @@ async fn main() {
         }
 
         let mut initial_pool_failures = 0usize;
+        let mut startup_quic_data_port_count = None;
         for peer in &proxy_peers {
             match build_peer_quic_pool(config.interface.private_key, peer).await {
                 Ok(pool) => {
+                    if let Err(e) = record_startup_quic_data_port_count(
+                        &mut startup_quic_data_port_count,
+                        pool.endpoint_count(),
+                    ) {
+                        pool.shutdown(b"QUIC data port count mismatch");
+                        log::error!(
+                            "Failed to establish initial QUIC pool for peer {}: {}",
+                            encode_base64_32(&peer.public_key),
+                            e
+                        );
+                        let cleanup_config = gateway_state.read().config.clone();
+                        cleanup_runtime(&cleanup_config, &interface_name);
+                        std::process::exit(1);
+                    }
+                    if let Err(e) = validate_client_quic_data_port_count(
+                        &client_quic_pools,
+                        pool.endpoint_count(),
+                    ) {
+                        pool.shutdown(b"QUIC data port count mismatch");
+                        log::error!(
+                            "Failed to establish initial QUIC pool for peer {}: {}",
+                            encode_base64_32(&peer.public_key),
+                            e
+                        );
+                        let cleanup_config = gateway_state.read().config.clone();
+                        cleanup_runtime(&cleanup_config, &interface_name);
+                        std::process::exit(1);
+                    }
                     client_quic_pools.write().insert(peer.public_key, pool);
                 }
                 Err(e) => {
                     initial_pool_failures += 1;
+                    if let Some(data_port_count) = e.data_port_count() {
+                        if let Err(mismatch) = record_startup_quic_data_port_count(
+                            &mut startup_quic_data_port_count,
+                            data_port_count,
+                        ) {
+                            log::error!(
+                                "Failed to establish initial QUIC pool for peer {}: {}; {}",
+                                encode_base64_32(&peer.public_key),
+                                e,
+                                mismatch
+                            );
+                            let cleanup_config = gateway_state.read().config.clone();
+                            cleanup_runtime(&cleanup_config, &interface_name);
+                            std::process::exit(1);
+                        }
+                    }
                     log::warn!(
                         "Failed to establish initial QUIC pool for peer {}; starting in WireGuard L3 fallback and retrying in background: {}",
                         encode_base64_32(&peer.public_key),
@@ -634,16 +798,31 @@ async fn main() {
             gateway_state.clone(),
             client_quic_pools.clone(),
             config.interface.private_key,
+            client_worker_count.clone(),
         );
 
-        let effective_num_threads = effective_client_tun_queues(startup_args.num_threads);
+        let quic_data_port_count =
+            client_quic_data_port_count(&client_quic_pools, startup_quic_data_port_count);
+        let tun_queue_count = effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
+        client_worker_count.store(quic_data_port_count.unwrap_or(0), Ordering::Relaxed);
+        match quic_data_port_count {
+            Some(count) => log::info!(
+                "Client TUN queue count follows negotiated QUIC data port count: data_ports {}, using {}",
+                count,
+                tun_queue_count
+            ),
+            None => log::info!(
+                "Client TUN queue count has no negotiated QUIC data port count yet; using {} initial queue",
+                tun_queue_count
+            ),
+        }
 
         log::info!(
             "Opening userspace multiqueue TUN device: {} with {} queues",
             interface_name,
-            effective_num_threads
+            tun_queue_count
         );
-        let tun_fds = match tun_device::open_tun(&interface_name, effective_num_threads) {
+        let tun_fds = match tun_device::open_tun(&interface_name, tun_queue_count) {
             Ok(fds) => fds,
             Err(e) => {
                 log::error!("Failed to open TUN device: {}", e);
@@ -665,90 +844,6 @@ async fn main() {
             std::process::exit(1);
         }
 
-        // Set up active connection handler
-        let gateway_state_clone = gateway_state.clone();
-        let client_quic_pools_clone = client_quic_pools.clone();
-        let telemetry_for_client_bridge = telemetry_registry.clone();
-        let client_bridge_limit = Arc::new(tokio::sync::Semaphore::new(
-            MAX_CLIENT_USERSPACE_TCP_BRIDGES,
-        ));
-        let client_bridge_limit_for_handler = client_bridge_limit.clone();
-        let active_conn_handler = Arc::new(
-            move |original_dest: SocketAddr, tx_receiver, rx_sender, worker_notify| {
-                let peer_pub_key = {
-                    let st = gateway_state_clone.read();
-                    st.router.longest_match(original_dest.ip())
-                };
-                if let Some(peer_pub_key) = peer_pub_key {
-                    let permit = match client_bridge_limit_for_handler.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            log::warn!(
-                                "Client userspace TCP bridge limit reached; dropping {}",
-                                original_dest
-                            );
-                            return;
-                        }
-                    };
-                    let quic_pool = {
-                        let pools = client_quic_pools_clone.read();
-                        pools.get(&peer_pub_key).cloned()
-                    };
-                    if let Some(quic_pool) = quic_pool {
-                        let stats = telemetry_for_client_bridge.get_or_create(peer_pub_key);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            crate::client_proxy::bridge_userspace_stream_to_quic(
-                                original_dest,
-                                quic_pool,
-                                stats,
-                                tx_receiver,
-                                rx_sender,
-                                worker_notify,
-                            )
-                            .await;
-                        });
-                    }
-                }
-            },
-        );
-
-        let client_udp = {
-            let mut sockets = Vec::new();
-            for i in 0..2 {
-                match bind_l3_udp_socket(0, needs_ipv6_l3_socket(&config)) {
-                    Ok(socket) => sockets.push(tokio::net::UdpSocket::from_std(socket).unwrap()),
-                    Err(e) => {
-                        log::error!(
-                            "Failed to bind client userspace WireGuard UDP socket {}: {}",
-                            i,
-                            e
-                        );
-                        let cleanup_config = gateway_state.read().config.clone();
-                        cleanup_runtime(&cleanup_config, &interface_name);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            let virtual_sock = match crate::virtual_tunnel::VirtualTunnelSocket::new_with_telemetry(
-                sockets,
-                virtual_tunnel_telemetry.clone(),
-            ) {
-                Ok(socket) => socket,
-                Err(e) => {
-                    log::error!("Failed to initialize client virtual UDP socket: {}", e);
-                    let cleanup_config = gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &interface_name);
-                    std::process::exit(1);
-                }
-            };
-            crate::virtual_tunnel::TunnelSocket::Virtual(virtual_sock)
-        };
-        let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
-            client_udp.clone(),
-            l3_registry.clone(),
-        ));
-
         let smoltcp_ip_cidrs = match smoltcp_ip_cidrs(&config) {
             Ok(addrs) => addrs,
             Err(e) => {
@@ -760,6 +855,29 @@ async fn main() {
         };
         let (local_ipv4, local_ipv6) = local_stack_ips(&config);
 
+        let client_udp = {
+            let socket = match bind_l3_udp_socket(0, needs_ipv6_l3_socket(&config)) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    log::error!(
+                        "Failed to bind client userspace WireGuard UDP socket: {}",
+                        e
+                    );
+                    let cleanup_config = gateway_state.read().config.clone();
+                    cleanup_runtime(&cleanup_config, &interface_name);
+                    std::process::exit(1);
+                }
+            };
+            crate::virtual_tunnel::TunnelSocket::Single(Arc::new(
+                tokio::net::UdpSocket::from_std(socket).unwrap(),
+            ))
+        };
+        let l3_timer_task = tokio::spawn(userspace_wg::run_userspace_wg_timer_loop(
+            client_udp.clone(),
+            l3_registry.clone(),
+            config.interface.mtu,
+        ));
+
         let mut worker_tasks = Vec::new();
         for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -770,9 +888,12 @@ async fn main() {
                 }
             });
 
+            let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
+            let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
             let tcp_stack = match userspace_tcp::UserspaceTcpStack::new(
                 smoltcp_ip_cidrs.clone(),
                 config.interface.mtu as usize,
+                worker_buffer_pool.clone(),
             ) {
                 Ok(stack) => stack,
                 Err(e) => {
@@ -786,12 +907,16 @@ async fn main() {
                 client_udp.clone(),
                 l3_registry.clone(),
                 tcp_stack,
-                local_ipv4,
-                local_ipv6,
-                config.interface.mtu as usize,
+                rtc_loop::RtcWorkerConfig {
+                    local_ipv4,
+                    local_ipv6,
+                    mtu: config.interface.mtu as usize,
+                    buffer_pool: worker_buffer_pool,
+                },
             );
-            worker.active_conn_handler = Some(active_conn_handler.clone());
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
+            worker.set_peer_telemetry(telemetry_registry.clone());
+            worker.set_l3_rx_enabled(worker_id == 0);
 
             let gateway_state_for_worker = gateway_state.clone();
             let client_quic_pools_for_worker = client_quic_pools.clone();
@@ -887,10 +1012,82 @@ mod tests {
     }
 
     #[test]
-    fn client_tun_queues_follow_requested_thread_count() {
+    fn server_tun_queues_follow_quic_listen_port_count() {
+        assert_eq!(effective_server_tun_queues(&[40001, 40002]), 2);
+        assert_eq!(effective_server_tun_queues(&[40001]), 1);
+        assert_eq!(effective_server_tun_queues(&[]), 1);
+    }
+
+    #[test]
+    fn client_tun_queues_follow_negotiated_quic_data_ports() {
+        assert_eq!(effective_client_tun_queues(2), 2);
         assert_eq!(effective_client_tun_queues(4), 4);
-        assert_eq!(effective_client_tun_queues(1), 1);
         assert_eq!(effective_client_tun_queues(0), 1);
+    }
+
+    #[test]
+    fn startup_failed_pool_data_port_count_drives_client_worker_count() {
+        let pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        assert_eq!(client_quic_data_port_count(&pools, Some(4)), Some(4));
+    }
+
+    #[test]
+    fn missing_startup_peer_leaves_client_quic_data_port_count_unset() {
+        let pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        assert_eq!(client_quic_data_port_count(&pools, None), None);
+    }
+
+    #[test]
+    fn startup_data_port_count_rejects_inconsistent_failed_peers() {
+        let mut expected = None;
+        record_startup_quic_data_port_count(&mut expected, 2).unwrap();
+        assert_eq!(expected, Some(2));
+        let err = record_startup_quic_data_port_count(&mut expected, 4).unwrap_err();
+        assert!(err.contains("previous peers use 2"));
+        assert!(err.contains("this peer uses 4"));
+    }
+
+    #[test]
+    fn client_quic_data_port_count_must_match_existing_proxy_peers() {
+        let pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        assert!(validate_client_quic_data_port_count(&pools, 2).is_ok());
+
+        pools.write().insert(
+            [2u8; 32],
+            Arc::new(QuicPoolClient::new(
+                [1u8; 32],
+                [2u8; 32],
+                [3u8; 32],
+                vec![
+                    "127.0.0.1:40001".parse().unwrap(),
+                    "127.0.0.1:40002".parse().unwrap(),
+                ],
+            )),
+        );
+
+        assert!(validate_client_quic_data_port_count(&pools, 2).is_ok());
+        let err = validate_client_quic_data_port_count(&pools, 3).unwrap_err();
+        assert!(err.contains("existing peers use 2"));
+        assert!(err.contains("new peer uses 3"));
+    }
+
+    #[test]
+    fn client_quic_data_port_count_must_match_active_workers() {
+        assert!(validate_client_quic_data_port_count_matches_workers(2, 2).is_ok());
+        assert!(validate_client_quic_data_port_count_matches_workers(2, 0).is_ok());
+        let err = validate_client_quic_data_port_count_matches_workers(4, 1).unwrap_err();
+        assert!(err.contains("active client workers use 1"));
+        assert!(err.contains("peer uses 4"));
+        assert!(err.contains("restart"));
+    }
+
+    #[test]
+    fn first_dynamic_peer_records_client_quic_data_port_count() {
+        let worker_count = AtomicUsize::new(0);
+        record_client_quic_data_port_count_if_unset(&worker_count, 2);
+        assert_eq!(worker_count.load(Ordering::Relaxed), 2);
+        record_client_quic_data_port_count_if_unset(&worker_count, 4);
+        assert_eq!(worker_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -899,7 +1096,6 @@ mod tests {
             parse_startup_args(&["new_proxy".to_string()]),
             StartupArgs {
                 config_path: "proxy.conf".to_string(),
-                num_threads: 1,
                 stats: false,
             }
         );
@@ -908,32 +1104,11 @@ mod tests {
                 "new_proxy".to_string(),
                 "-config".to_string(),
                 "conf/client.conf".to_string(),
-                "--threads".to_string(),
-                "4".to_string(),
             ]),
             StartupArgs {
                 config_path: "conf/client.conf".to_string(),
-                num_threads: 4,
                 stats: false,
             }
-        );
-        assert_eq!(
-            parse_startup_args(&[
-                "new_proxy".to_string(),
-                "--threads".to_string(),
-                "bad".to_string(),
-            ])
-            .num_threads,
-            1
-        );
-        assert_eq!(
-            parse_startup_args(&[
-                "new_proxy".to_string(),
-                "--threads".to_string(),
-                "0".to_string(),
-            ])
-            .num_threads,
-            1
         );
     }
 
@@ -948,7 +1123,6 @@ mod tests {
             ]),
             StartupArgs {
                 config_path: "proxy.conf".to_string(),
-                num_threads: 1,
                 stats: true,
             }
         );

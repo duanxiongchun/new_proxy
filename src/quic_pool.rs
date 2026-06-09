@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
@@ -17,6 +17,8 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const QUIC_RECOVERY_COOLDOWN: Duration = Duration::from_secs(10);
+const CONTROL_REFRESH_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+const CONTROL_REFRESH_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_AUTH_PACKET_LEN: usize = 2048;
 const MAX_INCOMING_QUIC_CONNECTIONS: usize = 4096;
 static NEXT_QUIC_CONN_RECORD_ID: AtomicU64 = AtomicU64::new(1);
@@ -41,6 +43,35 @@ struct ControlRefreshConfig {
     server_public_key: [u8; 32],
     control_endpoint: SocketAddr,
     fallback_endpoint: SocketAddr,
+}
+
+struct ControlRefreshBackoff {
+    next_allowed: Option<Instant>,
+    current_delay: Duration,
+}
+
+impl Default for ControlRefreshBackoff {
+    fn default() -> Self {
+        Self {
+            next_allowed: None,
+            current_delay: CONTROL_REFRESH_INITIAL_BACKOFF,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct QuicPoolClientTiming {
+    connect_timeout: Duration,
+    health_check_interval: Duration,
+}
+
+impl Default for QuicPoolClientTiming {
+    fn default() -> Self {
+        Self {
+            connect_timeout: CONNECT_TIMEOUT,
+            health_check_interval: Duration::from_secs(5),
+        }
+    }
 }
 
 fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoint, String> {
@@ -81,7 +112,27 @@ fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoi
         }
         Err(v6_err) => {
             let v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-            Endpoint::server(server_config, v4_addr).map_err(|v4_err| {
+            let v4_result = (|| -> Result<Endpoint, String> {
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )
+                .map_err(|e| format!("create IPv4 UDP socket failed: {}", e))?;
+                socket
+                    .bind(&v4_addr.into())
+                    .map_err(|e| format!("bind 0.0.0.0:{} failed: {}", port, e))?;
+                crate::socket_mark::set_socket2_outer_mark(&socket)?;
+                let udp_socket: std::net::UdpSocket = socket.into();
+                Endpoint::new(
+                    EndpointConfig::default(),
+                    Some(server_config),
+                    udp_socket,
+                    runtime,
+                )
+                .map_err(|e| format!("create IPv4 QUIC endpoint failed: {}", e))
+            })();
+            v4_result.map_err(|v4_err| {
                 format!(
                     "Failed to start QUIC listener on UDP port {}: IPv6 dual-stack bind failed: {}; IPv4 bind failed: {}",
                     port, v6_err, v4_err
@@ -204,6 +255,9 @@ pub struct QuicPoolClient {
     endpoint: Arc<Mutex<Option<Endpoint>>>,
     shutdown: Arc<AtomicBool>,
     pool_state: Arc<RwLock<PoolState>>,
+    control_refresh_backoff: Arc<Mutex<ControlRefreshBackoff>>,
+    timing: Arc<RwLock<QuicPoolClientTiming>>,
+    data_port_count: usize,
 }
 
 #[derive(Clone)]
@@ -262,6 +316,7 @@ impl QuicPoolClient {
         endpoints: Vec<SocketAddr>,
         refresh_config: Option<ControlRefreshConfig>,
     ) -> Self {
+        let data_port_count = endpoints.len();
         Self {
             client_public_key,
             runtime_config: Arc::new(RwLock::new(PoolRuntimeConfig {
@@ -275,11 +330,26 @@ impl QuicPoolClient {
             endpoint: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             pool_state: Arc::new(RwLock::new(PoolState::Active)),
+            control_refresh_backoff: Arc::new(Mutex::new(ControlRefreshBackoff::default())),
+            timing: Arc::new(RwLock::new(QuicPoolClientTiming::default())),
+            data_port_count,
         }
+    }
+
+    #[cfg(test)]
+    fn set_test_timing(&self, connect_timeout: Duration, health_check_interval: Duration) {
+        *self.timing.write() = QuicPoolClientTiming {
+            connect_timeout,
+            health_check_interval,
+        };
     }
 
     pub fn get_state(&self) -> PoolState {
         *self.pool_state.read()
+    }
+
+    pub fn endpoint_count(&self) -> usize {
+        self.data_port_count
     }
 
     pub fn connection_snapshots(&self) -> Vec<QuicConnSnapshot> {
@@ -310,6 +380,35 @@ impl QuicPoolClient {
         if let Some(endpoint) = self.endpoint.lock().as_ref() {
             endpoint.close(0u32.into(), reason);
         }
+    }
+
+    fn should_refresh_control_after_failure(error: &str) -> bool {
+        error.contains("PSK Authentication failed")
+            || error.contains("PSK Authentication timed out")
+            || error.contains("QUIC connection timed out")
+            || error.contains("QUIC connection failed")
+            || error.contains("pinned QUIC certificate fingerprint mismatch")
+            || error.contains("Server rejected PSK authentication")
+    }
+
+    fn control_refresh_allowed_now(&self) -> bool {
+        self.control_refresh_backoff
+            .lock()
+            .next_allowed
+            .map(|next_allowed| Instant::now() >= next_allowed)
+            .unwrap_or(true)
+    }
+
+    fn record_control_refresh_success(&self) {
+        *self.control_refresh_backoff.lock() = ControlRefreshBackoff::default();
+    }
+
+    fn record_control_refresh_failure(&self) -> Duration {
+        let mut backoff = self.control_refresh_backoff.lock();
+        let delay = backoff.current_delay;
+        backoff.next_allowed = Some(Instant::now() + delay);
+        backoff.current_delay = (delay * 2).min(CONTROL_REFRESH_MAX_BACKOFF);
+        delay
     }
 
     // 启动物理连接池，在后台并发拉起多路 QUIC 链接
@@ -390,12 +489,14 @@ impl QuicPoolClient {
             let endpoint_clone = endpoint.clone();
             let client_public_key = self.client_public_key;
             let session_psk = runtime_config.session_psk;
+            let connect_timeout = self.timing.read().connect_timeout;
             join_set.spawn(async move {
                 Self::connect_authenticated_with(
                     endpoint_clone,
                     target_addr,
                     client_public_key,
                     session_psk,
+                    connect_timeout,
                 )
                 .await
             });
@@ -475,11 +576,12 @@ impl QuicPoolClient {
         target_addr: SocketAddr,
         client_public_key: [u8; 32],
         session_psk: [u8; 32],
+        connect_timeout: Duration,
     ) -> Result<PoolSlot, String> {
         let connecting = endpoint
             .connect(target_addr, "localhost")
             .map_err(|e| format!("QUIC connect initiation failed to {}: {}", target_addr, e))?;
-        let conn = timeout(CONNECT_TIMEOUT, connecting)
+        let conn = timeout(connect_timeout, connecting)
             .await
             .map_err(|_| format!("QUIC connection timed out to {}", target_addr))?
             .map_err(|e| format!("QUIC connection failed to {}: {}", target_addr, e))?;
@@ -571,7 +673,8 @@ impl QuicPoolClient {
     pub fn start_health_checker(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let health_check_interval = self.timing.read().health_check_interval;
+                tokio::time::sleep(health_check_interval).await;
                 if self.shutdown.load(Ordering::Relaxed) {
                     break;
                 }
@@ -587,6 +690,7 @@ impl QuicPoolClient {
                         ep.clone(),
                     )
                 };
+                let connect_timeout = self.timing.read().connect_timeout;
 
                 let endpoint = match endpoint_opt {
                     Some(ep) => ep,
@@ -619,6 +723,7 @@ impl QuicPoolClient {
                                     target_addr,
                                     client_public_key,
                                     session_psk,
+                                    connect_timeout,
                                 )
                                 .await,
                             )
@@ -653,13 +758,14 @@ impl QuicPoolClient {
                                 target_addr,
                                 client_public_key,
                                 session_psk,
+                                connect_timeout,
                             )
                             .await,
                         )
                     });
                 }
 
-                let mut auth_failures = 0usize;
+                let mut refresh_worthy_failures = 0usize;
                 while let Some(result) = reconnects.join_next().await {
                     let (slot_index, target_addr, reconnect_result) = match result {
                         Ok(result) => result,
@@ -691,20 +797,29 @@ impl QuicPoolClient {
                             }
                         }
                         Err(e) => {
-                            if e.contains("PSK Authentication failed")
-                                || e.contains("PSK Authentication timed out")
-                                || e.contains("QUIC connection failed")
-                            {
-                                auth_failures += 1;
+                            if Self::should_refresh_control_after_failure(&e) {
+                                refresh_worthy_failures += 1;
                             }
                             log::warn!("{}", e);
                         }
                     }
                 }
 
-                if auth_failures >= endpoints.len().max(1) {
-                    if let Err(e) = self.refresh_control_config().await {
-                        log::warn!("Failed to refresh QUIC session after auth failures: {}", e);
+                if refresh_worthy_failures > 0 {
+                    if self.control_refresh_allowed_now() {
+                        match self.refresh_control_config().await {
+                            Ok(()) => self.record_control_refresh_success(),
+                            Err(e) => {
+                                let delay = self.record_control_refresh_failure();
+                                log::warn!(
+                                    "Failed to refresh QUIC session after auth failures: {}; backing off for {:?}",
+                                    e,
+                                    delay
+                                );
+                            }
+                        }
+                    } else {
+                        log::debug!("Skipping QUIC control refresh while backoff is active");
                     }
                 }
 
@@ -771,6 +886,13 @@ impl QuicPoolClient {
             .iter()
             .map(|&port| SocketAddr::new(quic_endpoint_ip, port))
             .collect::<Vec<_>>();
+        if endpoints.len() != self.data_port_count {
+            return Err(format!(
+                "refreshed QUIC data port count mismatch: existing pool uses {}, control plane returned {}; restart the client to change worker topology",
+                self.data_port_count,
+                endpoints.len()
+            ));
+        }
         let runtime_config = PoolRuntimeConfig {
             session_psk: control_response.session_psk,
             server_cert_sha256: control_response.quic_cert_sha256,
@@ -1313,6 +1435,7 @@ mod tests {
             control_addr,
             control_addr,
         ));
+        client.set_test_timing(Duration::from_millis(500), Duration::from_millis(50));
         client.start_pool().await.unwrap();
 
         old_session_cache.write().insert(client_pub, [8u8; 32]);
@@ -1324,7 +1447,7 @@ mod tests {
         }
 
         client.clone().start_health_checker();
-        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let refreshed =
                 client.runtime_config.read().endpoints == vec![new_addr]
@@ -1355,6 +1478,245 @@ mod tests {
 
         client.shutdown(b"test complete");
         control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_health_checker_refreshes_control_config_after_dead_data_port() {
+        let old_port = unused_udp_port();
+        let dead_port = unused_udp_port();
+        let new_port = unused_udp_port();
+        let control_port = unused_udp_port();
+
+        let client_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let client_pub = PublicKey::from(&client_secret).to_bytes();
+        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let server_pub = PublicKey::from(&server_secret).to_bytes();
+        let server_shared = server_secret
+            .diffie_hellman(&PublicKey::from(client_pub))
+            .to_bytes();
+
+        let old_psk = [9u8; 32];
+        let old_session_cache = Arc::new(RwLock::new(HashMap::new()));
+        old_session_cache.write().insert(client_pub, old_psk);
+        let (old_cert_fingerprint, _old_registry, _old_rx) =
+            start_echo_quic_server(old_port, old_session_cache.clone()).await;
+
+        let new_session_cache = Arc::new(RwLock::new(HashMap::new()));
+        let (new_cert_fingerprint, _new_registry, mut new_rx) =
+            start_echo_quic_server(new_port, new_session_cache.clone()).await;
+
+        let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
+        peer_secrets.write().insert(client_pub, server_shared);
+        let control_server = crate::control::ControlServer::new(
+            control_port,
+            peer_secrets,
+            vec![new_port],
+            None,
+            None,
+            new_cert_fingerprint,
+            new_session_cache.clone(),
+        );
+        let control_task = control_server.start().await.unwrap();
+
+        let old_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), old_port);
+        let dead_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), dead_port);
+        let new_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), new_port);
+        let control_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), control_port);
+        let client = Arc::new(QuicPoolClient::new_with_refresh(
+            client_pub,
+            old_psk,
+            old_cert_fingerprint,
+            vec![old_addr],
+            client_secret.to_bytes(),
+            server_pub,
+            control_addr,
+            control_addr,
+        ));
+        client.set_test_timing(Duration::from_millis(500), Duration::from_millis(50));
+        client.start_pool().await.unwrap();
+
+        {
+            let mut config = client.runtime_config.write();
+            config.endpoints = vec![dead_addr];
+        }
+        {
+            let old_slots = client.slots.load();
+            let old_conn = old_slots[0].conn.clone();
+            old_conn.close(0u32.into(), b"simulate dead data port");
+            client.slots.store(Arc::new(vec![PoolSlot {
+                endpoint: dead_addr,
+                stats: QuicConnStats::new(dead_addr, dead_port),
+                conn: old_conn,
+            }]));
+        }
+
+        client.clone().start_health_checker();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let refreshed =
+                client.runtime_config.read().endpoints == vec![new_addr]
+                    && client.slots.load().iter().any(|slot| {
+                        slot.endpoint == new_addr && slot.conn.close_reason().is_none()
+                    });
+            if refreshed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health checker did not refresh control config after dead QUIC data port"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let (mut send, mut recv, conn_stat) = client.open_mux_stream().await.unwrap();
+        assert_eq!(conn_stat.local_port, new_port);
+        send.write_all(b"after dead data port").await.unwrap();
+        send.finish().await.unwrap();
+
+        let mut resp = vec![0u8; 1024];
+        let n = recv.read(&mut resp).await.unwrap().unwrap();
+        resp.truncate(n);
+        assert_eq!(&resp, b"after dead data port");
+        assert_eq!(new_rx.recv().await.unwrap(), b"after dead data port");
+
+        client.shutdown(b"test complete");
+        control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_health_checker_refreshes_control_config_after_partial_data_port_failure() {
+        let old_port = unused_udp_port();
+        let dead_port = unused_udp_port();
+        let new_port = unused_udp_port();
+        let control_port = unused_udp_port();
+
+        let client_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let client_pub = PublicKey::from(&client_secret).to_bytes();
+        let server_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let server_pub = PublicKey::from(&server_secret).to_bytes();
+        let server_shared = server_secret
+            .diffie_hellman(&PublicKey::from(client_pub))
+            .to_bytes();
+
+        let old_psk = [10u8; 32];
+        let old_session_cache = Arc::new(RwLock::new(HashMap::new()));
+        old_session_cache.write().insert(client_pub, old_psk);
+        let (old_cert_fingerprint, _old_registry, _old_rx) =
+            start_echo_quic_server(old_port, old_session_cache.clone()).await;
+
+        let new_session_cache = Arc::new(RwLock::new(HashMap::new()));
+        let (new_cert_fingerprint, _new_registry, mut new_rx) =
+            start_echo_quic_server(new_port, new_session_cache.clone()).await;
+
+        let peer_secrets = Arc::new(RwLock::new(HashMap::new()));
+        peer_secrets.write().insert(client_pub, server_shared);
+        let control_server = crate::control::ControlServer::new(
+            control_port,
+            peer_secrets,
+            vec![new_port],
+            None,
+            None,
+            new_cert_fingerprint,
+            new_session_cache.clone(),
+        );
+        let control_task = control_server.start().await.unwrap();
+
+        let old_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), old_port);
+        let dead_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), dead_port);
+        let new_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), new_port);
+        let control_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), control_port);
+        let client = Arc::new(QuicPoolClient::new_with_refresh(
+            client_pub,
+            old_psk,
+            old_cert_fingerprint,
+            vec![old_addr],
+            client_secret.to_bytes(),
+            server_pub,
+            control_addr,
+            control_addr,
+        ));
+        client.set_test_timing(Duration::from_millis(500), Duration::from_millis(50));
+        client.start_pool().await.unwrap();
+
+        {
+            let mut config = client.runtime_config.write();
+            config.endpoints = vec![old_addr, dead_addr];
+        }
+
+        client.clone().start_health_checker();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let refreshed =
+                client.runtime_config.read().endpoints == vec![new_addr]
+                    && client.slots.load().iter().any(|slot| {
+                        slot.endpoint == new_addr && slot.conn.close_reason().is_none()
+                    });
+            if refreshed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health checker did not refresh control config after partial QUIC data port failure"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let (mut send, mut recv, conn_stat) = client.open_mux_stream().await.unwrap();
+        assert_eq!(conn_stat.local_port, new_port);
+        send.write_all(b"after partial data port failure")
+            .await
+            .unwrap();
+        send.finish().await.unwrap();
+
+        let mut resp = vec![0u8; 1024];
+        let n = recv.read(&mut resp).await.unwrap().unwrap();
+        resp.truncate(n);
+        assert_eq!(&resp, b"after partial data port failure");
+        assert_eq!(
+            new_rx.recv().await.unwrap(),
+            b"after partial data port failure"
+        );
+
+        client.shutdown(b"test complete");
+        control_task.abort();
+    }
+
+    #[test]
+    fn control_refresh_covers_auth_certificate_and_full_endpoint_failures() {
+        assert!(QuicPoolClient::should_refresh_control_after_failure(
+            "PSK Authentication failed on link 127.0.0.1:40001: Auth read error"
+        ));
+        assert!(QuicPoolClient::should_refresh_control_after_failure(
+            "QUIC connection failed to 127.0.0.1:40001: the cryptographic handshake failed: error 40: unexpected error: pinned QUIC certificate fingerprint mismatch"
+        ));
+        assert!(QuicPoolClient::should_refresh_control_after_failure(
+            "QUIC connection timed out to 127.0.0.1:40001"
+        ));
+        assert!(QuicPoolClient::should_refresh_control_after_failure(
+            "QUIC connection failed to 127.0.0.1:40001: transport error"
+        ));
+        assert!(!QuicPoolClient::should_refresh_control_after_failure(
+            "No active QUIC connections in pool"
+        ));
+    }
+
+    #[test]
+    fn control_refresh_backoff_blocks_immediate_retry_and_resets_on_success() {
+        let client = QuicPoolClient::new(
+            [1u8; 32],
+            [2u8; 32],
+            [3u8; 32],
+            vec!["127.0.0.1:40001".parse().unwrap()],
+        );
+
+        assert!(client.control_refresh_allowed_now());
+        assert_eq!(
+            client.record_control_refresh_failure(),
+            CONTROL_REFRESH_INITIAL_BACKOFF
+        );
+        assert!(!client.control_refresh_allowed_now());
+        client.record_control_refresh_success();
+        assert!(client.control_refresh_allowed_now());
     }
 
     #[test]

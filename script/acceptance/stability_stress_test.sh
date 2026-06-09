@@ -8,7 +8,7 @@ fi
 
 DURATION="${STABILITY_DURATION:-3600}"
 SAMPLE_INTERVAL="${STABILITY_SAMPLE_INTERVAL:-30}"
-LONG_THREADS="${STABILITY_LONG_THREADS:-8}"
+LONG_WORKERS="${STABILITY_LONG_WORKERS:-8}"
 SHORT_PARALLEL="${STABILITY_SHORT_PARALLEL:-4}"
 ARTIFACT_DIR="${STABILITY_ARTIFACT_DIR:-/tmp/new_proxy_stability_$(date +%Y%m%d_%H%M%S)}"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -467,9 +467,9 @@ echo "=== [5/7] Starting background traffic for ${DURATION}s ==="
 START_TS="$(date +%s)"
 # Long TCP MUST run from client workload namespaces so connections enter the
 # client gateway and are routed through TUN/smoltcp -> QUIC pool.
-ip netns exec client1_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
+ip netns exec client1_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --workers "$LONG_WORKERS" --stats-out "$ARTIFACT_DIR/long_tcp_stats.json" > "$ARTIFACT_DIR/long_tcp.log" 2>&1 &
 LONG_PID=$!
-ip netns exec client2_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --threads "$LONG_THREADS" --stats-out "$ARTIFACT_DIR/long_tcp2_stats.json" > "$ARTIFACT_DIR/long_tcp2.log" 2>&1 &
+ip netns exec client2_work_ns python3 "$ROOT_DIR/script/acceptance/stability_long_tcp.py" --duration "$DURATION" --workers "$LONG_WORKERS" --stats-out "$ARTIFACT_DIR/long_tcp2_stats.json" > "$ARTIFACT_DIR/long_tcp2.log" 2>&1 &
 LONG2_PID=$!
 short_loop &
 SHORT_PID=$!
