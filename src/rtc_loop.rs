@@ -1334,12 +1334,35 @@ impl RtcWorker {
                                     } => {
                                         if *bytes_read == 2 {
                                             let payload_len = u16::from_be_bytes(*len_buf) as usize;
-                                            let payload_buf = self.buffer_pool.get();
-                                            *udp_read_state = UdpReadState::ReadPayload {
-                                                payload_len,
-                                                payload_buf,
-                                                bytes_read: 0,
-                                            };
+                                            if payload_len == 0 {
+                                                let mut data = self.buffer_pool.get();
+                                                data.set_len(0);
+
+                                                // push_from_quic_pending inline:
+                                                if from_quic_pending.len() >= bridge_pending_limit()
+                                                    || from_quic_pending_bytes.saturating_add(0)
+                                                        > bridge_pending_bytes_limit()
+                                                {
+                                                    log::warn!("Userspace UDP bridge from-QUIC queue byte limit reached; closing bridge");
+                                                    if !closed_handles.contains(&handle) {
+                                                        closed_handles.push(handle);
+                                                    }
+                                                    break;
+                                                }
+                                                from_quic_pending.push_back(data);
+
+                                                *udp_read_state = UdpReadState::ReadLen {
+                                                    len_buf: [0u8; 2],
+                                                    bytes_read: 0,
+                                                };
+                                            } else {
+                                                let payload_buf = self.buffer_pool.get();
+                                                *udp_read_state = UdpReadState::ReadPayload {
+                                                    payload_len,
+                                                    payload_buf,
+                                                    bytes_read: 0,
+                                                };
+                                            }
                                         }
                                     }
                                     UdpReadState::ReadPayload {
@@ -1421,30 +1444,30 @@ impl RtcWorker {
                         match socket.recv() {
                             Ok((data, _metadata)) => {
                                 let n = data.len();
+                                let mut framed_data = self.buffer_pool.get();
+                                framed_data.as_mut_capacity()[..2]
+                                    .copy_from_slice(&(n as u16).to_be_bytes());
                                 if n > 0 {
-                                    let mut framed_data = self.buffer_pool.get();
-                                    framed_data.as_mut_capacity()[..2]
-                                        .copy_from_slice(&(n as u16).to_be_bytes());
                                     framed_data.as_mut_capacity()[2..2 + n]
                                         .copy_from_slice(&data[..n]);
-                                    framed_data.set_len(2 + n);
-
-                                    // push_to_quic_pending inline:
-                                    if to_quic_pending.len() >= bridge_pending_limit()
-                                        || to_quic_pending_bytes.saturating_add(framed_data.len())
-                                            > bridge_pending_bytes_limit()
-                                    {
-                                        log::warn!("Userspace UDP bridge to-QUIC queue byte limit reached; closing bridge");
-                                        if !closed_handles.contains(&handle) {
-                                            closed_handles.push(handle);
-                                        }
-                                        break;
-                                    }
-                                    *to_quic_pending_bytes += framed_data.len();
-                                    to_quic_pending.push_back(framed_data);
-
-                                    *last_seen = Instant::now();
                                 }
+                                framed_data.set_len(2 + n);
+
+                                // push_to_quic_pending inline:
+                                if to_quic_pending.len() >= bridge_pending_limit()
+                                    || to_quic_pending_bytes.saturating_add(framed_data.len())
+                                        > bridge_pending_bytes_limit()
+                                {
+                                    log::warn!("Userspace UDP bridge to-QUIC queue byte limit reached; closing bridge");
+                                    if !closed_handles.contains(&handle) {
+                                        closed_handles.push(handle);
+                                    }
+                                    break;
+                                }
+                                *to_quic_pending_bytes += framed_data.len();
+                                to_quic_pending.push_back(framed_data);
+
+                                *last_seen = Instant::now();
                             }
                             Err(_) => break,
                         }

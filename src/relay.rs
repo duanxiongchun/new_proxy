@@ -370,17 +370,12 @@ where
 
     let client_to_server = async {
         let mut buf = vec![0u8; 65536];
-        loop {
-            match read_framed_packet(quic_recv, &mut buf).await? {
-                Some(len) => {
-                    udp_socket.send(&buf[..len]).await?;
-                    activity_c2s.store(true, Ordering::Relaxed);
-                    stats.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                    if let Some(cs) = &conn_stat {
-                        cs.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                    }
-                }
-                None => break,
+        while let Some(len) = read_framed_packet(quic_recv, &mut buf).await? {
+            udp_socket.send(&buf[..len]).await?;
+            activity_c2s.store(true, Ordering::Relaxed);
+            stats.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+            if let Some(cs) = &conn_stat {
+                cs.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
             }
         }
         Ok::<(), std::io::Error>(())

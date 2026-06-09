@@ -1393,9 +1393,20 @@ mod tests {
     use std::task::Waker;
     use x25519_dalek::{PublicKey, StaticSecret};
 
+    static PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(45000);
+
     fn unused_udp_port() -> u16 {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.local_addr().unwrap().port()
+        use std::sync::atomic::Ordering;
+        loop {
+            let port = PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if !(45000..=65000).contains(&port) {
+                PORT_COUNTER.store(45000, Ordering::Relaxed);
+                continue;
+            }
+            if UdpSocket::bind(format!("127.0.0.1:{}", port)).is_ok() {
+                return port;
+            }
+        }
     }
 
     struct CountingPendingFuture {
