@@ -7,7 +7,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_COPY_YIELD_BUDGET_BYTES: usize = 64 * 1024;
 
 // 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
@@ -234,6 +233,13 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     }
 }
 
+/// TCP/QUIC bidirectional stream relay loop with idle timeout.
+///
+/// **Performance Optimization Note:**
+/// - Rather than allocating new timeout futures on every single read and write, we pin a single
+///   `tokio::time::sleep` future to the stack and update its deadline in-place using `.reset()`.
+/// - The write timeout has been removed in favor of transport-level keep-alives (TCP keep-alives
+///   and QUIC max idle timeouts) to further reduce timer-wheel registration overhead on the hot path.
 async fn relay_copy_with_idle<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -242,28 +248,33 @@ where
     let mut buf = PooledBuffer::new();
     let mut copied = 0u64;
     let mut copied_since_yield = 0usize;
+
+    let idle_sleep = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
+
     loop {
-        let n = match tokio::time::timeout(RELAY_IDLE_TIMEOUT, reader.read(&mut buf[..])).await {
-            Ok(res) => res?,
-            Err(_) => {
+        let n = tokio::select! {
+            res = reader.read(&mut buf[..]) => {
+                res?
+            }
+            _ = &mut idle_sleep => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "relay idle timeout",
                 ));
             }
         };
+
         if n == 0 {
             return Ok(copied);
         }
-        match tokio::time::timeout(RELAY_WRITE_TIMEOUT, writer.write_all(&buf[..n])).await {
-            Ok(res) => res?,
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "relay write timeout",
-                ));
-            }
-        }
+
+        writer.write_all(&buf[..n]).await?;
+
+        idle_sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+
         copied += n as u64;
         copied_since_yield += n;
         if copied_since_yield >= RELAY_COPY_YIELD_BUDGET_BYTES {
@@ -361,22 +372,46 @@ mod tests {
     async fn test_relay_copy_with_idle_timeout() {
         tokio::time::pause();
 
-        let (mut client, _server) = tokio::io::duplex(64);
-        let (mut writer_client, _writer_server) = tokio::io::duplex(64);
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let (mut writer_client, mut writer_server) = tokio::io::duplex(64);
 
-        let relay_fut = relay_copy_with_idle(&mut client, &mut writer_client);
-        tokio::pin!(relay_fut);
+        let relay_task =
+            tokio::spawn(
+                async move { relay_copy_with_idle(&mut client, &mut writer_client).await },
+            );
 
-        tokio::select! {
-            _ = &mut relay_fut => {
-                panic!("Should not complete immediately");
-            }
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-        }
+        // 1. Verify that sending data resets the idle timeout timer
+        tokio::io::AsyncWriteExt::write_all(&mut server, b"hello")
+            .await
+            .unwrap();
 
+        // Advance time by half the timeout duration
+        tokio::time::advance(RELAY_IDLE_TIMEOUT / 2).await;
+
+        // Write data again to trigger a reset
+        tokio::io::AsyncWriteExt::write_all(&mut server, b"world")
+            .await
+            .unwrap();
+
+        // Advance time again by another half timeout duration.
+        // Total elapsed time since start is now RELAY_IDLE_TIMEOUT, but because of the reset,
+        // it should not time out yet.
+        tokio::time::advance(RELAY_IDLE_TIMEOUT / 2).await;
+
+        // Read data from the writer's peer to ensure data was relayed
+        let mut read_buf = [0u8; 10];
+        let read_len = tokio::io::AsyncReadExt::read(&mut writer_server, &mut read_buf)
+            .await
+            .unwrap();
+        assert_eq!(&read_buf[..read_len], b"helloworld");
+
+        // The relay task should still be active
+        assert!(!relay_task.is_finished());
+
+        // 2. Now let it time out by advancing past the idle timeout without any new data
         tokio::time::advance(RELAY_IDLE_TIMEOUT + Duration::from_secs(1)).await;
 
-        let res = relay_fut.await;
+        let res = relay_task.await.unwrap();
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
