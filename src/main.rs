@@ -567,8 +567,14 @@ async fn run_gateway(
         }
     }
 
-    // 共享遥测注册中心与运行时共享状态初始化
-    let telemetry_registry = Arc::new(TelemetryRegistry::new());
+    let tun_queue_count = match runtime_mode {
+        RuntimeMode::Server => effective_server_tun_queues(&config.quic_pool.listen_ports),
+        RuntimeMode::Client => effective_client_tun_queues(fixed_client_quic_data_port_count.unwrap_or(0)),
+    };
+    let mut peer_telemetries = Vec::new();
+    for _ in 0..tun_queue_count {
+        peer_telemetries.push(Arc::new(TelemetryRegistry::new()));
+    }
     let worker_telemetry_registry = Arc::new(telemetry::WorkerTelemetryRegistry::new());
     let virtual_tunnel_telemetry = Arc::new(telemetry::VirtualTunnelTelemetry::default());
 
@@ -608,7 +614,7 @@ async fn run_gateway(
         uds_server::start(
             listener,
             uds_server::UdsServerContext {
-                telemetry: telemetry_registry.clone(),
+                peer_telemetries: peer_telemetries.clone(),
                 worker_telemetry: worker_telemetry_registry.clone(),
                 state: gateway_state.clone(),
                 peer_secrets: peer_secrets.clone(),
@@ -689,7 +695,7 @@ async fn run_gateway(
                 },
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
-            worker.set_peer_telemetry(telemetry_registry.clone());
+            worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
             let l4_data_plane_for_worker = l4_data_plane.clone();
             let task = tokio::spawn(async move {
                 if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
@@ -934,7 +940,7 @@ async fn run_gateway(
                 },
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
-            worker.set_peer_telemetry(telemetry_registry.clone());
+            worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
 
             let l4_data_plane_for_worker = l4_data_plane.clone();
 

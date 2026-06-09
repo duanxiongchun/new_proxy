@@ -152,7 +152,6 @@ impl RtcWorker {
     }
 
     pub async fn run_loop(&mut self, data_plane: crate::L4DataPlane) -> Result<(), String> {
-        let mut tun_buf = self.buffer_pool.get();
         let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut reload_timer = tokio::time::interval(std::time::Duration::from_millis(100));
 
@@ -172,6 +171,8 @@ impl RtcWorker {
             ),
         > = std::collections::HashMap::new();
 
+        let mut tun_vec = vec![0u8; 1600];
+
         loop {
             if active_conns.is_empty() {
                 dp_snapshot = data_plane.load();
@@ -179,15 +180,15 @@ impl RtcWorker {
             }
 
             tokio::select! {
-                read_res = self.tun_io.read(tun_buf.as_mut_capacity()) => {
+                read_res = self.tun_io.read(&mut tun_vec) => {
                     match read_res {
                         Ok(n) if n > 0 => {
-                            tun_buf.set_len(n);
                             local_stats.tun_rx_packets += 1;
                             local_stats.tun_rx_bytes += n as u64;
 
-                            if let Some(dst_ip) = parse_destination_ip(tun_buf.as_slice()) {
-                                crate::mss_clamping::clamp_tcp_mss(tun_buf.as_mut_slice(), 1160);
+                            let mut packet_sent = false;
+                            if let Some(dst_ip) = parse_destination_ip(&tun_vec[..n]) {
+                                crate::mss_clamping::clamp_tcp_mss(&mut tun_vec[..n], 1160);
 
                                 let cached_conn = if let Some(info) = conn_cache.get(&dst_ip) {
                                     let (conn, _, _) = info;
@@ -213,7 +214,11 @@ impl RtcWorker {
                                 };
 
                                 if let Some((conn, stats, pub_key)) = conn_info {
-                                    let payload = bytes::Bytes::copy_from_slice(tun_buf.as_slice());
+                                    tun_vec.truncate(n);
+                                    let payload = bytes::Bytes::from(tun_vec);
+                                    tun_vec = vec![0u8; 1600];
+                                    packet_sent = true;
+
                                     if let Err(e) = conn.send_datagram(payload) {
                                         log::debug!("Failed to send QUIC datagram: {}", e);
                                     } else {
@@ -221,8 +226,7 @@ impl RtcWorker {
                                         local_stats.l3_bytes += n as u64;
 
                                         // Update connection stats
-                                        let old_tx = stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                                        log::info!("RtcWorker {} [{:?}]: sent datagram size {}, stats tx_bytes now {}", self.worker_id, self.role, n, old_tx + n as u64);
+                                        let _old_tx = stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
                                         // Update peer stats
                                         if let Some(ref peer_telemetry) = self.peer_telemetry {
@@ -232,7 +236,11 @@ impl RtcWorker {
                                     }
                                 }
                             }
-                            tun_buf = self.buffer_pool.get();
+                            if !packet_sent {
+                                if tun_vec.len() != 1600 {
+                                    tun_vec.resize(1600, 0);
+                                }
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -252,8 +260,7 @@ impl RtcWorker {
 
                             // Update connection stats
                             let (_, stats, pub_key) = &active_conns[idx];
-                            let old_rx = stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                            log::info!("RtcWorker {} [{:?}]: received datagram size {}, stats rx_bytes now {}", self.worker_id, self.role, n, old_rx + n as u64);
+                            let _old_rx = stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
                             // Update peer stats
                             if let Some(ref peer_telemetry) = self.peer_telemetry {

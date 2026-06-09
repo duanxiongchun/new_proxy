@@ -24,7 +24,7 @@ const MAX_UDS_CLIENTS: usize = 1024;
 
 #[derive(Clone)]
 pub struct UdsServerContext {
-    pub telemetry: Arc<TelemetryRegistry>,
+    pub peer_telemetries: Vec<Arc<TelemetryRegistry>>,
     pub worker_telemetry: Arc<WorkerTelemetryRegistry>,
     pub state: Arc<RwLock<GatewayState>>,
     pub peer_secrets: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
@@ -156,6 +156,24 @@ pub fn start(listener: UnixListener, context: UdsServerContext) {
     });
 }
 
+fn combine_peer_telemetries(
+    peer_telemetries: &[Arc<crate::telemetry::TelemetryRegistry>],
+) -> HashMap<[u8; 32], Arc<crate::telemetry::PeerL4Stats>> {
+    let mut combined = HashMap::new();
+    for registry in peer_telemetries {
+        let snap = registry.snapshot();
+        for (pub_key, stats) in snap {
+            let combined_stats = combined.entry(pub_key).or_insert_with(|| {
+                Arc::new(crate::telemetry::PeerL4Stats::default())
+            });
+            combined_stats.rx_bytes.fetch_add(stats.rx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            combined_stats.tx_bytes.fetch_add(stats.tx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            combined_stats.active_streams.fetch_add(stats.active_streams.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+    combined
+}
+
 fn quic_connection_snapshots(
     quic_registry: &HashMap<[u8; 32], Vec<quic_pool::QuicConnRecord>>,
     client_quic_pools: &PeerQuicPools,
@@ -190,7 +208,7 @@ async fn handle_stats(
             st.config.peers.clone()
         };
         let sources = telemetry_sources(&peers, &l3_stats);
-        let registry_map = context.telemetry.snapshot();
+        let registry_map = combine_peer_telemetries(&context.peer_telemetries);
         let quic_registry = context.shared_quic_registry.read();
 
         for peer in peers {
@@ -331,7 +349,7 @@ async fn handle_dump(
 ) {
     let l3_stats = context.l3_registry.snapshot();
     let response = {
-        let telemetry = context.telemetry.snapshot();
+        let telemetry = combine_peer_telemetries(&context.peer_telemetries);
         let quic_registry = context.shared_quic_registry.read();
         let peers = {
             let state = context.state.read();
@@ -780,7 +798,9 @@ async fn handle_remove_peer(
     context.peer_secrets.write().remove(&parsed_pub_key);
     context.session_cache.write().remove(&parsed_pub_key);
     context.auth_nonce_cache.lock().remove(&parsed_pub_key);
-    context.telemetry.remove(&parsed_pub_key);
+    for registry in &context.peer_telemetries {
+        registry.remove(&parsed_pub_key);
+    }
 
     if context.runtime_mode == RuntimeMode::Client {
         if let Some(pool) = context.client_quic_pools.write().remove(&parsed_pub_key) {
@@ -966,7 +986,7 @@ mod tests {
         ));
 
         UdsServerContext {
-            telemetry,
+            peer_telemetries: vec![telemetry],
             worker_telemetry,
             state,
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
@@ -1235,7 +1255,7 @@ mod tests {
             .lock()
             .contains_key(&[2u8; 32]));
         assert!(!context_for_assert
-            .telemetry
+            .peer_telemetries[0]
             .snapshot()
             .contains_key(&[2u8; 32]));
 
