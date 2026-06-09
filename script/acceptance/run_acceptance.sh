@@ -61,12 +61,11 @@ fi
 echo "--- Checking Scripts Syntax ---"
 bash_scripts=(
   "script/acceptance/e2e_test_dualstack.sh"
-  "script/acceptance/e2e_scenarios.sh"
   "script/acceptance/e2e_multi_client.sh"
   "script/acceptance/e2e_dynamic_client_peer.sh"
   "script/acceptance/e2e_client_topology_gate.sh"
-  "script/acceptance/e2e_userspace_wg_fallback.sh"
   "script/acceptance/e2e_full_tunnel_bypass.sh"
+  "script/acceptance/e2e_mss_clamping.sh"
   "script/acceptance/e2e_udp_icmp_tunnel.sh"
   "script/acceptance/e2e_udp_over_quic.sh"
   "script/acceptance/stability_stress_test.sh"
@@ -95,12 +94,11 @@ echo "✅ Python helper syntax checks passed."
 # 4. Run E2E scenarios
 TESTS=(
   "e2e_test_dualstack"
-  "e2e_scenarios"
   "e2e_multi_client"
   "e2e_dynamic_client_peer"
   "e2e_client_topology_gate"
-  "e2e_userspace_wg_fallback"
   "e2e_full_tunnel_bypass"
+  "e2e_mss_clamping"
   "e2e_udp_icmp_tunnel"
   "e2e_udp_over_quic"
 )
