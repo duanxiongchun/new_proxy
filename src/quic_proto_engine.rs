@@ -1,7 +1,6 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use quinn_proto::{Connection, Endpoint};
+use quinn_proto::Connection;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SignedPacket {
