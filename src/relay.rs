@@ -284,6 +284,36 @@ where
     }
 }
 
+pub async fn write_framed_packet<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    data: &[u8],
+) -> std::io::Result<()> {
+    if data.len() > u16::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "packet too large for u16 frame",
+        ));
+    }
+    w.write_u16(data.len() as u16).await?;
+    w.write_all(data).await?;
+    Ok(())
+}
+
+pub async fn read_framed_packet<R: AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let len = r.read_u16().await? as usize;
+    if len > buf.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "buffer too small for framed packet",
+        ));
+    }
+    r.read_exact(&mut buf[..len]).await?;
+    Ok(len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,4 +445,20 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
+
+    #[tokio::test]
+    async fn test_udp_stream_framing_roundtrip() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let test_data = b"hello udp packet";
+
+        let write_fut = write_framed_packet(&mut client, test_data);
+        let read_fut = async {
+            let mut read_buf = vec![0u8; 100];
+            let len = read_framed_packet(&mut server, &mut read_buf).await.unwrap();
+            assert_eq!(&read_buf[..len], test_data);
+        };
+
+        tokio::join!(write_fut, read_fut).0.unwrap();
+    }
 }
+
