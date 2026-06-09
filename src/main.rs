@@ -588,7 +588,7 @@ async fn run_gateway(
     // - server 模式下由 QuicPoolServer.run_with_registry 填充
     // - client 模式下不使用，始终为空
     let shared_quic_registry: quic_pool::PeerConnRegistry =
-        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     let client_quic_pools: PeerQuicPools = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let l4_data_plane: L4DataPlane = Arc::new(ArcSwap::from_pointee(
         current_l4_data_plane_snapshot(&gateway_state, &client_quic_pools),

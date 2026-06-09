@@ -191,7 +191,7 @@ async fn handle_stats(
         };
         let sources = telemetry_sources(&peers, &l3_stats);
         let registry_map = context.telemetry.snapshot();
-        let quic_registry = context.shared_quic_registry.lock();
+        let quic_registry = context.shared_quic_registry.read();
 
         for peer in peers {
             let pub_key = peer.public_key;
@@ -332,7 +332,7 @@ async fn handle_dump(
     let l3_stats = context.l3_registry.snapshot();
     let response = {
         let telemetry = context.telemetry.snapshot();
-        let quic_registry = context.shared_quic_registry.lock();
+        let quic_registry = context.shared_quic_registry.read();
         let peers = {
             let state = context.state.read();
             state.config.peers.clone()
@@ -787,7 +787,7 @@ async fn handle_remove_peer(
             pool.shutdown(b"Peer removed");
         }
     }
-    if let Some(conns) = context.shared_quic_registry.lock().remove(&parsed_pub_key) {
+    if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
         for conn in conns {
             conn.close(b"Peer removed");
         }
@@ -971,7 +971,7 @@ mod tests {
             state,
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             server_secret: StaticSecret::from([1u8; 32]),
-            shared_quic_registry: Arc::new(Mutex::new(HashMap::new())),
+            shared_quic_registry: Arc::new(RwLock::new(HashMap::new())),
             interface_name: "nonexistent_interface".to_string(),
             session_cache: Arc::new(RwLock::new(HashMap::new())),
             auth_nonce_cache: Arc::new(Mutex::new(HashMap::new())),

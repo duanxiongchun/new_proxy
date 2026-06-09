@@ -93,7 +93,7 @@ impl RtcWorker {
                 if local_port == 0 {
                     return None;
                 }
-                let registry = peer_conn_registry.lock();
+                let registry = peer_conn_registry.read();
                 let records = registry.get(&peer_pub_key)?;
                 for record in records {
                     if record.stats.local_port == local_port && record.conn.close_reason().is_none()
@@ -131,7 +131,7 @@ impl RtcWorker {
             } => {
                 let local_port = listen_ports.get(self.worker_id).copied().unwrap_or(0);
                 if local_port > 0 {
-                    let registry = peer_conn_registry.lock();
+                    let registry = peer_conn_registry.read();
                     for (&pub_key, records) in registry.iter() {
                         for record in records {
                             if record.stats.local_port == local_port
@@ -154,15 +154,29 @@ impl RtcWorker {
     pub async fn run_loop(&mut self, data_plane: crate::L4DataPlane) -> Result<(), String> {
         let mut tun_buf = self.buffer_pool.get();
         let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut reload_timer = tokio::time::interval(std::time::Duration::from_millis(100));
 
         let mut local_stats = crate::telemetry::WorkerTelemetrySnapshot {
             worker_id: self.worker_id,
             ..crate::telemetry::WorkerTelemetrySnapshot::default()
         };
 
+        let mut dp_snapshot = data_plane.load();
+        let mut active_conns = self.get_all_active_connections(&dp_snapshot);
+        let mut conn_cache: std::collections::HashMap<
+            std::net::IpAddr,
+            (
+                quinn::Connection,
+                std::sync::Arc<crate::quic_pool::QuicConnStats>,
+                [u8; 32],
+            ),
+        > = std::collections::HashMap::new();
+
         loop {
-            let dp_snapshot = data_plane.load();
-            let active_conns = self.get_all_active_connections(&dp_snapshot);
+            if active_conns.is_empty() {
+                dp_snapshot = data_plane.load();
+                active_conns = self.get_all_active_connections(&dp_snapshot);
+            }
 
             tokio::select! {
                 read_res = self.tun_io.read(tun_buf.as_mut_capacity()) => {
@@ -175,7 +189,30 @@ impl RtcWorker {
                             if let Some(dst_ip) = parse_destination_ip(tun_buf.as_slice()) {
                                 crate::mss_clamping::clamp_tcp_mss(tun_buf.as_mut_slice(), 1160);
 
-                                if let Some((conn, stats, pub_key)) = self.get_active_connection(&dp_snapshot, dst_ip) {
+                                let cached_conn = if let Some(info) = conn_cache.get(&dst_ip) {
+                                    let (conn, _, _) = info;
+                                    if conn.close_reason().is_none() {
+                                        Some(info.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                let conn_info = match cached_conn {
+                                    Some(info) => Some(info),
+                                    None => {
+                                        if let Some((conn, stats, pub_key)) = self.get_active_connection(&dp_snapshot, dst_ip) {
+                                            conn_cache.insert(dst_ip, (conn.clone(), stats.clone(), pub_key));
+                                            Some((conn, stats, pub_key))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                };
+
+                                if let Some((conn, stats, pub_key)) = conn_info {
                                     let payload = bytes::Bytes::copy_from_slice(tun_buf.as_slice());
                                     if let Err(e) = conn.send_datagram(payload) {
                                         log::debug!("Failed to send QUIC datagram: {}", e);
@@ -225,6 +262,12 @@ impl RtcWorker {
                             }
                         }
                     }
+                }
+
+                _ = reload_timer.tick() => {
+                    dp_snapshot = data_plane.load();
+                    active_conns = self.get_all_active_connections(&dp_snapshot);
+                    conn_cache.clear();
                 }
 
                 _ = stats_timer.tick() => {
@@ -291,6 +334,63 @@ async fn read_any_datagram(
                 }
             }
         }
+        3 => {
+            tokio::select! {
+                r0 = conns[0].0.read_datagram() => match r0 {
+                    Ok(bytes) => Some((bytes, 0)),
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        None
+                    }
+                },
+                r1 = conns[1].0.read_datagram() => match r1 {
+                    Ok(bytes) => Some((bytes, 1)),
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        None
+                    }
+                },
+                r2 = conns[2].0.read_datagram() => match r2 {
+                    Ok(bytes) => Some((bytes, 2)),
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        None
+                    }
+                }
+            }
+        }
+        4 => {
+            tokio::select! {
+                r0 = conns[0].0.read_datagram() => match r0 {
+                    Ok(bytes) => Some((bytes, 0)),
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        None
+                    }
+                },
+                r1 = conns[1].0.read_datagram() => match r1 {
+                    Ok(bytes) => Some((bytes, 1)),
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        None
+                    }
+                },
+                r2 = conns[2].0.read_datagram() => match r2 {
+                    Ok(bytes) => Some((bytes, 2)),
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        None
+                    }
+                },
+                r3 = conns[3].0.read_datagram() => match r3 {
+                    Ok(bytes) => Some((bytes, 3)),
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        None
+                    }
+                }
+            }
+        }
         _ => {
             let futures = conns
                 .iter()
@@ -340,7 +440,7 @@ mod tests {
     async fn test_rtc_worker_datagram_loop() {
         let port = unused_udp_port();
         let session_cache = Arc::new(RwLock::new(HashMap::new()));
-        let peer_registry = Arc::new(Mutex::new(HashMap::new()));
+        let peer_registry = Arc::new(RwLock::new(HashMap::new()));
 
         let client_pub_key = [10u8; 32];
         let session_psk = [11u8; 32];
@@ -441,7 +541,7 @@ mod tests {
         // Server connection should receive the datagram
         tokio::time::sleep(Duration::from_millis(50)).await;
         let server_conn = {
-            let registry = peer_registry.lock();
+            let registry = peer_registry.read();
             registry[&client_pub_key][0].conn.clone()
         };
 

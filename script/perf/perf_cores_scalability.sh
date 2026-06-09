@@ -230,14 +230,23 @@ dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count="$BLOB_MIB" status=none
 run_group() {
   local data_ports="$1"
   local cpus
+  local server_cpus
+  local loader_cpus="8-15"
+  local target_cpus="16-23"
   local server_conf="$ARTIFACT_DIR/server_${data_ports}.conf"
   local server_log="$ARTIFACT_DIR/server_${data_ports}.log"
   local client_log="$ARTIFACT_DIR/client_${data_ports}.log"
   local worker_dump="$ARTIFACT_DIR/client_${data_ports}_dump.txt"
   cpus="$(cpus_for_data_ports "$data_ports")"
+  server_cpus="$(python3 - "$data_ports" <<'PY'
+import sys
+dp = int(sys.argv[1])
+print(",".join(str(4 + i) for i in range(dp)))
+PY
+)"
   write_server_conf "$data_ports" "$server_conf"
 
-  ip netns exec scale_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$server_conf" > "$server_log" 2>&1 &
+  ip netns exec scale_server_ns taskset -c "$server_cpus" "$ROOT_DIR/target/release/new_proxy" -config "$server_conf" > "$server_log" 2>&1 &
   SERVER_PID=$!
   sleep 2
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -246,7 +255,7 @@ run_group() {
     exit 1
   fi
 
-  ip netns exec scale_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
+  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
   HTTP_PID=$!
 
   ip netns exec scale_client_ns taskset -c "$cpus" "$ROOT_DIR/target/release/new_proxy" -config "$CLIENT_CONF" > "$client_log" 2>&1 &
@@ -261,7 +270,7 @@ run_group() {
   ip netns exec scale_work_ns curl -fsS --connect-timeout 5 --max-time 30 -o /dev/null "http://10.0.0.1:8080/blob.bin"
 
   local line
-  if ! line="$(ip netns exec scale_work_ns python3 - "$data_ports" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
+  if ! line="$(ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$data_ports" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
 import concurrent.futures
 import subprocess
 import sys
@@ -301,7 +310,7 @@ PY
   fi
 
   # Run UDP benchmark
-  ip netns exec scale_server_ns python3 - <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
+  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
 import socket
 import sys
 import time
@@ -338,7 +347,7 @@ PY
   UDP_RECV_PID=$!
   sleep 1
 
-  ip netns exec scale_work_ns python3 - "$PARALLEL" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
+  ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$PARALLEL" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
 import socket
 import sys
 import time

@@ -1064,7 +1064,7 @@ impl QuicPoolClient {
 
 // 3. 服务端 QUIC 接收端与验证服务
 // 每个已认证的对端连接 → 聚合统计（按 client_pub_key）
-pub type PeerConnRegistry = Arc<Mutex<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
+pub type PeerConnRegistry = Arc<RwLock<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
 
 #[derive(Clone)]
 pub struct QuicConnRecord {
@@ -1267,7 +1267,7 @@ impl QuicPoolServer {
         let record_id = NEXT_QUIC_CONN_RECORD_ID.fetch_add(1, Ordering::Relaxed);
         let conn_stat = Arc::new(QuicConnStats::new(remote_addr, port));
         {
-            let mut registry = peer_conn_registry.lock();
+            let mut registry = peer_conn_registry.write();
             registry
                 .entry(client_pub_key)
                 .or_default()
@@ -1388,7 +1388,7 @@ struct TelemetryRegistryGuard {
 
 impl Drop for TelemetryRegistryGuard {
     fn drop(&mut self) {
-        let mut registry = self.registry.lock();
+        let mut registry = self.registry.write();
         if let Some(conns) = registry.get_mut(&self.client_pub_key) {
             conns.retain(|record| record.id != self.record_id);
             if conns.is_empty() {
@@ -1610,7 +1610,7 @@ mod tests {
         PeerConnRegistry,
         tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
-        let peer_registry = Arc::new(Mutex::new(HashMap::new()));
+        let peer_registry = Arc::new(RwLock::new(HashMap::new()));
         let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
         let server = QuicPoolServer::new(vec![port], session_cache, auth_nonce_cache);
         let (certs, key) = generate_self_signed_cert().unwrap();
@@ -1664,7 +1664,7 @@ mod tests {
 
         // 2. 初始化服务端
         let session_cache = Arc::new(RwLock::new(HashMap::new()));
-        let peer_registry = Arc::new(Mutex::new(HashMap::new()));
+        let peer_registry = Arc::new(RwLock::new(HashMap::new()));
 
         let client_pub_key = [7u8; 32];
         let session_psk = [9u8; 32];
@@ -1737,7 +1737,7 @@ mod tests {
 
         // 7. 验证流量统计与快照
         {
-            let registry = peer_registry.lock();
+            let registry = peer_registry.read();
             assert!(registry.contains_key(&client_pub_key));
             let stats = &registry[&client_pub_key];
             assert_eq!(stats.len(), 1);
@@ -1763,7 +1763,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         {
-            let registry = peer_registry.lock();
+            let registry = peer_registry.read();
             assert!(registry.is_empty() || !registry.contains_key(&client_pub_key));
         }
     }
@@ -1772,7 +1772,7 @@ mod tests {
     async fn test_quic_pool_datagram_integration() {
         let port = unused_udp_port();
         let session_cache = Arc::new(RwLock::new(HashMap::new()));
-        let peer_registry = Arc::new(Mutex::new(HashMap::new()));
+        let peer_registry = Arc::new(RwLock::new(HashMap::new()));
 
         let client_pub_key = [10u8; 32];
         let session_psk = [11u8; 32];
@@ -1809,7 +1809,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let server_conn = {
-            let registry = peer_registry.lock();
+            let registry = peer_registry.read();
             assert!(registry.contains_key(&client_pub_key));
             registry[&client_pub_key][0].conn.clone()
         };
