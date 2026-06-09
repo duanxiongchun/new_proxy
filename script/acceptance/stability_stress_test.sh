@@ -91,12 +91,12 @@ ListenPorts = 40001, 40002, 40003, 40004
 # Client 1: Custom Proxy Client Peer (Defined in config, so it's 'both')
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
-AllowedIPs = 10.0.0.2/32, fd00::2/128
+AllowedIPs = 10.0.0.2/32, fd00::2/128, 10.0.4.0/24
 
 # Client 2: second independent QUIC proxy peer
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT2_PUBLIC_KEY}
-AllowedIPs = 10.0.0.4/32
+AllowedIPs = 10.0.0.4/32, 10.0.8.0/24
 
 # Client 3/4: direct physical L3 baseline namespaces; they must not enter any QUIC pool.
 [Peer]
@@ -243,10 +243,8 @@ ip netns exec client2_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # Clients Gateway Routes
 ip netns exec client1_ns ip route add default via 10.0.1.1
-ip netns exec client1_ns ip route add 10.0.0.1/32 via 10.0.1.1
 
 ip netns exec client2_ns ip route add default via 10.0.5.1
-ip netns exec client2_ns ip route add 10.0.0.1/32 via 10.0.5.1
 ip netns exec client3_ns ip route add default via 10.0.6.1
 ip netns exec client3_ns ip route add 10.0.0.1/32 via 10.0.6.1
 ip netns exec client4_ns ip route add default via 10.0.7.1
@@ -277,6 +275,10 @@ echo "=== [3/7] Starting server/client proxies with 4 QUIC ports ==="
 ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$ARTIFACT_DIR/server_daemon.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
+ip netns exec server_ns ip addr add 10.0.0.1/24 dev srv_stab || true
+ip netns exec server_ns ip link set srv_stab up
+ip netns exec server_ns ip route replace 10.0.4.0/24 dev srv_stab
+ip netns exec server_ns ip route replace 10.0.8.0/24 dev srv_stab
 ip netns exec client1_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$ARTIFACT_DIR/client_daemon.log" 2>&1 &
 CLIENT_PID=$!
 ip netns exec client2_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT2_CONF" > "$ARTIFACT_DIR/client2_daemon.log" 2>&1 &

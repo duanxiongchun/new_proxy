@@ -120,7 +120,7 @@ for test_name in "${TESTS[@]}"; do
   echo " Running E2E Test: $test_name"
   echo "======================================================================"
   
-  if sudo bash "script/acceptance/${test_name}.sh"; then
+  if sudo -E bash "script/acceptance/${test_name}.sh"; then
     RESULTS["$test_name"]="PASS"
   else
     RESULTS["$test_name"]="FAIL"
