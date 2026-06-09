@@ -356,4 +356,28 @@ mod tests {
         assert_eq!(conn_stat.tx_bytes.load(Ordering::Relaxed), 9);
         assert_eq!(stats.active_streams.load(Ordering::Relaxed), 0);
     }
+
+    #[tokio::test]
+    async fn test_relay_copy_with_idle_timeout() {
+        tokio::time::pause();
+
+        let (mut client, _server) = tokio::io::duplex(64);
+        let (mut writer_client, _writer_server) = tokio::io::duplex(64);
+
+        let relay_fut = relay_copy_with_idle(&mut client, &mut writer_client);
+        tokio::pin!(relay_fut);
+
+        tokio::select! {
+            _ = &mut relay_fut => {
+                panic!("Should not complete immediately");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+
+        tokio::time::advance(RELAY_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+
+        let res = relay_fut.await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
 }
