@@ -1,5 +1,5 @@
 use crate::buffer_pool::{BufferPool, PooledBuf};
-use crate::proxy_proto::write_target_addr;
+use crate::proxy_proto::{write_target_addr, ProxyProtocol, ProxyTargetHeader};
 use crate::quic_pool::{PoolState, QuicConnStats};
 use crate::relay::PeerL4Stats;
 use crate::telemetry::WorkerTelemetrySnapshot;
@@ -166,6 +166,79 @@ async fn establish_quic_bridge(
     }
 }
 
+async fn establish_quic_bridge_udp(
+    original_dest: SocketAddr,
+    peer_pub_key: [u8; 32],
+    data_plane: Arc<crate::L4DataPlaneSnapshot>,
+    peer_telemetry: Option<Arc<crate::telemetry::TelemetryRegistry>>,
+) -> Option<ActiveQuicBridge> {
+    let quic_pool = data_plane.client_quic_pools.get(&peer_pub_key).cloned()?;
+    if !matches!(quic_pool.get_state(), PoolState::Active) {
+        log::warn!(
+            "QUIC pool is not active, dropping userspace UDP stream to {}",
+            original_dest
+        );
+        return None;
+    }
+    let stats = peer_telemetry
+        .as_ref()
+        .map(|telemetry| telemetry.get_or_create(peer_pub_key))
+        .unwrap_or_else(|| Arc::new(PeerL4Stats::default()));
+
+    match quic_pool.open_mux_stream().await {
+        Ok((mut send, mut recv, conn_stat)) => {
+            let header = ProxyTargetHeader {
+                protocol: ProxyProtocol::Udp,
+                dst_ip: original_dest.ip(),
+                dst_port: original_dest.port(),
+            };
+            if header.write_to(&mut send).await.is_err() {
+                quic_pool.enter_fallback("failed to write userspace UDP stream target address");
+                return None;
+            }
+            let mut status = [0u8; 1];
+            match timeout(Duration::from_secs(5), recv.read_exact(&mut status)).await {
+                Ok(Ok(_)) if status[0] == 1 => {
+                    stats.active_streams.fetch_add(1, Ordering::Relaxed);
+                    conn_stat.active_streams.fetch_add(1, Ordering::Relaxed);
+                    Some(ActiveQuicBridge {
+                        send,
+                        recv,
+                        stats,
+                        conn_stat,
+                    })
+                }
+                Ok(Ok(_)) => {
+                    log::warn!("Server rejected userspace UDP target {}", original_dest);
+                    None
+                }
+                Ok(Err(e)) => {
+                    log::warn!(
+                        "Failed to read userspace UDP target proxy status for {}: {}",
+                        original_dest,
+                        e
+                    );
+                    quic_pool.enter_fallback("failed to read userspace UDP stream proxy status");
+                    None
+                }
+                Err(_) => {
+                    log::warn!(
+                        "Timed out waiting for userspace UDP target proxy status for {}",
+                        original_dest
+                    );
+                    quic_pool.enter_fallback("failed to complete userspace UDP stream proxy setup");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to open UDP stream for userspace bridge: {}", e);
+            quic_pool.enter_fallback("failed to open userspace QUIC UDP mux stream");
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct NatEntry {
     pub original_dst_ip: IpAddr,
@@ -317,6 +390,13 @@ pub fn parse_udp_packet(packet: &[u8]) -> Option<(IpAddr, u16, IpAddr, u16)> {
     }
 }
 
+fn std_ip_to_smoltcp(addr: IpAddr) -> smoltcp::wire::IpAddress {
+    match addr {
+        IpAddr::V4(a) => smoltcp::wire::IpAddress::Ipv4(a),
+        IpAddr::V6(a) => smoltcp::wire::IpAddress::Ipv6(a),
+    }
+}
+
 fn smoltcp_ip_to_std(addr: smoltcp::wire::IpAddress) -> IpAddr {
     match addr {
         smoltcp::wire::IpAddress::Ipv4(a) => IpAddr::V4(a),
@@ -453,6 +533,84 @@ fn repair_tcp_checksums(packet: &mut [u8]) {
     }
 }
 
+fn repair_udp_checksums(packet: &mut [u8]) {
+    if packet.is_empty() {
+        return;
+    }
+    match packet[0] >> 4 {
+        4 => {
+            if packet.len() < 20 || packet[9] != 17 {
+                return;
+            }
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            if ihl < 20 || packet.len() < ihl + 8 {
+                return;
+            }
+            let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+            if total_len < ihl + 8 || packet.len() < total_len {
+                return;
+            }
+            // Repair IP checksum
+            packet[10] = 0;
+            packet[11] = 0;
+            let ip_checksum = finish_checksum(add_ones_complement(0, &packet[..ihl]));
+            packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+            // Repair UDP checksum
+            packet[ihl + 6] = 0;
+            packet[ihl + 7] = 0;
+            let udp_len = total_len - ihl;
+            let mut sum = 0u32;
+            sum = add_ones_complement(sum, &packet[12..20]);
+            sum += 17;
+            sum += udp_len as u32;
+            sum = add_ones_complement(sum, &packet[ihl..total_len]);
+            let mut udp_checksum = finish_checksum(sum);
+            if udp_checksum == 0 {
+                udp_checksum = 0xffff;
+            }
+            packet[ihl + 6..ihl + 8].copy_from_slice(&udp_checksum.to_be_bytes());
+        }
+        6 => {
+            if packet.len() < 48 || packet[6] != 17 {
+                return;
+            }
+            let udp_offset = 40;
+            let udp_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+            if udp_len < 8 || packet.len() < udp_offset + udp_len {
+                return;
+            }
+            packet[udp_offset + 6] = 0;
+            packet[udp_offset + 7] = 0;
+            let mut sum = 0u32;
+            sum = add_ones_complement(sum, &packet[8..40]);
+            sum = add_ones_complement(sum, &(udp_len as u32).to_be_bytes());
+            sum += 17;
+            sum = add_ones_complement(sum, &packet[udp_offset..udp_offset + udp_len]);
+            let mut udp_checksum = finish_checksum(sum);
+            if udp_checksum == 0 {
+                udp_checksum = 0xffff;
+            }
+            packet[udp_offset + 6..udp_offset + 8].copy_from_slice(&udp_checksum.to_be_bytes());
+        }
+        _ => {}
+    }
+}
+
+pub enum UdpReadState {
+    ReadLen { len_buf: [u8; 2], bytes_read: usize },
+    ReadPayload { payload_len: usize, payload_buf: PooledBuf, bytes_read: usize },
+}
+
+impl Default for UdpReadState {
+    fn default() -> Self {
+        Self::ReadLen {
+            len_buf: [0u8; 2],
+            bytes_read: 0,
+        }
+    }
+}
+
 pub struct BridgeChannels {
     pub nat_key: NatKey,
     pub quic: BridgeQuicState,
@@ -463,6 +621,9 @@ pub struct BridgeChannels {
     pub to_quic_pending_bytes: usize,
     pub from_quic_pending_bytes: usize,
     pub quic_rx_closed: bool,
+    pub is_udp: bool,
+    pub udp_read_state: UdpReadState,
+    pub last_seen: Instant,
 }
 
 pub enum BridgeQuicState {
@@ -877,19 +1038,7 @@ impl RtcWorker {
             .iface
             .poll(now, &mut self.tcp_stack.device, &mut self.tcp_stack.sockets);
 
-        // Flush outgoing TCP packets from smoltcp to TUN
-        while let Some(mut pkt) = self.tcp_stack.device.tx_queue.pop_front() {
-            if let Some((_src_ip, src_port, dst_ip, dst_port, _)) = parse_tcp_packet(pkt.as_slice())
-            {
-                let key = (dst_ip, dst_port, src_port);
-                if let Some(entry) = self.nat_map.get(&key) {
-                    rewrite_source_ip(pkt.as_mut_slice(), entry.original_dst_ip);
-                    rewrite_source_port(pkt.as_mut_slice(), entry.original_dst_port);
-                    repair_tcp_checksums(pkt.as_mut_slice());
-                }
-            }
-            self.write_or_queue_tun_packet(pkt, "smoltcp");
-        }
+        self.flush_smoltcp_tx_to_tun();
 
         // Handle active TCP bridges
         self.handle_bridges(None);
@@ -919,20 +1068,7 @@ impl RtcWorker {
                 .iface
                 .poll(now, &mut self.tcp_stack.device, &mut self.tcp_stack.sockets);
 
-            // Flush outgoing TCP packets from smoltcp to TUN, applying NAT reverse rewrite
-            while let Some(mut pkt) = self.tcp_stack.device.tx_queue.pop_front() {
-                if let Some((_src_ip, src_port, dst_ip, dst_port, _)) =
-                    parse_tcp_packet(pkt.as_slice())
-                {
-                    let key = (dst_ip, dst_port, src_port);
-                    if let Some(entry) = self.nat_map.get(&key) {
-                        rewrite_source_ip(pkt.as_mut_slice(), entry.original_dst_ip);
-                        rewrite_source_port(pkt.as_mut_slice(), entry.original_dst_port);
-                        repair_tcp_checksums(pkt.as_mut_slice());
-                    }
-                }
-                self.write_or_queue_tun_packet(pkt, "smoltcp");
-            }
+            self.flush_smoltcp_tx_to_tun();
 
             self.handle_bridges(Some(&data_plane));
 
@@ -973,207 +1109,8 @@ impl RtcWorker {
                         Ok(n) if n > 0 => {
                             tun_buf.set_len(n);
                             self.record_tun_rx(n);
-                            let packet = tun_buf.as_mut_slice();
-                            if let Some((src_ip, src_port, dst_ip, dst_port, is_syn)) = parse_tcp_packet(packet) {
-                                let flow_key = (src_ip, src_port, dst_ip, dst_port);
-                                let existing_flow = self.flow_map.contains_key(&flow_key);
-                                let offload_peer_for_new_flow = if !existing_flow && is_syn {
-                                    let snapshot = data_plane.load();
-                                    snapshot
-                                        .userspace_tcp_offload_enabled
-                                        .then(|| snapshot.router.longest_match(dst_ip))
-                                        .flatten()
-                                        .filter(|peer_pub_key| {
-                                            snapshot
-                                                .client_quic_pools
-                                                .get(peer_pub_key)
-                                                .map(|pool| matches!(pool.get_state(), crate::quic_pool::PoolState::Active))
-                                                .unwrap_or(false)
-                                        })
-                                } else {
-                                    None
-                                };
-                                let offload_available_for_new_flow =
-                                    offload_peer_for_new_flow.is_some();
-
-                                if self.should_route_via_smoltcp(
-                                    &flow_key,
-                                    is_syn,
-                                    offload_available_for_new_flow,
-                                ) {
-                                    let Some(local_ip) = self.local_ip_for(dst_ip) else {
-                                        log::warn!(
-                                            "No configured smoltcp local address for {}; using userspace WireGuard L3",
-                                            dst_ip
-                                        );
-                                        if let Some((endpoint, enc_pkt)) =
-                                            self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                        {
-                                            self.record_l3_packet(n);
-                                            self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
-                                        }
-                                        continue;
-                                    };
-                                    if self.tcp_flow_limit_reached_for_new_flow(&flow_key, is_syn) {
-                                        log::warn!(
-                                            "Userspace TCP flow limit reached; falling back to userspace WireGuard L3"
-                                        );
-                                        if let Some((endpoint, enc_pkt)) =
-                                            self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                        {
-                                            self.record_l3_packet(n);
-                                            self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
-                                        }
-                                        continue;
-                                    }
-
-                                    let local_port = if is_syn {
-                                        match self.flow_map.get(&flow_key).copied() {
-                                            Some(port) => port,
-                                            None => match self.allocate_local_port() {
-                                                Some(port) => {
-                                                    self.insert_flow_port(flow_key, port);
-                                                    self.record_new_tcp_flow();
-                                                    port
-                                                }
-                                                None => {
-                                                    log::warn!("No free smoltcp local ports; falling back to userspace WireGuard L3");
-                                                    if let Some((endpoint, enc_pkt)) =
-                                                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                                    {
-                                                        self.record_l3_packet(n);
-                                                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
-                                                    }
-                                                    continue;
-                                                }
-                                            },
-                                        }
-                                    } else if let Some(port) = self.flow_map.get(&flow_key).copied() {
-                                        port
-                                    } else {
-                                        log::debug!("No userspace TCP flow state for non-SYN packet; using userspace WireGuard L3");
-                                        if let Some((endpoint, enc_pkt)) =
-                                            self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                        {
-                                            self.record_l3_packet(n);
-                                            self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
-                                        }
-                                        continue;
-                                    };
-
-                                    if is_syn {
-                                        let has_listening = self.tcp_stack.sockets.iter().any(|(_, s)| {
-                                            if let Some(s) = tcp::Socket::downcast(s) {
-                                                s.state() == tcp::State::Listen && s.local_endpoint().map(|ep| ep.port == local_port).unwrap_or(false)
-                                            } else {
-                                                false
-                                            }
-                                        });
-                                        if !has_listening {
-                                            match self.tcp_stack.create_tcp_socket(
-                                                userspace_tcp_socket_buffer_bytes(),
-                                                userspace_tcp_socket_buffer_bytes(),
-                                            ) {
-                                                Ok(handle) => {
-                                                    let listen_result = {
-                                                        let s = self
-                                                            .tcp_stack
-                                                            .sockets
-                                                            .get_mut::<tcp::Socket>(handle);
-                                                        s.listen(local_port)
-                                                    };
-                                                    if let Err(e) = listen_result {
-                                                        self.tcp_stack.sockets.remove(handle);
-                                                        self.release_flow_port(&flow_key);
-                                                        log::warn!(
-                                                            "Failed to create userspace TCP listener on port {}: {}; falling back to userspace WireGuard L3",
-                                                            local_port,
-                                                            e
-                                                        );
-                                                        if let Some((endpoint, enc_pkt)) =
-                                                            self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                                        {
-                                                            self.record_l3_packet(n);
-                                                            self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
-                                                        }
-                                                        continue;
-                                                    }
-                                                    log::debug!(
-                                                        "Created userspace listening TCP socket on port {}",
-                                                        local_port
-                                                    );
-                                                    self.pending_bridge_handles.insert(handle);
-                                                }
-                                                Err(e) => {
-                                                    self.release_flow_port(&flow_key);
-                                                    log::warn!(
-                                                        "Failed to allocate userspace TCP socket: {}; falling back to userspace WireGuard L3",
-                                                        e
-                                                    );
-                                                    if let Some((endpoint, enc_pkt)) =
-                                                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                                    {
-                                                        self.record_l3_packet(n);
-                                                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
-                                                    }
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    let peer_pub_key = offload_peer_for_new_flow
-                                        .or_else(|| {
-                                            self.nat_map
-                                                .get(&(src_ip, src_port, local_port))
-                                                .map(|entry| entry.peer_pub_key)
-                                        });
-                                    let Some(peer_pub_key) = peer_pub_key else {
-                                        log::warn!(
-                                            "No QUIC peer mapping for userspace TCP flow; falling back to userspace WireGuard L3"
-                                        );
-                                        if let Some((endpoint, enc_pkt)) =
-                                            self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                        {
-                                            self.record_l3_packet(n);
-                                            self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
-                                        }
-                                        continue;
-                                    };
-
-                                    self.nat_map.insert(
-                                        (src_ip, src_port, local_port),
-                                        NatEntry {
-                                            original_dst_ip: dst_ip,
-                                            original_dst_port: dst_port,
-                                            peer_pub_key,
-                                            flow_key,
-                                            last_seen: Instant::now(),
-                                        },
-                                    );
-
-                                    rewrite_destination_ip(packet, local_ip);
-                                    rewrite_destination_port(packet, local_port);
-
-                                    self.record_tcp_offload(n);
-                                    let packet = std::mem::replace(&mut tun_buf, self.buffer_pool.get());
-                                    self.tcp_stack.process_input_packet(packet);
-                                } else {
-                                    if let Some((endpoint, enc_pkt)) =
-                                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                    {
-                                        self.record_l3_packet(n);
-                                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard");
-                                    }
-                                }
-                            } else {
-                                if let Some((endpoint, enc_pkt)) =
-                                    self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
-                                {
-                                    self.record_l3_packet(n);
-                                    self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard");
-                                }
-                            }
+                            let packet_buf = std::mem::replace(&mut tun_buf, self.buffer_pool.get());
+                            self.process_tun_packet(packet_buf, Some(&data_plane));
                         }
                         _ => {}
                     }
@@ -1263,6 +1200,9 @@ impl RtcWorker {
                         to_quic_pending_bytes: 0,
                         from_quic_pending_bytes: 0,
                         quic_rx_closed: false,
+                        is_udp: false,
+                        udp_read_state: UdpReadState::default(),
+                        last_seen: Instant::now(),
                     },
                 );
             } else {
@@ -1278,6 +1218,9 @@ impl RtcWorker {
                         to_quic_pending_bytes: 0,
                         from_quic_pending_bytes: 0,
                         quic_rx_closed: false,
+                        is_udp: false,
+                        udp_read_state: UdpReadState::default(),
+                        last_seen: Instant::now(),
                     },
                 );
             }
@@ -1285,154 +1228,385 @@ impl RtcWorker {
 
         // Process existing bridges
         for (&handle, bridge) in self.bridges.iter_mut() {
-            let socket = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
+            if bridge.is_udp {
+                let BridgeChannels {
+                    nat_key,
+                    quic,
+                    recv_buf,
+                    quic_recv_buf: _,
+                    to_quic_pending,
+                    from_quic_pending,
+                    to_quic_pending_bytes,
+                    from_quic_pending_bytes,
+                    quic_rx_closed,
+                    is_udp: _,
+                    udp_read_state,
+                    last_seen,
+                } = bridge;
 
-            if !socket.is_active() {
-                if !closed_handles.contains(&handle) {
-                    closed_handles.push(handle);
-                }
-                continue;
-            }
-
-            if let BridgeQuicState::Opening(opening) = &mut bridge.quic {
-                match with_notify_context(&self.bridge_notify, |cx| opening.as_mut().poll(cx)) {
-                    Poll::Ready(Some(active)) => {
-                        bridge.quic = BridgeQuicState::Active(active);
-                    }
-                    Poll::Ready(None) => {
-                        if !closed_handles.contains(&handle) {
-                            closed_handles.push(handle);
+                if let BridgeQuicState::Opening(opening) = quic {
+                    match with_notify_context(&self.bridge_notify, |cx| opening.as_mut().poll(cx)) {
+                        Poll::Ready(Some(active)) => {
+                            *quic = BridgeQuicState::Active(active);
                         }
-                        continue;
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            while !bridge.to_quic_pending.is_empty() {
-                let BridgeQuicState::Active(active) = &mut bridge.quic else {
-                    break;
-                };
-                let poll_result = {
-                    let front = bridge.to_quic_pending.front().expect("front exists");
-                    with_notify_context(&self.bridge_notify, |cx| {
-                        Pin::new(&mut active.send).poll_write(cx, front.as_slice())
-                    })
-                };
-                match poll_result {
-                    Poll::Ready(Ok(0)) | Poll::Pending => break,
-                    Poll::Ready(Ok(n)) => {
-                        active.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                        active
-                            .conn_stat
-                            .tx_bytes
-                            .fetch_add(n as u64, Ordering::Relaxed);
-                        bridge.consume_to_quic_front(n);
-                    }
-                    Poll::Ready(Err(_)) => {
-                        if !closed_handles.contains(&handle) {
-                            closed_handles.push(handle);
+                        Poll::Ready(None) => {
+                            if !closed_handles.contains(&handle) {
+                                closed_handles.push(handle);
+                            }
+                            continue;
                         }
+                        Poll::Pending => {}
+                    }
+                }
+
+                if let BridgeQuicState::Active(active) = quic {
+                    let chunk_capacity = recv_buf.capacity().max(1);
+                    while from_quic_pending.len() < bridge_pending_limit()
+                        && *from_quic_pending_bytes + chunk_capacity <= bridge_pending_bytes_limit()
+                        && !*quic_rx_closed
+                    {
+                        let poll_result = with_notify_context(&self.bridge_notify, |cx| {
+                            match udp_read_state {
+                                UdpReadState::ReadLen { len_buf, bytes_read } => {
+                                    let mut read_buf = ReadBuf::new(&mut len_buf[*bytes_read..2]);
+                                    match Pin::new(&mut active.recv).poll_read(cx, &mut read_buf) {
+                                        Poll::Ready(Ok(())) => {
+                                            let n = read_buf.filled().len();
+                                            if n == 0 {
+                                                Poll::Ready(Ok(0))
+                                            } else {
+                                                *bytes_read += n;
+                                                Poll::Ready(Ok(n))
+                                            }
+                                        }
+                                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                                        Poll::Pending => Poll::Pending,
+                                    }
+                                }
+                                UdpReadState::ReadPayload { payload_len, payload_buf, bytes_read } => {
+                                    let mut read_buf = ReadBuf::new(&mut payload_buf.as_mut_capacity()[*bytes_read..*payload_len]);
+                                    match Pin::new(&mut active.recv).poll_read(cx, &mut read_buf) {
+                                        Poll::Ready(Ok(())) => {
+                                            let n = read_buf.filled().len();
+                                            if n == 0 {
+                                                Poll::Ready(Ok(0))
+                                            } else {
+                                                *bytes_read += n;
+                                                Poll::Ready(Ok(n))
+                                            }
+                                        }
+                                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                                        Poll::Pending => Poll::Pending,
+                                    }
+                                }
+                            }
+                        });
+
+                        match poll_result {
+                            Poll::Ready(Ok(n)) if n > 0 => {
+                                active.stats.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                active.conn_stat.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                *last_seen = Instant::now();
+
+                                match udp_read_state {
+                                    UdpReadState::ReadLen { len_buf, bytes_read } => {
+                                        if *bytes_read == 2 {
+                                            let payload_len = u16::from_be_bytes(*len_buf) as usize;
+                                            let payload_buf = self.buffer_pool.get();
+                                            *udp_read_state = UdpReadState::ReadPayload {
+                                                payload_len,
+                                                payload_buf,
+                                                bytes_read: 0,
+                                            };
+                                        }
+                                    }
+                                    UdpReadState::ReadPayload { payload_len, payload_buf, bytes_read } => {
+                                        if bytes_read == payload_len {
+                                            let mut data = std::mem::replace(payload_buf, self.buffer_pool.get());
+                                            data.set_len(*payload_len);
+                                            
+                                            // push_from_quic_pending inline:
+                                            if from_quic_pending.len() >= bridge_pending_limit()
+                                                || from_quic_pending_bytes.saturating_add(data.len())
+                                                    > bridge_pending_bytes_limit()
+                                            {
+                                                log::warn!("Userspace UDP bridge from-QUIC queue byte limit reached; closing bridge");
+                                                if !closed_handles.contains(&handle) {
+                                                    closed_handles.push(handle);
+                                                }
+                                                break;
+                                            }
+                                            *from_quic_pending_bytes += data.len();
+                                            from_quic_pending.push_back(data);
+
+                                            *udp_read_state = UdpReadState::ReadLen {
+                                                len_buf: [0u8; 2],
+                                                bytes_read: 0,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            Poll::Ready(Ok(_)) => {
+                                *quic_rx_closed = true;
+                                break;
+                            }
+                            Poll::Ready(Err(_)) => {
+                                if !closed_handles.contains(&handle) {
+                                    closed_handles.push(handle);
+                                }
+                                break;
+                            }
+                            Poll::Pending => break,
+                        }
+                    }
+
+                    let socket = self.tcp_stack.sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                    while socket.can_send() {
+                        let Some(front) = from_quic_pending.front() else {
+                            break;
+                        };
+                        let client_endpoint = smoltcp::wire::IpEndpoint::new(
+                            std_ip_to_smoltcp(nat_key.0),
+                            nat_key.1,
+                        );
+                        match socket.send(front.len(), client_endpoint) {
+                            Ok(buf) => {
+                                buf.copy_from_slice(front.as_slice());
+                                let len = front.len();
+                                from_quic_pending.pop_front();
+                                *from_quic_pending_bytes = from_quic_pending_bytes.saturating_sub(len);
+                                *last_seen = Instant::now();
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    while socket.can_recv()
+                        && to_quic_pending.len() < bridge_pending_limit()
+                        && *to_quic_pending_bytes < bridge_pending_bytes_limit()
+                    {
+                        match socket.recv() {
+                            Ok((data, _metadata)) => {
+                                let n = data.len();
+                                if n > 0 {
+                                    let mut framed_data = self.buffer_pool.get();
+                                    framed_data.as_mut_capacity()[..2].copy_from_slice(&(n as u16).to_be_bytes());
+                                    framed_data.as_mut_capacity()[2..2 + n].copy_from_slice(&data[..n]);
+                                    framed_data.set_len(2 + n);
+                                    
+                                    // push_to_quic_pending inline:
+                                    if to_quic_pending.len() >= bridge_pending_limit()
+                                        || to_quic_pending_bytes.saturating_add(framed_data.len())
+                                            > bridge_pending_bytes_limit()
+                                    {
+                                        log::warn!("Userspace UDP bridge to-QUIC queue byte limit reached; closing bridge");
+                                        if !closed_handles.contains(&handle) {
+                                            closed_handles.push(handle);
+                                        }
+                                        break;
+                                    }
+                                    *to_quic_pending_bytes += framed_data.len();
+                                    to_quic_pending.push_back(framed_data);
+
+                                    *last_seen = Instant::now();
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    while !to_quic_pending.is_empty() {
+                        let poll_result = {
+                            let front = to_quic_pending.front().expect("front exists");
+                            with_notify_context(&self.bridge_notify, |cx| {
+                                Pin::new(&mut active.send).poll_write(cx, front.as_slice())
+                            })
+                        };
+                        match poll_result {
+                            Poll::Ready(Ok(0)) | Poll::Pending => break,
+                            Poll::Ready(Ok(n)) => {
+                                active.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                active.conn_stat.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                
+                                // consume_to_quic_front inline:
+                                *to_quic_pending_bytes = to_quic_pending_bytes.saturating_sub(n);
+                                if let Some(front) = to_quic_pending.front_mut() {
+                                    if n >= front.len() {
+                                        to_quic_pending.pop_front();
+                                    } else {
+                                        front.consume_front(n);
+                                    }
+                                }
+
+                                *last_seen = Instant::now();
+                            }
+                            Poll::Ready(Err(_)) => {
+                                if !closed_handles.contains(&handle) {
+                                    closed_handles.push(handle);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if Instant::now().duration_since(*last_seen) >= Duration::from_secs(30) {
+                    log::info!("UDP bridge on local port {} timed out due to inactivity", nat_key.2);
+                    if !closed_handles.contains(&handle) {
+                        closed_handles.push(handle);
+                    }
+                }
+            } else {
+                let socket = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
+
+                if !socket.is_active() {
+                    if !closed_handles.contains(&handle) {
+                        closed_handles.push(handle);
+                    }
+                    continue;
+                }
+
+                if let BridgeQuicState::Opening(opening) = &mut bridge.quic {
+                    match with_notify_context(&self.bridge_notify, |cx| opening.as_mut().poll(cx)) {
+                        Poll::Ready(Some(active)) => {
+                            bridge.quic = BridgeQuicState::Active(active);
+                        }
+                        Poll::Ready(None) => {
+                            if !closed_handles.contains(&handle) {
+                                closed_handles.push(handle);
+                            }
+                            continue;
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+
+                while !bridge.to_quic_pending.is_empty() {
+                    let BridgeQuicState::Active(active) = &mut bridge.quic else {
                         break;
-                    }
-                }
-            }
-
-            while bridge.has_from_quic_pending_capacity() && !bridge.quic_rx_closed {
-                let BridgeQuicState::Active(active) = &mut bridge.quic else {
-                    break;
-                };
-                let poll_result = with_notify_context(&self.bridge_notify, |cx| {
-                    let mut read_buf = ReadBuf::new(bridge.quic_recv_buf.as_mut_capacity());
-                    match Pin::new(&mut active.recv).poll_read(cx, &mut read_buf) {
-                        Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                        Poll::Pending => Poll::Pending,
-                    }
-                });
-                match poll_result {
-                    Poll::Ready(Ok(n)) if n > 0 => {
-                        active.stats.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                        active
-                            .conn_stat
-                            .rx_bytes
-                            .fetch_add(n as u64, Ordering::Relaxed);
-                        let mut data =
-                            std::mem::replace(&mut bridge.quic_recv_buf, self.buffer_pool.get());
-                        data.set_len(n);
-                        if !bridge.push_from_quic_pending(data) {
-                            log::warn!("Userspace TCP bridge from-QUIC queue byte limit reached; closing bridge");
+                    };
+                    let poll_result = {
+                        let front = bridge.to_quic_pending.front().expect("front exists");
+                        with_notify_context(&self.bridge_notify, |cx| {
+                            Pin::new(&mut active.send).poll_write(cx, front.as_slice())
+                        })
+                    };
+                    match poll_result {
+                        Poll::Ready(Ok(0)) | Poll::Pending => break,
+                        Poll::Ready(Ok(n)) => {
+                            active.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            active
+                                .conn_stat
+                                .tx_bytes
+                                .fetch_add(n as u64, Ordering::Relaxed);
+                            bridge.consume_to_quic_front(n);
+                        }
+                        Poll::Ready(Err(_)) => {
                             if !closed_handles.contains(&handle) {
                                 closed_handles.push(handle);
                             }
                             break;
                         }
                     }
-                    Poll::Ready(Ok(_)) => {
-                        bridge.quic_rx_closed = true;
+                }
+
+                while bridge.has_from_quic_pending_capacity() && !bridge.quic_rx_closed {
+                    let BridgeQuicState::Active(active) = &mut bridge.quic else {
                         break;
-                    }
-                    Poll::Ready(Err(_)) => {
-                        if !closed_handles.contains(&handle) {
-                            closed_handles.push(handle);
+                    };
+                    let poll_result = with_notify_context(&self.bridge_notify, |cx| {
+                        let mut read_buf = ReadBuf::new(bridge.quic_recv_buf.as_mut_capacity());
+                        match Pin::new(&mut active.recv).poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                            Poll::Pending => Poll::Pending,
                         }
-                        break;
-                    }
-                    Poll::Pending => break,
-                }
-            }
-
-            while socket.can_send() {
-                let Some(front_len) = bridge.from_quic_pending.front().map(|front| front.len())
-                else {
-                    break;
-                };
-                let send_result = {
-                    let front = bridge.from_quic_pending.front_mut().expect("front exists");
-                    socket.send_slice(front.as_slice())
-                };
-                match send_result {
-                    Ok(0) => break,
-                    Ok(n) if n >= front_len => {
-                        bridge.consume_from_quic_front(n);
-                    }
-                    Ok(n) => {
-                        bridge.consume_from_quic_front(n);
-                    }
-                    Err(_) => break,
-                }
-            }
-            if bridge.quic_rx_closed && bridge.from_quic_pending.is_empty() {
-                socket.close();
-            }
-
-            while socket.can_recv()
-                && bridge.to_quic_pending.len() < bridge_pending_limit()
-                && bridge.to_quic_pending_bytes < bridge_pending_bytes_limit()
-            {
-                let remaining = bridge_pending_bytes_limit() - bridge.to_quic_pending_bytes;
-                let read_len = self.packet_buffer_size.min(remaining);
-                if read_len == 0 {
-                    break;
-                }
-                if let Ok(n) = socket.recv_slice(&mut bridge.recv_buf.as_mut_capacity()[..read_len])
-                {
-                    if n > 0 {
-                        let mut data =
-                            std::mem::replace(&mut bridge.recv_buf, self.buffer_pool.get());
-                        data.set_len(n);
-                        if !bridge.push_to_quic_pending(data) {
-                            log::warn!("Userspace TCP bridge to-QUIC queue byte limit reached; closing bridge");
+                    });
+                    match poll_result {
+                        Poll::Ready(Ok(n)) if n > 0 => {
+                            active.stats.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            active
+                                .conn_stat
+                                .rx_bytes
+                                .fetch_add(n as u64, Ordering::Relaxed);
+                            let mut data =
+                                std::mem::replace(&mut bridge.quic_recv_buf, self.buffer_pool.get());
+                            data.set_len(n);
+                            if !bridge.push_from_quic_pending(data) {
+                                log::warn!("Userspace TCP bridge from-QUIC queue byte limit reached; closing bridge");
+                                if !closed_handles.contains(&handle) {
+                                    closed_handles.push(handle);
+                                }
+                                break;
+                            }
+                        }
+                        Poll::Ready(Ok(_)) => {
+                            bridge.quic_rx_closed = true;
+                            break;
+                        }
+                        Poll::Ready(Err(_)) => {
                             if !closed_handles.contains(&handle) {
                                 closed_handles.push(handle);
                             }
+                            break;
+                        }
+                        Poll::Pending => break,
+                    }
+                }
+
+                while socket.can_send() {
+                    let Some(front_len) = bridge.from_quic_pending.front().map(|front| front.len())
+                    else {
+                        break;
+                    };
+                    let send_result = {
+                        let front = bridge.from_quic_pending.front_mut().expect("front exists");
+                        socket.send_slice(front.as_slice())
+                    };
+                    match send_result {
+                        Ok(0) => break,
+                        Ok(n) if n >= front_len => {
+                            bridge.consume_from_quic_front(n);
+                        }
+                        Ok(n) => {
+                            bridge.consume_from_quic_front(n);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if bridge.quic_rx_closed && bridge.from_quic_pending.is_empty() {
+                    socket.close();
+                }
+
+                while socket.can_recv()
+                    && bridge.to_quic_pending.len() < bridge_pending_limit()
+                    && bridge.to_quic_pending_bytes < bridge_pending_bytes_limit()
+                {
+                    let remaining = bridge_pending_bytes_limit() - bridge.to_quic_pending_bytes;
+                    let read_len = self.packet_buffer_size.min(remaining);
+                    if read_len == 0 {
+                        break;
+                    }
+                    if let Ok(n) = socket.recv_slice(&mut bridge.recv_buf.as_mut_capacity()[..read_len])
+                    {
+                        if n > 0 {
+                            let mut data =
+                                std::mem::replace(&mut bridge.recv_buf, self.buffer_pool.get());
+                            data.set_len(n);
+                            if !bridge.push_to_quic_pending(data) {
+                                log::warn!("Userspace TCP bridge to-QUIC queue byte limit reached; closing bridge");
+                                if !closed_handles.contains(&handle) {
+                                    closed_handles.push(handle);
+                                }
+                                break;
+                            }
+                        } else {
                             break;
                         }
                     } else {
                         break;
                     }
-                } else {
-                    break;
                 }
             }
         }
@@ -1441,10 +1615,410 @@ impl RtcWorker {
             self.pending_bridge_handles.remove(&handle);
             if let Some(bridge) = self.bridges.remove(&handle) {
                 let _ = self.release_nat_key(&bridge.nat_key);
+                if bridge.is_udp {
+                    self.tcp_stack.sockets.remove(handle);
+                } else {
+                    let socket = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
+                    socket.abort();
+                    self.tcp_stack.sockets.remove(handle);
+                }
             }
-            let socket = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
-            socket.abort();
-            self.tcp_stack.sockets.remove(handle);
+        }
+    }
+
+    pub fn flush_smoltcp_tx_to_tun(&mut self) {
+        while let Some(mut pkt) = self.tcp_stack.device.tx_queue.pop_front() {
+            if let Some((_src_ip, src_port, dst_ip, dst_port, _)) = parse_tcp_packet(pkt.as_slice()) {
+                let key = (dst_ip, dst_port, src_port);
+                if let Some(entry) = self.nat_map.get(&key) {
+                    rewrite_source_ip(pkt.as_mut_slice(), entry.original_dst_ip);
+                    rewrite_source_port(pkt.as_mut_slice(), entry.original_dst_port);
+                    repair_tcp_checksums(pkt.as_mut_slice());
+                }
+            } else if let Some((_src_ip, src_port, dst_ip, dst_port)) = parse_udp_packet(pkt.as_slice()) {
+                let key = (dst_ip, dst_port, src_port);
+                if let Some(entry) = self.nat_map.get(&key) {
+                    rewrite_source_ip(pkt.as_mut_slice(), entry.original_dst_ip);
+                    rewrite_source_port(pkt.as_mut_slice(), entry.original_dst_port);
+                    repair_udp_checksums(pkt.as_mut_slice());
+                }
+            }
+            self.write_or_queue_tun_packet(pkt, "smoltcp");
+        }
+    }
+
+    pub fn process_tun_packet(&mut self, mut tun_buf: PooledBuf, data_plane: Option<&crate::L4DataPlane>) {
+        let n = tun_buf.len();
+        let packet = tun_buf.as_mut_slice();
+        if let Some((src_ip, src_port, dst_ip, dst_port, is_syn)) = parse_tcp_packet(packet) {
+            let flow_key = (src_ip, src_port, dst_ip, dst_port);
+            let existing_flow = self.flow_map.contains_key(&flow_key);
+            let offload_peer_for_new_flow = if !existing_flow && is_syn {
+                if let Some(dp) = data_plane {
+                    let snapshot = dp.load();
+                    snapshot
+                        .userspace_tcp_offload_enabled
+                        .then(|| snapshot.router.longest_match(dst_ip))
+                        .flatten()
+                        .filter(|peer_pub_key| {
+                            snapshot
+                                .client_quic_pools
+                                .get(peer_pub_key)
+                                .map(|pool| matches!(pool.get_state(), crate::quic_pool::PoolState::Active))
+                                .unwrap_or(false)
+                        })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let offload_available_for_new_flow = offload_peer_for_new_flow.is_some();
+
+            if self.should_route_via_smoltcp(&flow_key, is_syn, offload_available_for_new_flow) {
+                let Some(local_ip) = self.local_ip_for(dst_ip) else {
+                    log::warn!(
+                        "No configured smoltcp local address for {}; using userspace WireGuard L3",
+                        dst_ip
+                    );
+                    if let Some((endpoint, enc_pkt)) =
+                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                    {
+                        self.record_l3_packet(n);
+                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                    }
+                    return;
+                };
+                if self.tcp_flow_limit_reached_for_new_flow(&flow_key, is_syn) {
+                    log::warn!(
+                        "Userspace TCP flow limit reached; falling back to userspace WireGuard L3"
+                    );
+                    if let Some((endpoint, enc_pkt)) =
+                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                    {
+                        self.record_l3_packet(n);
+                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                    }
+                    return;
+                }
+
+                let local_port = if is_syn {
+                    match self.flow_map.get(&flow_key).copied() {
+                        Some(port) => port,
+                        None => match self.allocate_local_port() {
+                            Some(port) => {
+                                self.insert_flow_port(flow_key, port);
+                                self.record_new_tcp_flow();
+                                port
+                            }
+                            None => {
+                                log::warn!("No free smoltcp local ports; falling back to userspace WireGuard L3");
+                                if let Some((endpoint, enc_pkt)) =
+                                    self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                                {
+                                    self.record_l3_packet(n);
+                                    self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                                }
+                                return;
+                            }
+                        },
+                    }
+                } else if let Some(port) = self.flow_map.get(&flow_key).copied() {
+                    port
+                } else {
+                    log::debug!("No userspace TCP flow state for non-SYN packet; using userspace WireGuard L3");
+                    if let Some((endpoint, enc_pkt)) =
+                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                    {
+                        self.record_l3_packet(n);
+                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                    }
+                    return;
+                };
+
+                if is_syn {
+                    let has_listening = self.tcp_stack.sockets.iter().any(|(_, s)| {
+                        if let Some(s) = tcp::Socket::downcast(s) {
+                            s.state() == tcp::State::Listen && s.local_endpoint().map(|ep| ep.port == local_port).unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    });
+                    if !has_listening {
+                        match self.tcp_stack.create_tcp_socket(
+                            userspace_tcp_socket_buffer_bytes(),
+                            userspace_tcp_socket_buffer_bytes(),
+                        ) {
+                            Ok(handle) => {
+                                let listen_result = {
+                                    let s = self.tcp_stack.sockets.get_mut::<tcp::Socket>(handle);
+                                    s.listen(local_port)
+                                };
+                                if let Err(e) = listen_result {
+                                    self.tcp_stack.sockets.remove(handle);
+                                    self.release_flow_port(&flow_key);
+                                    log::warn!(
+                                        "Failed to create userspace TCP listener on port {}: {}; falling back to userspace WireGuard L3",
+                                        local_port,
+                                        e
+                                    );
+                                    if let Some((endpoint, enc_pkt)) =
+                                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                                    {
+                                        self.record_l3_packet(n);
+                                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                                    }
+                                    return;
+                                }
+                                log::debug!("Created userspace listening TCP socket on port {}", local_port);
+                                self.pending_bridge_handles.insert(handle);
+                            }
+                            Err(e) => {
+                                self.release_flow_port(&flow_key);
+                                log::warn!(
+                                    "Failed to allocate userspace TCP socket: {}; falling back to userspace WireGuard L3",
+                                    e
+                                );
+                                if let Some((endpoint, enc_pkt)) =
+                                    self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                                {
+                                    self.record_l3_packet(n);
+                                    self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let peer_pub_key = offload_peer_for_new_flow.or_else(|| {
+                    self.nat_map
+                        .get(&(src_ip, src_port, local_port))
+                        .map(|entry| entry.peer_pub_key)
+                });
+                let Some(peer_pub_key) = peer_pub_key else {
+                    log::warn!(
+                        "No QUIC peer mapping for userspace TCP flow; falling back to userspace WireGuard L3"
+                    );
+                    if let Some((endpoint, enc_pkt)) =
+                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                    {
+                        self.record_l3_packet(n);
+                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                    }
+                    return;
+                };
+
+                self.nat_map.insert(
+                    (src_ip, src_port, local_port),
+                    NatEntry {
+                        original_dst_ip: dst_ip,
+                        original_dst_port: dst_port,
+                        peer_pub_key,
+                        flow_key,
+                        last_seen: Instant::now(),
+                    },
+                );
+
+                rewrite_destination_ip(packet, local_ip);
+                rewrite_destination_port(packet, local_port);
+
+                self.record_tcp_offload(n);
+                self.tcp_stack.process_input_packet(tun_buf);
+            } else {
+                if let Some((endpoint, enc_pkt)) =
+                    self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                {
+                    self.record_l3_packet(n);
+                    self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard");
+                }
+            }
+        } else if let Some((src_ip, src_port, dst_ip, dst_port)) = parse_udp_packet(packet) {
+            let flow_key = (src_ip, src_port, dst_ip, dst_port);
+            let existing_flow = self.flow_map.contains_key(&flow_key);
+            let offload_peer = if !existing_flow {
+                if let Some(dp) = data_plane {
+                    let snapshot = dp.load();
+                    snapshot
+                        .userspace_tcp_offload_enabled
+                        .then(|| snapshot.router.longest_match(dst_ip))
+                        .flatten()
+                        .filter(|peer_pub_key| {
+                            snapshot
+                                .client_quic_pools
+                                .get(peer_pub_key)
+                                .map(|pool| matches!(pool.get_state(), crate::quic_pool::PoolState::Active))
+                                .unwrap_or(false)
+                        })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if existing_flow || offload_peer.is_some() {
+                let Some(local_ip) = self.local_ip_for(dst_ip) else {
+                    log::warn!("No configured smoltcp local address for UDP {}; using userspace WireGuard L3", dst_ip);
+                    if let Some((endpoint, enc_pkt)) =
+                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                    {
+                        self.record_l3_packet(n);
+                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                    }
+                    return;
+                };
+
+                let local_port = if !existing_flow {
+                    match self.allocate_local_port() {
+                        Some(port) => {
+                            self.insert_flow_port(flow_key, port);
+                            port
+                        }
+                        None => {
+                            log::warn!("No free smoltcp local ports for UDP; falling back to userspace WireGuard L3");
+                            if let Some((endpoint, enc_pkt)) =
+                                self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                            {
+                                self.record_l3_packet(n);
+                                self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    self.flow_map.get(&flow_key).copied().unwrap()
+                };
+
+                let peer_pub_key = offload_peer.or_else(|| {
+                    self.nat_map
+                        .get(&(src_ip, src_port, local_port))
+                        .map(|entry| entry.peer_pub_key)
+                });
+                let Some(peer_pub_key) = peer_pub_key else {
+                    if let Some((endpoint, enc_pkt)) =
+                        self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                    {
+                        self.record_l3_packet(n);
+                        self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                    }
+                    return;
+                };
+
+                let nat_key = (src_ip, src_port, local_port);
+                self.nat_map.insert(
+                    nat_key,
+                    NatEntry {
+                        original_dst_ip: dst_ip,
+                        original_dst_port: dst_port,
+                        peer_pub_key,
+                        flow_key,
+                        last_seen: Instant::now(),
+                    },
+                );
+
+                if !existing_flow {
+                    match self.tcp_stack.create_udp_socket(65536, 65536) {
+                        Ok(handle) => {
+                            let bind_result = {
+                                let s = self.tcp_stack.sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                                s.bind(local_port)
+                            };
+                            if let Err(e) = bind_result {
+                                self.tcp_stack.sockets.remove(handle);
+                                self.release_flow_port(&flow_key);
+                                self.nat_map.remove(&nat_key);
+                                log::warn!("Failed to bind userspace UDP socket on port {}: {}; falling back to userspace WireGuard L3", local_port, e);
+                                if let Some((endpoint, enc_pkt)) =
+                                    self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                                {
+                                    self.record_l3_packet(n);
+                                    self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                                }
+                                return;
+                            }
+                            
+                            let original_dest = std::net::SocketAddr::new(dst_ip, dst_port);
+                            if let Some(dp) = data_plane {
+                                let opening = establish_quic_bridge_udp(
+                                    original_dest,
+                                    peer_pub_key,
+                                    dp.load_full(),
+                                    self.peer_telemetry.clone(),
+                                );
+                                self.bridges.insert(
+                                    handle,
+                                    BridgeChannels {
+                                        nat_key,
+                                        quic: BridgeQuicState::Opening(Box::pin(opening)),
+                                        recv_buf: self.buffer_pool.get(),
+                                        quic_recv_buf: self.buffer_pool.get(),
+                                        to_quic_pending: VecDeque::new(),
+                                        from_quic_pending: VecDeque::new(),
+                                        to_quic_pending_bytes: 0,
+                                        from_quic_pending_bytes: 0,
+                                        quic_rx_closed: false,
+                                        is_udp: true,
+                                        udp_read_state: UdpReadState::default(),
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                            } else {
+                                self.bridges.insert(
+                                    handle,
+                                    BridgeChannels {
+                                        nat_key,
+                                        quic: BridgeQuicState::Inactive,
+                                        recv_buf: self.buffer_pool.get(),
+                                        quic_recv_buf: self.buffer_pool.get(),
+                                        to_quic_pending: VecDeque::new(),
+                                        from_quic_pending: VecDeque::new(),
+                                        to_quic_pending_bytes: 0,
+                                        from_quic_pending_bytes: 0,
+                                        quic_rx_closed: false,
+                                        is_udp: true,
+                                        udp_read_state: UdpReadState::default(),
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            self.release_flow_port(&flow_key);
+                            self.nat_map.remove(&nat_key);
+                            log::warn!("Failed to allocate userspace UDP socket: {}; falling back to userspace WireGuard L3", e);
+                            if let Some((endpoint, enc_pkt)) =
+                                self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                            {
+                                self.record_l3_packet(n);
+                                self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard fallback");
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                rewrite_destination_ip(packet, local_ip);
+                rewrite_destination_port(packet, local_port);
+                repair_udp_checksums(packet);
+
+                self.record_tcp_offload(n);
+                self.tcp_stack.process_input_packet(tun_buf);
+            } else {
+                if let Some((endpoint, enc_pkt)) =
+                    self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+                {
+                    self.record_l3_packet(n);
+                    self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard");
+                }
+            }
+        } else {
+            if let Some((endpoint, enc_pkt)) =
+                self.l3_registry.encapsulate_tunnel_packet(packet, &self.buffer_pool)
+            {
+                self.record_l3_packet(n);
+                self.send_or_queue_udp_packet(endpoint, enc_pkt, "userspace WireGuard");
+            }
         }
     }
 
@@ -1616,7 +2190,7 @@ mod tests {
     fn bridge_pending_queues_are_capped_by_bytes() {
         let pool = BufferPool::new(bridge_pending_bytes_limit());
         let mut bridge = BridgeChannels {
-            nat_key: ("10.0.0.2".parse().unwrap(), 40000, 49152),
+            nat_key: ("10.0.0.1".parse().unwrap(), 12345, 80),
             quic: BridgeQuicState::Inactive,
             recv_buf: pool.get(),
             quic_recv_buf: pool.get(),
@@ -1625,6 +2199,9 @@ mod tests {
             to_quic_pending_bytes: 0,
             from_quic_pending_bytes: 0,
             quic_rx_closed: false,
+            is_udp: false,
+            udp_read_state: UdpReadState::default(),
+            last_seen: Instant::now(),
         };
 
         let mut full = pool.get();
@@ -1858,6 +2435,9 @@ mod tests {
                 to_quic_pending_bytes: 0,
                 from_quic_pending_bytes: 0,
                 quic_rx_closed: false,
+                is_udp: false,
+                udp_read_state: UdpReadState::default(),
+                last_seen: Instant::now(),
             },
         );
         worker.last_housekeeping = Instant::now() - HOUSEKEEPING_INTERVAL - Duration::from_secs(1);
@@ -2101,5 +2681,72 @@ mod tests {
         assert_eq!(res.1, 53000);
         assert_eq!(res.2, IpAddr::V6(Ipv6Addr::new(2, 0, 0, 0, 0, 0, 0, 3)));
         assert_eq!(res.3, 53);
+    }
+
+    #[tokio::test]
+    async fn test_client_udp_bridge_and_nat() {
+        use std::sync::Arc;
+        use std::collections::HashMap;
+        use crate::routing::AllowedIPsRouter;
+        use crate::quic_pool::QuicPoolClient;
+
+        let mut worker = test_worker();
+
+        let private_key = boringtun::x25519::StaticSecret::from([1u8; 32]);
+        let public_key = boringtun::x25519::PublicKey::from(&private_key);
+        let client = Arc::new(QuicPoolClient::new(
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            vec!["127.0.0.1:12345".parse().unwrap()],
+        ));
+        let mut client_quic_pools = HashMap::new();
+        client_quic_pools.insert(public_key.to_bytes(), client);
+
+        let mut router = AllowedIPsRouter::new();
+        router.insert("10.0.0.0/24".parse().unwrap(), public_key.to_bytes());
+
+        let snapshot = crate::L4DataPlaneSnapshot {
+            router,
+            userspace_tcp_offload_enabled: true,
+            client_quic_pools,
+        };
+        let data_plane = Arc::new(arc_swap::ArcSwap::from_pointee(snapshot));
+
+        // Construct mock UDP packet from client to a target
+        let mut pkt = worker.buffer_pool.get();
+        let mut data = vec![0u8; 28];
+        data[0] = 0x45; // Version 4, IHL 20
+        data[2..4].copy_from_slice(&28u16.to_be_bytes()); // IPv4 Total Length
+        data[9] = 17;   // UDP Protocol
+        data[12..16].copy_from_slice(&[10, 0, 0, 10]); // Src IP (Client IP)
+        data[16..20].copy_from_slice(&[10, 0, 0, 100]); // Dst IP (Target IP)
+        data[20..22].copy_from_slice(&53000u16.to_be_bytes()); // Src Port
+        data[22..24].copy_from_slice(&53u16.to_be_bytes());    // Dst Port
+        pkt.as_mut_capacity()[..28].copy_from_slice(&data);
+        pkt.set_len(28);
+
+        // Process the packet
+        worker.process_tun_packet(pkt, Some(&data_plane));
+
+        // Verify that:
+        // 1. NAT mapping was allocated.
+        let flow_key = (
+            "10.0.0.10".parse::<std::net::IpAddr>().unwrap(),
+            53000,
+            "10.0.0.100".parse::<std::net::IpAddr>().unwrap(),
+            53,
+        );
+        let local_port = worker.flow_map.get(&flow_key).copied().unwrap();
+        let nat_key = ("10.0.0.10".parse().unwrap(), 53000, local_port);
+        let entry = worker.nat_map.get(&nat_key).unwrap();
+        assert_eq!(entry.original_dst_ip, "10.0.0.100".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(entry.original_dst_port, 53);
+
+        // 2. A UDP bridge was created in bridges map.
+        let bridge_handle = worker.bridges.keys().copied().next().unwrap();
+        let bridge = worker.bridges.get(&bridge_handle).unwrap();
+        assert!(bridge.is_udp);
+        assert_eq!(bridge.nat_key, nat_key);
     }
 }
