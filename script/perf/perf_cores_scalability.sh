@@ -171,7 +171,7 @@ PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
-Table = off
+Table = auto
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
@@ -179,7 +179,7 @@ ListenPorts = ${listen_ports}
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
-AllowedIPs = 10.0.0.2/32
+AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 EOF_CONF
 }
 
@@ -199,16 +199,12 @@ ip link set vs-w netns scale_work_ns
 ip link set vs-cw netns scale_client_ns
 
 ip netns exec scale_server_ns ip addr add 10.0.2.2/24 dev vs-s
-ip netns exec scale_server_ns ip addr add 10.0.0.1/32 dev lo
 ip netns exec scale_server_ns ip link set vs-s up
 ip netns exec scale_server_ns ip link set lo up
 ip netns exec scale_server_ns ip route add default via 10.0.2.1
-ip netns exec scale_server_ns ip route add 10.0.0.1/32 dev lo scope host
-ip netns exec scale_server_ns ip route add 10.0.0.2/32 via 10.0.2.1
 
 ip netns exec scale_client_ns ip addr add 10.0.1.2/24 dev vs-c
 ip netns exec scale_client_ns ip addr add 10.0.4.1/24 dev vs-cw
-ip netns exec scale_client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec scale_client_ns ip link set vs-c up
 ip netns exec scale_client_ns ip link set vs-cw up
 ip netns exec scale_client_ns ip link set lo up
@@ -230,8 +226,6 @@ ip netns exec scale_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec scale_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count="$BLOB_MIB" status=none
-ip netns exec scale_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
-HTTP_PID=$!
 
 run_group() {
   local data_ports="$1"
@@ -251,6 +245,9 @@ run_group() {
     cat "$server_log" >&2
     exit 1
   fi
+
+  ip netns exec scale_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
+  HTTP_PID=$!
 
   ip netns exec scale_client_ns taskset -c "$cpus" "$ROOT_DIR/target/release/new_proxy" -config "$CLIENT_CONF" > "$client_log" 2>&1 &
   CLIENT_PID=$!
@@ -303,6 +300,82 @@ PY
     exit 1
   fi
 
+  # Run UDP benchmark
+  ip netns exec scale_server_ns python3 - <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
+import socket
+import sys
+import time
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+sock.bind(('10.0.0.1', 9999))
+sock.settimeout(5.0)
+
+bytes_received = 0
+start = None
+last_packet_time = None
+
+try:
+    while True:
+        data, addr = sock.recvfrom(65535)
+        if not data:
+            break
+        now = time.monotonic()
+        if start is None:
+            start = now
+        last_packet_time = now
+        if data == b'EOF':
+            break
+        bytes_received += len(data)
+except socket.timeout:
+    pass
+
+duration = last_packet_time - start if (start and last_packet_time) else 0.001
+if duration <= 0:
+    duration = 0.001
+print(f"{bytes_received},{duration:.6f}")
+PY
+  UDP_RECV_PID=$!
+  sleep 1
+
+  ip netns exec scale_work_ns python3 - "$PARALLEL" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
+import socket
+import sys
+import time
+import concurrent.futures
+
+parallel = int(sys.argv[1])
+total_to_send = 128 * 1024 * 1024
+per_thread = total_to_send // parallel
+chunk_size = 1100
+data = b'X' * chunk_size
+
+def send_one(_):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dest = ('10.0.0.1', 9999)
+    sent = 0
+    while sent < per_thread:
+        sock.sendto(data, dest)
+        sent += chunk_size
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+    list(ex.map(send_one, range(parallel)))
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for _ in range(20):
+    sock.sendto(b'EOF', ('10.0.0.1', 9999))
+PY
+
+  wait "$UDP_RECV_PID" || true
+  local udp_line
+  udp_line="$(cat "$ARTIFACT_DIR/udp_recv_${data_ports}.log")"
+  local udp_bytes
+  local udp_secs
+  udp_bytes="$(echo "$udp_line" | cut -d',' -f1)"
+  udp_secs="$(echo "$udp_line" | cut -d',' -f2)"
+  local udp_mib_s
+  udp_mib_s="$(python3 -c "print('{:.3f}'.format(int($udp_bytes) / 1024 / 1024 / float($udp_secs)))" 2>/dev/null || echo "0.000")"
+
   ip netns exec scale_client_ns "$ROOT_DIR/target/release/new-proxy-cli" --interface client dump > "$worker_dump"
   kill "$CLIENT_PID" 2>/dev/null || true
   wait "$CLIENT_PID" 2>/dev/null || true
@@ -310,14 +383,17 @@ PY
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
   SERVER_PID=""
+  kill "$HTTP_PID" 2>/dev/null || true
+  wait "$HTTP_PID" 2>/dev/null || true
+  HTTP_PID=""
 
-  printf "%s" "$line"
+  printf "%s,%s" "$line" "$udp_mib_s"
 }
 
 echo "Artifact directory: $ARTIFACT_DIR"
 RAW_RESULTS_CSV="$ARTIFACT_DIR/results.raw.csv"
-echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,worker_new_flows" > "$RAW_RESULTS_CSV"
-echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,linear_efficiency,worker_new_flows" > "$RESULTS_CSV"
+echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,udp_mib_per_s,worker_new_flows" > "$RAW_RESULTS_CSV"
+echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,udp_mib_per_s,relative_to_1,linear_efficiency,worker_new_flows" > "$RESULTS_CSV"
 for data_ports in $DATA_PORT_COUNTS; do
   if ! line="$(run_group "$data_ports")"; then
     exit 1
@@ -350,11 +426,11 @@ awk -F, -v base="$base_rate" '
   {
     relative = ($6 / base)
     efficiency = ($1 > 0) ? (relative / $1) : 0
-    printf "%s,%s,%s,%s,%s,%s,%.3f,%.3f,%s\n", $1, $2, $3, $4, $5, $6, relative, efficiency, $7
+    printf "%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%s\n", $1, $2, $3, $4, $5, $6, $7, relative, efficiency, $8
   }
 ' "$RAW_RESULTS_CSV" > "$RESULTS_CSV.tmp"
 {
-  echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,linear_efficiency,worker_new_flows"
+  echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,udp_mib_per_s,relative_to_1,linear_efficiency,worker_new_flows"
   cat "$RESULTS_CSV.tmp"
 } | tee "$RESULTS_CSV"
 rm -f "$RESULTS_CSV.tmp"
