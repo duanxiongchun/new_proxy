@@ -54,11 +54,11 @@ Table = off
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
-ListenPorts = 40001, 40002
+ListenPorts = 40001
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
-AllowedIPs = 10.0.0.2/32
+AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 EOF_CONF
 
 cat > "$ARTIFACT_DIR/client_dyn.conf" <<EOF_CONF
@@ -132,6 +132,9 @@ WORK_HTTP_PID=$!
 ip netns exec dyn_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
+ip netns exec dyn_server_ns ip addr add 10.0.0.1/24 dev server || true
+ip netns exec dyn_server_ns ip link set server up
+ip netns exec dyn_server_ns ip route replace 10.0.4.0/24 dev server
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "Server daemon exited early"
   cat "$ARTIFACT_DIR/server.log"

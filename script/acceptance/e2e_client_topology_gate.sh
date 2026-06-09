@@ -170,6 +170,9 @@ SERVER1_PID=$!
 ip netns exec topo_server2_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER2_CONF" > "$ARTIFACT_DIR/server2.log" 2>&1 &
 SERVER2_PID=$!
 sleep 2
+ip netns exec topo_server1_ns ip addr add 10.70.0.1/24 dev server1_topo || true
+ip netns exec topo_server1_ns ip link set server1_topo up
+ip netns exec topo_server1_ns ip route replace 10.70.0.2/32 dev server1_topo
 for pid in "$SERVER1_PID" "$SERVER2_PID"; do
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "A server daemon exited early"

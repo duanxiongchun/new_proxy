@@ -59,7 +59,7 @@ ListenPorts = 40001, 40002
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
-AllowedIPs = 10.30.0.2/32
+AllowedIPs = 10.30.0.2/32, 10.20.4.0/24
 EOF_CONF
 
 cat > "$ARTIFACT_DIR/ft_client.conf" <<EOF_CONF
@@ -128,6 +128,9 @@ HTTP_PID=$!
 ip netns exec ft_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/ft_server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
+ip netns exec ft_server_ns ip addr add 10.30.0.1/24 dev ft_server
+ip netns exec ft_server_ns ip link set ft_server up
+ip netns exec ft_server_ns ip route add 10.20.4.0/24 dev ft_server
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "Server daemon exited early"
   cat "$ARTIFACT_DIR/server.log"
