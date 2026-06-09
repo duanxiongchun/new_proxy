@@ -315,17 +315,13 @@ PY
 }
 
 echo "Artifact directory: $ARTIFACT_DIR"
-echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,worker_new_flows" | tee "$RESULTS_CSV"
-base_rate=""
+RAW_RESULTS_CSV="$ARTIFACT_DIR/results.raw.csv"
+echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,worker_new_flows" > "$RAW_RESULTS_CSV"
+echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,linear_efficiency,worker_new_flows" > "$RESULTS_CSV"
 for data_ports in $DATA_PORT_COUNTS; do
   if ! line="$(run_group "$data_ports")"; then
     exit 1
   fi
-  rate="$(printf "%s" "$line" | awk -F, '{print $6}')"
-  if [ -z "$base_rate" ]; then
-    base_rate="$rate"
-  fi
-  relative="$(awk -v rate="$rate" -v base="$base_rate" 'BEGIN { if (base > 0) printf "%.3f", rate / base; else printf "0.000" }')"
   worker_dump="$ARTIFACT_DIR/client_${data_ports}_dump.txt"
   worker_flows="$(awk -F'new_flows=' '/^worker:/ { split($2, a, "\t"); printf "%s%s", sep, a[1]; sep="|" }' "$worker_dump")"
   worker_count="$(awk '/^worker:/ { count++ } END { print count + 0 }' "$worker_dump")"
@@ -339,8 +335,26 @@ for data_ports in $DATA_PORT_COUNTS; do
     cat "$worker_dump" >&2
     exit 1
   fi
-  printf "%s,%s,%s\n" "$line" "$relative" "$worker_flows" | tee -a "$RESULTS_CSV"
+  printf "%s,%s\n" "$line" "$worker_flows" | tee -a "$RAW_RESULTS_CSV"
   sleep 1
 done
 
-cat "$RESULTS_CSV"
+base_rate="$(awk -F, '$1 == 1 { print $6; found=1; exit } END { if (!found) exit 1 }' "$RAW_RESULTS_CSV")" || {
+  echo "PERF_DATA_PORT_COUNTS must include 1 to compute relative_to_1" >&2
+  cat "$RAW_RESULTS_CSV" >&2
+  exit 1
+}
+
+awk -F, -v base="$base_rate" '
+  NR == 1 { next }
+  {
+    relative = ($6 / base)
+    efficiency = ($1 > 0) ? (relative / $1) : 0
+    printf "%s,%s,%s,%s,%s,%s,%.3f,%.3f,%s\n", $1, $2, $3, $4, $5, $6, relative, efficiency, $7
+  }
+' "$RAW_RESULTS_CSV" > "$RESULTS_CSV.tmp"
+{
+  echo "data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,linear_efficiency,worker_new_flows"
+  cat "$RESULTS_CSV.tmp"
+} | tee "$RESULTS_CSV"
+rm -f "$RESULTS_CSV.tmp"
