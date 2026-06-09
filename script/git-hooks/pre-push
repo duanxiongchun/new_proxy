@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# new_proxy Git Pre-Push Hook
+# ==============================================================================
+# Redirect stdin to tty so that interactive commands (like sudo password prompt) work.
+exec < /dev/tty
+
+echo "======================================================================"
+echo " Running Pre-Push Git Hook: Unified Acceptance Tests"
+echo "======================================================================"
+
+# Run the acceptance runner (this runs all code format/clippy/unit/E2E tests)
+if ! ./script/acceptance/run_acceptance.sh; then
+  echo "❌ Push rejected: Acceptance tests failed!" >&2
+  exit 1
+fi
+
+echo "✅ All acceptance tests passed. Pushing to git server..."
+exit 0

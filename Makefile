@@ -13,12 +13,25 @@ endif
 DEB_DIR = target/deb-pkg
 DEB_FILE = target/new-proxy_$(VERSION)_$(ARCH).deb
 
-.PHONY: all build package coverage clean
+.PHONY: all build package coverage clean test test-acceptance setup-git-hooks
 
 all: build
 
-build:
+build: setup-git-hooks
 	cargo build $(CARGO_BUILD_FLAGS)
+
+test:
+	cargo test
+
+test-acceptance:
+	sudo ./script/acceptance/run_acceptance.sh
+
+setup-git-hooks:
+	@echo "Installing Git pre-push hook..."
+	@mkdir -p .git/hooks
+	@cp script/git-hooks/pre-push .git/hooks/pre-push
+	@chmod +x .git/hooks/pre-push
+
 
 package: build
 	@echo "Building Debian package structure..."
