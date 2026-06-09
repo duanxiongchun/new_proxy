@@ -5,6 +5,7 @@ mod client;
 mod config;
 mod control;
 mod quic_pool;
+pub mod quic_proto_engine;
 mod routing;
 pub mod rtc_loop;
 mod runtime;
