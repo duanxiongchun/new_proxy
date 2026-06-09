@@ -1,6 +1,6 @@
 use crate::quic_pool::QuicConnStats;
 use quinn::{RecvStream, SendStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -314,6 +314,98 @@ pub async fn read_framed_packet<R: AsyncRead + Unpin>(
     Ok(len)
 }
 
+pub async fn relay_stream_to_udp<R, W>(
+    quic_recv: &mut R,
+    quic_send: &mut W,
+    udp_socket: &tokio::net::UdpSocket,
+    stats: Arc<PeerL4Stats>,
+    conn_stat: Option<Arc<QuicConnStats>>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    struct ActiveStreamGuard {
+        stats: Arc<PeerL4Stats>,
+        conn_stat: Option<Arc<QuicConnStats>>,
+    }
+
+    impl Drop for ActiveStreamGuard {
+        fn drop(&mut self) {
+            self.stats.active_streams.fetch_sub(1, Ordering::Relaxed);
+            if let Some(cs) = &self.conn_stat {
+                cs.active_streams.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    stats.active_streams.fetch_add(1, Ordering::Relaxed);
+    if let Some(cs) = &conn_stat {
+        cs.active_streams.fetch_add(1, Ordering::Relaxed);
+    }
+    let _active_stream_guard = ActiveStreamGuard {
+        stats: stats.clone(),
+        conn_stat: conn_stat.clone(),
+    };
+
+    let activity = Arc::new(AtomicBool::new(false));
+    let activity_c2s = activity.clone();
+    let activity_s2c = activity.clone();
+
+    let client_to_server = async {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let len = read_framed_packet(quic_recv, &mut buf).await?;
+            if len == 0 {
+                break;
+            }
+            udp_socket.send(&buf[..len]).await?;
+            activity_c2s.store(true, Ordering::Relaxed);
+            stats.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+            if let Some(cs) = &conn_stat {
+                cs.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let server_to_client = async {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let len = udp_socket.recv(&mut buf).await?;
+            if len == 0 {
+                break;
+            }
+            write_framed_packet(quic_send, &buf[..len]).await?;
+            activity_s2c.store(true, Ordering::Relaxed);
+            stats.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+            if let Some(cs) = &conn_stat {
+                cs.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let timeout_duration = Duration::from_secs(30);
+    let timer = async {
+        loop {
+            tokio::time::sleep(timeout_duration).await;
+            if !activity.swap(false, Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "UDP stream idle timeout",
+                ));
+            }
+        }
+    };
+
+    tokio::select! {
+        res = client_to_server => res,
+        res = server_to_client => res,
+        res = timer => res,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +551,46 @@ mod tests {
         };
 
         tokio::join!(write_fut, read_fut).0.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_relay_stream_to_udp_success() {
+        let (mut client_stream, server_stream) = tokio::io::duplex(1024);
+        let target_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_udp.local_addr().unwrap();
+
+        let relay_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        relay_udp.connect(target_addr).await.unwrap();
+
+        let stats = Arc::new(PeerL4Stats::default());
+
+        // Spawn relay_stream_to_udp
+        let (quic_recv, quic_send) = tokio::io::split(server_stream);
+        let stats_clone = stats.clone();
+        let relay_task = tokio::spawn(async move {
+            let mut recv = quic_recv;
+            let mut send = quic_send;
+            relay_stream_to_udp(&mut recv, &mut send, &relay_udp, stats_clone, None).await
+        });
+
+        // 1. Client send framed packet to stream -> UDP target should receive it
+        let test_data = b"hello udp target";
+        write_framed_packet(&mut client_stream, test_data).await.unwrap();
+
+        let mut udp_buf = vec![0u8; 100];
+        let (n, src) = target_udp.recv_from(&mut udp_buf).await.unwrap();
+        assert_eq!(&udp_buf[..n], test_data);
+
+        // 2. UDP target send packet back -> client stream should read framed packet
+        target_udp.send_to(b"reply from target", src).await.unwrap();
+
+        let mut client_buf = vec![0u8; 100];
+        let len = read_framed_packet(&mut client_stream, &mut client_buf).await.unwrap();
+        assert_eq!(&client_buf[..len], b"reply from target");
+
+        // Cleanup: drop client stream to end the relay task
+        drop(client_stream);
+        let _ = relay_task.await.unwrap();
     }
 }
 
