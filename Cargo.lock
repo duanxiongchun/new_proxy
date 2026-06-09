@@ -553,6 +553,7 @@ version = "5.0.0"
 dependencies = [
  "arc-swap",
  "boringtun",
+ "bytes",
  "env_logger",
  "hmac",
  "ipnet",

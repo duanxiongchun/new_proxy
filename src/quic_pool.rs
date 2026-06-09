@@ -491,6 +491,11 @@ impl QuicPoolClient {
             .collect()
     }
 
+    pub fn get_connection_by_slot(&self, slot_idx: usize) -> Option<(Connection, Arc<QuicConnStats>)> {
+        let slots = self.slots.load();
+        slots.get(slot_idx).map(|slot| (slot.conn.clone(), slot.stats.clone()))
+    }
+
     pub fn enter_fallback(&self, reason: &str) {
         let mut state = self.pool_state.write();
         if !matches!(*state, PoolState::Fallback) {
@@ -579,6 +584,8 @@ impl QuicPoolClient {
         transport.stream_receive_window(quinn::VarInt::from(8 * 1024 * 1024u32));
         transport.receive_window(quinn::VarInt::from(16 * 1024 * 1024u32));
         transport.send_window(16 * 1024 * 1024);
+        transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+        transport.datagram_send_buffer_size(8 * 1024 * 1024);
         client_config.transport_config(Arc::new(transport));
         client_config
     }
@@ -1331,6 +1338,8 @@ impl QuicPoolServer {
         transport.stream_receive_window(quinn::VarInt::from(8 * 1024 * 1024u32));
         transport.receive_window(quinn::VarInt::from(16 * 1024 * 1024u32));
         transport.send_window(16 * 1024 * 1024);
+        transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+        transport.datagram_send_buffer_size(8 * 1024 * 1024);
         server_config.transport_config(Arc::new(transport));
 
         let mut listeners = Vec::new();
@@ -1387,6 +1396,7 @@ impl Drop for TelemetryRegistryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::Ordering;
@@ -1751,6 +1761,69 @@ mod tests {
             let registry = peer_registry.lock();
             assert!(registry.is_empty() || !registry.contains_key(&client_pub_key));
         }
+    }
+
+    #[tokio::test]
+    async fn test_quic_pool_datagram_integration() {
+        let port = unused_udp_port();
+        let session_cache = Arc::new(RwLock::new(HashMap::new()));
+        let peer_registry = Arc::new(Mutex::new(HashMap::new()));
+
+        let client_pub_key = [10u8; 32];
+        let session_psk = [11u8; 32];
+        session_cache.write().insert(client_pub_key, session_psk);
+
+        let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+        let server = QuicPoolServer::new(vec![port], session_cache.clone(), auth_nonce_cache);
+        let (certs, key) = generate_self_signed_cert().unwrap();
+        let cert_fingerprint = cert_sha256(&certs).unwrap();
+
+        let handler = Arc::new(
+            move |_pub_key: [u8; 32],
+                  _send: quinn::SendStream,
+                  _recv: quinn::RecvStream,
+                  _stat: Arc<QuicConnStats>|
+                  -> ServerFuture {
+                Box::pin(async move {})
+            },
+        );
+
+        server
+            .run_with_registry(certs, key, handler, peer_registry.clone())
+            .await
+            .unwrap();
+
+        let server_addr = format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap();
+        let client = QuicPoolClient::new(
+            client_pub_key,
+            session_psk,
+            cert_fingerprint,
+            vec![server_addr],
+        );
+        client.start_pool().await.unwrap();
+
+        let (client_conn, _) = client.get_connection_by_slot(0).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let server_conn = {
+            let registry = peer_registry.lock();
+            assert!(registry.contains_key(&client_pub_key));
+            registry[&client_pub_key][0].conn.clone()
+        };
+
+        let test_payload = Bytes::from_static(b"Hello Datagram!");
+        client_conn.send_datagram(test_payload.clone()).unwrap();
+
+        let received = server_conn.read_datagram().await.unwrap();
+        assert_eq!(received, test_payload);
+
+        let reply_payload = Bytes::from_static(b"Datagram Reply!");
+        server_conn.send_datagram(reply_payload.clone()).unwrap();
+
+        let client_received = client_conn.read_datagram().await.unwrap();
+        assert_eq!(client_received, reply_payload);
+
+        client.shutdown(b"test complete");
     }
 
     #[tokio::test]
