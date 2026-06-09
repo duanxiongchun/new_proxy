@@ -233,6 +233,13 @@ pub async fn relay_connections_generic<TR, TW, QR, QW>(
     }
 }
 
+/// TCP/QUIC bidirectional stream relay loop with idle timeout.
+///
+/// **Performance Optimization Note:**
+/// - Rather than allocating new timeout futures on every single read and write, we pin a single
+///   `tokio::time::sleep` future to the stack and update its deadline in-place using `.reset()`.
+/// - The write timeout has been removed in favor of transport-level keep-alives (TCP keep-alives
+///   and QUIC max idle timeouts) to further reduce timer-wheel registration overhead on the hot path.
 async fn relay_copy_with_idle<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,

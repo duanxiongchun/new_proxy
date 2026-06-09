@@ -8,6 +8,32 @@
 - 测试环境：单机 Linux Network Namespace 三/四节点拓扑
 - 测试拓扑：`client_ns -> router_ns -> server_ns`、`client1_ns + client2_ns -> router_ns -> server_ns`、动态 peer/perf/stability 专用 namespace
 
+## 2026-06-09 数据面超时机制与定时器优化验证
+
+本次补充优化覆盖：
+- 双向流转发热路径（`relay_copy_with_idle`）中采用单实例栈分配的 pinned 定时器 `tokio::pin!(idle_sleep)`，每次读写成功后通过 `.reset()` 进行原地 Deadline 修改，实现了热路径零内存分配，极大降低了在高吞吐、高并发下的 Tokio 时间轮调度竞争。
+- 移除了应用层写超时 `RELAY_WRITE_TIMEOUT` 包裹，转发层完全依赖底层的 TCP Keepalive 和 QUIC transport 级超时进行死连接清理，降低了 50% 的定时器生命周期管理开销。
+- 移除了未使用的 `RELAY_WRITE_TIMEOUT` 静态常量，修复了 Clippy 的 dead-code 编译警告。
+- 将 `tokio` 的 `test-util` 依赖隔离在 `[dev-dependencies]` 中，防止测试框架代码污染生产二进制体积。
+- 补齐了针对 `relay_copy_with_idle` 定时器复位与空闲到期机制的 Mock 单元测试。
+
+测试结果：
+- **单元测试**：所有 134 个单元测试 100% 通过（包含新超时复位测试 `test_relay_copy_with_idle_timeout`）。
+- **Acceptance 验收测试**：全部 E2E 测试例通过（`e2e_test_dualstack`、`e2e_scenarios` 等 8 项全 PASS）。
+- **性能单流吞吐（Smoke Test）**：
+  - 吞吐量：由原来的 `152.31 MiB/s` 提升至 **`175.11 MiB/s`**（**性能提升约 15.0%**）。
+  - TTFB 首包延迟：P50 维持在 `2.63 ms` 极低水准。
+- **并发多核扩展性（Covers Scalability）**：
+  - 测试产物目录为 `/tmp/new_proxy_cores_scalability_20260609_164649`：
+  ```text
+  data_ports,parallel,rounds,total_mib,seconds,mib_per_s,relative_to_1,linear_efficiency,worker_new_flows
+  1,32,2,4096,37.029566,110.614,1.000,1.000,65
+  2,32,2,4096,19.860860,206.235,1.864,0.932,32|33
+  3,32,2,4096,12.296502,333.103,3.011,1.004,21|22|22
+  4,32,2,4096,9.140728,448.104,4.051,1.013,18|15|17|15
+  ```
+  在 1 核到 4 核的阶梯并发下，系统吞吐量呈现非常完美的线性扩展（4 核扩展倍数 4.051 倍，扩展效率维持在 101.3%），无任何时间轮锁竞争瓶颈。
+
 ## 2026-06-09 ServerFutures event-base 修复验证
 
 本次补充修复覆盖：

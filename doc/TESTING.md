@@ -36,7 +36,7 @@ cargo test
 - `src/virtual_tunnel.rs`：空物理 socket 集拒绝、RTC receive path 不预取业务包、调用方 buffer 直接接收、双物理 UDP socket 直接 readiness 接收、发送使用当前 active socket、不创建后台 task，并验证 `tick_control()` 发送 PING/处理 PONG 后切换 active socket。
 - `src/quic_pool.rs`：自签证书生成、QUIC client/server 集成、证书 pinning 失败路径、空 endpoint pool 拒绝、服务端重启后控制面刷新与 QUIC pool 自动恢复、旧 QUIC data port 不可达后的控制面刷新恢复、控制面刷新拒绝 data port 数变化、QUIC pool fallback/recovering/active 状态、控制面刷新触发条件和退避；server-side data port listener 使用 ready queue 推进 connection/stream future，并验证只重新 poll 被唤醒 future、self-wake 延迟到下一轮、完成任务槽位复用、旧 waker 不会误唤醒复用后的槽位、每轮 ready poll 有预算上限。
 - `src/main.rs`：userspace TCP failover policy，确认任意 pool 处于 fallback/recovering 时不恢复 TCP offload，所有 pool active 后才允许回切；client 启动主 runtime 前预协商 QUIC data port 数，TUN worker、Tokio runtime worker 和 QUIC data port baseline 使用同一个固定宽度；多个 proxy peer 的启动期协商端口数不一致时拒绝启动，启动期无法获知端口数时固定为单队列 baseline，后续动态新增或后台恢复不能改变拓扑；WireGuard UDP receive/timer 只归属 worker 0；服务端 QUIC 数据面只允许 client health checker 和固定 listener task，业务 stream 由 event-driven `ServerFutures` 推进；入口不使用 `#[tokio::main]` 默认 runtime。
-- `src/relay.rs`：双向 relay、计数 reader；双向 relay 在单个 future 内推进，不为两个方向创建额外 task。
+- `src/relay.rs`：双向 relay、计数 reader；双向 relay 在单个 future 内推进，不为两个方向创建额外 task；并针对 `relay_copy_with_idle` 原地复位与超时到期设计了高精度的虚拟时钟单元测试。
 - `src/routing.rs`：AllowedIPs longest-prefix matching。
 - `src/uds_server.rs`：真实 UDS server 的 `Stats`、`Dump`、非法请求响应和 remove-peer 缓存清理。
 - `src/wireguard.rs`：当前仅保留 `WgPeerStats` DTO，内核 WireGuard generic netlink 路径已移除。
@@ -82,7 +82,7 @@ python3 -m py_compile \
 
 | 层级 | 已覆盖 | 主要缺口 |
 | --- | --- | --- |
-| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限、VirtualTunnel drop/failover 边界、worker flow limit fallback 判断 | QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
+| 单元测试 | 配置解析、HMAC 控制面、控制面 stale nonce/重放/坏 HMAC、非法 public IP、空 QUIC pool、QUIC pinning、relay、router、UDS 协议兼容、真实 UDS server stats/dump/error、telemetry registry、userspace TCP fallback 回切策略、TUN opener/AsyncFd I/O、boringtun/smoltcp wrapper、RtcWorker 创建、包分类、IPv6 短包边界、IPv4/IPv6 NAT checksum 重算、bridge pending 队列字节上限、VirtualTunnel drop/failover 边界、worker flow limit fallback 判断、`relay_copy_with_idle` 零分配原地 Deadline 复位与超时到期机制 | QUIC pool 状态切换到 boringtun fallback 的更多包级断言仍需加强 |
 | E2E | 双栈 WAN、IPv6 HTTP over TUN/smoltcp/QUIC、TUN/smoltcp->QUIC、QUIC 被阻断时新 TCP 经 userspace WireGuard fallback、服务端重启后客户端自动重连、动态 server peer add/remove、多客户端 proxy + direct L3 baseline、动态 client proxy peer add/remove 生命周期、client 启动前 data-port 预协商驱动 4 worker 拓扑、移除所有 pool 后仍拒绝 1-port 动态 peer 改变固定 baseline、full-tunnel endpoint bypass 与动态 full-tunnel peer replacement、server 主动访问 client 后端的物理路径保持可达 | UDP/ICMP 经 userspace boringtun 的 namespace 闭环、服务端 session rotation/peer removal 的长流关闭与恢复还没有独立 E2E |
 | 稳定性 | 多 client、两条独立 proxy peer、direct L3 baseline、长/短 TCP、UDP、ping、warmup 后 RSS、per-peer QUIC CV；crash、短/长 TCP、UDP、ping、QUIC CV 为硬门禁，RSS 默认 WARN、`STABILITY_ENFORCE_RSS=1` 时为硬门禁 | 还没有 1 小时 CI 固化结果；没有 FD 数、CPU 斜率、失败日志自动摘要；还缺高 stream churn 后 `ServerFutures` RSS/FD 斜率门禁 |
 | 性能 | `script/perf/perf_smoke.sh` 覆盖 TTFB sample 和 8 MiB throughput sample；`script/perf/perf_cores_scalability.sh` 自建 namespace 拓扑，按 QUIC data port 数 `1..4` 同步重启 server/client，并用 `taskset` 约束 client CPU，默认 32 并发输出吞吐与 per-worker flow 分布 | 缺正式吞吐、延迟、CPU、连接建立耗时基准和并发阶梯压测；当前 cores scalability 使用 curl/Python HTTP，不能替代 iperf3 或专用 traffic generator；还缺长下载与短请求混跑的 p95/p99 TTFB 门禁；L3 userspace WireGuard 仍是 per-peer shared state，需单独评估 UDP/ICMP/fallback 扩展性 |
@@ -264,6 +264,14 @@ Rust 单元测试覆盖：
 - `src/virtual_tunnel.rs::virtual_tunnel_recv_reads_directly_from_multiple_physical_sockets`：验证多个物理 UDP socket 任一 ready 时都能直接读入调用方 buffer。
 - `src/virtual_tunnel.rs::virtual_tunnel_keeps_active_socket_when_all_pongs_are_stale`：验证所有物理路径健康探测都过期时不会强制回切到 socket 0。
 - `src/virtual_tunnel.rs::virtual_tunnel_send_uses_active_physical_socket`：验证发送使用当前 active 底层 UDP socket。
+
+### 3.13 数据面超时机制与定时器优化单元测试
+
+`src/relay.rs::test_relay_copy_with_idle_timeout` 覆盖：
+
+1. **虚拟时钟 Mock 测试**：通过 `tokio::time::pause()` 暂停真实时间，使用 `tokio::time::advance()` 精确前进虚拟时间，排除外部墙上时钟抖动引起的 flaky test。
+2. **连接活跃度复位（Reset）验证**：建立两端 duplex 流并在 `tokio::spawn` 异步任务中启动 `relay_copy_with_idle`。先向流写入数据，前进一半超时时间（`RELAY_IDLE_TIMEOUT / 2`），再次写入数据触发原地 `.reset()`。接着再前进另一半超时时间，验证虽然累计时间达到了 `RELAY_IDLE_TIMEOUT`，但由于原地复位，流没有超时且数据被正确转发。
+3. **空闲到期超时（TimedOut）验证**：流停止数据传输后，将虚拟时钟一次性推移超过 `RELAY_IDLE_TIMEOUT`，验证 `relay_copy_with_idle` 准确返回 `std::io::ErrorKind::TimedOut` 错误。
 
 需要补齐的回归用例：
 
