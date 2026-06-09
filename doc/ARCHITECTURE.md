@@ -217,3 +217,37 @@ UDS 路径：`/run/new_proxy/<interface>.sock`
 - userspace WireGuard registry 按 peer 维护共享的 `boringtun` 状态，并通过 AllowedIPs 路由选择出站 peer；入站数据优先使用 receiver index 与 endpoint 索引定位 peer，未知握手包才退回逐 peer 尝试。
 - 为避免未知来源 WireGuard 握手包在多 peer 场景下触发无界 O(N) 扫描，未知 endpoint 的握手/控制类入站包会经过轻量 per-IP token bucket 限速；已建立 receiver index 或已知 endpoint 的数据包不走该限速路径。成功解开的 unknown handshake 不消耗 token，无法解开的 unknown 包才消耗 token；可通过 `NEW_PROXY_UNKNOWN_HANDSHAKE_BURST` 和 `NEW_PROXY_UNKNOWN_HANDSHAKE_REFILL_PER_SEC` 调整阈值，drop 计数会暴露在 UDS telemetry 中。
 - 当前 client/server 启动路径不创建 transparent listener，也不下发 TPROXY iptables 规则。
+
+## 10. UDP-over-QUIC Stream 代理设计（规划中）
+
+为提升 UDP 流量的规避特征与防封锁能力，系统规划了将 UDP 流量（如 DNS、WebRTC 和部分 HTTP/3 流量）代理至 QUIC 流通道的设计。所有匹配 AllowedIPs 路由的 UDP 流量均会被封装为标准的 QUIC 双向流，使之呈现为普通的 TCP 样式的流式传输流量。
+
+### 10.1 协议头与包边界帧化 (Framing)
+1. **多协议头定义 (`src/proxy_proto.rs`)**：
+   扩展目标连接头部定义以支持 TCP 与 UDP 分流：
+   ```rust
+   pub enum ProxyProtocol {
+       Tcp = 1,
+       Udp = 2,
+   }
+   pub struct ProxyTargetHeader {
+       pub protocol: ProxyProtocol,
+       pub dst_ip: std::net::IpAddr,
+       pub dst_port: u16,
+   }
+   ```
+2. **流边界帧化**：
+   QUIC stream 为无结构字节流，对每个 UDP 报文前置 `[2字节大端长度 (Length)][UDP Payload]` 进行帧化边界划定，以在接收端还原为独立的 UDP 报文。
+
+### 10.2 客户端 Smoltcp 用户态 UDP 栈集成
+1. **Smoltcp UDP 支持**：
+   在 `UserspaceTcpStack` 中扩展 `create_udp_socket` 接口，在 `SocketSet` 中添加并管理 `smoltcp::socket::udp::Socket` 实例。
+2. **NAT 与生命周期**：
+   在 `RtcWorker` 中为 UDP 维护 NAT 转换表。新 UDP 会话到来时创建 userspace 绑定端口并向服务端发起 QUIC stream。
+
+### 10.3 双向 Stream-to-UDP 转发与老化
+1. **服务端物理桥接 (`src/server_proxy.rs`)**：
+   服务端接受连接请求后，在宿主机绑定物理 UDP 端口，并与该 QUIC Stream 形成双向循环桥接。
+2. **空闲老化清理**：
+   由于 UDP 无关闭信号，两端桥接通道内使用 pinned sleep 定时器原地复位机制，若连续 30 秒无任何读写活动（`UDP_IDLE_TIMEOUT`），主动关闭 QUIC Stream 并回收 NAT 及 socket 资源。
+
