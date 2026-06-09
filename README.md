@@ -89,14 +89,13 @@ target/release/new-proxy-cli
 
 ### 服务端配置
 
-服务端需要配置监听端口、控制面端口、QUIC 端口池以及允许接入的 Peer：
+服务端需要配置监听端口、QUIC 端口池以及允许接入的 Peer：
 
 ```ini
 [Interface]
 PrivateKey = <server_private_key_base64>
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
-ListenControlPort = 51821
 Table = auto
 PreScript = echo "Server starting..."
 PostScript = echo "Server stopped cleanly."
@@ -121,7 +120,7 @@ sudo target/release/new_proxy -config conf/server.conf
 
 ### 客户端配置
 
-客户端的 QUIC proxy peer 需要配置服务端 endpoint、控制面端口和目标 `AllowedIPs`：
+客户端的 QUIC proxy peer 需要配置服务端 endpoint 和目标 `AllowedIPs`：
 
 ```ini
 [Interface]
@@ -135,7 +134,6 @@ PostScript = echo "Client stopped cleanly."
 [Peer]
 PublicKey = <server_public_key_base64>
 Endpoint = <server_public_ip>:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32, fd00::1/128
 ```
 
@@ -149,7 +147,7 @@ sudo target/release/new_proxy -config conf/client.conf
 
 同样，`conf/client.conf` 会使用接口名 `client`；需要兼容现有 `tun0` 路由/脚本时，请使用 `tun0.conf`。
 
-客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint` 和 `ProxyPort`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，`Endpoint` 和 `ProxyPort` 必须同时存在。
+客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，必须配置 `Endpoint`；控制面端口 `ProxyPort` 是可选配置，默认使用 `Endpoint` 的端口。
 
 ## 系统服务管理 (Systemd)
 

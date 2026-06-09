@@ -52,3 +52,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+debug = true

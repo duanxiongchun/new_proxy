@@ -19,11 +19,6 @@ struct ActiveConn {
     _pub_key: [u8; 32],
 }
 
-enum ReadDatagramResult {
-    Ok(bytes::Bytes, usize),
-    Err(usize),
-}
-
 #[derive(Clone)]
 pub enum WorkerRole {
     Client,
@@ -126,7 +121,7 @@ impl RtcWorker {
                             .map(|pt| pt.get_or_create(peer_pub_key));
                         return Some(ActiveConn {
                             conn: record.conn.clone(),
-                            stats: Arc::new(record.stats.clone()),
+                            stats: record.stats.clone(),
                             peer_stats,
                             _pub_key: peer_pub_key,
                         });
@@ -179,7 +174,7 @@ impl RtcWorker {
                                     .map(|pt| pt.get_or_create(pub_key));
                                 conns.push(ActiveConn {
                                     conn: record.conn.clone(),
-                                    stats: Arc::new(record.stats.clone()),
+                                    stats: record.stats.clone(),
                                     peer_stats,
                                     _pub_key: pub_key,
                                 });
@@ -203,8 +198,44 @@ impl RtcWorker {
 
         let mut dp_snapshot = data_plane.load();
         let mut active_conns = self.get_all_active_connections(&dp_snapshot);
-        let mut conn_cache: std::collections::HashMap<std::net::IpAddr, ActiveConn> =
+        let mut conn_cache: std::collections::HashMap<std::net::IpAddr, Option<ActiveConn>> =
             std::collections::HashMap::new();
+
+        let rx_packets = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let rx_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut spawned_conns: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Spawn read tasks for initial connections
+        for conn_info in &active_conns {
+            let key = conn_info.conn.stable_id();
+            if spawned_conns.insert(key) {
+                let conn = conn_info.conn.clone();
+                let tun_io = self.tun_io.clone();
+                let conn_stats = conn_info.stats.clone();
+                let peer_stats = conn_info.peer_stats.clone();
+                let rx_packets = rx_packets.clone();
+                let rx_bytes = rx_bytes.clone();
+                tokio::spawn(async move {
+                    while let Ok(bytes) = conn.read_datagram().await {
+                        let n = bytes.len();
+                        if let Err(e) = tun_io.write_packet(&bytes).await {
+                            log::warn!("Failed to write to TUN: {}", e);
+                        } else {
+                            rx_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            conn_stats
+                                .rx_bytes
+                                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(ref p_stats) = peer_stats {
+                                p_stats
+                                    .rx_bytes
+                                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         let mut tun_vec = vec![0u8; 1600];
 
@@ -212,6 +243,43 @@ impl RtcWorker {
             if active_conns.is_empty() {
                 dp_snapshot = data_plane.load();
                 active_conns = self.get_all_active_connections(&dp_snapshot);
+
+                let current_keys: std::collections::HashSet<usize> =
+                    active_conns.iter().map(|c| c.conn.stable_id()).collect();
+                spawned_conns.retain(|key| current_keys.contains(key));
+
+                for conn_info in &active_conns {
+                    let key = conn_info.conn.stable_id();
+                    if spawned_conns.insert(key) {
+                        let conn = conn_info.conn.clone();
+                        let tun_io = self.tun_io.clone();
+                        let conn_stats = conn_info.stats.clone();
+                        let peer_stats = conn_info.peer_stats.clone();
+                        let rx_packets = rx_packets.clone();
+                        let rx_bytes = rx_bytes.clone();
+                        tokio::spawn(async move {
+                            while let Ok(bytes) = conn.read_datagram().await {
+                                let n = bytes.len();
+                                if let Err(e) = tun_io.write_packet(&bytes).await {
+                                    log::warn!("Failed to write to TUN: {}", e);
+                                } else {
+                                    rx_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    rx_bytes
+                                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                    conn_stats
+                                        .rx_bytes
+                                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                    if let Some(ref p_stats) = peer_stats {
+                                        p_stats.rx_bytes.fetch_add(
+                                            n as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
             }
 
             tokio::select! {
@@ -221,40 +289,23 @@ impl RtcWorker {
                             local_stats.tun_rx_packets += 1;
                             local_stats.tun_rx_bytes += n as u64;
 
-                            let mut packet_sent = false;
                             if let Some(dst_ip) = parse_destination_ip(&tun_vec[..n]) {
-                                crate::mss_clamping::clamp_tcp_mss(&mut tun_vec[..n], 1160);
 
-                                let cached_conn = if let Some(info) = conn_cache.get(&dst_ip) {
-                                    if info.conn.close_reason().is_none() {
-                                        Some(info.clone())
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                let active_conn = match cached_conn {
-                                    Some(info) => Some(info),
+                                let active_conn = match conn_cache.get(&dst_ip) {
+                                    Some(cached) => cached.as_ref(),
                                     None => {
-                                        if let Some(info) = self.get_active_connection(&dp_snapshot, dst_ip) {
-                                            conn_cache.insert(dst_ip, info.clone());
-                                            Some(info)
-                                        } else {
-                                            None
-                                        }
+                                        let info = self.get_active_connection(&dp_snapshot, dst_ip);
+                                        conn_cache.insert(dst_ip, info);
+                                        conn_cache.get(&dst_ip).unwrap().as_ref()
                                     }
                                 };
 
                                 if let Some(active_conn) = active_conn {
-                                    tun_vec.truncate(n);
-                                    let payload = bytes::Bytes::from(tun_vec);
-                                    tun_vec = vec![0u8; 1600];
-                                    packet_sent = true;
+                                    let payload = bytes::Bytes::copy_from_slice(&tun_vec[..n]);
 
                                     if let Err(e) = active_conn.conn.send_datagram(payload) {
                                         log::debug!("Failed to send QUIC datagram: {}", e);
+                                        conn_cache.remove(&dst_ip);
                                     } else {
                                         local_stats.l3_packets += 1;
                                         local_stats.l3_bytes += n as u64;
@@ -269,9 +320,6 @@ impl RtcWorker {
                                     }
                                 }
                             }
-                            if !packet_sent && tun_vec.len() != 1600 {
-                                tun_vec.resize(1600, 0);
-                            }
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -280,44 +328,51 @@ impl RtcWorker {
                     }
                 }
 
-                read_dg = ReadAnyDatagram { conns: &active_conns } => {
-                    match read_dg {
-                        ReadDatagramResult::Ok(bytes, idx) => {
-                            let n = bytes.len();
-                            if let Err(e) = self.tun_io.write_packet(&bytes).await {
-                                log::warn!("Failed to write to TUN: {}", e);
-                            } else {
-                                local_stats.l3_packets += 1;
-                                local_stats.l3_bytes += n as u64;
-
-                                // Update connection stats
-                                let active_conn = &active_conns[idx];
-                                active_conn.stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-
-                                // Update peer stats
-                                if let Some(ref peer_stats) = active_conn.peer_stats {
-                                    peer_stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        ReadDatagramResult::Err(idx) => {
-                            log::warn!("QUIC link at index {} is dead, removing from active pool", idx);
-                            if idx < active_conns.len() {
-                                active_conns.remove(idx);
-                            }
-                        }
-                        }
-                }
-
                 _ = reload_timer.tick() => {
                     dp_snapshot = data_plane.load();
                     active_conns = self.get_all_active_connections(&dp_snapshot);
                     conn_cache.clear();
+
+                    let current_keys: std::collections::HashSet<usize> = active_conns
+                        .iter()
+                        .map(|c| c.conn.stable_id())
+                        .collect();
+                    spawned_conns.retain(|key| current_keys.contains(key));
+
+                    for conn_info in &active_conns {
+                        let key = conn_info.conn.stable_id();
+                        if spawned_conns.insert(key) {
+                            let conn = conn_info.conn.clone();
+                            let tun_io = self.tun_io.clone();
+                            let conn_stats = conn_info.stats.clone();
+                            let peer_stats = conn_info.peer_stats.clone();
+                            let rx_packets = rx_packets.clone();
+                            let rx_bytes = rx_bytes.clone();
+                            tokio::spawn(async move {
+                                while let Ok(bytes) = conn.read_datagram().await {
+                                    let n = bytes.len();
+                                    if let Err(e) = tun_io.write_packet(&bytes).await {
+                                        log::warn!("Failed to write to TUN: {}", e);
+                                    } else {
+                                        rx_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                        conn_stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                        if let Some(ref p_stats) = peer_stats {
+                                            p_stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
 
                 _ = stats_timer.tick() => {
                     if let Some(ref stats) = self.worker_stats {
-                        stats.publish(&local_stats);
+                        let mut publish_stats = local_stats.clone();
+                        publish_stats.l3_packets += rx_packets.load(std::sync::atomic::Ordering::Relaxed);
+                        publish_stats.l3_bytes += rx_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                        stats.publish(&publish_stats);
                     }
                 }
             }
@@ -331,66 +386,17 @@ fn parse_destination_ip(packet: &[u8]) -> Option<IpAddr> {
     }
     let version = packet[0] >> 4;
     if version == 4 {
-        let mut ip_bytes = [0u8; 4];
-        ip_bytes.copy_from_slice(&packet[16..20]);
-        Some(IpAddr::V4(std::net::Ipv4Addr::from(ip_bytes)))
+        Some(IpAddr::V4(std::net::Ipv4Addr::new(
+            packet[16], packet[17], packet[18], packet[19],
+        )))
     } else if version == 6 {
         if packet.len() < 40 {
             return None;
         }
-        let mut ip_bytes = [0u8; 16];
-        ip_bytes.copy_from_slice(&packet[24..40]);
+        let ip_bytes: [u8; 16] = packet[24..40].try_into().ok()?;
         Some(IpAddr::V6(std::net::Ipv6Addr::from(ip_bytes)))
     } else {
         None
-    }
-}
-
-struct ReadAnyDatagram<'a> {
-    conns: &'a [ActiveConn],
-}
-
-impl<'a> std::future::Future for ReadAnyDatagram<'a> {
-    type Output = ReadDatagramResult;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.conns.is_empty() {
-            return std::task::Poll::Pending;
-        }
-
-        if this.conns.len() == 1 {
-            let mut read_future = this.conns[0].conn.read_datagram();
-            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut read_future) };
-            match pinned.poll(cx) {
-                std::task::Poll::Ready(Ok(bytes)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Ok(bytes, 0))
-                }
-                std::task::Poll::Ready(Err(_)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Err(0))
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-        }
-
-        for (idx, conn) in this.conns.iter().enumerate() {
-            let mut read_future = conn.conn.read_datagram();
-            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut read_future) };
-            match pinned.poll(cx) {
-                std::task::Poll::Ready(Ok(bytes)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Ok(bytes, idx))
-                }
-                std::task::Poll::Ready(Err(_)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Err(idx))
-                }
-                std::task::Poll::Pending => {}
-            }
-        }
-
-        std::task::Poll::Pending
     }
 }
 
@@ -459,9 +465,9 @@ mod tests {
         );
         client.start_pool().await.unwrap();
 
-        // Setup Unix socketpair for mocking TUN
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
         sock1.set_nonblocking(true).unwrap();
+        sock2.set_nonblocking(true).unwrap();
 
         let tun_io = Arc::new(AsyncTunIo::new(sock1.into_raw_fd()).unwrap());
         let pool = Arc::new(client);
@@ -527,10 +533,10 @@ mod tests {
         };
 
         let received = server_conn.read_datagram().await.unwrap();
-        // Assert it was received, and MSS option was clamped to 1160 (0x0488)
+        // Assert it was received, and MSS option remained 1460 (0x05B4)
         assert_eq!(received.len(), 44);
-        assert_eq!(received[42], 0x04);
-        assert_eq!(received[43], 0x88);
+        assert_eq!(received[42], 0x05);
+        assert_eq!(received[43], 0xB4);
 
         // 2. Test Inbound Packet (QUIC Datagram -> TUN)
         let inbound_payload = vec![9u8; 20];
@@ -538,10 +544,15 @@ mod tests {
             .send_datagram(bytes::Bytes::copy_from_slice(&inbound_payload))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut reader = sock2;
+        let mut reader = tokio::net::UnixStream::from_std(sock2).unwrap();
         let mut read_buf = vec![0u8; 20];
-        std::io::Read::read_exact(&mut reader, &mut read_buf).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut read_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(read_buf, inbound_payload);
 
         // Cleanup

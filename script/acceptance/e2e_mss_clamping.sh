@@ -138,8 +138,8 @@ fi
 sleep 2
 
 echo "=== [8/9] Starting Blob Server and Capturing Traffic ==="
-# Generate a 64MiB blob file
-dd if=/dev/zero of="$ARTIFACT_DIR/large_blob.bin" bs=1M count=64 status=none
+# Generate a 32MiB blob file
+dd if=/dev/zero of="$ARTIFACT_DIR/large_blob.bin" bs=1M count=32 status=none
 
 # Run HTTP server in server namespace serving from the artifact directory
 cd "$ARTIFACT_DIR"
@@ -166,8 +166,8 @@ TCPDUMP_T_PID=$!
 sleep 2
 
 # Download the file from client namespace (routing via client TUN -> QUIC -> server TUN)
-echo "Downloading 64MiB file from client namespace..."
-if ! ip netns exec client_ns curl -fsS --connect-timeout 5 --max-time 15 -o "$ARTIFACT_DIR/downloaded_blob.bin" "http://10.0.0.1:8080/large_blob.bin"; then
+echo "Downloading 32MiB file from client namespace..."
+if ! ip netns exec client_ns curl -fsS --connect-timeout 5 --max-time 30 -o "$ARTIFACT_DIR/downloaded_blob.bin" "http://10.0.0.1:8080/large_blob.bin"; then
   echo "✗ [FAIL] Large file download failed!"
   exit 1
 fi

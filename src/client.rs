@@ -43,9 +43,7 @@ pub async fn negotiate_peer_quic_data_port_count(
     let endpoint = peer
         .endpoint
         .ok_or_else(|| BuildPeerQuicPoolError::new("proxy peer is missing Endpoint", None))?;
-    let proxy_port = peer
-        .proxy_port
-        .ok_or_else(|| BuildPeerQuicPoolError::new("proxy peer is missing ProxyPort", None))?;
+    let proxy_port = peer.proxy_port.unwrap_or(endpoint.port());
     let control_addr = SocketAddr::new(endpoint.ip(), proxy_port);
     let control_client = ControlClient::new(private_key, peer.public_key, control_addr);
 
@@ -80,9 +78,7 @@ pub async fn build_peer_quic_pool(
     let endpoint = peer
         .endpoint
         .ok_or_else(|| BuildPeerQuicPoolError::new("proxy peer is missing Endpoint", None))?;
-    let proxy_port = peer
-        .proxy_port
-        .ok_or_else(|| BuildPeerQuicPoolError::new("proxy peer is missing ProxyPort", None))?;
+    let proxy_port = peer.proxy_port.unwrap_or(endpoint.port());
     let control_addr = SocketAddr::new(endpoint.ip(), proxy_port);
     let control_client = ControlClient::new(private_key, peer.public_key, control_addr);
 

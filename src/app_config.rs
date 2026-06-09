@@ -140,9 +140,10 @@ pub fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, Str
     let server_mode =
         config.interface.listen_control_port.is_some() || !config.quic_pool.listen_ports.is_empty();
     if server_mode {
-        if config.interface.listen_control_port.is_none() {
+        if config.interface.listen_control_port.is_none() && config.interface.listen_port.is_none()
+        {
             return Err(
-                "Invalid server config: ListenControlPort is required when QUICPool.ListenPorts is set"
+                "Invalid server config: Either ListenControlPort or ListenPort must be set when QUICPool.ListenPorts is set"
                     .to_string(),
             );
         }
@@ -159,22 +160,18 @@ pub fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, Str
         return Err("Invalid client config: at least one [Peer] is required".to_string());
     }
     for peer in &config.peers {
-        match (peer.endpoint, peer.proxy_port) {
-            (Some(_), Some(_)) => {}
-            (None, None) => {}
-            _ => {
-                return Err(format!(
-                    "Invalid client config: peer {} must define both Endpoint and ProxyPort for QUIC offload, or neither for WireGuard-only mode",
-                    encode_base64_32(&peer.public_key)
-                ));
-            }
+        if peer.proxy_port.is_some() && peer.endpoint.is_none() {
+            return Err(format!(
+                "Invalid client config: peer {} specifies ProxyPort but is missing Endpoint",
+                encode_base64_32(&peer.public_key)
+            ));
         }
     }
     Ok(RuntimeMode::Client)
 }
 
 pub fn peer_has_l4_proxy(peer: &config::PeerConfig) -> bool {
-    peer.endpoint.is_some() && peer.proxy_port.is_some()
+    peer.endpoint.is_some()
 }
 
 pub fn rebuild_l4_router(peers: &[config::PeerConfig]) -> AllowedIPsRouter<[u8; 32]> {
@@ -303,11 +300,12 @@ mod tests {
 
         assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
         config.peers[0].proxy_port = None;
+        assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
+        config.peers[0].endpoint = None;
+        config.peers[0].proxy_port = Some(51821);
         assert!(determine_runtime_mode(&config)
             .unwrap_err()
-            .contains("must define both Endpoint and ProxyPort"));
-        config.peers[0].endpoint = None;
-        assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
+            .contains("specifies ProxyPort but is missing Endpoint"));
     }
 
     #[test]
@@ -353,10 +351,11 @@ mod tests {
             .contains("QUICPool.ListenPorts must contain at least one port"));
 
         config.interface.listen_control_port = None;
+        config.interface.listen_port = None;
         config.quic_pool.listen_ports = vec![40001];
         assert!(determine_runtime_mode(&config)
             .unwrap_err()
-            .contains("ListenControlPort is required"));
+            .contains("Either ListenControlPort or ListenPort must be set"));
     }
 
     #[test]

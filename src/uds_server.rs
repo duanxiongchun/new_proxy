@@ -3,7 +3,7 @@ use crate::app_config::{
     api_socket_path, encode_base64_32, peer_has_l4_proxy, rebuild_l4_router, telemetry_sources,
     RuntimeMode,
 };
-use crate::client_proxy::build_peer_quic_pool;
+use crate::client::build_peer_quic_pool;
 use crate::config::{self, decode_base64_32};
 use crate::control::NonceCache;
 use crate::quic_pool;
@@ -514,20 +514,17 @@ async fn handle_add_peer(
         proxy_port,
     };
 
-    if context.runtime_mode == RuntimeMode::Client {
-        match (new_peer.endpoint, new_peer.proxy_port) {
-            (Some(_), Some(_)) | (None, None) => {}
-            _ => {
-                write_error(
-                    stream,
-                    framed_response,
-                    "Endpoint and ProxyPort must be provided together for client QUIC offload"
-                        .to_string(),
-                )
-                .await;
-                return;
-            }
-        }
+    if context.runtime_mode == RuntimeMode::Client
+        && new_peer.proxy_port.is_some()
+        && new_peer.endpoint.is_none()
+    {
+        write_error(
+            stream,
+            framed_response,
+            "ProxyPort requires Endpoint to be specified for client QUIC offload".to_string(),
+        )
+        .await;
+        return;
     }
 
     let precheck_conflict = {
@@ -1289,8 +1286,8 @@ mod tests {
             &CommandInput::AddPeer {
                 public_key: encode_base64_32(&[8u8; 32]),
                 allowed_ips: vec!["10.8.0.0/24".to_string()],
-                endpoint: Some("1.2.3.4:51820".to_string()),
-                proxy_port: None,
+                endpoint: None,
+                proxy_port: Some(51821),
             },
         )
         .await;
@@ -1300,7 +1297,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap_or_default()
-            .contains("Endpoint and ProxyPort"));
+            .contains("ProxyPort requires Endpoint"));
 
         let _ = fs::remove_file(path);
     }

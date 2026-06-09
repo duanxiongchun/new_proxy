@@ -17,6 +17,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 
+use std::sync::OnceLock;
+
+pub fn quic_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(4))
+                    .unwrap_or(2),
+            )
+            .thread_name("new-proxy-quic")
+            .enable_all()
+            .build()
+            .expect("Failed to build QUIC Tokio runtime")
+    })
+}
+
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
@@ -79,6 +97,7 @@ impl Default for QuicPoolClientTiming {
 }
 
 fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoint, String> {
+    let _guard = quic_runtime().enter();
     let runtime =
         quinn::default_runtime().ok_or_else(|| "No async runtime found for QUIC".to_string())?;
     let v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
@@ -588,6 +607,7 @@ impl QuicPoolClient {
     }
 
     fn create_client_endpoint(runtime_config: &PoolRuntimeConfig) -> Result<Endpoint, String> {
+        let _guard = quic_runtime().enter();
         if runtime_config.endpoints.is_empty() {
             return Err("Empty endpoints pool".to_string());
         }
@@ -714,9 +734,12 @@ impl QuicPoolClient {
         session_psk: [u8; 32],
         connect_timeout: Duration,
     ) -> Result<PoolSlot, String> {
-        let connecting = endpoint
-            .connect(target_addr, "localhost")
-            .map_err(|e| format!("QUIC connect initiation failed to {}: {}", target_addr, e))?;
+        let connecting = {
+            let _guard = quic_runtime().enter();
+            endpoint
+                .connect(target_addr, "localhost")
+                .map_err(|e| format!("QUIC connect initiation failed to {}: {}", target_addr, e))?
+        };
         let conn = timeout(connect_timeout, connecting)
             .await
             .map_err(|_| format!("QUIC connection timed out to {}", target_addr))?
@@ -1059,7 +1082,7 @@ pub type PeerConnRegistry = Arc<RwLock<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
 #[derive(Clone)]
 pub struct QuicConnRecord {
     pub id: u64,
-    pub stats: QuicConnStats,
+    pub stats: Arc<QuicConnStats>,
     pub conn: Connection,
 }
 
@@ -1263,7 +1286,7 @@ impl QuicPoolServer {
                 .or_default()
                 .push(QuicConnRecord {
                     id: record_id,
-                    stats: (*conn_stat).clone(),
+                    stats: conn_stat.clone(),
                     conn: conn.clone(),
                 });
         }
@@ -1352,7 +1375,7 @@ impl QuicPoolServer {
             let handler = handler.clone();
             let peer_conn_registry = external_registry.clone();
             let connection_limit = connection_limit.clone();
-            tokio::spawn(async move {
+            quic_runtime().spawn(async move {
                 Self::drive_quic_listener(
                     port,
                     endpoint,

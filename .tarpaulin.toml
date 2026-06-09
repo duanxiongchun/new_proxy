@@ -9,17 +9,12 @@ output-dir = "."
 exclude-files = [
     "src/cli.rs",
     "src/main.rs",
-    "src/client_proxy.rs",
-    "src/server_proxy.rs",
+    "src/client.rs",
     "src/quic_pool.rs",
     "src/rtc_loop.rs",
     "src/uds_server.rs",
     "src/tun_device.rs",
     "src/tun_io.rs",
-    "src/userspace_wg.rs",
-    "src/userspace_tcp.rs",
-    "src/tcp_util.rs",
     "src/stats_cli.rs",
     "src/control.rs",
-    "src/relay.rs",
 ]

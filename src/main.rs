@@ -1,10 +1,9 @@
 mod api;
 mod app_config;
 mod buffer_pool;
-mod client_proxy;
+mod client;
 mod config;
 mod control;
-pub mod mss_clamping;
 mod quic_pool;
 mod routing;
 pub mod rtc_loop;
@@ -17,7 +16,7 @@ pub mod tun_io;
 mod uds_server;
 
 use arc_swap::ArcSwap;
-use client_proxy::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
+use client::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
 use std::collections::HashMap;
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -739,12 +738,11 @@ async fn run_gateway(
             l3_tasks.push(task);
         }
 
-        let Some(listen_control_port) = config.interface.listen_control_port else {
-            log::error!("Server config validation failed to enforce ListenControlPort");
-            let cleanup_config = gateway_state.read().config.clone();
-            cleanup_runtime(&cleanup_config, &interface_name);
-            std::process::exit(1);
-        };
+        let listen_control_port = config
+            .interface
+            .listen_control_port
+            .or(config.interface.listen_port)
+            .expect("Server config validation failed to enforce control port");
 
         let (quic_certs, quic_key) = match generate_self_signed_cert() {
             Ok(cert) => cert,
