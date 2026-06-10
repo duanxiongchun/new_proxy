@@ -132,8 +132,8 @@ if __name__ == '__main__':
     if mss is None:
         print("FAIL: No TCP SYN packet with MSS option found on server TUN!")
         sys.exit(1)
-    if mss > 1160:
-        print("FAIL: MSS option is {} (expected <= 1160)!".format(mss))
+    if mss > 1340:
+        print("FAIL: MSS option is {} (expected <= 1340)!".format(mss))
         sys.exit(1)
         
     print("SUCCESS: PCAP checks passed!")

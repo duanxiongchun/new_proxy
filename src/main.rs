@@ -747,6 +747,7 @@ async fn run_gateway(
             let mut server_proto_config =
                 quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
             let mut transport = quinn_proto::TransportConfig::default();
+            let quic_mtu = rtc_loop::quic_initial_mtu_for_packet_buffer(packet_buffer_size);
             transport
                 .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
             transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
@@ -755,6 +756,8 @@ async fn run_gateway(
             transport.send_window(16 * 1024 * 1024);
             transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
             transport.datagram_send_buffer_size(8 * 1024 * 1024);
+            transport.initial_mtu(quic_mtu);
+            transport.min_mtu(quic_mtu);
             server_proto_config.transport_config(Arc::new(transport));
 
             let endpoint_config = quinn_proto::EndpointConfig::default();
