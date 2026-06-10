@@ -417,20 +417,35 @@ fn cleanup_tun_link(interface_name: &str) {
 
 #[cfg(not(tarpaulin))]
 fn run_command_checked(program: &str, args: &[String]) -> Result<(), String> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to execute '{} {}': {}", program, args.join(" "), e))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "command '{} {}' failed with status {:?}: {}",
-            program,
-            args.join(" "),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to execute '{} {}': {}", program, args.join(" "), e))?;
+        if output.status.success() {
+            return Ok(());
+        } else {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            if attempts < 30 && err_msg.contains("No such device") {
+                log::warn!(
+                    "Command '{} {}' failed with 'No such device', retrying in 50ms... (attempt {})",
+                    program,
+                    args.join(" "),
+                    attempts
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            return Err(format!(
+                "command '{} {}' failed with status {:?}: {}",
+                program,
+                args.join(" "),
+                output.status.code(),
+                err_msg.trim()
+            ));
+        }
     }
 }
 

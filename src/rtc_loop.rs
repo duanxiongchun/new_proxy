@@ -377,8 +377,7 @@ impl RtcWorker {
                         log::warn!("Failed to write data packet to TUN: {:?}", e);
                     } else if let Some(conn) = self.connections.get(&handle) {
                         let payload_len = (bytes.len() - 1) as u64;
-                        conn.rx_bytes
-                            .fetch_add(payload_len, std::sync::atomic::Ordering::Relaxed);
+                        conn.rx_bytes.add(payload_len);
                         local_stats.l3_packets += 1;
                         local_stats.l3_bytes += payload_len;
 
@@ -386,10 +385,7 @@ impl RtcWorker {
                             if let Some(ip) = self.handle_to_ip.get(&handle) {
                                 if let Some(pub_key) = dp_snapshot.router.longest_match(*ip) {
                                     let peer_stats = peer_telemetry.get_or_create(pub_key);
-                                    peer_stats.rx_bytes.fetch_add(
-                                        payload_len,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    peer_stats.rx_bytes.add(payload_len);
                                 }
                             }
                         }
@@ -440,37 +436,28 @@ impl RtcWorker {
 
     async fn handle_tun_packet(
         &mut self,
-        packet: &[u8],
+        packet: bytes::Bytes,
         dp_snapshot: &crate::L4DataPlaneSnapshot,
         now: std::time::Instant,
         local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
     ) {
-        if let Some(dst_ip) = parse_destination_ip(packet) {
+        if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
             if let Some(handle) = self.find_handle_for_ip(dst_ip, dp_snapshot) {
                 let mut sent = false;
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     if conn.authenticated {
-                        let mut frame = Vec::with_capacity(1 + packet.len());
-                        frame.push(0x02);
-                        frame.extend_from_slice(packet);
-
-                        if let Err(e) = conn.connection.datagrams().send(bytes::Bytes::from(frame))
-                        {
+                        if let Err(e) = conn.connection.datagrams().send(packet.clone()) {
                             log::debug!("Failed to send datagram: {:?}", e);
                         } else {
-                            let packet_len = packet.len() as u64;
-                            conn.tx_bytes
-                                .fetch_add(packet_len, std::sync::atomic::Ordering::Relaxed);
+                            let packet_len = (packet.len() - 1) as u64;
+                            conn.tx_bytes.add(packet_len);
                             local_stats.l3_packets += 1;
                             local_stats.l3_bytes += packet_len;
 
                             if let Some(ref peer_telemetry) = self.peer_telemetry {
                                 if let Some(pub_key) = dp_snapshot.router.longest_match(dst_ip) {
                                     let peer_stats = peer_telemetry.get_or_create(pub_key);
-                                    peer_stats.tx_bytes.fetch_add(
-                                        packet_len,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    peer_stats.tx_bytes.add(packet_len);
                                 }
                             }
                             sent = true;
@@ -502,8 +489,8 @@ impl RtcWorker {
                     let worker_conn = crate::quic_proto_engine::WorkerConnection {
                         connection: conn,
                         authenticated: false,
-                        tx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                        rx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                        rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
                         peer_public_key: None,
                     };
                     self.connections.insert(handle, worker_conn);
@@ -551,8 +538,8 @@ impl RtcWorker {
                         let worker_conn = crate::quic_proto_engine::WorkerConnection {
                             connection: conn,
                             authenticated: false,
-                            tx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                            rx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                            tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                            rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
                             peer_public_key: Some(pub_key),
                         };
                         self.connections.insert(handle, worker_conn);
@@ -581,13 +568,17 @@ impl RtcWorker {
             self.process_endpoint_transmits().await;
         }
 
-        let mut tun_buf = vec![0u8; 65536];
+        let mut tun_buf = bytes::BytesMut::new();
+        tun_buf.resize(65536, 0);
         let mut udp_buf = vec![0u8; 65536];
 
         let sleep = tokio::time::sleep(std::time::Duration::from_secs(3600));
         tokio::pin!(sleep);
 
         loop {
+            if tun_buf.len() < 65536 {
+                tun_buf.resize(65536, 0);
+            }
             let mut next_timeout = None;
             for conn in self.connections.values_mut() {
                 if let Some(timeout) = conn.connection.poll_timeout() {
@@ -619,21 +610,28 @@ impl RtcWorker {
                     self.process_endpoint_transmits().await;
                 }
 
-                read_res = self.tun_io.read(&mut tun_buf) => {
+                read_res = self.tun_io.read(&mut tun_buf[1..]) => {
                     match read_res {
                         Ok(0) => return Err("TUN interface EOF".to_string()),
                         Ok(n) => {
                             let now = std::time::Instant::now();
                             local_stats.tun_rx_packets += 1;
                             local_stats.tun_rx_bytes += n as u64;
-                            self.handle_tun_packet(&tun_buf[..n], &dp_snapshot, now, &mut local_stats).await;
+                            tun_buf[0] = 0x02;
+                            let frame = tun_buf.split_to(1 + n).freeze();
+                            self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
 
                             for _ in 0..63 {
-                                match self.tun_io.try_read(&mut tun_buf) {
+                                if tun_buf.len() < 65536 {
+                                    tun_buf.resize(65536, 0);
+                                }
+                                match self.tun_io.try_read(&mut tun_buf[1..]) {
                                     Ok(Some(n)) if n > 0 => {
                                         local_stats.tun_rx_packets += 1;
                                         local_stats.tun_rx_bytes += n as u64;
-                                        self.handle_tun_packet(&tun_buf[..n], &dp_snapshot, now, &mut local_stats).await;
+                                        tun_buf[0] = 0x02;
+                                        let frame = tun_buf.split_to(1 + n).freeze();
+                                        self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
                                     }
                                     _ => break,
                                 }
@@ -715,8 +713,8 @@ impl RtcWorker {
                         let mut total_tx = 0;
                         let mut total_rx = 0;
                         for conn in self.connections.values() {
-                            total_tx += conn.tx_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                            total_rx += conn.rx_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                            total_tx += conn.tx_bytes.load();
+                            total_rx += conn.rx_bytes.load();
                         }
                         publish_stats.l3_bytes = total_tx + total_rx;
                         stats.publish(&publish_stats);
@@ -735,8 +733,8 @@ impl RtcWorker {
                                     let snap = crate::quic_pool::QuicConnSnapshot {
                                         remote_addr: remote_address,
                                         local_port,
-                                        rx_bytes: conn.rx_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                                        tx_bytes: conn.tx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                        rx_bytes: conn.rx_bytes.load(),
+                                        tx_bytes: conn.tx_bytes.load(),
                                         active_streams,
                                     };
                                     reg_guard.entry(pub_key).or_default().push(snap);
