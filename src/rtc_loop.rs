@@ -576,6 +576,9 @@ impl RtcWorker {
             if tun_buf.capacity() < 65536 {
                 tun_buf.reserve(256 * 1024);
             }
+            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+            // for read/recv_from. The uninitialized bytes are never read before they are
+            // overwritten by the OS kernel during the IO system call.
             unsafe {
                 let cap = tun_buf.capacity();
                 tun_buf.set_len(cap);
@@ -586,6 +589,9 @@ impl RtcWorker {
             if udp_buf.capacity() < 65536 {
                 udp_buf.reserve(256 * 1024);
             }
+            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+            // for read/recv_from. The uninitialized bytes are never read before they are
+            // overwritten by the OS kernel during the IO system call.
             unsafe {
                 let cap = udp_buf.capacity();
                 udp_buf.set_len(cap);
@@ -633,6 +639,9 @@ impl RtcWorker {
                             local_stats.tun_rx_packets += 1;
                             local_stats.tun_rx_bytes += n as u64;
                             tun_buf[0] = 0x02;
+                            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                            // for read/recv_from. The uninitialized bytes are never read before they are
+                            // overwritten by the OS kernel during the IO system call.
                             unsafe {
                                 tun_buf.set_len(1 + n);
                             }
@@ -643,6 +652,9 @@ impl RtcWorker {
                                 if tun_buf.capacity() < 65536 {
                                     tun_buf.reserve(256 * 1024);
                                 }
+                                // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                // for read/recv_from. The uninitialized bytes are never read before they are
+                                // overwritten by the OS kernel during the IO system call.
                                 unsafe {
                                     let cap = tun_buf.capacity();
                                     tun_buf.set_len(cap);
@@ -652,6 +664,9 @@ impl RtcWorker {
                                         local_stats.tun_rx_packets += 1;
                                         local_stats.tun_rx_bytes += n as u64;
                                         tun_buf[0] = 0x02;
+                                        // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                        // for read/recv_from. The uninitialized bytes are never read before they are
+                                        // overwritten by the OS kernel during the IO system call.
                                         unsafe {
                                             tun_buf.set_len(1 + n);
                                         }
@@ -677,6 +692,9 @@ impl RtcWorker {
                     match read_res {
                         Ok((n, remote_addr)) if n > 0 => {
                             let now = std::time::Instant::now();
+                            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                            // for read/recv_from. The uninitialized bytes are never read before they are
+                            // overwritten by the OS kernel during the IO system call.
                             unsafe {
                                 udp_buf.set_len(n);
                             }
@@ -687,12 +705,18 @@ impl RtcWorker {
                                 if udp_buf.capacity() < 65536 {
                                     udp_buf.reserve(256 * 1024);
                                 }
+                                // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                // for read/recv_from. The uninitialized bytes are never read before they are
+                                // overwritten by the OS kernel during the IO system call.
                                 unsafe {
                                     let cap = udp_buf.capacity();
                                     udp_buf.set_len(cap);
                                 }
                                 match self.udp_socket.try_recv_from(&mut udp_buf) {
                                     Ok((n, remote_addr)) if n > 0 => {
+                                        // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                        // for read/recv_from. The uninitialized bytes are never read before they are
+                                        // overwritten by the OS kernel during the IO system call.
                                         unsafe {
                                             udp_buf.set_len(n);
                                         }
@@ -934,9 +958,7 @@ mod tests {
             client_tun_io,
             0,
             WorkerRole::Client,
-            RtcWorkerConfig {
-                mtu: 1400,
-            },
+            RtcWorkerConfig { mtu: 1400 },
             client_sock,
             client_endpoint,
             None,
@@ -948,9 +970,7 @@ mod tests {
             server_tun_io,
             0,
             WorkerRole::Server,
-            RtcWorkerConfig {
-                mtu: 1400,
-            },
+            RtcWorkerConfig { mtu: 1400 },
             server_sock,
             server_endpoint,
             Some(session_cache.clone()),

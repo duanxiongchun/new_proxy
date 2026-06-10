@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // 线程安全的 U64 计数器包装类，使用 AtomicU64 替代 UnsafeCell 从而避免多线程并发读写下的 Undefined Behavior (数据竞争)。
 // 注意：本计数器的 `add` 操作使用 Relaxed 内存序的 load 和 store（非 fetch_add 组合），在 x86_64 架构下编译为普通的 mov 指令
 // 而不会产生 LOCK 前缀总线锁，从而与非原子变量具有相同的极致性能。
-// 
+//
 // 关键约束：`add` 操作只能由单线程独占写入（单写入者场景，如各个独立的 RtcWorker 线程），不允许并发多线程写入，
 // 否则可能导致更新丢失。而读操作可以由任意线程（如 UDS 管控线程）并发安全读取。
 #[derive(Debug)]
