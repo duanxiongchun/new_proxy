@@ -35,6 +35,20 @@ impl AsyncTunIo {
         }
     }
 
+    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        match self.fd.try_io(tokio::io::Interest::READABLE, |_ready| {
+            let fd = self.fd.get_ref().as_raw_fd();
+            match unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } {
+                r if r >= 0 => Ok(r as usize),
+                _ => Err(io::Error::last_os_error()),
+            }
+        }) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
         loop {
             let mut guard = self.fd.writable().await?;

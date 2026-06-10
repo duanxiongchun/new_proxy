@@ -14,6 +14,48 @@ impl<V> TrieNode<V> {
             children: [None, None],
         }
     }
+
+    fn find_ips(&self, val: &V, path: u32, depth: u8, results: &mut Vec<IpAddr>)
+    where
+        V: PartialEq,
+    {
+        if let Some(ref v) = self.value {
+            if v == val {
+                let ip_val = if depth == 0 { 0 } else { path << (32 - depth) };
+                let ip = std::net::Ipv4Addr::from(ip_val);
+                results.push(IpAddr::V4(ip));
+            }
+        }
+        for bit in 0..2 {
+            if let Some(ref child) = self.children[bit] {
+                child.find_ips(val, (path << 1) | (bit as u32), depth + 1, results);
+            }
+        }
+    }
+
+    fn find_ips_v6(&self, val: &V, path: [u8; 16], depth: u8, results: &mut Vec<IpAddr>)
+    where
+        V: PartialEq,
+    {
+        if let Some(ref v) = self.value {
+            if v == val {
+                results.push(IpAddr::V6(std::net::Ipv6Addr::from(path)));
+            }
+        }
+        for bit in 0..2 {
+            if let Some(ref child) = self.children[bit] {
+                let mut next_path = path;
+                let byte_idx = (depth / 8) as usize;
+                let bit_idx = 7 - (depth % 8);
+                if bit == 1 {
+                    next_path[byte_idx] |= 1 << bit_idx;
+                } else {
+                    next_path[byte_idx] &= !(1 << bit_idx);
+                }
+                child.find_ips_v6(val, next_path, depth + 1, results);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -110,6 +152,16 @@ impl<V: Clone> AllowedIPsRouter<V> {
                 best_match.clone()
             }
         }
+    }
+
+    pub fn find_ips_for_value(&self, val: &V) -> Vec<IpAddr>
+    where
+        V: PartialEq,
+    {
+        let mut results = Vec::new();
+        self.v4_root.find_ips(val, 0, 0, &mut results);
+        self.v6_root.find_ips_v6(val, [0u8; 16], 0, &mut results);
+        results
     }
 }
 

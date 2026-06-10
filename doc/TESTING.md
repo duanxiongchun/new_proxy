@@ -36,6 +36,7 @@ cargo test
 * **`src/app_config.rs` & `src/config.rs`**：
   * 校验基础配置、Base64 密钥材料解析以及 AllowedIPs 路由解析。
   * 验证非法地址、不合规端口范围的边界防御。
+  * 验证 MTU 的默认加载以及如果配置值超过 `1150` 时的自动 Clamp 机制。
 * **`src/control.rs`**：
   * **HMAC 双向校验**：控制面请求与响应的 HMAC-SHA256 生成与合法性判定。
   * **防重放攻击**：利用 nonce replay cache 校验 `client_nonce`。
@@ -47,11 +48,9 @@ cargo test
 * **`src/rtc_loop.rs`（RtcWorker 事件循环）**：
   * **网卡多队列读写**：验证工作线程 $i$ 对 TUN 队列 $i$ 的独占非阻塞轮询。
   * **Datagram 封装与解封装**：验证从 TUN 读出 IP 数据包后，直接作为 Payload 塞入 QUIC Datagram 发送，以及反向解析 Datagram 直接写回 TUN 的正确性（IP 头部必须完全保留）。
-  * **TCP MSS 夹紧（MSS Clamping）**：
-    * 识别 TCP SYN 包和 SYN-ACK 包的 IP 数据包。
-    * 解析并改写 TCP Option 中的 MSS 字段。
-    * 重新计算 IP 校验和与 TCP 校验和。
-    * **测试用例**：输入 1500 字节 MTU 配置下的 TCP SYN，断言改写后的 MSS 是否被夹紧至 `1160`（或根据 QUIC datagram 最大容量动态夹紧），并验证 checksum 重新计算后的合法性。
+  * **MTU 自动 Clamp 与零拷贝传输**：
+    * 验证从 TUN 读取数据包到 `BytesMut` 缓冲区时正确的零拷贝封装（偏移读取及 header 打标）。
+    * 验证对 `CellU64` 等非原子计数器的安全读写与聚合。
   * **线程局部 BufferPool 循环**：
     * 验证数据面转发逻辑中，所有报文缓冲区（`PooledBuf`）全部在当前工作线程的本地 BufferPool 内借用和释放。
     * **测试用例**：通过内存分配追踪，确保包转发热路径上没有发生任何全局堆内存分配（`malloc` / `free`），实现 100% 内存静态化。
@@ -106,8 +105,8 @@ sudo ./script/acceptance/run_acceptance.sh
 
 #### 6. TCP MSS 夹紧有效性与零分片 (`e2e_mss_clamping.sh`)
 * **验证点**：
-  * 将客户端 TUN 的 MTU 设为 1200，并发起大流量 TCP 传输。
-  * 在物理链路上抓包硬性断言：绝对不能出现 IP 层的分片包（Fragmentation），且 TCP 握手 SYN 的 MSS 字段被完美夹紧至 `1160` 安全值。
+  * 将客户端/服务端配置为 MTU = 1100（或配置大 MTU 被自动 Clamp 为 1100），并发起大流量 TCP 传输。
+  * 在物理链路上抓包硬性断言：绝对不能出现 IP 层的分片包（Fragmentation），且 TCP 握手 SYN 的 MSS 字段被操作系统内核自动限制至 `1060` 安全值（即 MTU - 40 字节）。
 
 #### 7. UDP 与 ICMP 隧道穿透 (`e2e_udp_icmp_tunnel.sh`)
 * **验证点**：

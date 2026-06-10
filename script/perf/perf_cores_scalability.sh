@@ -150,7 +150,7 @@ cat > "$CLIENT_CONF" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-MTU = 1400
+MTU = 1100
 Table = auto
 
 [Peer]
@@ -171,6 +171,7 @@ PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
+MTU = 1100
 Table = auto
 
 [QUICPool]
@@ -188,13 +189,13 @@ ip netns add scale_router_ns
 ip netns add scale_client_ns
 ip netns add scale_work_ns
 
-ip link add vs-s type veth peer name vs-rs
+ip link add vs-s numtxqueues 4 numrxqueues 4 type veth peer name vs-rs numtxqueues 4 numrxqueues 4
 ip link set vs-s netns scale_server_ns
 ip link set vs-rs netns scale_router_ns
-ip link add vs-c type veth peer name vs-rc
+ip link add vs-c numtxqueues 4 numrxqueues 4 type veth peer name vs-rc numtxqueues 4 numrxqueues 4
 ip link set vs-c netns scale_client_ns
 ip link set vs-rc netns scale_router_ns
-ip link add vs-w type veth peer name vs-cw
+ip link add vs-w numtxqueues 4 numrxqueues 4 type veth peer name vs-cw numtxqueues 4 numrxqueues 4
 ip link set vs-w netns scale_work_ns
 ip link set vs-cw netns scale_client_ns
 
@@ -255,13 +256,34 @@ PY
     exit 1
   fi
 
-  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$ARTIFACT_DIR" <<'PY' > "$ARTIFACT_DIR/http.log" 2>&1 &
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$BLOB_MIB" <<'PY' > "$ARTIFACT_DIR/http.log" 2>&1 &
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
 import sys
-import os
 
-os.chdir(sys.argv[1])
-server = ThreadingHTTPServer(('10.0.0.1', 8080), SimpleHTTPRequestHandler)
+class ForkingHTTPServer(socketserver.ForkingMixIn, HTTPServer):
+    pass
+
+blob_mib = int(sys.argv[1])
+blob_data = b'\x00' * (blob_mib * 1024 * 1024)
+
+class InMemoryHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, format, *args):
+        pass
+    def do_GET(self):
+        if self.path == '/blob.bin':
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(blob_data)))
+            self.end_headers()
+            chunk_size = 128 * 1024
+            for i in range(0, len(blob_data), chunk_size):
+                self.wfile.write(blob_data[i:i+chunk_size])
+        else:
+            self.send_error(404, "Not Found")
+
+server = ForkingHTTPServer(('10.0.0.1', 8080), InMemoryHandler)
 server.serve_forever()
 PY
   HTTP_PID=$!
@@ -276,6 +298,10 @@ PY
   fi
 
   ip netns exec scale_work_ns curl -fsS --connect-timeout 5 --max-time 30 -o /dev/null "http://10.0.0.1:8080/blob.bin"
+
+  echo "Starting perf record on client ($CLIENT_PID) and server ($SERVER_PID) for 10 seconds..." >&2
+  perf record -F 99 -g -p "$CLIENT_PID" -o "$ARTIFACT_DIR/perf_client_${data_ports}.data" -- sleep 10 >/dev/null 2>&1 &
+  perf record -F 99 -g -p "$SERVER_PID" -o "$ARTIFACT_DIR/perf_server_${data_ports}.data" -- sleep 10 >/dev/null 2>&1 &
 
   local line
   if ! line="$(ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$data_ports" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
@@ -415,13 +441,24 @@ def send_worker(thread_idx):
     port = 9990 + (thread_idx % data_ports)
     dest = ('10.0.0.1', port)
     sent = 0
-    packet_interval = 0.000080
+    
+    # Target: 50 MiB/s per port
+    target_port_rate = 50.0 # MiB/s
+    total_rate = target_port_rate * data_ports
+    rate_per_thread = total_rate / parallel # MiB/s
+    
+    sleep_interval = 0.002
+    packets_per_sec = (rate_per_thread * 1024 * 1024) / chunk_size
+    burst_size = max(1, int(packets_per_sec * sleep_interval))
+    
+    burst_count = 0
     while sent < per_thread:
-        t0 = time.monotonic()
         sock.sendto(data, dest)
         sent += chunk_size
-        while time.monotonic() - t0 < packet_interval:
-            pass
+        burst_count += 1
+        if burst_count >= burst_size:
+            time.sleep(sleep_interval)
+            burst_count = 0
 
 if __name__ == '__main__':
     processes = []

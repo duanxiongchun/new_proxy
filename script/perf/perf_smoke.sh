@@ -48,12 +48,15 @@ if [ ! -e /dev/net/tun ]; then
 fi
 chmod 666 /dev/net/tun
 
+export RUST_LOG=debug
+
 cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
+MTU = 1100
 Table = auto
 
 [QUICPool]
@@ -69,7 +72,7 @@ cat > "$ARTIFACT_DIR/client_perf.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-MTU = 1400
+MTU = 1100
 Table = auto
 
 [Peer]
@@ -78,6 +81,7 @@ Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 EOF_CONF
+
 
 ip netns add perf_server_ns
 ip netns add perf_router_ns

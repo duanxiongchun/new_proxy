@@ -1,11 +1,11 @@
 mod api;
 mod app_config;
 mod buffer_pool;
-mod client_proxy;
+mod client;
 mod config;
 mod control;
-pub mod mss_clamping;
 mod quic_pool;
+pub mod quic_proto_engine;
 mod routing;
 pub mod rtc_loop;
 mod runtime;
@@ -17,7 +17,7 @@ pub mod tun_io;
 mod uds_server;
 
 use arc_swap::ArcSwap;
-use client_proxy::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
+use client::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
 use std::collections::HashMap;
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -29,9 +29,7 @@ use app_config::{
 };
 use config::GatewayConfig;
 use control::ControlServer;
-use quic_pool::{
-    cert_sha256, generate_self_signed_cert, PoolState, QuicPoolClient, QuicPoolServer,
-};
+use quic_pool::{cert_sha256, generate_self_signed_cert, PoolState, QuicPoolClient};
 use routing::AllowedIPsRouter;
 use runtime::{cleanup_runtime, run_script, setup_routes};
 use stats_cli::run_cli_stats;
@@ -690,6 +688,25 @@ async fn run_gateway(
             std::process::exit(1);
         }
 
+        let (quic_certs, quic_key) = match generate_self_signed_cert() {
+            Ok(cert) => cert,
+            Err(e) => {
+                log::error!("Failed to generate QUIC certificate: {}", e);
+                let cleanup_config = gateway_state.read().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+        let quic_cert_sha256 = match cert_sha256(&quic_certs) {
+            Ok(fingerprint) => fingerprint,
+            Err(e) => {
+                log::error!("Failed to fingerprint QUIC certificate: {}", e);
+                let cleanup_config = gateway_state.read().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+        };
+
         let mut l3_tasks = Vec::new();
         for (worker_id, fd) in tun_fds.into_iter().enumerate() {
             let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
@@ -702,17 +719,64 @@ async fn run_gateway(
             });
             let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
             let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
+
+            let local_port = config.quic_pool.listen_ports[worker_id];
+            let bind_addr = format!("0.0.0.0:{}", local_port)
+                .parse::<std::net::SocketAddr>()
+                .unwrap();
+            let std_sock =
+                std::net::UdpSocket::bind(bind_addr).expect("Failed to bind server UDP socket");
+            std_sock.set_nonblocking(true).unwrap();
+            let sock_ref = socket2::SockRef::from(&std_sock);
+            let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
+            let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
+            if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
+                log::error!("Failed to set outer mark on server UDP socket: {}", e);
+                cleanup_runtime(&config, &interface_name);
+                std::process::exit(1);
+            }
+            let udp_socket =
+                tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
+
+            let mut rustls_config = rustls::ServerConfig::builder()
+                .with_safe_defaults()
+                .with_no_client_auth()
+                .with_single_cert(quic_certs.clone(), quic_key.clone())
+                .expect("Failed to build rustls ServerConfig");
+            rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
+            let mut server_proto_config =
+                quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
+            let mut transport = quinn_proto::TransportConfig::default();
+            transport
+                .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+            transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+            transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
+            transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
+            transport.send_window(16 * 1024 * 1024);
+            transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+            transport.datagram_send_buffer_size(8 * 1024 * 1024);
+            server_proto_config.transport_config(Arc::new(transport));
+
+            let endpoint_config = quinn_proto::EndpointConfig::default();
+            let endpoint = quinn_proto::Endpoint::new(
+                Arc::new(endpoint_config),
+                Some(Arc::new(server_proto_config)),
+                false,
+            );
+
             let mut worker = rtc_loop::RtcWorker::new(
                 tun_io,
                 worker_id,
-                rtc_loop::WorkerRole::Server {
-                    peer_conn_registry: shared_quic_registry.clone(),
-                    listen_ports: config.quic_pool.listen_ports.clone(),
-                },
+                rtc_loop::WorkerRole::Server,
                 rtc_loop::RtcWorkerConfig {
                     mtu: config.interface.mtu as usize,
                     buffer_pool: worker_buffer_pool,
                 },
+                udp_socket,
+                endpoint,
+                Some(session_cache.clone()),
+                Some(auth_nonce_cache.clone()),
+                Some(shared_quic_registry.clone()),
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
             worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
@@ -739,31 +803,11 @@ async fn run_gateway(
             l3_tasks.push(task);
         }
 
-        let Some(listen_control_port) = config.interface.listen_control_port else {
-            log::error!("Server config validation failed to enforce ListenControlPort");
-            let cleanup_config = gateway_state.read().config.clone();
-            cleanup_runtime(&cleanup_config, &interface_name);
-            std::process::exit(1);
-        };
-
-        let (quic_certs, quic_key) = match generate_self_signed_cert() {
-            Ok(cert) => cert,
-            Err(e) => {
-                log::error!("Failed to generate QUIC certificate: {}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-        let quic_cert_sha256 = match cert_sha256(&quic_certs) {
-            Ok(fingerprint) => fingerprint,
-            Err(e) => {
-                log::error!("Failed to fingerprint QUIC certificate: {}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
+        let listen_control_port = config
+            .interface
+            .listen_control_port
+            .or(config.interface.listen_port)
+            .expect("Server config validation failed to enforce control port");
 
         // 启动用户态独立公网控制通道协商服务器 (传递动态 peer_secrets 哈希表)
         let control_server = ControlServer::new(
@@ -785,32 +829,6 @@ async fn run_gateway(
                 std::process::exit(1);
             }
         };
-
-        // 启动用户态多路复用平行 QUIC 物理池接收服务器
-        let quic_server = QuicPoolServer::new(
-            config.quic_pool.listen_ports.clone(),
-            session_cache.clone(),
-            auth_nonce_cache.clone(),
-        );
-        let shared_reg_for_server = shared_quic_registry.clone();
-        let handler = Arc::new(
-            move |_client_pub: [u8; 32],
-                  _send_mux: quinn::SendStream,
-                  _recv_mux: quinn::RecvStream,
-                  _conn_stat: Arc<quic_pool::QuicConnStats>|
-                  -> quic_pool::ServerFuture { Box::pin(async move {}) },
-        );
-
-        if let Err(e) = quic_server
-            .run_with_registry(quic_certs, quic_key, handler, shared_reg_for_server)
-            .await
-        {
-            log::error!("QUIC Pool Server error: {}", e);
-            control_task.abort();
-            let cleanup_config = gateway_state.read().config.clone();
-            cleanup_runtime(&cleanup_config, &interface_name);
-            std::process::exit(1);
-        }
 
         tokio::select! {
             _ = wait_for_shutdown() => {},
@@ -969,6 +987,24 @@ async fn run_gateway(
             let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
             let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
 
+            let std_sock =
+                std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind client UDP socket");
+            std_sock.set_nonblocking(true).unwrap();
+            let sock_ref = socket2::SockRef::from(&std_sock);
+            let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
+            let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
+            if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
+                log::error!("Failed to set outer mark on client UDP socket: {}", e);
+                let cleanup_config = gateway_state.read().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
+            let udp_socket =
+                tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
+
+            let endpoint_config = quinn_proto::EndpointConfig::default();
+            let endpoint = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, false);
+
             let mut worker = rtc_loop::RtcWorker::new(
                 tun_io,
                 worker_id,
@@ -977,6 +1013,11 @@ async fn run_gateway(
                     mtu: config.interface.mtu as usize,
                     buffer_pool: worker_buffer_pool,
                 },
+                udp_socket,
+                endpoint,
+                None,
+                None,
+                Some(shared_quic_registry.clone()),
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
             worker.set_peer_telemetry(peer_telemetries[worker_id].clone());

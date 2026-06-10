@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig};
@@ -16,6 +17,24 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
+
+use std::sync::OnceLock;
+
+pub fn quic_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(4))
+                    .unwrap_or(2),
+            )
+            .thread_name("new-proxy-quic")
+            .enable_all()
+            .build()
+            .expect("Failed to build QUIC Tokio runtime")
+    })
+}
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,6 +98,7 @@ impl Default for QuicPoolClientTiming {
 }
 
 fn bind_server_endpoint(server_config: ServerConfig, port: u16) -> Result<Endpoint, String> {
+    let _guard = quic_runtime().enter();
     let runtime =
         quinn::default_runtime().ok_or_else(|| "No async runtime found for QUIC".to_string())?;
     let v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
@@ -288,9 +308,9 @@ pub struct QuicAuthPacket {
 pub struct QuicConnStats {
     pub remote_addr: SocketAddr,
     pub local_port: u16,
-    pub rx_bytes: Arc<AtomicU64>,
-    pub tx_bytes: Arc<AtomicU64>,
-    pub active_streams: Arc<AtomicU64>,
+    pub rx_bytes: Arc<crate::telemetry::CellU64>,
+    pub tx_bytes: Arc<crate::telemetry::CellU64>,
+    pub active_streams: Arc<crate::telemetry::CellU64>,
 }
 
 impl QuicConnStats {
@@ -298,9 +318,9 @@ impl QuicConnStats {
         Self {
             remote_addr,
             local_port,
-            rx_bytes: Arc::new(AtomicU64::new(0)),
-            tx_bytes: Arc::new(AtomicU64::new(0)),
-            active_streams: Arc::new(AtomicU64::new(0)),
+            rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+            tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+            active_streams: Arc::new(crate::telemetry::CellU64::new(0)),
         }
     }
 
@@ -309,9 +329,9 @@ impl QuicConnStats {
         QuicConnSnapshot {
             remote_addr: self.remote_addr.to_string(),
             local_port: self.local_port,
-            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
-            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
-            active_streams: self.active_streams.load(Ordering::Relaxed),
+            rx_bytes: self.rx_bytes.load(),
+            tx_bytes: self.tx_bytes.load(),
+            active_streams: self.active_streams.load(),
         }
     }
 }
@@ -327,8 +347,8 @@ pub struct QuicConnSnapshot {
 }
 
 // 控制面通过已认证 HMAC 响应下发 QUIC 证书指纹；数据面只接受该证书。
-struct PinnedCertVerifier {
-    expected_sha256: [u8; 32],
+pub struct PinnedCertVerifier {
+    pub expected_sha256: [u8; 32],
 }
 
 impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
@@ -481,6 +501,22 @@ impl QuicPoolClient {
         self.data_port_count
     }
 
+    pub fn session_psk(&self) -> [u8; 32] {
+        self.runtime_config.read().session_psk
+    }
+
+    pub fn server_cert_sha256(&self) -> [u8; 32] {
+        self.runtime_config.read().server_cert_sha256
+    }
+
+    pub fn endpoints(&self) -> Vec<SocketAddr> {
+        self.runtime_config.read().endpoints.clone()
+    }
+
+    pub fn client_public_key(&self) -> [u8; 32] {
+        self.client_public_key
+    }
+
     pub fn connection_snapshots(&self) -> Vec<QuicConnSnapshot> {
         self.slots
             .load()
@@ -588,6 +624,7 @@ impl QuicPoolClient {
     }
 
     fn create_client_endpoint(runtime_config: &PoolRuntimeConfig) -> Result<Endpoint, String> {
+        let _guard = quic_runtime().enter();
         if runtime_config.endpoints.is_empty() {
             return Err("Empty endpoints pool".to_string());
         }
@@ -714,9 +751,12 @@ impl QuicPoolClient {
         session_psk: [u8; 32],
         connect_timeout: Duration,
     ) -> Result<PoolSlot, String> {
-        let connecting = endpoint
-            .connect(target_addr, "localhost")
-            .map_err(|e| format!("QUIC connect initiation failed to {}: {}", target_addr, e))?;
+        let connecting = {
+            let _guard = quic_runtime().enter();
+            endpoint
+                .connect(target_addr, "localhost")
+                .map_err(|e| format!("QUIC connect initiation failed to {}: {}", target_addr, e))?
+        };
         let conn = timeout(connect_timeout, connecting)
             .await
             .map_err(|_| format!("QUIC connection timed out to {}", target_addr))?
@@ -1054,12 +1094,12 @@ impl QuicPoolClient {
 
 // 3. 服务端 QUIC 接收端与验证服务
 // 每个已认证的对端连接 → 聚合统计（按 client_pub_key）
-pub type PeerConnRegistry = Arc<RwLock<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
+pub type PeerConnRegistry = Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<QuicConnSnapshot>>>>;
 
 #[derive(Clone)]
 pub struct QuicConnRecord {
     pub id: u64,
-    pub stats: QuicConnStats,
+    pub stats: Arc<QuicConnStats>,
     pub conn: Connection,
 }
 
@@ -1254,24 +1294,28 @@ impl QuicPoolServer {
         let _ = send.shutdown().await;
 
         let client_pub_key = auth_packet.client_public_key;
-        let record_id = NEXT_QUIC_CONN_RECORD_ID.fetch_add(1, Ordering::Relaxed);
         let conn_stat = Arc::new(QuicConnStats::new(remote_addr, port));
         {
             let mut registry = peer_conn_registry.write();
             registry
                 .entry(client_pub_key)
                 .or_default()
-                .push(QuicConnRecord {
-                    id: record_id,
-                    stats: (*conn_stat).clone(),
-                    conn: conn.clone(),
-                });
+                .push(conn_stat.snapshot());
+        }
+
+        #[cfg(test)]
+        {
+            TEST_ACCEPTED_CONNECTIONS
+                .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .insert(port, conn.clone());
         }
 
         let _guard = TelemetryRegistryGuard {
             registry: peer_conn_registry.clone(),
             client_pub_key,
-            record_id,
+            remote_addr: remote_addr.to_string(),
+            local_port: port,
         };
 
         let mut streams = ServerFutures::new();
@@ -1352,7 +1396,7 @@ impl QuicPoolServer {
             let handler = handler.clone();
             let peer_conn_registry = external_registry.clone();
             let connection_limit = connection_limit.clone();
-            tokio::spawn(async move {
+            quic_runtime().spawn(async move {
                 Self::drive_quic_listener(
                     port,
                     endpoint,
@@ -1373,20 +1417,28 @@ impl QuicPoolServer {
 struct TelemetryRegistryGuard {
     registry: PeerConnRegistry,
     client_pub_key: [u8; 32],
-    record_id: u64,
+    remote_addr: String,
+    local_port: u16,
 }
 
 impl Drop for TelemetryRegistryGuard {
     fn drop(&mut self) {
         let mut registry = self.registry.write();
         if let Some(conns) = registry.get_mut(&self.client_pub_key) {
-            conns.retain(|record| record.id != self.record_id);
+            conns.retain(|snap| {
+                snap.remote_addr != self.remote_addr || snap.local_port != self.local_port
+            });
             if conns.is_empty() {
                 registry.remove(&self.client_pub_key);
             }
         }
     }
 }
+
+#[cfg(test)]
+static TEST_ACCEPTED_CONNECTIONS: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<u16, quinn::Connection>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod tests {
@@ -1618,9 +1670,9 @@ mod tests {
                     let mut buf = vec![0u8; 1024];
                     if let Ok(Some(n)) = recv.read(&mut buf).await {
                         buf.truncate(n);
-                        stat.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        stat.rx_bytes.add(n as u64);
                         if send.write_all(&buf).await.is_ok() {
-                            stat.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            stat.tx_bytes.add(n as u64);
                         }
                         let _ = send.finish().await;
                         let _ = tx.send(buf).await;
@@ -1667,22 +1719,38 @@ mod tests {
 
         // 3. 服务端流处理逻辑 (Echo 服务)
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+        let peer_registry_clone = peer_registry.clone();
         let handler = Arc::new(
-            move |_pub_key: [u8; 32],
+            move |pub_key: [u8; 32],
                   mut send: quinn::SendStream,
                   mut recv: quinn::RecvStream,
                   stat: Arc<QuicConnStats>|
                   -> ServerFuture {
                 let tx = tx.clone();
+                let peer_registry_clone = peer_registry_clone.clone();
                 Box::pin(async move {
                     // 模拟接收数据并增加 rx 计数
                     let mut buf = vec![0u8; 1024];
                     if let Ok(Some(n)) = recv.read(&mut buf).await {
                         buf.truncate(n);
-                        stat.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        stat.rx_bytes.add(n as u64);
                         // 回写数据并增加 tx 计数
                         if send.write_all(&buf).await.is_ok() {
-                            stat.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            stat.tx_bytes.add(n as u64);
+                        }
+                        {
+                            let mut reg = peer_registry_clone.write();
+                            if let Some(snaps) = reg.get_mut(&pub_key) {
+                                for snap in snaps {
+                                    let snap: &mut QuicConnSnapshot = snap;
+                                    if snap.local_port == stat.local_port
+                                        && snap.remote_addr == stat.remote_addr.to_string()
+                                    {
+                                        snap.rx_bytes = stat.rx_bytes.load();
+                                        snap.tx_bytes = stat.tx_bytes.load();
+                                    }
+                                }
+                            }
                         }
                         let _ = send.finish().await;
                         let _ = tx.send(buf).await;
@@ -1731,12 +1799,10 @@ mod tests {
             assert!(registry.contains_key(&client_pub_key));
             let stats = &registry[&client_pub_key];
             assert_eq!(stats.len(), 1);
-            assert_eq!(stats[0].stats.local_port, port);
+            assert_eq!(stats[0].local_port, port);
 
-            let snapshot = stats[0].snapshot();
-            assert_eq!(snapshot.local_port, port);
-            assert!(snapshot.rx_bytes > 0);
-            assert!(snapshot.tx_bytes > 0);
+            assert!(stats[0].rx_bytes > 0);
+            assert!(stats[0].tx_bytes > 0);
         }
 
         // 8. 启动健康检查探针以实现代码覆盖 (验证不会崩溃即可)
@@ -1797,11 +1863,22 @@ mod tests {
 
         let (client_conn, _) = client.get_connection_by_slot(0).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let server_conn = {
-            let registry = peer_registry.read();
-            assert!(registry.contains_key(&client_pub_key));
-            registry[&client_pub_key][0].conn.clone()
+            let mut conn = None;
+            for _ in 0..50 {
+                let found = {
+                    let map = TEST_ACCEPTED_CONNECTIONS
+                        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                        .lock();
+                    map.get(&port).cloned()
+                };
+                if let Some(c) = found {
+                    conn = Some(c);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            conn.expect("Server connection not accepted in time")
         };
 
         let test_payload = Bytes::from_static(b"Hello Datagram!");

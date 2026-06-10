@@ -1,7 +1,5 @@
 use crate::buffer_pool::BufferPool;
-use crate::quic_pool::PeerConnRegistry;
 use crate::tun_io::AsyncTunIo;
-use quinn::Connection;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -11,37 +9,13 @@ pub struct RtcWorkerConfig {
     pub buffer_pool: BufferPool,
 }
 
-#[derive(Clone)]
-struct ActiveConn {
-    conn: Connection,
-    stats: Arc<crate::quic_pool::QuicConnStats>,
-    peer_stats: Option<Arc<crate::telemetry::PeerL4Stats>>,
-    _pub_key: [u8; 32],
-}
-
-enum ReadDatagramResult {
-    Ok(bytes::Bytes, usize),
-    Err(usize),
-}
-
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WorkerRole {
     Client,
-    Server {
-        peer_conn_registry: PeerConnRegistry,
-        listen_ports: Vec<u16>,
-    },
+    Server,
 }
 
-impl std::fmt::Debug for WorkerRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WorkerRole::Client => write!(f, "Client"),
-            WorkerRole::Server { .. } => write!(f, "Server"),
-        }
-    }
-}
-
+#[allow(clippy::type_complexity)]
 pub struct RtcWorker {
     pub tun_io: Arc<AsyncTunIo>,
     pub worker_id: usize,
@@ -51,14 +25,41 @@ pub struct RtcWorker {
     pub peer_telemetry: Option<Arc<crate::telemetry::TelemetryRegistry>>,
     pub role: WorkerRole,
     pub bridge_notify: Arc<Notify>,
+
+    pub udp_socket: tokio::net::UdpSocket,
+    pub endpoint: quinn_proto::Endpoint,
+    pub connections: std::collections::HashMap<
+        quinn_proto::ConnectionHandle,
+        crate::quic_proto_engine::WorkerConnection,
+    >,
+    pub ip_to_handle: std::collections::HashMap<std::net::IpAddr, quinn_proto::ConnectionHandle>,
+    pub handle_to_ip: std::collections::HashMap<quinn_proto::ConnectionHandle, std::net::IpAddr>,
+    pub session_cache:
+        Option<Arc<parking_lot::RwLock<std::collections::HashMap<[u8; 32], [u8; 32]>>>>,
+    pub auth_nonce_cache: Option<
+        Arc<parking_lot::Mutex<std::collections::HashMap<[u8; 32], crate::control::NonceCache>>>,
+    >,
+    pub shared_quic_registry: Option<crate::quic_pool::PeerConnRegistry>,
 }
 
 impl RtcWorker {
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn new(
         tun_io: Arc<AsyncTunIo>,
         worker_id: usize,
         role: WorkerRole,
         config: RtcWorkerConfig,
+        udp_socket: tokio::net::UdpSocket,
+        endpoint: quinn_proto::Endpoint,
+        session_cache: Option<
+            Arc<parking_lot::RwLock<std::collections::HashMap<[u8; 32], [u8; 32]>>>,
+        >,
+        auth_nonce_cache: Option<
+            Arc<
+                parking_lot::Mutex<std::collections::HashMap<[u8; 32], crate::control::NonceCache>>,
+            >,
+        >,
+        shared_quic_registry: Option<crate::quic_pool::PeerConnRegistry>,
     ) -> Self {
         let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(config.mtu as u16);
         Self {
@@ -70,6 +71,14 @@ impl RtcWorker {
             peer_telemetry: None,
             role,
             bridge_notify: Arc::new(Notify::new()),
+            udp_socket,
+            endpoint,
+            connections: std::collections::HashMap::new(),
+            ip_to_handle: std::collections::HashMap::new(),
+            handle_to_ip: std::collections::HashMap::new(),
+            session_cache,
+            auth_nonce_cache,
+            shared_quic_registry,
         }
     }
 
@@ -81,115 +90,466 @@ impl RtcWorker {
         self.peer_telemetry = Some(telemetry);
     }
 
-    fn get_active_connection(
-        &self,
-        data_plane: &crate::L4DataPlaneSnapshot,
-        dst_ip: IpAddr,
-    ) -> Option<ActiveConn> {
-        match &self.role {
-            WorkerRole::Client => {
-                let peer_pub_key = data_plane.router.longest_match(dst_ip)?;
-                let pool = data_plane.client_quic_pools.get(&peer_pub_key)?;
-                let (conn, stats) = pool.get_connection_by_slot(self.worker_id)?;
-                if conn.close_reason().is_none() {
-                    let peer_stats = self
-                        .peer_telemetry
-                        .as_ref()
-                        .map(|pt| pt.get_or_create(peer_pub_key));
-                    Some(ActiveConn {
-                        conn,
-                        stats,
-                        peer_stats,
-                        _pub_key: peer_pub_key,
-                    })
-                } else {
-                    None
-                }
-            }
-            WorkerRole::Server {
-                peer_conn_registry,
-                listen_ports,
-            } => {
-                let peer_pub_key = data_plane.router.longest_match(dst_ip)?;
-                let local_port = listen_ports.get(self.worker_id).copied().unwrap_or(0);
-                if local_port == 0 {
-                    return None;
-                }
-                let registry = peer_conn_registry.read();
-                let records = registry.get(&peer_pub_key)?;
-                for record in records {
-                    if record.stats.local_port == local_port && record.conn.close_reason().is_none()
-                    {
-                        let peer_stats = self
-                            .peer_telemetry
-                            .as_ref()
-                            .map(|pt| pt.get_or_create(peer_pub_key));
-                        return Some(ActiveConn {
-                            conn: record.conn.clone(),
-                            stats: Arc::new(record.stats.clone()),
-                            peer_stats,
-                            _pub_key: peer_pub_key,
-                        });
+    async fn send_transmit(&mut self, transmit: quinn_proto::Transmit) {
+        let contents = &transmit.contents;
+        let dest = transmit.destination;
+        if let Some(seg_size) = transmit.segment_size {
+            for chunk in contents.chunks(seg_size) {
+                match self.udp_socket.try_send_to(chunk, dest) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Err(e) = self.udp_socket.send_to(chunk, dest).await {
+                            log::warn!("Failed to send UDP transmit packet: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to send UDP transmit packet: {}", e);
                     }
                 }
-                None
+            }
+        } else {
+            match self.udp_socket.try_send_to(contents, dest) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Err(e) = self.udp_socket.send_to(contents, dest).await {
+                        log::warn!("Failed to send UDP transmit packet: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to send UDP transmit packet: {}", e);
+                }
             }
         }
     }
 
-    fn get_all_active_connections(
-        &self,
-        data_plane: &crate::L4DataPlaneSnapshot,
-    ) -> Vec<ActiveConn> {
-        let mut conns = Vec::new();
-        match &self.role {
-            WorkerRole::Client => {
-                for (&pub_key, pool) in &data_plane.client_quic_pools {
-                    if let Some((conn, stats)) = pool.get_connection_by_slot(self.worker_id) {
-                        if conn.close_reason().is_none() {
-                            let peer_stats = self
-                                .peer_telemetry
-                                .as_ref()
-                                .map(|pt| pt.get_or_create(pub_key));
-                            conns.push(ActiveConn {
-                                conn,
-                                stats,
-                                peer_stats,
-                                _pub_key: pub_key,
-                            });
+    async fn process_endpoint_transmits(&mut self) {
+        let now = std::time::Instant::now();
+        // 1. Poll endpoint-level transmits
+        while let Some(transmit) = self.endpoint.poll_transmit() {
+            self.send_transmit(transmit).await;
+        }
+        // 2. Poll connection-level transmits from all active connections
+        let mut transmits = Vec::new();
+        for conn in self.connections.values_mut() {
+            while let Some(transmit) = conn.connection.poll_transmit(now, 1024) {
+                transmits.push(transmit);
+            }
+        }
+        for transmit in transmits {
+            self.send_transmit(transmit).await;
+        }
+    }
+
+    async fn drive_connection(
+        &mut self,
+        handle: quinn_proto::ConnectionHandle,
+        dp_snapshot: &crate::L4DataPlaneSnapshot,
+        _now: std::time::Instant,
+        local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
+    ) {
+        let mut connection_lost = false;
+        let mut datagrams = Vec::new();
+        let mut events = Vec::new();
+
+        if let Some(conn) = self.connections.get_mut(&handle) {
+            while let Some(event) = conn.connection.poll() {
+                match event {
+                    quinn_proto::Event::DatagramReceived => {
+                        while let Some(bytes) = conn.connection.datagrams().recv() {
+                            datagrams.push(bytes);
                         }
+                    }
+                    other => {
+                        events.push(other);
                     }
                 }
             }
-            WorkerRole::Server {
-                peer_conn_registry,
-                listen_ports,
-            } => {
-                let local_port = listen_ports.get(self.worker_id).copied().unwrap_or(0);
-                if local_port > 0 {
-                    let registry = peer_conn_registry.read();
-                    for (&pub_key, records) in registry.iter() {
-                        for record in records {
-                            if record.stats.local_port == local_port
-                                && record.conn.close_reason().is_none()
-                            {
-                                let peer_stats = self
-                                    .peer_telemetry
-                                    .as_ref()
-                                    .map(|pt| pt.get_or_create(pub_key));
-                                conns.push(ActiveConn {
-                                    conn: record.conn.clone(),
-                                    stats: Arc::new(record.stats.clone()),
-                                    peer_stats,
-                                    _pub_key: pub_key,
-                                });
+        }
+
+        for bytes in datagrams {
+            self.handle_inbound_datagram(handle, bytes, dp_snapshot, local_stats)
+                .await;
+        }
+
+        for event in events {
+            match event {
+                quinn_proto::Event::Connected => {
+                    log::info!("Connection {:?} connected", handle);
+                    if self.role == WorkerRole::Client {
+                        self.send_client_auth(handle, dp_snapshot).await;
+                    }
+                }
+                quinn_proto::Event::ConnectionLost { reason } => {
+                    log::warn!("Connection {:?} lost: {:?}", handle, reason);
+                    connection_lost = true;
+                }
+                _ => {}
+            }
+        }
+
+        if connection_lost {
+            self.connections.remove(&handle);
+            self.ip_to_handle.retain(|_, h| *h != handle);
+            self.handle_to_ip.remove(&handle);
+            return;
+        }
+
+        if let Some(conn) = self.connections.get_mut(&handle) {
+            while let Some(endpoint_event) = conn.connection.poll_endpoint_events() {
+                if let Some(conn_event) = self.endpoint.handle_event(handle, endpoint_event) {
+                    conn.connection.handle_event(conn_event);
+                }
+            }
+        }
+    }
+
+    async fn send_client_auth(
+        &mut self,
+        handle: quinn_proto::ConnectionHandle,
+        dp_snapshot: &crate::L4DataPlaneSnapshot,
+    ) {
+        let mut found_info = None;
+        if let Some(conn) = self.connections.get(&handle) {
+            let server_ip = conn.connection.remote_address().ip();
+            for pool in dp_snapshot.client_quic_pools.values() {
+                if pool.endpoints().iter().any(|addr| addr.ip() == server_ip) {
+                    found_info = Some((pool.client_public_key(), pool.session_psk()));
+                    break;
+                }
+            }
+        }
+
+        if let Some((client_pub_key, session_psk)) = found_info {
+            let nonce = rand::random::<[u8; 16]>();
+            let auth_payload = crate::quic_proto_engine::generate_auth_payload(
+                [0u8; 32],
+                client_pub_key,
+                session_psk,
+                nonce,
+            );
+            if let Some(conn) = self.connections.get_mut(&handle) {
+                if let Err(e) = conn
+                    .connection
+                    .datagrams()
+                    .send(bytes::Bytes::from(auth_payload))
+                {
+                    log::warn!("Failed to send client auth datagram: {:?}", e);
+                }
+            }
+        }
+    }
+
+    async fn handle_inbound_datagram(
+        &mut self,
+        handle: quinn_proto::ConnectionHandle,
+        bytes: bytes::Bytes,
+        dp_snapshot: &crate::L4DataPlaneSnapshot,
+        local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let header = bytes[0];
+        match header {
+            0x01 => {
+                if self.role == WorkerRole::Server {
+                    let signed_packet = match serde_json::from_slice::<
+                        crate::quic_proto_engine::SignedPacket,
+                    >(&bytes[1..])
+                    {
+                        Ok(sp) => sp,
+                        Err(e) => {
+                            log::warn!("Failed to parse SignedPacket: {:?}", e);
+                            self.abort_connection(handle, b"Invalid SignedPacket format")
+                                .await;
+                            return;
+                        }
+                    };
+                    if signed_packet.payload.len() != 48 {
+                        log::warn!("Invalid SignedPacket payload len");
+                        self.abort_connection(handle, b"Invalid payload length")
+                            .await;
+                        return;
+                    }
+                    let nonce: [u8; 16] = signed_packet.payload[0..16].try_into().unwrap();
+                    let client_pub_key: [u8; 32] =
+                        signed_packet.payload[16..48].try_into().unwrap();
+
+                    let session_psk = if let Some(ref cache) = self.session_cache {
+                        cache.read().get(&client_pub_key).copied()
+                    } else {
+                        None
+                    };
+                    let session_psk = match session_psk {
+                        Some(psk) => psk,
+                        None => {
+                            log::warn!("No session PSK found for client key");
+                            self.abort_connection(handle, b"No session PSK found").await;
+                            return;
+                        }
+                    };
+
+                    let nonce_valid = if let Some(ref cache) = self.auth_nonce_cache {
+                        let mut cache_guard = cache.lock();
+                        let nonce_cache = cache_guard
+                            .entry(client_pub_key)
+                            .or_insert_with(|| crate::control::NonceCache::new(4096));
+                        nonce_cache.insert(nonce)
+                    } else {
+                        false
+                    };
+                    if !nonce_valid {
+                        log::warn!("Replayed or invalid auth nonce");
+                        self.abort_connection(handle, b"Replay protection triggered")
+                            .await;
+                        return;
+                    }
+
+                    if !crate::quic_proto_engine::verify_auth_payload(&bytes, &session_psk, &nonce)
+                    {
+                        log::warn!("verify_auth_payload signature verification failed");
+                        self.abort_connection(handle, b"Signature verification failed")
+                            .await;
+                        return;
+                    }
+
+                    if let Some(conn) = self.connections.get_mut(&handle) {
+                        conn.authenticated = true;
+                        conn.peer_public_key = Some(client_pub_key);
+                    }
+
+                    let ips = dp_snapshot.router.find_ips_for_value(&client_pub_key);
+                    for ip in ips {
+                        self.ip_to_handle.insert(ip, handle);
+                        self.handle_to_ip.insert(handle, ip);
+                    }
+
+                    let ok_payload = vec![0x01, b'O', b'K'];
+                    if let Some(conn) = self.connections.get_mut(&handle) {
+                        let _ = conn
+                            .connection
+                            .datagrams()
+                            .send(bytes::Bytes::from(ok_payload));
+                    }
+                } else {
+                    if &bytes[1..] == b"OK" {
+                        if let Some(conn) = self.connections.get_mut(&handle) {
+                            conn.authenticated = true;
+                        }
+
+                        let mut found_pub_key = None;
+                        if let Some(conn) = self.connections.get(&handle) {
+                            let server_ip = conn.connection.remote_address().ip();
+                            for (pub_key, pool) in &dp_snapshot.client_quic_pools {
+                                if pool.endpoints().iter().any(|addr| addr.ip() == server_ip) {
+                                    found_pub_key = Some(*pub_key);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(pub_key) = found_pub_key {
+                            if let Some(conn) = self.connections.get_mut(&handle) {
+                                conn.peer_public_key = Some(pub_key);
+                            }
+                            let ips = dp_snapshot.router.find_ips_for_value(&pub_key);
+                            for ip in ips {
+                                self.ip_to_handle.insert(ip, handle);
+                                self.handle_to_ip.insert(handle, ip);
                             }
                         }
                     }
                 }
             }
+            0x02 => {
+                let authenticated = self
+                    .connections
+                    .get(&handle)
+                    .map(|c| c.authenticated)
+                    .unwrap_or(false);
+                if authenticated {
+                    let mut write_res = self.tun_io.try_write_packet(&bytes[1..]);
+                    if let Err(ref e) = write_res {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            write_res = self.tun_io.write_packet(&bytes[1..]).await;
+                        }
+                    }
+                    if let Err(e) = write_res {
+                        log::warn!("Failed to write data packet to TUN: {:?}", e);
+                    } else if let Some(conn) = self.connections.get(&handle) {
+                        let payload_len = (bytes.len() - 1) as u64;
+                        conn.rx_bytes.add(payload_len);
+                        local_stats.l3_packets += 1;
+                        local_stats.l3_bytes += payload_len;
+
+                        if let Some(ref peer_telemetry) = self.peer_telemetry {
+                            if let Some(ip) = self.handle_to_ip.get(&handle) {
+                                if let Some(pub_key) = dp_snapshot.router.longest_match(*ip) {
+                                    let peer_stats = peer_telemetry.get_or_create(pub_key);
+                                    peer_stats.rx_bytes.add(payload_len);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    log::debug!("Discarding data packet from unauthenticated connection");
+                }
+            }
+            _ => {
+                log::debug!("Unknown datagram header: {}", header);
+            }
         }
-        conns
+    }
+
+    async fn abort_connection(&mut self, handle: quinn_proto::ConnectionHandle, reason: &[u8]) {
+        if let Some(mut conn) = self.connections.remove(&handle) {
+            let now = std::time::Instant::now();
+            let error_code = quinn_proto::VarInt::from(0u32);
+            let reason_bytes = bytes::Bytes::copy_from_slice(reason);
+            conn.connection.close(now, error_code, reason_bytes);
+            while let Some(endpoint_event) = conn.connection.poll_endpoint_events() {
+                let _ = self.endpoint.handle_event(handle, endpoint_event);
+            }
+        }
+        self.ip_to_handle.retain(|_, h| *h != handle);
+        self.handle_to_ip.remove(&handle);
+        self.process_endpoint_transmits().await;
+    }
+
+    fn find_handle_for_ip(
+        &self,
+        dst_ip: std::net::IpAddr,
+        dp_snapshot: &crate::L4DataPlaneSnapshot,
+    ) -> Option<quinn_proto::ConnectionHandle> {
+        if let Some(&handle) = self.ip_to_handle.get(&dst_ip) {
+            return Some(handle);
+        }
+        if let Some(pub_key) = dp_snapshot.router.longest_match(dst_ip) {
+            let ips = dp_snapshot.router.find_ips_for_value(&pub_key);
+            for ip in ips {
+                if let Some(&handle) = self.ip_to_handle.get(&ip) {
+                    return Some(handle);
+                }
+            }
+        }
+        None
+    }
+
+    async fn handle_tun_packet(
+        &mut self,
+        packet: bytes::Bytes,
+        dp_snapshot: &crate::L4DataPlaneSnapshot,
+        now: std::time::Instant,
+        local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
+    ) {
+        if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
+            if let Some(handle) = self.find_handle_for_ip(dst_ip, dp_snapshot) {
+                let mut sent = false;
+                if let Some(conn) = self.connections.get_mut(&handle) {
+                    if conn.authenticated {
+                        if let Err(e) = conn.connection.datagrams().send(packet.clone()) {
+                            log::debug!("Failed to send datagram: {:?}", e);
+                        } else {
+                            let packet_len = (packet.len() - 1) as u64;
+                            conn.tx_bytes.add(packet_len);
+                            local_stats.l3_packets += 1;
+                            local_stats.l3_bytes += packet_len;
+
+                            if let Some(ref peer_telemetry) = self.peer_telemetry {
+                                if let Some(pub_key) = dp_snapshot.router.longest_match(dst_ip) {
+                                    let peer_stats = peer_telemetry.get_or_create(pub_key);
+                                    peer_stats.tx_bytes.add(packet_len);
+                                }
+                            }
+                            sent = true;
+                        }
+                    }
+                }
+                if sent {
+                    self.drive_connection(handle, dp_snapshot, now, local_stats)
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn handle_udp_packet(
+        &mut self,
+        packet: &[u8],
+        remote_addr: std::net::SocketAddr,
+        dp_snapshot: &crate::L4DataPlaneSnapshot,
+        now: std::time::Instant,
+        local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
+    ) {
+        let data = bytes::BytesMut::from(packet);
+        if let Some((handle, datagram_event)) =
+            self.endpoint.handle(now, remote_addr, None, None, data)
+        {
+            match datagram_event {
+                quinn_proto::DatagramEvent::NewConnection(conn) => {
+                    let worker_conn = crate::quic_proto_engine::WorkerConnection {
+                        connection: conn,
+                        authenticated: false,
+                        tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                        rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                        peer_public_key: None,
+                    };
+                    self.connections.insert(handle, worker_conn);
+                    self.handle_to_ip.insert(handle, remote_addr.ip());
+                }
+                quinn_proto::DatagramEvent::ConnectionEvent(conn_event) => {
+                    if let Some(conn) = self.connections.get_mut(&handle) {
+                        conn.connection.handle_event(conn_event);
+                    }
+                }
+            }
+            self.drive_connection(handle, dp_snapshot, now, local_stats)
+                .await;
+        }
+    }
+
+    async fn check_and_connect_clients(&mut self, dp_snapshot: &crate::L4DataPlaneSnapshot) {
+        for (&pub_key, pool) in &dp_snapshot.client_quic_pools {
+            let endpoints = pool.endpoints();
+            if endpoints.is_empty() {
+                continue;
+            }
+            let server_addr = match endpoints.get(self.worker_id) {
+                Some(&addr) => addr,
+                None => {
+                    log::warn!(
+                        "Worker {} has no corresponding endpoint in pool (total endpoints {})",
+                        self.worker_id,
+                        endpoints.len()
+                    );
+                    continue;
+                }
+            };
+            let already_connected = self
+                .connections
+                .values()
+                .any(|conn| conn.connection.remote_address() == server_addr);
+            if !already_connected {
+                let client_config = build_client_proto_config(pool.server_cert_sha256());
+                match self
+                    .endpoint
+                    .connect(client_config, server_addr, "localhost")
+                {
+                    Ok((handle, conn)) => {
+                        let worker_conn = crate::quic_proto_engine::WorkerConnection {
+                            connection: conn,
+                            authenticated: false,
+                            tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                            rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                            peer_public_key: Some(pub_key),
+                        };
+                        self.connections.insert(handle, worker_conn);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to connect to {}: {:?}", server_addr, e);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn run_loop(&mut self, data_plane: crate::L4DataPlane) -> Result<(), String> {
@@ -202,127 +562,212 @@ impl RtcWorker {
         };
 
         let mut dp_snapshot = data_plane.load();
-        let mut active_conns = self.get_all_active_connections(&dp_snapshot);
-        let mut conn_cache: std::collections::HashMap<std::net::IpAddr, ActiveConn> =
-            std::collections::HashMap::new();
 
-        let mut tun_vec = vec![0u8; 1600];
+        if self.role == WorkerRole::Client {
+            self.check_and_connect_clients(&dp_snapshot).await;
+            self.process_endpoint_transmits().await;
+        }
+
+        let mut tun_buf = bytes::BytesMut::new();
+        tun_buf.resize(65536, 0);
+        let mut udp_buf = vec![0u8; 65536];
+
+        let sleep = tokio::time::sleep(std::time::Duration::from_secs(3600));
+        tokio::pin!(sleep);
 
         loop {
-            if active_conns.is_empty() {
-                dp_snapshot = data_plane.load();
-                active_conns = self.get_all_active_connections(&dp_snapshot);
+            if tun_buf.len() < 65536 {
+                tun_buf.resize(65536, 0);
+            }
+            let mut next_timeout = None;
+            for conn in self.connections.values_mut() {
+                if let Some(timeout) = conn.connection.poll_timeout() {
+                    next_timeout =
+                        Some(next_timeout.map_or(timeout, |t| std::cmp::min(t, timeout)));
+                }
+            }
+
+            if let Some(timeout) = next_timeout {
+                sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::from_std(timeout));
+            } else {
+                sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
             }
 
             tokio::select! {
-                read_res = self.tun_io.read(&mut tun_vec) => {
+                _ = &mut sleep => {
+                    let now = std::time::Instant::now();
+                    for conn in self.connections.values_mut() {
+                        conn.connection.handle_timeout(now);
+                    }
+                    let handles: Vec<_> = self.connections.keys().copied().collect();
+                    for handle in handles {
+                        self.drive_connection(handle, &dp_snapshot, now, &mut local_stats).await;
+                    }
+                    self.process_endpoint_transmits().await;
+                }
+
+                read_res = self.tun_io.read(&mut tun_buf[1..]) => {
                     match read_res {
-                        Ok(n) if n > 0 => {
+                        Ok(0) => return Err("TUN interface EOF".to_string()),
+                        Ok(n) => {
+                            let now = std::time::Instant::now();
                             local_stats.tun_rx_packets += 1;
                             local_stats.tun_rx_bytes += n as u64;
+                            tun_buf[0] = 0x02;
+                            let frame = tun_buf.split_to(1 + n).freeze();
+                            self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
 
-                            let mut packet_sent = false;
-                            if let Some(dst_ip) = parse_destination_ip(&tun_vec[..n]) {
-                                crate::mss_clamping::clamp_tcp_mss(&mut tun_vec[..n], 1160);
-
-                                let cached_conn = if let Some(info) = conn_cache.get(&dst_ip) {
-                                    if info.conn.close_reason().is_none() {
-                                        Some(info.clone())
-                                    } else {
-                                        None
+                            for _ in 0..63 {
+                                if tun_buf.len() < 65536 {
+                                    tun_buf.resize(65536, 0);
+                                }
+                                match self.tun_io.try_read(&mut tun_buf[1..]) {
+                                    Ok(Some(n)) if n > 0 => {
+                                        local_stats.tun_rx_packets += 1;
+                                        local_stats.tun_rx_bytes += n as u64;
+                                        tun_buf[0] = 0x02;
+                                        let frame = tun_buf.split_to(1 + n).freeze();
+                                        self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
                                     }
-                                } else {
-                                    None
-                                };
-
-                                let active_conn = match cached_conn {
-                                    Some(info) => Some(info),
-                                    None => {
-                                        if let Some(info) = self.get_active_connection(&dp_snapshot, dst_ip) {
-                                            conn_cache.insert(dst_ip, info.clone());
-                                            Some(info)
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                };
-
-                                if let Some(active_conn) = active_conn {
-                                    tun_vec.truncate(n);
-                                    let payload = bytes::Bytes::from(tun_vec);
-                                    tun_vec = vec![0u8; 1600];
-                                    packet_sent = true;
-
-                                    if let Err(e) = active_conn.conn.send_datagram(payload) {
-                                        log::debug!("Failed to send QUIC datagram: {}", e);
-                                    } else {
-                                        local_stats.l3_packets += 1;
-                                        local_stats.l3_bytes += n as u64;
-
-                                        // Update connection stats
-                                        active_conn.stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-
-                                        // Update peer stats
-                                        if let Some(ref peer_stats) = active_conn.peer_stats {
-                                            peer_stats.tx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                                        }
-                                    }
+                                    _ => break,
                                 }
                             }
-                            if !packet_sent && tun_vec.len() != 1600 {
-                                tun_vec.resize(1600, 0);
-                            }
+                            self.process_endpoint_transmits().await;
                         }
-                        Ok(_) => {}
                         Err(e) => {
-                            log::warn!("TUN read error: {}", e);
+                            log::warn!("TUN read error: {:?}", e);
                         }
                     }
                 }
 
-                read_dg = ReadAnyDatagram { conns: &active_conns } => {
-                    match read_dg {
-                        ReadDatagramResult::Ok(bytes, idx) => {
-                            let n = bytes.len();
-                            if let Err(e) = self.tun_io.write_packet(&bytes).await {
-                                log::warn!("Failed to write to TUN: {}", e);
-                            } else {
-                                local_stats.l3_packets += 1;
-                                local_stats.l3_bytes += n as u64;
+                read_res = self.udp_socket.recv_from(&mut udp_buf) => {
+                    match read_res {
+                        Ok((n, remote_addr)) if n > 0 => {
+                            let now = std::time::Instant::now();
+                            self.handle_udp_packet(&udp_buf[..n], remote_addr, &dp_snapshot, now, &mut local_stats).await;
 
-                                // Update connection stats
-                                let active_conn = &active_conns[idx];
-                                active_conn.stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-
-                                // Update peer stats
-                                if let Some(ref peer_stats) = active_conn.peer_stats {
-                                    peer_stats.rx_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            for _ in 0..63 {
+                                match self.udp_socket.try_recv_from(&mut udp_buf) {
+                                    Ok((n, remote_addr)) if n > 0 => {
+                                        self.handle_udp_packet(&udp_buf[..n], remote_addr, &dp_snapshot, now, &mut local_stats).await;
+                                    }
+                                    _ => break,
                                 }
                             }
+                            self.process_endpoint_transmits().await;
                         }
-                        ReadDatagramResult::Err(idx) => {
-                            log::warn!("QUIC link at index {} is dead, removing from active pool", idx);
-                            if idx < active_conns.len() {
-                                active_conns.remove(idx);
-                            }
-                        }
-                        }
+                        _ => {}
+                    }
                 }
 
                 _ = reload_timer.tick() => {
                     dp_snapshot = data_plane.load();
-                    active_conns = self.get_all_active_connections(&dp_snapshot);
-                    conn_cache.clear();
+                    if self.role == WorkerRole::Client {
+                        self.check_and_connect_clients(&dp_snapshot).await;
+                        self.process_endpoint_transmits().await;
+                        let handles_to_abort: Vec<quinn_proto::ConnectionHandle> = self.connections.iter()
+                            .filter(|(_, conn)| {
+                                if let Some(pub_key) = conn.peer_public_key {
+                                    !dp_snapshot.client_quic_pools.contains_key(&pub_key)
+                                } else {
+                                    false
+                                }
+                            })
+                            .map(|(handle, _)| *handle)
+                            .collect();
+                        for handle in handles_to_abort {
+                            log::warn!("Closing client connection for removed peer");
+                            self.abort_connection(handle, b"Peer removed").await;
+                        }
+                    }
+                    if self.role == WorkerRole::Server {
+                        let handles_to_abort = if let Some(ref session_cache) = self.session_cache {
+                            let cache_guard = session_cache.read();
+                            self.connections.iter()
+                                .filter(|(_, conn)| {
+                                    if let Some(pub_key) = conn.peer_public_key {
+                                        !cache_guard.contains_key(&pub_key)
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .map(|(handle, _)| *handle)
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        for handle in handles_to_abort {
+                            log::warn!("Closing connection for removed or rotated peer");
+                            self.abort_connection(handle, b"Peer removed or session rotated").await;
+                        }
+                    }
                 }
 
                 _ = stats_timer.tick() => {
                     if let Some(ref stats) = self.worker_stats {
-                        stats.publish(&local_stats);
+                        let mut publish_stats = local_stats.clone();
+                        let mut total_tx = 0;
+                        let mut total_rx = 0;
+                        for conn in self.connections.values() {
+                            total_tx += conn.tx_bytes.load();
+                            total_rx += conn.rx_bytes.load();
+                        }
+                        publish_stats.l3_bytes = total_tx + total_rx;
+                        stats.publish(&publish_stats);
+                    }
+                    if let Some(ref registry) = self.shared_quic_registry {
+                        let mut reg_guard = registry.write();
+                        let local_port = self.udp_socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+                        for conns in reg_guard.values_mut() {
+                            conns.retain(|snap| snap.local_port != local_port);
+                        }
+                        for conn in self.connections.values() {
+                            if conn.authenticated {
+                                if let Some(pub_key) = conn.peer_public_key {
+                                    let remote_address = conn.connection.remote_address().to_string();
+                                    let active_streams = 0;
+                                    let snap = crate::quic_pool::QuicConnSnapshot {
+                                        remote_addr: remote_address,
+                                        local_port,
+                                        rx_bytes: conn.rx_bytes.load(),
+                                        tx_bytes: conn.tx_bytes.load(),
+                                        active_streams,
+                                    };
+                                    reg_guard.entry(pub_key).or_default().push(snap);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn build_client_proto_config(server_cert_sha256: [u8; 32]) -> quinn_proto::ClientConfig {
+    let mut rustls_config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(Arc::new(crate::quic_pool::PinnedCertVerifier {
+            expected_sha256: server_cert_sha256,
+        }))
+        .with_no_client_auth();
+    rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
+
+    let mut client_config = quinn_proto::ClientConfig::new(Arc::new(rustls_config));
+    let mut transport = quinn_proto::TransportConfig::default();
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
+    transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
+    transport.send_window(16 * 1024 * 1024);
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    client_config.transport_config(Arc::new(transport));
+    client_config
 }
 
 fn parse_destination_ip(packet: &[u8]) -> Option<IpAddr> {
@@ -331,173 +776,160 @@ fn parse_destination_ip(packet: &[u8]) -> Option<IpAddr> {
     }
     let version = packet[0] >> 4;
     if version == 4 {
-        let mut ip_bytes = [0u8; 4];
-        ip_bytes.copy_from_slice(&packet[16..20]);
-        Some(IpAddr::V4(std::net::Ipv4Addr::from(ip_bytes)))
+        Some(IpAddr::V4(std::net::Ipv4Addr::new(
+            packet[16], packet[17], packet[18], packet[19],
+        )))
     } else if version == 6 {
         if packet.len() < 40 {
             return None;
         }
-        let mut ip_bytes = [0u8; 16];
-        ip_bytes.copy_from_slice(&packet[24..40]);
+        let ip_bytes: [u8; 16] = packet[24..40].try_into().ok()?;
         Some(IpAddr::V6(std::net::Ipv6Addr::from(ip_bytes)))
     } else {
         None
     }
 }
 
-struct ReadAnyDatagram<'a> {
-    conns: &'a [ActiveConn],
-}
-
-impl<'a> std::future::Future for ReadAnyDatagram<'a> {
-    type Output = ReadDatagramResult;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.conns.is_empty() {
-            return std::task::Poll::Pending;
-        }
-
-        if this.conns.len() == 1 {
-            let mut read_future = this.conns[0].conn.read_datagram();
-            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut read_future) };
-            match pinned.poll(cx) {
-                std::task::Poll::Ready(Ok(bytes)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Ok(bytes, 0))
-                }
-                std::task::Poll::Ready(Err(_)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Err(0))
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-        }
-
-        for (idx, conn) in this.conns.iter().enumerate() {
-            let mut read_future = conn.conn.read_datagram();
-            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut read_future) };
-            match pinned.poll(cx) {
-                std::task::Poll::Ready(Ok(bytes)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Ok(bytes, idx))
-                }
-                std::task::Poll::Ready(Err(_)) => {
-                    return std::task::Poll::Ready(ReadDatagramResult::Err(idx))
-                }
-                std::task::Poll::Pending => {}
-            }
-        }
-
-        std::task::Poll::Pending
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic_pool::{QuicConnStats, QuicPoolClient};
+    use crate::quic_pool::QuicPoolClient;
     use crate::routing::AllowedIPsRouter;
     use arc_swap::ArcSwap;
     use parking_lot::{Mutex, RwLock};
     use std::collections::HashMap;
-    use std::net::SocketAddr;
     use std::os::unix::io::IntoRawFd;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
-
-    static PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(46000);
-
-    fn unused_udp_port() -> u16 {
-        loop {
-            let port = PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
-            if std::net::UdpSocket::bind(format!("127.0.0.1:{}", port)).is_ok() {
-                return port;
-            }
-        }
-    }
 
     #[tokio::test]
     async fn test_rtc_worker_datagram_loop() {
-        let port = unused_udp_port();
         let session_cache = Arc::new(RwLock::new(HashMap::new()));
-        let peer_registry = Arc::new(RwLock::new(HashMap::new()));
+        let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
 
         let client_pub_key = [10u8; 32];
         let session_psk = [11u8; 32];
         session_cache.write().insert(client_pub_key, session_psk);
 
-        let auth_nonce_cache = Arc::new(Mutex::new(HashMap::new()));
-        let server = crate::quic_pool::QuicPoolServer::new(
-            vec![port],
-            session_cache.clone(),
-            auth_nonce_cache,
-        );
+        // Bind UDP sockets
+        let server_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Server TLS & Quinn-Proto Endpoint Setup
         let (certs, key) = crate::quic_pool::generate_self_signed_cert().unwrap();
-        let cert_fingerprint = crate::quic_pool::cert_sha256(&certs).unwrap();
-
-        let handler = Arc::new(
-            move |_pub_key: [u8; 32],
-                  _send: quinn::SendStream,
-                  _recv: quinn::RecvStream,
-                  _stat: Arc<QuicConnStats>|
-                  -> crate::quic_pool::ServerFuture { Box::pin(async move {}) },
-        );
-
-        server
-            .run_with_registry(certs, key, handler, peer_registry.clone())
-            .await
+        let mut rustls_config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key.clone())
             .unwrap();
+        rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
+        let mut server_proto_config =
+            quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
+        let mut transport = quinn_proto::TransportConfig::default();
+        transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
+        transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
+        transport.send_window(16 * 1024 * 1024);
+        transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+        transport.datagram_send_buffer_size(8 * 1024 * 1024);
+        server_proto_config.transport_config(Arc::new(transport));
 
-        let server_addr = format!("127.0.0.1:{}", port).parse::<SocketAddr>().unwrap();
-        let client = QuicPoolClient::new(
-            client_pub_key,
-            session_psk,
-            cert_fingerprint,
-            vec![server_addr],
+        let server_endpoint = quinn_proto::Endpoint::new(
+            Arc::new(quinn_proto::EndpointConfig::default()),
+            Some(Arc::new(server_proto_config)),
+            false,
         );
-        client.start_pool().await.unwrap();
 
-        // Setup Unix socketpair for mocking TUN
-        let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
-        sock1.set_nonblocking(true).unwrap();
+        // Client Quinn-Proto Endpoint Setup
+        let client_endpoint = quinn_proto::Endpoint::new(
+            Arc::new(quinn_proto::EndpointConfig::default()),
+            None,
+            false,
+        );
 
-        let tun_io = Arc::new(AsyncTunIo::new(sock1.into_raw_fd()).unwrap());
-        let pool = Arc::new(client);
+        let (client_sock_tun, client_sock_user) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (server_sock_tun, server_sock_user) = std::os::unix::net::UnixStream::pair().unwrap();
+        client_sock_tun.set_nonblocking(true).unwrap();
+        client_sock_user.set_nonblocking(true).unwrap();
+        server_sock_tun.set_nonblocking(true).unwrap();
+        server_sock_user.set_nonblocking(true).unwrap();
 
-        // Setup L4DataPlane snapshot
-        let mut client_quic_pools = HashMap::new();
-        client_quic_pools.insert(client_pub_key, pool.clone());
+        let client_tun_io = Arc::new(AsyncTunIo::new(client_sock_tun.into_raw_fd()).unwrap());
+        let server_tun_io = Arc::new(AsyncTunIo::new(server_sock_tun.into_raw_fd()).unwrap());
 
-        let mut router = AllowedIPsRouter::new();
-        router.insert("10.0.0.1/32".parse().unwrap(), client_pub_key);
-
-        let data_plane = Arc::new(ArcSwap::new(Arc::new(crate::L4DataPlaneSnapshot {
-            router,
-            userspace_tcp_offload_enabled: true,
-            client_quic_pools,
-        })));
-
-        // Spawn Worker
-        let buffer_pool = crate::buffer_pool::BufferPool::new(1500);
-        let mut worker = RtcWorker::new(
-            tun_io,
+        let mut client_worker = RtcWorker::new(
+            client_tun_io,
             0,
             WorkerRole::Client,
             RtcWorkerConfig {
                 mtu: 1400,
-                buffer_pool,
+                buffer_pool: BufferPool::new(1500),
             },
+            client_sock,
+            client_endpoint,
+            None,
+            None,
+            None,
         );
 
-        let data_plane_clone = data_plane.clone();
-        let worker_task = tokio::spawn(async move {
-            let _ = worker.run_loop(data_plane_clone).await;
+        let mut server_worker = RtcWorker::new(
+            server_tun_io,
+            0,
+            WorkerRole::Server,
+            RtcWorkerConfig {
+                mtu: 1400,
+                buffer_pool: BufferPool::new(1500),
+            },
+            server_sock,
+            server_endpoint,
+            Some(session_cache.clone()),
+            Some(auth_nonce_cache.clone()),
+            None,
+        );
+
+        let cert_fingerprint = crate::quic_pool::cert_sha256(&certs).unwrap();
+        let pool = Arc::new(QuicPoolClient::new(
+            client_pub_key,
+            session_psk,
+            cert_fingerprint,
+            vec![server_addr],
+        ));
+
+        let mut client_pools = HashMap::new();
+        client_pools.insert(client_pub_key, pool.clone());
+
+        let mut client_router = AllowedIPsRouter::new();
+        client_router.insert("10.0.0.1/32".parse().unwrap(), client_pub_key);
+
+        let mut server_router = AllowedIPsRouter::new();
+        server_router.insert("10.0.0.2/32".parse().unwrap(), client_pub_key);
+
+        let client_data_plane = Arc::new(ArcSwap::new(Arc::new(crate::L4DataPlaneSnapshot {
+            router: client_router,
+            userspace_tcp_offload_enabled: true,
+            client_quic_pools: client_pools,
+        })));
+
+        let server_data_plane = Arc::new(ArcSwap::new(Arc::new(crate::L4DataPlaneSnapshot {
+            router: server_router,
+            userspace_tcp_offload_enabled: true,
+            client_quic_pools: HashMap::new(),
+        })));
+
+        let server_task = tokio::spawn(async move {
+            let _ = server_worker.run_loop(server_data_plane).await;
         });
 
-        // 1. Test Outbound Packet (TUN -> QUIC Datagram)
-        // Build mock IPv4 TCP SYN to 10.0.0.1 with MSS=1460 (0x05B4)
+        let client_task = tokio::spawn(async move {
+            let _ = client_worker.run_loop(client_data_plane).await;
+        });
+
+        // Give some time for handshake and authentication
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 1. Test Outbound Packet (Client TUN -> Server TUN)
         let mut test_packet = vec![0u8; 44];
         test_packet[0] = 0x45;
         test_packet[2] = 0x00;
@@ -516,36 +948,57 @@ mod tests {
         test_packet[42] = 0x05;
         test_packet[43] = 0xB4; // MSS Value: 1460
 
-        let mut writer = sock2.try_clone().unwrap();
+        let mut writer = client_sock_user.try_clone().unwrap();
         std::io::Write::write_all(&mut writer, &test_packet).unwrap();
 
-        // Server connection should receive the datagram
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let server_conn = {
-            let registry = peer_registry.read();
-            registry[&client_pub_key][0].conn.clone()
-        };
+        let mut writer2 = server_sock_user.try_clone().unwrap();
+        let mut reader = tokio::net::UnixStream::from_std(server_sock_user).unwrap();
+        let mut read_buf = vec![0u8; 44];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut read_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
-        let received = server_conn.read_datagram().await.unwrap();
-        // Assert it was received, and MSS option was clamped to 1160 (0x0488)
-        assert_eq!(received.len(), 44);
-        assert_eq!(received[42], 0x04);
-        assert_eq!(received[43], 0x88);
+        assert_eq!(read_buf.len(), 44);
+        assert_eq!(read_buf[12..16], [10, 0, 0, 2]);
+        assert_eq!(read_buf[16..20], [10, 0, 0, 1]);
 
-        // 2. Test Inbound Packet (QUIC Datagram -> TUN)
-        let inbound_payload = vec![9u8; 20];
-        server_conn
-            .send_datagram(bytes::Bytes::copy_from_slice(&inbound_payload))
-            .unwrap();
+        // 2. Test Inbound Packet (Server TUN -> Client TUN)
+        let mut inbound_packet = vec![0u8; 44];
+        inbound_packet[0] = 0x45;
+        inbound_packet[2] = 0x00;
+        inbound_packet[3] = 44;
+        inbound_packet[9] = 0x06; // TCP
+        inbound_packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        inbound_packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        inbound_packet[20] = 0x00;
+        inbound_packet[21] = 0x50; // Src Port
+        inbound_packet[22] = 0x30;
+        inbound_packet[23] = 0x39; // Dst Port
+        inbound_packet[32] = 0x60; // Data offset
+        inbound_packet[33] = 0x12; // Flags: SYN-ACK
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut reader = sock2;
-        let mut read_buf = vec![0u8; 20];
-        std::io::Read::read_exact(&mut reader, &mut read_buf).unwrap();
-        assert_eq!(read_buf, inbound_payload);
+        std::io::Write::write_all(&mut writer2, &inbound_packet).unwrap();
+
+        let mut reader2 = tokio::net::UnixStream::from_std(client_sock_user).unwrap();
+        let mut read_buf2 = vec![0u8; 44];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut reader2, &mut read_buf2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(read_buf2.len(), 44);
+        assert_eq!(read_buf2[12..16], [10, 0, 0, 1]);
+        assert_eq!(read_buf2[16..20], [10, 0, 0, 2]);
 
         // Cleanup
-        worker_task.abort();
-        pool.shutdown(b"test complete");
+        server_task.abort();
+        client_task.abort();
     }
 }

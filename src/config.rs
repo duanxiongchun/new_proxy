@@ -141,11 +141,34 @@ impl GatewayConfig {
             })
             .transpose()?;
 
-        let mtu = interface_section
+        let has_ipv6 = addresses
+            .iter()
+            .any(|addr| matches!(addr, ipnet::IpNet::V6(_)));
+        let default_mtu = if has_ipv6 { 1280 } else { 1100 };
+
+        let mut mtu = interface_section
             .get("MTU")
             .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid MTU: {}", e)))
             .transpose()?
-            .unwrap_or(1400);
+            .unwrap_or(default_mtu);
+
+        if has_ipv6 {
+            if mtu != 1280 {
+                log::warn!(
+                    "Configured MTU {} is adjusted to 1280 for IPv6 to support kernel IPv6 stack initialization.",
+                    mtu
+                );
+                mtu = 1280;
+            }
+        } else {
+            if mtu > 1150 {
+                log::warn!(
+                    "Configured MTU {} is too large for QUIC Datagram. Clamping to 1100 to prevent packet drop.",
+                    mtu
+                );
+                mtu = 1100;
+            }
+        }
 
         let table = interface_section
             .get("Table")
@@ -318,7 +341,7 @@ PrivateKey = {key}
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
 ListenControlPort = 51821
-MTU = 1420
+MTU = 1280
 
 [Peer]
 PublicKey = {key}
@@ -337,7 +360,7 @@ ListenPorts = 40001, 40002
         let config = GatewayConfig::load_from_file(path).unwrap();
         assert_eq!(config.interface.listen_port, Some(51820));
         assert_eq!(config.interface.listen_control_port, Some(51821));
-        assert_eq!(config.interface.mtu, 1420);
+        assert_eq!(config.interface.mtu, 1280);
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].proxy_port, Some(40001));
         assert_eq!(config.quic_pool.public_ipv4, Some("1.2.3.4".to_string()));
@@ -382,6 +405,36 @@ Address = 10.0.0.1/33
         let res = GatewayConfig::load_from_file(path);
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("Invalid Address"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_load_config_default_and_clamped_mtu() {
+        let path = "test_temp_mtu.conf";
+        let key = test_key();
+        let content = format!(
+            r#"
+[Interface]
+PrivateKey = {key}
+Address = 10.0.0.1/24
+MTU = 1500
+"#
+        );
+        fs::write(path, content).unwrap();
+        let config = GatewayConfig::load_from_file(path).unwrap();
+        assert_eq!(config.interface.mtu, 1100); // Clamped from 1500 to 1100
+
+        let content_no_mtu = format!(
+            r#"
+[Interface]
+PrivateKey = {key}
+Address = 10.0.0.1/24
+"#
+        );
+        fs::write(path, content_no_mtu).unwrap();
+        let config_no_mtu = GatewayConfig::load_from_file(path).unwrap();
+        assert_eq!(config_no_mtu.interface.mtu, 1100); // Defaults to 1100
 
         let _ = fs::remove_file(path);
     }

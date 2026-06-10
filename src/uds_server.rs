@@ -3,7 +3,7 @@ use crate::app_config::{
     api_socket_path, encode_base64_32, peer_has_l4_proxy, rebuild_l4_router, telemetry_sources,
     RuntimeMode,
 };
-use crate::client_proxy::build_peer_quic_pool;
+use crate::client::build_peer_quic_pool;
 use crate::config::{self, decode_base64_32};
 use crate::control::NonceCache;
 use crate::quic_pool;
@@ -15,7 +15,6 @@ use crate::telemetry::{
 use crate::{ClientQuicDataPortBaseline, GatewayState, L4DataPlane, PeerQuicPools};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -166,30 +165,22 @@ fn combine_peer_telemetries(
             let combined_stats = combined
                 .entry(pub_key)
                 .or_insert_with(|| Arc::new(crate::telemetry::PeerL4Stats::default()));
+            combined_stats.rx_bytes.add(stats.rx_bytes.load());
+            combined_stats.tx_bytes.add(stats.tx_bytes.load());
             combined_stats
-                .rx_bytes
-                .fetch_add(stats.rx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            combined_stats
-                .tx_bytes
-                .fetch_add(stats.tx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            combined_stats.active_streams.fetch_add(
-                stats.active_streams.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+                .active_streams
+                .add(stats.active_streams.load());
         }
     }
     combined
 }
 
 fn quic_connection_snapshots(
-    quic_registry: &HashMap<[u8; 32], Vec<quic_pool::QuicConnRecord>>,
+    quic_registry: &std::collections::HashMap<[u8; 32], Vec<quic_pool::QuicConnSnapshot>>,
     client_quic_pools: &PeerQuicPools,
     pub_key: &[u8; 32],
 ) -> Vec<quic_pool::QuicConnSnapshot> {
-    let server_side = quic_registry
-        .get(pub_key)
-        .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let server_side = quic_registry.get(pub_key).cloned().unwrap_or_default();
     if !server_side.is_empty() {
         return server_side;
     }
@@ -225,9 +216,9 @@ async fn handle_stats(
                 .get(&pub_key)
                 .map(|stats| {
                     (
-                        stats.rx_bytes.load(Ordering::Relaxed),
-                        stats.tx_bytes.load(Ordering::Relaxed),
-                        stats.active_streams.load(Ordering::Relaxed),
+                        stats.rx_bytes.load(),
+                        stats.tx_bytes.load(),
+                        stats.active_streams.load(),
                     )
                 })
                 .unwrap_or((0, 0, 0));
@@ -276,9 +267,9 @@ async fn handle_stats(
                 .get(pub_key)
                 .map(|stats| {
                     (
-                        stats.rx_bytes.load(Ordering::Relaxed),
-                        stats.tx_bytes.load(Ordering::Relaxed),
-                        stats.active_streams.load(Ordering::Relaxed),
+                        stats.rx_bytes.load(),
+                        stats.tx_bytes.load(),
+                        stats.active_streams.load(),
                     )
                 })
                 .unwrap_or((0, 0, 0));
@@ -314,9 +305,9 @@ async fn handle_stats(
                 .get(pub_key)
                 .map(|stats| {
                     (
-                        stats.rx_bytes.load(Ordering::Relaxed),
-                        stats.tx_bytes.load(Ordering::Relaxed),
-                        stats.active_streams.load(Ordering::Relaxed),
+                        stats.rx_bytes.load(),
+                        stats.tx_bytes.load(),
+                        stats.active_streams.load(),
                     )
                 })
                 .unwrap_or((0, 0, 0));
@@ -400,15 +391,9 @@ async fn handle_dump(
             let configured = peer_map.get(&key).copied();
             let wg = l3_stats.get(&key);
             let l4 = telemetry.get(&key);
-            let l4_rx = l4
-                .map(|stats| stats.rx_bytes.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let l4_tx = l4
-                .map(|stats| stats.tx_bytes.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let active_streams = l4
-                .map(|stats| stats.active_streams.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            let l4_rx = l4.map(|stats| stats.rx_bytes.load()).unwrap_or(0);
+            let l4_tx = l4.map(|stats| stats.tx_bytes.load()).unwrap_or(0);
+            let active_streams = l4.map(|stats| stats.active_streams.load()).unwrap_or(0);
             let quic_connections =
                 quic_connection_snapshots(&quic_registry, &context.client_quic_pools, &key).len();
             let endpoint = configured
@@ -514,20 +499,17 @@ async fn handle_add_peer(
         proxy_port,
     };
 
-    if context.runtime_mode == RuntimeMode::Client {
-        match (new_peer.endpoint, new_peer.proxy_port) {
-            (Some(_), Some(_)) | (None, None) => {}
-            _ => {
-                write_error(
-                    stream,
-                    framed_response,
-                    "Endpoint and ProxyPort must be provided together for client QUIC offload"
-                        .to_string(),
-                )
-                .await;
-                return;
-            }
-        }
+    if context.runtime_mode == RuntimeMode::Client
+        && new_peer.proxy_port.is_some()
+        && new_peer.endpoint.is_none()
+    {
+        write_error(
+            stream,
+            framed_response,
+            "ProxyPort requires Endpoint to be specified for client QUIC offload".to_string(),
+        )
+        .await;
+        return;
     }
 
     let precheck_conflict = {
@@ -735,11 +717,7 @@ async fn handle_add_peer(
             &context.client_quic_pools,
         );
     } else {
-        if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
-            for conn in conns {
-                conn.close(b"Peer replaced");
-            }
-        }
+        context.shared_quic_registry.write().remove(&parsed_pub_key);
     }
 
     let message = if quic_pool_unavailable {
@@ -820,11 +798,7 @@ async fn handle_remove_peer(
             pool.shutdown(b"Peer removed");
         }
     }
-    if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
-        for conn in conns {
-            conn.close(b"Peer removed");
-        }
-    }
+    context.shared_quic_registry.write().remove(&parsed_pub_key);
 
     {
         let mut state = context.state.write();
@@ -983,8 +957,8 @@ mod tests {
         let telemetry = Arc::new(TelemetryRegistry::new());
         let worker_telemetry = Arc::new(WorkerTelemetryRegistry::new());
         let stats = telemetry.get_or_create([2u8; 32]);
-        stats.rx_bytes.store(70, Ordering::Relaxed);
-        stats.tx_bytes.store(80, Ordering::Relaxed);
+        stats.rx_bytes.store(70);
+        stats.tx_bytes.store(80);
 
         let l3_registry =
             UserspaceWgRegistry::new(config.interface.private_key, &config.peers).unwrap();
@@ -1289,8 +1263,8 @@ mod tests {
             &CommandInput::AddPeer {
                 public_key: encode_base64_32(&[8u8; 32]),
                 allowed_ips: vec!["10.8.0.0/24".to_string()],
-                endpoint: Some("1.2.3.4:51820".to_string()),
-                proxy_port: None,
+                endpoint: None,
+                proxy_port: Some(51821),
             },
         )
         .await;
@@ -1300,7 +1274,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap_or_default()
-            .contains("Endpoint and ProxyPort"));
+            .contains("ProxyPort requires Endpoint"));
 
         let _ = fs::remove_file(path);
     }
@@ -1404,9 +1378,7 @@ mod tests {
             .lock()
             .insert(pub_key, crate::control::NonceCache::new(10));
         let stats = telemetry.get_or_create(pub_key);
-        stats
-            .rx_bytes
-            .store(500, std::sync::atomic::Ordering::Relaxed);
+        stats.rx_bytes.store(500);
 
         peer_secrets.write().remove(&pub_key);
         session_cache.write().remove(&pub_key);

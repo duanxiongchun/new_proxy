@@ -1,18 +1,17 @@
 # new_proxy
 
-`new_proxy` 是一个高性能混合多协议安全代理网关。它使用用户态 WireGuard L3 通道和用户态 QUIC L4 多路复用通道组合数据面：UDP、ICMP 以及 TCP fallback 走 `boringtun` L3 通道，TCP 命中 proxy peer 后由 TUN + `smoltcp` 接管并转发到 QUIC 连接池，从而规避 TCP-over-VPN 的队头阻塞问题。
+`new_proxy` 是一个高性能纯 L3 IP-over-QUIC Datagram 异步隧道安全网关。所有数据流量（TCP, UDP, ICMP）均被无状态、零额外分流处理地封装进 QUIC Datagram 报文进行公网加密传输。依托 Linux 多队列 TUN 网卡与对称多核绑定哈希设计，实现无全局锁竞争的高并发 RTC 转发流，彻底消除 TCP-over-TCP 的队头阻塞及拥塞崩溃瓶颈。
 
 ## 主要功能
 
-- **双轨数据面**：L3 WireGuard 风格通道承载 UDP/ICMP 和 TCP fallback，L4 QUIC 多路复用通道承载可卸载 TCP。
-- **用户态 TUN 透明接管**：客户端按 `AllowedIPs` 判断 TCP 目的地址，命中后由 `smoltcp` 接管并导入 QUIC 池，不依赖 iptables/TPROXY listener。
-- **多物理 QUIC 连接池**：服务端可配置多个 UDP 端口，客户端自动建立并轮询分流。
-- **对等密钥认证**：复用 WireGuard 密钥材料，通过 X25519 shared secret 和 HMAC-SHA256 进行用户态控制面协商。
-- **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端只接受该指纹对应证书。
-- **多 Peer 客户端**：客户端可同时配置多个 QUIC proxy peer，也可混合 WireGuard-only peer。
-- **来源诊断**：遥测输出提供 `"both"`, `"wireguard"`, `"proxy"` source 标识，用于判断 peer 在代理配置和 WireGuard 设备状态中的分布关系。
-- **聚合遥测**：通过 `new-proxy-cli` 查看 L3/L4 合并统计、QUIC 物理连接统计和活跃流数量，并直接输出 `source` 同步溯源字段。
-- **动态 Peer 管理**：运行期支持通过 CLI 添加和删除 Peer。
+- **纯 L3 隧道数据面**：摒弃用户态 SOCKS/TCP 流代理，采用 IP-over-QUIC Datagram 方式，无需任何用户态 SOCKS、WireGuard (boringtun) 或 TCP/IP 协议栈 (smoltcp)，纯粹在 IP 层高速透传。
+- **对称多队列多核心映射**：支持多物理 QUIC 数据面连接池，与多队列 TUN 设备队列一一对称绑定绑定物理 OS 线程，实现无共享状态、近线性的多核并发转发性能。
+- **操作系统自动 MSS 夹紧 (MSS Clamping)**：利用 TUN 网卡 MTU Clamping 强制内核在 TCP 握手阶段自动协商更小的 MSS 大小，防范 IP 分片并节省用户态包改写与校验和重算开销。
+- **集约化管控面单线程**：主运行时使用 `new_current_thread` 单线程调度，将 UDS CLI 服务、控制协商及 Failover 检测与高频数据工作线程进行物理隔离，避免调度开销与干扰。
+- **对等密钥认证与防重放**：复用 WireGuard 格式的密钥材料，通过 X25519 ECDH 派生共享密钥，并利用 HMAC-SHA256 签名校验和 Nonce 缓存防范控制面重放攻击。
+- **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端强校验建立可信 QUIC 数据物理连接。
+- **聚合遥测与诊断**：通过 `new-proxy-cli` 实时查询每个网卡队列、物理 Slot 连接状态、收发字节数及物理连接数指标。
+- **动态 Peer 管理**：运行期支持通过 CLI / UDS API 动态添加和删除对等体，自动安全地重新热插拔网络拓扑。
 
 ## 目录结构
 
@@ -84,20 +83,19 @@ target/release/new-proxy-cli
 * **`PreScript` / `pre_script`**：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
 * **`PostScript` / `post_script`**：在网关优雅退出并清理完所有路由和防火墙之后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
 
-### WireGuard 后端
+### 纯 L3 IP-over-QUIC 数据面后端
 
-当前版本内置 `boringtun`，client/server L3 数据面都在进程内完成 WireGuard 封装和解封装；程序仍需要创建 TUN 设备并配置路由，因此通常需要 root 或 `CAP_NET_ADMIN`。
+当前版本已移除了 `boringtun` (WireGuard) 和 `smoltcp`，改用纯 L3 IP-over-QUIC Datagram 异步转发。程序仍需要创建多队列 TUN 设备并配置路由，因此通常需要 root 权限或 `CAP_NET_ADMIN` 能力。
 
 ### 服务端配置
 
-服务端需要配置监听端口、控制面端口、QUIC 端口池以及允许接入的 Peer：
+服务端需要配置监听端口、QUIC 端口池以及允许接入的 Peer：
 
 ```ini
 [Interface]
 PrivateKey = <server_private_key_base64>
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
-ListenControlPort = 51821
 Table = auto
 PreScript = echo "Server starting..."
 PostScript = echo "Server stopped cleanly."
@@ -122,13 +120,13 @@ sudo target/release/new_proxy -config conf/server.conf
 
 ### 客户端配置
 
-客户端的 QUIC proxy peer 需要配置服务端 endpoint、控制面端口和目标 `AllowedIPs`：
+客户端的 QUIC proxy peer 需要配置服务端 endpoint 和目标 `AllowedIPs`：
 
 ```ini
 [Interface]
 PrivateKey = <client_private_key_base64>
 Address = 10.0.0.2/24, fd00::2/64
-MTU = 1400
+MTU = 1100
 Table = auto
 PreScript = echo "Client starting..." && sysctl -w net.ipv4.ip_forward=1
 PostScript = echo "Client stopped cleanly."
@@ -136,11 +134,10 @@ PostScript = echo "Client stopped cleanly."
 [Peer]
 PublicKey = <server_public_key_base64>
 Endpoint = <server_public_ip>:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32, fd00::1/128
 ```
 
-运行时 packet buffer 默认按 `MTU + 256` 分配，并限制在 `1500..65535` 字节；默认 `MTU = 1400` 时 buffer 为 `1656` 字节，jumbo MTU `9000` 时为 `9256` 字节。需要特殊调参时可用环境变量 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖。
+运行时 packet buffer 默认按 `MTU + 256` 分配，并限制在 `1500..65535` 字节；默认 `MTU = 1100` 时 buffer 为最低值 `1500` 字节，jumbo MTU `9000` 时为 `9256` 字节。需要特殊调参时可用环境变量 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖。
 
 启动客户端：
 
@@ -150,7 +147,7 @@ sudo target/release/new_proxy -config conf/client.conf
 
 同样，`conf/client.conf` 会使用接口名 `client`；需要兼容现有 `tun0` 路由/脚本时，请使用 `tun0.conf`。
 
-客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint` 和 `ProxyPort`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，`Endpoint` 和 `ProxyPort` 必须同时存在。
+客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，必须配置 `Endpoint`；控制面端口 `ProxyPort` 是可选配置，默认使用 `Endpoint` 的端口。
 
 ## 系统服务管理 (Systemd)
 
@@ -225,40 +222,22 @@ target/release/new-proxy-cli --interface tun0 remove-peer <public_key>
 cargo check
 ```
 
-运行双栈端到端测试：
+运行 Rust 单元测试：
 
 ```bash
-sudo script/acceptance/e2e_test_dualstack.sh
+cargo test
 ```
 
-运行多场景 E2E 测试：
+运行统一的 E2E 验收与集成测试套件（包括格式、Clippy、脚本语法及 8 项端到端场景）：
 
 ```bash
-sudo script/acceptance/e2e_scenarios.sh
+sudo ./script/acceptance/run_acceptance.sh
 ```
 
-运行多客户端并发 L3 回退 E2E 测试：
+运行 1 小时稳定性压测（需置环境变量 `RUN_STABILITY=1`）：
 
 ```bash
-sudo script/acceptance/e2e_multi_client.sh
-```
-
-运行 userspace WireGuard TCP fallback E2E 测试：
-
-```bash
-sudo script/acceptance/e2e_userspace_wg_fallback.sh
-```
-
-运行 1 小时稳定性压测：
-
-```bash
-sudo script/acceptance/stability_stress_test.sh
-```
-
-缩短稳定性压测时间用于 smoke test：
-
-```bash
-sudo STABILITY_DURATION=30 STABILITY_SAMPLE_INTERVAL=5 script/acceptance/stability_stress_test.sh
+sudo RUN_STABILITY=1 ./script/acceptance/run_acceptance.sh
 ```
 
 最新测试结果见 `doc/TEST_REPORT.md`。

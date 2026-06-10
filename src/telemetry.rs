@@ -2,22 +2,62 @@ use crate::quic_pool::QuicConnSnapshot;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+// 非原子型 U64 计数器包装类，通过 UnsafeCell 绕过 Rust 的内部可变性检查，
+// 从而在多线程环境的单线程独占写入（Worker 线程）场景中完全消除 LOCK 前缀指令的原子开销。
+#[derive(Debug)]
+pub struct CellU64(core::cell::UnsafeCell<u64>);
+
+impl CellU64 {
+    #[inline(always)]
+    pub fn new(val: u64) -> Self {
+        Self(core::cell::UnsafeCell::new(val))
+    }
+
+    #[inline(always)]
+    pub fn add(&self, val: u64) {
+        unsafe {
+            *self.0.get() += val;
+        }
+    }
+
+    #[inline(always)]
+    pub fn load(&self) -> u64 {
+        unsafe { *self.0.get() }
+    }
+
+    #[inline(always)]
+    pub fn store(&self, val: u64) {
+        unsafe {
+            *self.0.get() = val;
+        }
+    }
+}
+
+unsafe impl Send for CellU64 {}
+unsafe impl Sync for CellU64 {}
+
+impl Default for CellU64 {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
 
 // 用户态 L4 (QUIC) 统计指标（聚合到 peer 级别）
 pub struct PeerL4Stats {
-    pub tx_bytes: Arc<AtomicU64>,
-    pub rx_bytes: Arc<AtomicU64>,
-    pub active_streams: AtomicU64,
+    pub tx_bytes: Arc<CellU64>,
+    pub rx_bytes: Arc<CellU64>,
+    pub active_streams: CellU64,
 }
 
 impl Default for PeerL4Stats {
     fn default() -> Self {
         Self {
-            tx_bytes: Arc::new(AtomicU64::new(0)),
-            rx_bytes: Arc::new(AtomicU64::new(0)),
-            active_streams: AtomicU64::new(0),
+            tx_bytes: Arc::new(CellU64::new(0)),
+            rx_bytes: Arc::new(CellU64::new(0)),
+            active_streams: CellU64::new(0),
         }
     }
 }
@@ -169,19 +209,19 @@ pub struct VirtualTunnelTelemetrySnapshot {
 
 #[derive(Default)]
 pub struct VirtualTunnelTelemetry {
-    pub rx_packets: AtomicU64,
-    pub rx_bytes: AtomicU64,
-    pub control_packets: AtomicU64,
-    pub recv_errors: AtomicU64,
+    pub rx_packets: CellU64,
+    pub rx_bytes: CellU64,
+    pub control_packets: CellU64,
+    pub recv_errors: CellU64,
 }
 
 impl VirtualTunnelTelemetry {
     pub fn snapshot(&self) -> VirtualTunnelTelemetrySnapshot {
         VirtualTunnelTelemetrySnapshot {
-            rx_packets: self.rx_packets.load(Ordering::Relaxed),
-            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
-            control_packets: self.control_packets.load(Ordering::Relaxed),
-            recv_errors: self.recv_errors.load(Ordering::Relaxed),
+            rx_packets: self.rx_packets.load(),
+            rx_bytes: self.rx_bytes.load(),
+            control_packets: self.control_packets.load(),
+            recv_errors: self.recv_errors.load(),
         }
     }
 }
@@ -189,7 +229,6 @@ impl VirtualTunnelTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_telemetry_registry_get_or_create_and_snapshot() {
@@ -202,15 +241,15 @@ mod tests {
         let _stats2 = registry.get_or_create(key2);
 
         assert!(Arc::ptr_eq(&stats1, &stats1_again));
-        stats1.rx_bytes.store(100, Ordering::Relaxed);
-        stats1.tx_bytes.store(200, Ordering::Relaxed);
-        stats1.active_streams.store(3, Ordering::Relaxed);
+        stats1.rx_bytes.store(100);
+        stats1.tx_bytes.store(200);
+        stats1.active_streams.store(3);
 
         let snap = registry.snapshot();
         assert_eq!(snap.len(), 2);
-        assert_eq!(snap[&key1].rx_bytes.load(Ordering::Relaxed), 100);
-        assert_eq!(snap[&key1].tx_bytes.load(Ordering::Relaxed), 200);
-        assert_eq!(snap[&key1].active_streams.load(Ordering::Relaxed), 3);
+        assert_eq!(snap[&key1].rx_bytes.load(), 100);
+        assert_eq!(snap[&key1].tx_bytes.load(), 200);
+        assert_eq!(snap[&key1].active_streams.load(), 3);
     }
 
     #[test]
@@ -218,7 +257,7 @@ mod tests {
         let registry = TelemetryRegistry::new();
         let key = [9u8; 32];
         let stats = registry.get_or_create(key);
-        stats.rx_bytes.store(500, Ordering::Relaxed);
+        stats.rx_bytes.store(500);
 
         registry.remove(&key);
         let snap = registry.snapshot();
