@@ -94,6 +94,7 @@ impl RtcWorker {
         self.peer_telemetry = Some(telemetry);
     }
 
+    #[cfg(not(target_os = "linux"))]
     async fn send_transmit(&mut self, transmit: quinn_proto::Transmit) {
         let contents = &transmit.contents;
         let dest = transmit.destination;
@@ -126,6 +127,7 @@ impl RtcWorker {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     async fn process_endpoint_transmits(&mut self) {
         let now = std::time::Instant::now();
         // 1. Poll endpoint-level transmits
@@ -903,6 +905,103 @@ impl RtcWorker {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RtcWorker {
+    async fn send_transmits_for_peer(&mut self, dest: std::net::SocketAddr, transmits: &[quinn_proto::Transmit]) {
+        if transmits.is_empty() {
+            return;
+        }
+
+        let fd = self.udp_socket.as_raw_fd();
+        let mut tx_batch = UdpBatch::new();
+
+        // We chunk transmits into sizes of UDP_BATCH_SIZE
+        for chunk in transmits.chunks(UDP_BATCH_SIZE) {
+            let count = chunk.len();
+            for (i, transmit) in chunk.iter().enumerate() {
+                tx_batch.iovs[i].iov_base = transmit.contents.as_ptr() as *mut libc::c_void;
+                tx_batch.iovs[i].iov_len = transmit.contents.len() as libc::size_t;
+
+                socket_addr_to_sockaddr(dest, &mut tx_batch.addrs[i]);
+                tx_batch.mmsgs[i].msg_hdr.msg_name = &mut tx_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
+                tx_batch.mmsgs[i].msg_hdr.msg_namelen = if dest.is_ipv4() {
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+                } else {
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+                };
+                tx_batch.mmsgs[i].msg_hdr.msg_iov = &mut tx_batch.iovs[i] as *mut libc::iovec;
+                tx_batch.mmsgs[i].msg_hdr.msg_iovlen = 1;
+                tx_batch.mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
+                tx_batch.mmsgs[i].msg_hdr.msg_controllen = 0;
+                tx_batch.mmsgs[i].msg_hdr.msg_flags = 0;
+                tx_batch.mmsgs[i].msg_len = 0;
+            }
+
+            let res = self.udp_socket.try_io(Interest::WRITABLE, || {
+                let sent = unsafe {
+                    libc::sendmmsg(
+                        fd,
+                        tx_batch.mmsgs.as_mut_ptr(),
+                        count as libc::c_uint,
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if sent < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(sent as usize)
+            });
+
+            match res {
+                Ok(sent) => {
+                    if sent < count {
+                        // Fallback for unsent packets in the batch
+                        for transmit in &chunk[sent..] {
+                            if let Err(e) = self.udp_socket.send_to(&transmit.contents, dest).await {
+                                log::warn!("Failed to send UDP transmit fallback packet: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Fallback blockingly or await writable
+                    for transmit in chunk {
+                        if let Err(e) = self.udp_socket.send_to(&transmit.contents, dest).await {
+                            log::warn!("Failed to send UDP transmit fallback packet: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to sendmmsg: {:?}", e);
+                }
+            }
+        }
+    }
+
+    async fn process_endpoint_transmits(&mut self) {
+        let now = std::time::Instant::now();
+        // Group transmits by destination SocketAddr
+        let mut peer_transmits: std::collections::HashMap<std::net::SocketAddr, Vec<quinn_proto::Transmit>> = std::collections::HashMap::new();
+
+        // 1. Poll endpoint-level transmits
+        while let Some(transmit) = self.endpoint.poll_transmit() {
+            peer_transmits.entry(transmit.destination).or_default().push(transmit);
+        }
+
+        // 2. Poll connection-level transmits
+        for conn in self.connections.values_mut() {
+            while let Some(transmit) = conn.connection.poll_transmit(now, 1024) {
+                peer_transmits.entry(transmit.destination).or_default().push(transmit);
+            }
+        }
+
+        // 3. Batch send per peer
+        for (dest, transmits) in peer_transmits {
+            self.send_transmits_for_peer(dest, &transmits).await;
         }
     }
 }
