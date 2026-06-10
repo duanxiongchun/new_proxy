@@ -42,6 +42,9 @@ pub struct RtcWorker {
     pub shared_quic_registry: Option<crate::quic_pool::PeerConnRegistry>,
     #[cfg(target_os = "linux")]
     pub udp_batch: UdpBatch,
+    #[cfg(target_os = "linux")]
+    pub tx_batch: UdpBatch,
+    pub tx_packet_run: Vec<bytes::Bytes>,
 }
 
 impl RtcWorker {
@@ -81,6 +84,9 @@ impl RtcWorker {
             shared_quic_registry,
             #[cfg(target_os = "linux")]
             udp_batch: UdpBatch::new(),
+            #[cfg(target_os = "linux")]
+            tx_batch: UdpBatch::new(),
+            tx_packet_run: Vec::with_capacity(64),
         }
     }
 
@@ -425,6 +431,46 @@ impl RtcWorker {
         None
     }
 
+    async fn send_batch_to_connection(
+        &mut self,
+        handle: quinn_proto::ConnectionHandle,
+        packets: &[bytes::Bytes],
+        local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
+        now: std::time::Instant,
+        dp_snapshot: &crate::L4DataPlaneSnapshot,
+    ) {
+        if packets.is_empty() {
+            return;
+        }
+        let mut sent = false;
+        if let Some(conn) = self.connections.get_mut(&handle) {
+            if conn.authenticated {
+                for packet in packets {
+                    let packet_len = (packet.len() - 1) as u64;
+                    if let Err(e) = conn.connection.datagrams().send(packet.clone()) {
+                        log::warn!("Failed to send datagram: {:?}", e);
+                    } else {
+                        conn.tx_bytes.add(packet_len);
+                        local_stats.l3_packets += 1;
+                        local_stats.l3_bytes += packet_len;
+
+                        if let Some(ref peer_telemetry) = self.peer_telemetry {
+                            if let Some(pub_key) = conn.peer_public_key {
+                                let peer_stats = peer_telemetry.get_or_create(pub_key);
+                                peer_stats.tx_bytes.add(packet_len);
+                            }
+                        }
+                        sent = true;
+                    }
+                }
+            }
+        }
+        if sent {
+            self.drive_connection(handle, dp_snapshot, now, local_stats)
+                .await;
+        }
+    }
+
     #[allow(dead_code)]
     async fn handle_tun_packet(
         &mut self,
@@ -565,6 +611,8 @@ impl RtcWorker {
         let sleep = tokio::time::sleep(std::time::Duration::from_secs(3600));
         tokio::pin!(sleep);
 
+        let mut consecutive_polls = 0;
+
         loop {
             // Reset and prepare tun_buf
             tun_buf.truncate(0);
@@ -593,6 +641,301 @@ impl RtcWorker {
                     let cap = udp_buf.capacity();
                     udp_buf.set_len(cap);
                 }
+            }
+
+            let mut processed = false;
+            if consecutive_polls < 32 {
+                let now = std::time::Instant::now();
+                #[cfg(target_os = "linux")]
+                {
+                    // A. Try reading from TUN non-blockingly
+                    match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                        Ok(Some(n)) if n > 0 => {
+                            processed = true;
+                            local_stats.tun_rx_packets += 1;
+                            local_stats.tun_rx_bytes += n as u64;
+                            tun_buf[0] = 0x02;
+                            unsafe {
+                                tun_buf.set_len(1 + n);
+                            }
+                            let first_frame = tun_buf.split_to(1 + n).freeze();
+                            let mut batch = Vec::with_capacity(64);
+                            batch.push(first_frame);
+
+                            for _ in 0..63 {
+                                if tun_buf.capacity() < 65536 {
+                                    tun_buf.reserve(256 * 1024);
+                                }
+                                unsafe {
+                                    let cap = tun_buf.capacity();
+                                    tun_buf.set_len(cap);
+                                }
+                                match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                                    Ok(Some(n_next)) if n_next > 0 => {
+                                        local_stats.tun_rx_packets += 1;
+                                        local_stats.tun_rx_bytes += n_next as u64;
+                                        tun_buf[0] = 0x02;
+                                        unsafe {
+                                            tun_buf.set_len(1 + n_next);
+                                        }
+                                        let frame = tun_buf.split_to(1 + n_next).freeze();
+                                        batch.push(frame);
+                                    }
+                                    _ => {
+                                        break;
+                                    }
+                                }
+                            }
+                            tun_buf.truncate(0);
+
+                            self.tx_packet_run.clear();
+                            let mut current_handle: Option<quinn_proto::ConnectionHandle> = None;
+
+                            for packet in batch {
+                                if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
+                                    if let Some(handle) =
+                                        self.find_handle_for_ip(dst_ip, &dp_snapshot)
+                                    {
+                                        if let Some(curr) = current_handle {
+                                            if curr == handle {
+                                                self.tx_packet_run.push(packet);
+                                            } else {
+                                                let mut packets =
+                                                    std::mem::take(&mut self.tx_packet_run);
+                                                self.send_batch_to_connection(
+                                                    curr,
+                                                    &packets,
+                                                    &mut local_stats,
+                                                    now,
+                                                    &dp_snapshot,
+                                                )
+                                                .await;
+                                                packets.clear();
+                                                self.tx_packet_run = packets;
+                                                current_handle = Some(handle);
+                                                self.tx_packet_run.push(packet);
+                                            }
+                                        } else {
+                                            current_handle = Some(handle);
+                                            self.tx_packet_run.push(packet);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(curr) = current_handle {
+                                let mut packets = std::mem::take(&mut self.tx_packet_run);
+                                self.send_batch_to_connection(
+                                    curr,
+                                    &packets,
+                                    &mut local_stats,
+                                    now,
+                                    &dp_snapshot,
+                                )
+                                .await;
+                                packets.clear();
+                                self.tx_packet_run = packets;
+                            }
+                            self.tx_packet_run.clear();
+
+                            self.process_endpoint_transmits().await;
+                        }
+                        _ => {}
+                    }
+
+                    // B. Try reading from UDP non-blockingly
+                    let recv_packet_size = self.packet_buffer_size + 512;
+                    let mut batch_buf =
+                        bytes::BytesMut::with_capacity(UDP_BATCH_SIZE * recv_packet_size);
+                    unsafe {
+                        batch_buf.set_len(UDP_BATCH_SIZE * recv_packet_size);
+                    }
+                    let fd = self.udp_socket.as_raw_fd();
+
+                    let res = self.udp_socket.try_io(Interest::READABLE, || {
+                        for i in 0..UDP_BATCH_SIZE {
+                            self.udp_batch.iovs[i].iov_base = unsafe {
+                                batch_buf.as_mut_ptr().add(i * recv_packet_size)
+                                    as *mut libc::c_void
+                            };
+                            self.udp_batch.iovs[i].iov_len = recv_packet_size as libc::size_t;
+
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_name = &mut self.udp_batch.addrs[i]
+                                as *mut libc::sockaddr_storage
+                                as *mut libc::c_void;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_namelen =
+                                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_iov =
+                                &mut self.udp_batch.iovs[i] as *mut libc::iovec;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_iovlen = 1;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_controllen = 0;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_flags = 0;
+                            self.udp_batch.mmsgs[i].msg_len = 0;
+                        }
+
+                        let count = unsafe {
+                            libc::recvmmsg(
+                                fd,
+                                self.udp_batch.mmsgs.as_mut_ptr(),
+                                UDP_BATCH_SIZE as libc::c_uint,
+                                libc::MSG_DONTWAIT,
+                                std::ptr::null_mut(),
+                            )
+                        };
+
+                        if count < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(count as usize)
+                    });
+
+                    match res {
+                        Ok(count) if count > 0 => {
+                            processed = true;
+                            let mut remaining = batch_buf;
+                            for i in 0..count {
+                                let len = self.udp_batch.mmsgs[i].msg_len as usize;
+                                let mut packet_chunk = remaining.split_to(recv_packet_size);
+                                if len > 0 {
+                                    packet_chunk.truncate(len);
+                                    let namelen = self.udp_batch.mmsgs[i].msg_hdr.msg_namelen;
+                                    if let Some(remote_addr) =
+                                        sockaddr_to_socket_addr(&self.udp_batch.addrs[i], namelen)
+                                    {
+                                        self.handle_udp_packet(
+                                            packet_chunk,
+                                            remote_addr,
+                                            &dp_snapshot,
+                                            now,
+                                            &mut local_stats,
+                                        )
+                                        .await;
+                                    } else {
+                                        log::warn!(
+                                            "sockaddr_to_socket_addr failed: namelen={}",
+                                            namelen
+                                        );
+                                    }
+                                }
+                            }
+                            self.process_endpoint_transmits().await;
+                        }
+                        _ => {}
+                    }
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // A. Try reading from TUN non-blockingly
+                    match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                        Ok(Some(n)) if n > 0 => {
+                            processed = true;
+                            local_stats.tun_rx_packets += 1;
+                            local_stats.tun_rx_bytes += n as u64;
+                            tun_buf[0] = 0x02;
+                            unsafe {
+                                tun_buf.set_len(1 + n);
+                            }
+                            let frame = tun_buf.split_to(1 + n).freeze();
+                            self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats)
+                                .await;
+
+                            for _ in 0..63 {
+                                if tun_buf.capacity() < 65536 {
+                                    tun_buf.reserve(256 * 1024);
+                                }
+                                unsafe {
+                                    let cap = tun_buf.capacity();
+                                    tun_buf.set_len(cap);
+                                }
+                                match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                                    Ok(Some(n_next)) if n_next > 0 => {
+                                        local_stats.tun_rx_packets += 1;
+                                        local_stats.tun_rx_bytes += n_next as u64;
+                                        tun_buf[0] = 0x02;
+                                        unsafe {
+                                            tun_buf.set_len(1 + n_next);
+                                        }
+                                        let frame = tun_buf.split_to(1 + n_next).freeze();
+                                        self.handle_tun_packet(
+                                            frame,
+                                            &dp_snapshot,
+                                            now,
+                                            &mut local_stats,
+                                        )
+                                        .await;
+                                    }
+                                    _ => {
+                                        break;
+                                    }
+                                }
+                            }
+                            tun_buf.truncate(0);
+                            self.process_endpoint_transmits().await;
+                        }
+                        _ => {}
+                    }
+
+                    // B. Try reading from UDP non-blockingly
+                    match self.udp_socket.try_recv_from(&mut udp_buf) {
+                        Ok((n, remote_addr)) if n > 0 => {
+                            processed = true;
+                            unsafe {
+                                udp_buf.set_len(n);
+                            }
+                            let data = udp_buf.split_to(n);
+                            self.handle_udp_packet(
+                                data,
+                                remote_addr,
+                                &dp_snapshot,
+                                now,
+                                &mut local_stats,
+                            )
+                            .await;
+
+                            for _ in 0..63 {
+                                if udp_buf.capacity() < 65536 {
+                                    udp_buf.reserve(256 * 1024);
+                                }
+                                unsafe {
+                                    let cap = udp_buf.capacity();
+                                    udp_buf.set_len(cap);
+                                }
+                                match self.udp_socket.try_recv_from(&mut udp_buf) {
+                                    Ok((n_next, remote_addr)) if n_next > 0 => {
+                                        unsafe {
+                                            udp_buf.set_len(n_next);
+                                        }
+                                        let data = udp_buf.split_to(n_next);
+                                        self.handle_udp_packet(
+                                            data,
+                                            remote_addr,
+                                            &dp_snapshot,
+                                            now,
+                                            &mut local_stats,
+                                        )
+                                        .await;
+                                    }
+                                    _ => {
+                                        udp_buf.truncate(0);
+                                        break;
+                                    }
+                                }
+                            }
+                            self.process_endpoint_transmits().await;
+                        }
+                        _ => {
+                            udp_buf.truncate(0);
+                        }
+                    }
+                }
+            }
+
+            if processed {
+                consecutive_polls += 1;
+                continue;
+            } else {
+                consecutive_polls = 0;
             }
 
             let mut next_timeout = None;
@@ -684,47 +1027,37 @@ impl RtcWorker {
                                         }
                                         tun_buf.truncate(0);
 
-                                        // Look up destination IP and group packets by ConnectionHandle
-                                        let mut groups: std::collections::HashMap<quinn_proto::ConnectionHandle, Vec<bytes::Bytes>> = std::collections::HashMap::new();
-                                        for packet in batch {
-                                            if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
-                                                if let Some(handle) = self.find_handle_for_ip(dst_ip, &dp_snapshot) {
-                                                    groups.entry(handle).or_default().push(packet);
-                                                }
-                                            }
-                                        }
+                                         self.tx_packet_run.clear();
+                                         let mut current_handle: Option<quinn_proto::ConnectionHandle> = None;
 
-                                        // For each peer connection group:
-                                        // - Batch write to Quinn: call datagrams().send(frame) in a loop
-                                        // - Increment stats (l3_packets, l3_bytes, tx_bytes)
-                                        for (handle, packets) in groups {
-                                            let mut sent = false;
-                                            if let Some(conn) = self.connections.get_mut(&handle) {
-                                                if conn.authenticated {
-                                                    for packet in packets {
-                                                        let packet_len = (packet.len() - 1) as u64;
-                                                        if let Err(e) = conn.connection.datagrams().send(packet) {
-                                                            log::warn!("Failed to send datagram: {:?}", e);
-                                                        } else {
-                                                            conn.tx_bytes.add(packet_len);
-                                                            local_stats.l3_packets += 1;
-                                                            local_stats.l3_bytes += packet_len;
-
-                                                            if let Some(ref peer_telemetry) = self.peer_telemetry {
-                                                                if let Some(pub_key) = conn.peer_public_key {
-                                                                    let peer_stats = peer_telemetry.get_or_create(pub_key);
-                                                                    peer_stats.tx_bytes.add(packet_len);
-                                                                }
-                                                            }
-                                                            sent = true;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if sent {
-                                                self.drive_connection(handle, &dp_snapshot, now, &mut local_stats).await;
-                                            }
-                                        }
+                                         for packet in batch {
+                                             if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
+                                                 if let Some(handle) = self.find_handle_for_ip(dst_ip, &dp_snapshot) {
+                                                     if let Some(curr) = current_handle {
+                                                         if curr == handle {
+                                                             self.tx_packet_run.push(packet);
+                                                         } else {
+                                                             let mut packets = std::mem::take(&mut self.tx_packet_run);
+                                                             self.send_batch_to_connection(curr, &packets, &mut local_stats, now, &dp_snapshot).await;
+                                                             packets.clear();
+                                                             self.tx_packet_run = packets;
+                                                             current_handle = Some(handle);
+                                                             self.tx_packet_run.push(packet);
+                                                         }
+                                                     } else {
+                                                         current_handle = Some(handle);
+                                                         self.tx_packet_run.push(packet);
+                                                     }
+                                                 }
+                                             }
+                                         }
+                                         if let Some(curr) = current_handle {
+                                             let mut packets = std::mem::take(&mut self.tx_packet_run);
+                                             self.send_batch_to_connection(curr, &packets, &mut local_stats, now, &dp_snapshot).await;
+                                             packets.clear();
+                                             self.tx_packet_run = packets;
+                                         }
+                                         self.tx_packet_run.clear();
 
                                         self.process_endpoint_transmits().await;
                                     }
@@ -1018,8 +1351,7 @@ impl RtcWorker {
         }
 
         let fd = self.udp_socket.as_raw_fd();
-        let mut tx_batch = UdpBatch::new();
-
+        let tx_batch = &mut self.tx_batch;
         // We chunk packets into sizes of UDP_BATCH_SIZE
         for chunk in packets.chunks(UDP_BATCH_SIZE) {
             let count = chunk.len();
@@ -1043,20 +1375,18 @@ impl RtcWorker {
                 tx_batch.mmsgs[i].msg_len = 0;
             }
 
-            let res = self.udp_socket.try_io(Interest::WRITABLE, || {
-                let sent = unsafe {
-                    libc::sendmmsg(
-                        fd,
-                        tx_batch.mmsgs.as_mut_ptr(),
-                        count as libc::c_uint,
-                        libc::MSG_DONTWAIT,
-                    )
-                };
-                if sent < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(sent as usize)
-            });
+            let res = {
+                let tx_ptr = tx_batch.mmsgs.as_mut_ptr();
+                self.udp_socket.try_io(Interest::WRITABLE, || {
+                    let sent = unsafe {
+                        libc::sendmmsg(fd, tx_ptr, count as libc::c_uint, libc::MSG_DONTWAIT)
+                    };
+                    if sent < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(sent as usize)
+                })
+            };
 
             match res {
                 Ok(sent) => {

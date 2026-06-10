@@ -150,7 +150,7 @@ cat > "$CLIENT_CONF" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-MTU = 1280
+MTU = 1420
 Table = auto
 
 [Peer]
@@ -171,7 +171,7 @@ PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
-MTU = 1280
+MTU = 1420
 Table = auto
 
 [QUICPool]
