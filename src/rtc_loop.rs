@@ -1,6 +1,10 @@
 use crate::tun_io::AsyncTunIo;
 use std::net::IpAddr;
+#[allow(unused_imports)]
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+#[allow(unused_imports)]
+use tokio::io::Interest;
 use tokio::sync::Notify;
 
 pub struct RtcWorkerConfig {
@@ -883,6 +887,47 @@ fn parse_destination_ip(packet: &[u8]) -> Option<IpAddr> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub const UDP_BATCH_SIZE: usize = 64;
+
+#[cfg(target_os = "linux")]
+pub struct UdpBatch {
+    pub mmsgs: [libc::mmsghdr; UDP_BATCH_SIZE],
+    pub iovs: [libc::iovec; UDP_BATCH_SIZE],
+    pub addrs: [libc::sockaddr_storage; UDP_BATCH_SIZE],
+}
+
+#[cfg(target_os = "linux")]
+impl UdpBatch {
+    pub fn new() -> Self {
+        // SAFETY: All components are POD structures. Zero-initializing them is safe.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for UdpBatch {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for UdpBatch {}
+
+pub fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<std::net::SocketAddr> {
+    let sockaddr = unsafe { socket2::SockAddr::new(*addr, len) };
+    sockaddr.as_socket()
+}
+
+pub fn socket_addr_to_sockaddr(addr: std::net::SocketAddr, dest: &mut libc::sockaddr_storage) -> libc::socklen_t {
+    let sockaddr = socket2::SockAddr::from(addr);
+    let len = sockaddr.len();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            sockaddr.as_ptr() as *const u8,
+            dest as *mut libc::sockaddr_storage as *mut u8,
+            len as usize,
+        );
+    }
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,4 +1133,23 @@ mod tests {
         server_task.abort();
         client_task.abort();
     }
+
+    #[test]
+    fn test_sockaddr_conversion_roundtrip() {
+        use super::*;
+        let ipv4_addr: std::net::SocketAddr = "1.2.3.4:51820".parse().unwrap();
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let len = socket_addr_to_sockaddr(ipv4_addr, &mut storage);
+        assert!(len > 0);
+        let back = sockaddr_to_socket_addr(&storage, len).unwrap();
+        assert_eq!(back, ipv4_addr);
+
+        let ipv6_addr: std::net::SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+        let mut storage6: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let len6 = socket_addr_to_sockaddr(ipv6_addr, &mut storage6);
+        assert!(len6 > 0);
+        let back6 = sockaddr_to_socket_addr(&storage6, len6).unwrap();
+        assert_eq!(back6, ipv6_addr);
+    }
 }
+
