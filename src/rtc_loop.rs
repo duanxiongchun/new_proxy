@@ -33,8 +33,7 @@ pub struct RtcWorker {
         quinn_proto::ConnectionHandle,
         crate::quic_proto_engine::WorkerConnection,
     >,
-    pub ip_to_handle: std::collections::HashMap<std::net::IpAddr, quinn_proto::ConnectionHandle>,
-    pub handle_to_ip: std::collections::HashMap<quinn_proto::ConnectionHandle, std::net::IpAddr>,
+    pub pub_key_to_handle: std::collections::HashMap<[u8; 32], quinn_proto::ConnectionHandle>,
     pub session_cache:
         Option<Arc<parking_lot::RwLock<std::collections::HashMap<[u8; 32], [u8; 32]>>>>,
     pub auth_nonce_cache: Option<
@@ -76,8 +75,7 @@ impl RtcWorker {
             udp_socket,
             endpoint,
             connections: std::collections::HashMap::new(),
-            ip_to_handle: std::collections::HashMap::new(),
-            handle_to_ip: std::collections::HashMap::new(),
+            pub_key_to_handle: std::collections::HashMap::new(),
             session_cache,
             auth_nonce_cache,
             shared_quic_registry,
@@ -194,9 +192,11 @@ impl RtcWorker {
         }
 
         if connection_lost {
-            self.connections.remove(&handle);
-            self.ip_to_handle.retain(|_, h| *h != handle);
-            self.handle_to_ip.remove(&handle);
+            if let Some(conn) = self.connections.remove(&handle) {
+                if let Some(pub_key) = conn.peer_public_key {
+                    self.pub_key_to_handle.remove(&pub_key);
+                }
+            }
             return;
         }
 
@@ -324,11 +324,7 @@ impl RtcWorker {
                         conn.peer_public_key = Some(client_pub_key);
                     }
 
-                    let ips = dp_snapshot.router.find_ips_for_value(&client_pub_key);
-                    for ip in ips {
-                        self.ip_to_handle.insert(ip, handle);
-                        self.handle_to_ip.insert(handle, ip);
-                    }
+                    self.pub_key_to_handle.insert(client_pub_key, handle);
 
                     let ok_payload = vec![0x01, b'O', b'K'];
                     if let Some(conn) = self.connections.get_mut(&handle) {
@@ -357,11 +353,7 @@ impl RtcWorker {
                             if let Some(conn) = self.connections.get_mut(&handle) {
                                 conn.peer_public_key = Some(pub_key);
                             }
-                            let ips = dp_snapshot.router.find_ips_for_value(&pub_key);
-                            for ip in ips {
-                                self.ip_to_handle.insert(ip, handle);
-                                self.handle_to_ip.insert(handle, ip);
-                            }
+                            self.pub_key_to_handle.insert(pub_key, handle);
                         }
                     }
                 }
@@ -406,6 +398,9 @@ impl RtcWorker {
 
     async fn abort_connection(&mut self, handle: quinn_proto::ConnectionHandle, reason: &[u8]) {
         if let Some(mut conn) = self.connections.remove(&handle) {
+            if let Some(pub_key) = conn.peer_public_key {
+                self.pub_key_to_handle.remove(&pub_key);
+            }
             let now = std::time::Instant::now();
             let error_code = quinn_proto::VarInt::from(0u32);
             let reason_bytes = bytes::Bytes::copy_from_slice(reason);
@@ -414,8 +409,6 @@ impl RtcWorker {
                 let _ = self.endpoint.handle_event(handle, endpoint_event);
             }
         }
-        self.ip_to_handle.retain(|_, h| *h != handle);
-        self.handle_to_ip.remove(&handle);
         self.process_endpoint_transmits().await;
     }
 
@@ -424,15 +417,9 @@ impl RtcWorker {
         dst_ip: std::net::IpAddr,
         dp_snapshot: &crate::L4DataPlaneSnapshot,
     ) -> Option<quinn_proto::ConnectionHandle> {
-        if let Some(&handle) = self.ip_to_handle.get(&dst_ip) {
-            return Some(handle);
-        }
         if let Some(pub_key) = dp_snapshot.router.longest_match(dst_ip) {
-            let ips = dp_snapshot.router.find_ips_for_value(&pub_key);
-            for ip in ips {
-                if let Some(&handle) = self.ip_to_handle.get(&ip) {
-                    return Some(handle);
-                }
+            if let Some(&handle) = self.pub_key_to_handle.get(&pub_key) {
+                return Some(handle);
             }
         }
         None
@@ -486,8 +473,7 @@ impl RtcWorker {
         local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
     ) {
         let handle_res = self.endpoint.handle(now, remote_addr, None, None, data);
-        if let Some((handle, datagram_event)) = handle_res
-        {
+        if let Some((handle, datagram_event)) = handle_res {
             match datagram_event {
                 quinn_proto::DatagramEvent::NewConnection(conn) => {
                     let worker_conn = crate::quic_proto_engine::WorkerConnection {
@@ -498,7 +484,6 @@ impl RtcWorker {
                         peer_public_key: None,
                     };
                     self.connections.insert(handle, worker_conn);
-                    self.handle_to_ip.insert(handle, remote_addr.ip());
                 }
                 quinn_proto::DatagramEvent::ConnectionEvent(conn_event) => {
                     if let Some(conn) = self.connections.get_mut(&handle) {
@@ -785,11 +770,11 @@ impl RtcWorker {
                                                     self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
                                                 }
                                                 _ => {
-                                                    tun_buf.truncate(0);
                                                     break;
                                                 }
                                             }
                                         }
+                                        tun_buf.truncate(0);
                                         self.process_endpoint_transmits().await;
                                     }
                                 }
@@ -1012,7 +997,11 @@ impl RtcWorker {
 
 #[cfg(target_os = "linux")]
 impl RtcWorker {
-    async fn send_transmits_for_peer(&mut self, dest: std::net::SocketAddr, transmits: &[quinn_proto::Transmit]) {
+    async fn send_transmits_for_peer(
+        &mut self,
+        dest: std::net::SocketAddr,
+        transmits: &[quinn_proto::Transmit],
+    ) {
         if transmits.is_empty() {
             return;
         }
@@ -1039,7 +1028,8 @@ impl RtcWorker {
                 tx_batch.iovs[i].iov_len = pkt.len() as libc::size_t;
 
                 socket_addr_to_sockaddr(dest, &mut tx_batch.addrs[i]);
-                tx_batch.mmsgs[i].msg_hdr.msg_name = &mut tx_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
+                tx_batch.mmsgs[i].msg_hdr.msg_name =
+                    &mut tx_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
                 tx_batch.mmsgs[i].msg_hdr.msg_namelen = if dest.is_ipv4() {
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
                 } else {
@@ -1097,17 +1087,26 @@ impl RtcWorker {
     async fn process_endpoint_transmits(&mut self) {
         let now = std::time::Instant::now();
         // Group transmits by destination SocketAddr
-        let mut peer_transmits: std::collections::HashMap<std::net::SocketAddr, Vec<quinn_proto::Transmit>> = std::collections::HashMap::new();
+        let mut peer_transmits: std::collections::HashMap<
+            std::net::SocketAddr,
+            Vec<quinn_proto::Transmit>,
+        > = std::collections::HashMap::new();
 
         // 1. Poll endpoint-level transmits
         while let Some(transmit) = self.endpoint.poll_transmit() {
-            peer_transmits.entry(transmit.destination).or_default().push(transmit);
+            peer_transmits
+                .entry(transmit.destination)
+                .or_default()
+                .push(transmit);
         }
 
         // 2. Poll connection-level transmits
         for conn in self.connections.values_mut() {
             while let Some(transmit) = conn.connection.poll_transmit(now, 1024) {
-                peer_transmits.entry(transmit.destination).or_default().push(transmit);
+                peer_transmits
+                    .entry(transmit.destination)
+                    .or_default()
+                    .push(transmit);
             }
         }
 
@@ -1201,16 +1200,29 @@ impl UdpBatch {
 }
 
 #[cfg(target_os = "linux")]
+impl Default for UdpBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
 unsafe impl Send for UdpBatch {}
 #[cfg(target_os = "linux")]
 unsafe impl Sync for UdpBatch {}
 
-pub fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<std::net::SocketAddr> {
+pub fn sockaddr_to_socket_addr(
+    addr: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<std::net::SocketAddr> {
     let sockaddr = unsafe { socket2::SockAddr::new(*addr, len) };
     sockaddr.as_socket()
 }
 
-pub fn socket_addr_to_sockaddr(addr: std::net::SocketAddr, dest: &mut libc::sockaddr_storage) -> libc::socklen_t {
+pub fn socket_addr_to_sockaddr(
+    addr: std::net::SocketAddr,
+    dest: &mut libc::sockaddr_storage,
+) -> libc::socklen_t {
     let sockaddr = socket2::SockAddr::from(addr);
     let len = sockaddr.len();
     unsafe {
@@ -1386,11 +1398,8 @@ mod tests {
         let mut read_buf = vec![0u8; 1500];
         let mut recved_count = 0;
         for _ in 0..64 {
-            let res = tokio::time::timeout(
-                Duration::from_secs(5),
-                reader.recv(&mut read_buf),
-            )
-            .await;
+            let res =
+                tokio::time::timeout(Duration::from_secs(5), reader.recv(&mut read_buf)).await;
             if let Ok(Ok(n)) = res {
                 assert_eq!(n, 44);
                 assert_eq!(&read_buf[12..16], &[10, 0, 0, 2]);
@@ -1421,13 +1430,10 @@ mod tests {
 
         let reader2 = tokio::net::UnixDatagram::from_std(client_sock_user).unwrap();
         let mut read_buf2 = vec![0u8; 1500];
-        let n2 = tokio::time::timeout(
-            Duration::from_secs(5),
-            reader2.recv(&mut read_buf2),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let n2 = tokio::time::timeout(Duration::from_secs(5), reader2.recv(&mut read_buf2))
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(n2, 44);
         assert_eq!(read_buf2[12..16], [10, 0, 0, 1]);
@@ -1456,4 +1462,3 @@ mod tests {
         assert_eq!(back6, ipv6_addr);
     }
 }
-
