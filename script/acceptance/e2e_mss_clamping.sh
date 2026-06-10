@@ -102,7 +102,7 @@ cat > "$CLIENT_CONF" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-MTU = 1200
+MTU = 1100
 Table = auto
 
 [Peer]
@@ -125,7 +125,7 @@ for _ in $(seq 1 40); do
 done
 
 ip netns exec server_ns ip addr add 10.0.0.1/24 dev e2e_server || true
-ip netns exec server_ns ip link set e2e_server up
+ip netns exec server_ns ip link set e2e_server up mtu 1100
 ip netns exec server_ns ip route replace 10.0.0.2/32 dev e2e_server
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "✗ [FAIL] Server daemon exited early"

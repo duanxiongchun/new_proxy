@@ -450,18 +450,15 @@ impl RtcWorker {
                 let mut sent = false;
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     if conn.authenticated {
-                        let mut packet_data = packet.to_vec();
-                        crate::mss_clamping::clamp_tcp_mss(&mut packet_data, 1100);
-
-                        let mut frame = Vec::with_capacity(1 + packet_data.len());
+                        let mut frame = Vec::with_capacity(1 + packet.len());
                         frame.push(0x02);
-                        frame.extend_from_slice(&packet_data);
+                        frame.extend_from_slice(packet);
 
                         if let Err(e) = conn.connection.datagrams().send(bytes::Bytes::from(frame))
                         {
                             log::debug!("Failed to send datagram: {:?}", e);
                         } else {
-                            let packet_len = packet_data.len() as u64;
+                            let packet_len = packet.len() as u64;
                             conn.tx_bytes
                                 .fetch_add(packet_len, std::sync::atomic::Ordering::Relaxed);
                             local_stats.l3_packets += 1;

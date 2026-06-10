@@ -4,7 +4,6 @@ mod buffer_pool;
 mod client;
 mod config;
 mod control;
-mod mss_clamping;
 mod quic_pool;
 pub mod quic_proto_engine;
 mod routing;
