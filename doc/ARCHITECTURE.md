@@ -187,5 +187,5 @@ TUN 批接收 (read + try_read) ---> 批量路由与加密 (Quinn send) ---> UDP
 
 ### 10.2 TUN -> UDP 数据路径批处理
 1. **TUN 批量读取（Batch Read）**：在事件循环中，首先通过异步 `read` 等待并读取第一个 TUN 报文。随后，通过非阻塞的 `try_read` 循环，将 TUN 驱动队列中当前所有立即可用的报文（最多 63 个）全部读取出来，组成一个最大 64 报文的批次。
-2. **按 Peer 批量分类与加密（Batch Routing & Peer Classification）**：对批次中的每一个报文，在无锁哈希表中检索其目的 Connection Handle。将属于相同 Peer/ConnectionHandle 的报文进行聚合归类（可通过对批次数据按 ConnectionHandle 进行就地排序实现，以确保零动态分配）。随后，按 Peer 轮流调用连接的 Datagram 发送队列 `send()` 批量写入该 Peer 的所有报文，批量触发 Quinn 内部的 AEAD 加密流程。
-3. **UDP 批量发送（Batch Send）**：轮询所有连接并收集最多 64 个待发送的加密 UDP 报文（`Transmit`），最后使用 Linux 原生的 `sendmmsg` 系统调用在单次内核态切换中将所有报文批量发送出去。
+2. **按 Peer 批量分类与加密（Batch Routing & Peer Classification）**：对批次中的每一个报文，在无锁哈希表中检索其目的 Connection Handle 并归类到对应的 Peer。将属于相同 Peer 的报文聚合后，轮流调用对应 Peer 的 Datagram 发送队列 `send()` 批量写入该 Peer 的所有报文，触发 Quinn 内部的 AEAD 加密。
+3. **UDP 批量发送（Batch Send）**：对每个 Peer 独立收集其生成的所有待发送加密 UDP 报文（`Transmit`），并针对每个 Peer 分别使用 Linux 原生的 `sendmmsg` 系统调用将属于该 Peer 的报文批量发送出去。
