@@ -308,9 +308,9 @@ pub struct QuicAuthPacket {
 pub struct QuicConnStats {
     pub remote_addr: SocketAddr,
     pub local_port: u16,
-    pub rx_bytes: Arc<AtomicU64>,
-    pub tx_bytes: Arc<AtomicU64>,
-    pub active_streams: Arc<AtomicU64>,
+    pub rx_bytes: Arc<crate::telemetry::CellU64>,
+    pub tx_bytes: Arc<crate::telemetry::CellU64>,
+    pub active_streams: Arc<crate::telemetry::CellU64>,
 }
 
 impl QuicConnStats {
@@ -318,9 +318,9 @@ impl QuicConnStats {
         Self {
             remote_addr,
             local_port,
-            rx_bytes: Arc::new(AtomicU64::new(0)),
-            tx_bytes: Arc::new(AtomicU64::new(0)),
-            active_streams: Arc::new(AtomicU64::new(0)),
+            rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+            tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+            active_streams: Arc::new(crate::telemetry::CellU64::new(0)),
         }
     }
 
@@ -329,9 +329,9 @@ impl QuicConnStats {
         QuicConnSnapshot {
             remote_addr: self.remote_addr.to_string(),
             local_port: self.local_port,
-            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
-            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
-            active_streams: self.active_streams.load(Ordering::Relaxed),
+            rx_bytes: self.rx_bytes.load(),
+            tx_bytes: self.tx_bytes.load(),
+            active_streams: self.active_streams.load(),
         }
     }
 }
@@ -1670,9 +1670,9 @@ mod tests {
                     let mut buf = vec![0u8; 1024];
                     if let Ok(Some(n)) = recv.read(&mut buf).await {
                         buf.truncate(n);
-                        stat.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        stat.rx_bytes.add(n as u64);
                         if send.write_all(&buf).await.is_ok() {
-                            stat.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            stat.tx_bytes.add(n as u64);
                         }
                         let _ = send.finish().await;
                         let _ = tx.send(buf).await;
@@ -1733,10 +1733,10 @@ mod tests {
                     let mut buf = vec![0u8; 1024];
                     if let Ok(Some(n)) = recv.read(&mut buf).await {
                         buf.truncate(n);
-                        stat.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        stat.rx_bytes.add(n as u64);
                         // 回写数据并增加 tx 计数
                         if send.write_all(&buf).await.is_ok() {
-                            stat.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            stat.tx_bytes.add(n as u64);
                         }
                         {
                             let mut reg = peer_registry_clone.write();
@@ -1746,8 +1746,8 @@ mod tests {
                                     if snap.local_port == stat.local_port
                                         && snap.remote_addr == stat.remote_addr.to_string()
                                     {
-                                        snap.rx_bytes = stat.rx_bytes.load(Ordering::Relaxed);
-                                        snap.tx_bytes = stat.tx_bytes.load(Ordering::Relaxed);
+                                        snap.rx_bytes = stat.rx_bytes.load();
+                                        snap.tx_bytes = stat.tx_bytes.load();
                                     }
                                 }
                             }

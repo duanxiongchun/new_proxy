@@ -15,8 +15,8 @@ pub struct SignedPacket {
 pub struct WorkerConnection {
     pub connection: Connection,
     pub authenticated: bool,
-    pub tx_bytes: Arc<std::sync::atomic::AtomicU64>,
-    pub rx_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub tx_bytes: Arc<crate::telemetry::CellU64>,
+    pub rx_bytes: Arc<crate::telemetry::CellU64>,
     pub peer_public_key: Option<[u8; 32]>,
 }
 

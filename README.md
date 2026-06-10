@@ -6,7 +6,7 @@
 
 - **纯 L3 隧道数据面**：摒弃用户态 SOCKS/TCP 流代理，采用 IP-over-QUIC Datagram 方式，无需任何用户态 SOCKS、WireGuard (boringtun) 或 TCP/IP 协议栈 (smoltcp)，纯粹在 IP 层高速透传。
 - **对称多队列多核心映射**：支持多物理 QUIC 数据面连接池，与多队列 TUN 设备队列一一对称绑定绑定物理 OS 线程，实现无共享状态、近线性的多核并发转发性能。
-- **TCP MSS 夹紧 (MSS Clamping)**：就地拦截并重写握手报文的 TCP MSS 选项，防范 IP 分片（Fragmentation），提高传输效能。
+- **操作系统自动 MSS 夹紧 (MSS Clamping)**：利用 TUN 网卡 MTU Clamping 强制内核在 TCP 握手阶段自动协商更小的 MSS 大小，防范 IP 分片并节省用户态包改写与校验和重算开销。
 - **集约化管控面单线程**：主运行时使用 `new_current_thread` 单线程调度，将 UDS CLI 服务、控制协商及 Failover 检测与高频数据工作线程进行物理隔离，避免调度开销与干扰。
 - **对等密钥认证与防重放**：复用 WireGuard 格式的密钥材料，通过 X25519 ECDH 派生共享密钥，并利用 HMAC-SHA256 签名校验和 Nonce 缓存防范控制面重放攻击。
 - **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端强校验建立可信 QUIC 数据物理连接。
@@ -126,7 +126,7 @@ sudo target/release/new_proxy -config conf/server.conf
 [Interface]
 PrivateKey = <client_private_key_base64>
 Address = 10.0.0.2/24, fd00::2/64
-MTU = 1400
+MTU = 1100
 Table = auto
 PreScript = echo "Client starting..." && sysctl -w net.ipv4.ip_forward=1
 PostScript = echo "Client stopped cleanly."
@@ -137,7 +137,7 @@ Endpoint = <server_public_ip>:51820
 AllowedIPs = 10.0.0.1/32, fd00::1/128
 ```
 
-运行时 packet buffer 默认按 `MTU + 256` 分配，并限制在 `1500..65535` 字节；默认 `MTU = 1400` 时 buffer 为 `1656` 字节，jumbo MTU `9000` 时为 `9256` 字节。需要特殊调参时可用环境变量 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖。
+运行时 packet buffer 默认按 `MTU + 256` 分配，并限制在 `1500..65535` 字节；默认 `MTU = 1100` 时 buffer 为最低值 `1500` 字节，jumbo MTU `9000` 时为 `9256` 字节。需要特殊调参时可用环境变量 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖。
 
 启动客户端：
 

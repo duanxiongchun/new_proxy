@@ -727,6 +727,9 @@ async fn run_gateway(
             let std_sock =
                 std::net::UdpSocket::bind(bind_addr).expect("Failed to bind server UDP socket");
             std_sock.set_nonblocking(true).unwrap();
+            let sock_ref = socket2::SockRef::from(&std_sock);
+            let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
+            let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
             if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
                 log::error!("Failed to set outer mark on server UDP socket: {}", e);
                 cleanup_runtime(&config, &interface_name);
@@ -987,6 +990,9 @@ async fn run_gateway(
             let std_sock =
                 std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind client UDP socket");
             std_sock.set_nonblocking(true).unwrap();
+            let sock_ref = socket2::SockRef::from(&std_sock);
+            let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
+            let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
             if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
                 log::error!("Failed to set outer mark on client UDP socket: {}", e);
                 let cleanup_config = gateway_state.read().config.clone();
