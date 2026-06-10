@@ -150,25 +150,7 @@ impl GatewayConfig {
             .get("MTU")
             .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid MTU: {}", e)))
             .transpose()?
-            .unwrap_or(default_mtu);
-
-        if has_ipv6 {
-            if mtu != 1280 {
-                log::warn!(
-                    "Configured MTU {} is adjusted to 1280 for IPv6 to support kernel IPv6 stack initialization.",
-                    mtu
-                );
-                mtu = 1280;
-            }
-        } else {
-            if mtu > 1150 {
-                log::warn!(
-                    "Configured MTU {} is too large for QUIC Datagram. Clamping to 1100 to prevent packet drop.",
-                    mtu
-                );
-                mtu = 1100;
-            }
-        }
+            .unwrap_or(1280);
 
         let table = interface_section
             .get("Table")
@@ -410,7 +392,7 @@ Address = 10.0.0.1/33
     }
 
     #[test]
-    fn test_load_config_default_and_clamped_mtu() {
+    fn test_load_config_default_mtu() {
         let path = "test_temp_mtu.conf";
         let key = test_key();
         let content = format!(
@@ -423,7 +405,7 @@ MTU = 1500
         );
         fs::write(path, content).unwrap();
         let config = GatewayConfig::load_from_file(path).unwrap();
-        assert_eq!(config.interface.mtu, 1100); // Clamped from 1500 to 1100
+        assert_eq!(config.interface.mtu, 1500); // Manually set remains 1500
 
         let content_no_mtu = format!(
             r#"
@@ -434,7 +416,7 @@ Address = 10.0.0.1/24
         );
         fs::write(path, content_no_mtu).unwrap();
         let config_no_mtu = GatewayConfig::load_from_file(path).unwrap();
-        assert_eq!(config_no_mtu.interface.mtu, 1100); // Defaults to 1100
+        assert_eq!(config_no_mtu.interface.mtu, 1280); // Defaults to 1280
 
         let _ = fs::remove_file(path);
     }

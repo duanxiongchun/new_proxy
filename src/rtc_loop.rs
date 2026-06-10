@@ -474,13 +474,12 @@ impl RtcWorker {
 
     async fn handle_udp_packet(
         &mut self,
-        packet: &[u8],
+        data: bytes::BytesMut,
         remote_addr: std::net::SocketAddr,
         dp_snapshot: &crate::L4DataPlaneSnapshot,
         now: std::time::Instant,
         local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
     ) {
-        let data = bytes::BytesMut::from(packet);
         if let Some((handle, datagram_event)) =
             self.endpoint.handle(now, remote_addr, None, None, data)
         {
@@ -529,7 +528,8 @@ impl RtcWorker {
                 .values()
                 .any(|conn| conn.connection.remote_address() == server_addr);
             if !already_connected {
-                let client_config = build_client_proto_config(pool.server_cert_sha256());
+                let client_config =
+                    build_client_proto_config(pool.server_cert_sha256(), self.packet_buffer_size);
                 match self
                     .endpoint
                     .connect(client_config, server_addr, "localhost")
@@ -568,17 +568,33 @@ impl RtcWorker {
             self.process_endpoint_transmits().await;
         }
 
-        let mut tun_buf = bytes::BytesMut::new();
-        tun_buf.resize(65536, 0);
-        let mut udp_buf = vec![0u8; 65536];
+        let mut tun_buf = bytes::BytesMut::with_capacity(256 * 1024);
+        let mut udp_buf = bytes::BytesMut::with_capacity(256 * 1024);
 
         let sleep = tokio::time::sleep(std::time::Duration::from_secs(3600));
         tokio::pin!(sleep);
 
         loop {
-            if tun_buf.len() < 65536 {
-                tun_buf.resize(65536, 0);
+            // Reset and prepare tun_buf
+            tun_buf.truncate(0);
+            if tun_buf.capacity() < 65536 {
+                tun_buf.reserve(256 * 1024);
             }
+            unsafe {
+                let cap = tun_buf.capacity();
+                tun_buf.set_len(cap);
+            }
+
+            // Reset and prepare udp_buf
+            udp_buf.truncate(0);
+            if udp_buf.capacity() < 65536 {
+                udp_buf.reserve(256 * 1024);
+            }
+            unsafe {
+                let cap = udp_buf.capacity();
+                udp_buf.set_len(cap);
+            }
+
             let mut next_timeout = None;
             for conn in self.connections.values_mut() {
                 if let Some(timeout) = conn.connection.poll_timeout() {
@@ -610,35 +626,52 @@ impl RtcWorker {
                     self.process_endpoint_transmits().await;
                 }
 
-                read_res = self.tun_io.read(&mut tun_buf[1..]) => {
+                read_res = self.tun_io.read(&mut tun_buf[1..65536]) => {
                     match read_res {
-                        Ok(0) => return Err("TUN interface EOF".to_string()),
+                        Ok(0) => {
+                            tun_buf.truncate(0);
+                            return Err("TUN interface EOF".to_string());
+                        }
                         Ok(n) => {
                             let now = std::time::Instant::now();
                             local_stats.tun_rx_packets += 1;
                             local_stats.tun_rx_bytes += n as u64;
                             tun_buf[0] = 0x02;
+                            unsafe {
+                                tun_buf.set_len(1 + n);
+                            }
                             let frame = tun_buf.split_to(1 + n).freeze();
                             self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
 
                             for _ in 0..63 {
-                                if tun_buf.len() < 65536 {
-                                    tun_buf.resize(65536, 0);
+                                if tun_buf.capacity() < 65536 {
+                                    tun_buf.reserve(256 * 1024);
                                 }
-                                match self.tun_io.try_read(&mut tun_buf[1..]) {
+                                unsafe {
+                                    let cap = tun_buf.capacity();
+                                    tun_buf.set_len(cap);
+                                }
+                                match self.tun_io.try_read(&mut tun_buf[1..65536]) {
                                     Ok(Some(n)) if n > 0 => {
                                         local_stats.tun_rx_packets += 1;
                                         local_stats.tun_rx_bytes += n as u64;
                                         tun_buf[0] = 0x02;
+                                        unsafe {
+                                            tun_buf.set_len(1 + n);
+                                        }
                                         let frame = tun_buf.split_to(1 + n).freeze();
                                         self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
                                     }
-                                    _ => break,
+                                    _ => {
+                                        tun_buf.truncate(0);
+                                        break;
+                                    }
                                 }
                             }
                             self.process_endpoint_transmits().await;
                         }
                         Err(e) => {
+                            tun_buf.truncate(0);
                             log::warn!("TUN read error: {:?}", e);
                         }
                     }
@@ -648,19 +681,39 @@ impl RtcWorker {
                     match read_res {
                         Ok((n, remote_addr)) if n > 0 => {
                             let now = std::time::Instant::now();
-                            self.handle_udp_packet(&udp_buf[..n], remote_addr, &dp_snapshot, now, &mut local_stats).await;
+                            unsafe {
+                                udp_buf.set_len(n);
+                            }
+                            let data = udp_buf.split_to(n);
+                            self.handle_udp_packet(data, remote_addr, &dp_snapshot, now, &mut local_stats).await;
 
                             for _ in 0..63 {
+                                if udp_buf.capacity() < 65536 {
+                                    udp_buf.reserve(256 * 1024);
+                                }
+                                unsafe {
+                                    let cap = udp_buf.capacity();
+                                    udp_buf.set_len(cap);
+                                }
                                 match self.udp_socket.try_recv_from(&mut udp_buf) {
                                     Ok((n, remote_addr)) if n > 0 => {
-                                        self.handle_udp_packet(&udp_buf[..n], remote_addr, &dp_snapshot, now, &mut local_stats).await;
+                                        unsafe {
+                                            udp_buf.set_len(n);
+                                        }
+                                        let data = udp_buf.split_to(n);
+                                        self.handle_udp_packet(data, remote_addr, &dp_snapshot, now, &mut local_stats).await;
                                     }
-                                    _ => break,
+                                    _ => {
+                                        udp_buf.truncate(0);
+                                        break;
+                                    }
                                 }
                             }
                             self.process_endpoint_transmits().await;
                         }
-                        _ => {}
+                        _ => {
+                            udp_buf.truncate(0);
+                        }
                     }
                 }
 
@@ -748,7 +801,26 @@ impl RtcWorker {
     }
 }
 
-fn build_client_proto_config(server_cert_sha256: [u8; 32]) -> quinn_proto::ClientConfig {
+/// Calculate the minimum QUIC initial_mtu required to carry a full-size TUN packet
+/// as a QUIC datagram. The QUIC packet must contain:
+///   - 1 byte: flags/header
+///   - up to 20 bytes: connection ID
+///   - 4 bytes: worst-case packet number
+///   - 16 bytes: AEAD tag (AES-256-GCM)
+///   - ~3 bytes: datagram frame header (type + length varint)
+///   - the payload (packet_buffer_size bytes)
+///
+/// We add 100 bytes of headroom to be safe.
+pub fn quic_initial_mtu_for_packet_buffer(packet_buffer_size: usize) -> u16 {
+    // QUIC minimum MTU is 1200; we need at least packet_buffer_size + overhead
+    let required = packet_buffer_size as u16 + 100;
+    required.max(1200)
+}
+
+fn build_client_proto_config(
+    server_cert_sha256: [u8; 32],
+    packet_buffer_size: usize,
+) -> quinn_proto::ClientConfig {
     let mut rustls_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(crate::quic_pool::PinnedCertVerifier {
@@ -757,6 +829,7 @@ fn build_client_proto_config(server_cert_sha256: [u8; 32]) -> quinn_proto::Clien
         .with_no_client_auth();
     rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
 
+    let quic_mtu = quic_initial_mtu_for_packet_buffer(packet_buffer_size);
     let mut client_config = quinn_proto::ClientConfig::new(Arc::new(rustls_config));
     let mut transport = quinn_proto::TransportConfig::default();
     transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
@@ -766,6 +839,8 @@ fn build_client_proto_config(server_cert_sha256: [u8; 32]) -> quinn_proto::Clien
     transport.send_window(16 * 1024 * 1024);
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.initial_mtu(quic_mtu);
+    transport.min_mtu(quic_mtu);
     client_config.transport_config(Arc::new(transport));
     client_config
 }

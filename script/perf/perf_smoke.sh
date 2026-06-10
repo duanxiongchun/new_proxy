@@ -56,7 +56,7 @@ PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
-MTU = 1100
+MTU = 1280
 Table = auto
 
 [QUICPool]
@@ -72,7 +72,7 @@ cat > "$ARTIFACT_DIR/client_perf.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-MTU = 1100
+MTU = 1280
 Table = auto
 
 [Peer]
