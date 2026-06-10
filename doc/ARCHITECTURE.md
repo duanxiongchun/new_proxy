@@ -161,9 +161,31 @@
 4. **客户端对称基准建立**：
    * 客户端以获取的 $N$ 个端口在本地拉起拥有 $N$ 个队列通道的多队列 TUN 网卡。
    * 开启恰好 $N$ 个工作线程，每个线程绑定一个对应的本地 UDP Socket 和服务端端口 `40000+i` 的 QUIC 连接。
-   * 随后的 Peer 必须符合相同的 $N$ 端口配置约束，否则予以拒绝。
+   * 随后的 Peer 必须符合相同的 $N$ 个端口配置约束，否则予以拒绝。
 
-### 8.4 安全与自愈机制
+### 9.4 安全与自愈机制
 * **TLS 1.3 安全通道**：所有的 Datagram 数据均由 TLS 1.3 派生的 QUIC AEAD 加密上下文进行就地加密和完整性校验。
 * **PSK 握手绑定**：数据面连接必须携带由 `session_psk` 签名 of 认证包，由服务端进行 nonce 防重放校验。
 * **Slot 断线重连自愈**：客户端后台健康检查（Health Checker）循环检测各物理 Slot 状态。若 Slot $i$ 的连接中断，会单独触发该 Slot 的控制面预协商和链路重连，期间其他 $N-1$ 个 Slot 依然在高速转发数据，避免全链路抖动。
+
+---
+
+## 10. 全链路批处理 (Full-Pipeline Batch Processing)
+
+为了在单核心上支持数万甚至数十万 PPS 的高吞吐转发，`new_proxy` 引入了全链路批处理架构，将数据面热路径上的系统调用、路由检索、数据加解密和传输操作完全合并为最多 64 个数据包的批次进行处理。
+
+```
+UDP 批接收 (recvmmsg) ---> 解复用与批量解密 (Quinn poll) ---> TUN 批写入 (try_write_packet)
+                                                                       
+TUN 批接收 (read + try_read) ---> 批量路由与加密 (Quinn send) ---> UDP 批发送 (sendmmsg)
+```
+
+### 10.1 UDP -> TUN 数据路径批处理
+1. **系统调用批量化（Batch Receive）**：当 UDP 套接字可读时，使用 `recvmmsg` 系统调用配合 `MSG_DONTWAIT` 非阻塞标志，单次系统调用读取最多 64 个加密 UDP 报文到预分配的扁平缓冲区中，极大减少系统调用和上下文切换开销。
+2. **解复用与批量解密（Batch Decrypt）**：遍历接收到的批次，将报文批量输入 Quinn `Endpoint`。Quinn 批量驱动连接状态机，并行解密报文。随后，遍历有事件的连接，从中批量拉取已解密的原始 IP 报文。
+3. **批量写入 TUN（Batch Write）**：将解密出的数据包批量收集到临时向量中，然后通过非阻塞的 `try_write_packet` 循环快速写入 TUN 设备队列。如果 TUN 队列暂满，则优雅退化为异步等待写入，避免阻塞整个批次。
+
+### 10.2 TUN -> UDP 数据路径批处理
+1. **TUN 批量读取（Batch Read）**：在事件循环中，首先通过异步 `read` 等待并读取第一个 TUN 报文。随后，通过非阻塞的 `try_read` 循环，将 TUN 驱动队列中当前所有立即可用的报文（最多 63 个）全部读取出来，组成一个最大 64 报文的批次。
+2. **按 Peer 批量分类与加密（Batch Routing & Peer Classification）**：对批次中的每一个报文，在无锁哈希表中检索其目的 Connection Handle 并归类到对应的 Peer。将属于相同 Peer 的报文聚合后，轮流调用对应 Peer 的 Datagram 发送队列 `send()` 批量写入该 Peer 的所有报文，触发 Quinn 内部的 AEAD 加密。
+3. **UDP 批量发送（Batch Send）**：对每个 Peer 独立收集其生成的所有待发送加密 UDP 报文（`Transmit`），并针对每个 Peer 分别使用 Linux 原生的 `sendmmsg` 系统调用将属于该 Peer 的报文批量发送出去。
