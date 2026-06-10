@@ -1,6 +1,5 @@
 mod api;
 mod app_config;
-mod buffer_pool;
 mod client;
 mod config;
 mod control;
