@@ -718,7 +718,6 @@ async fn run_gateway(
                 }
             });
             let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
-            let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
 
             let local_port = config.quic_pool.listen_ports[worker_id];
             let bind_addr = format!("0.0.0.0:{}", local_port)
@@ -772,8 +771,7 @@ async fn run_gateway(
                 worker_id,
                 rtc_loop::WorkerRole::Server,
                 rtc_loop::RtcWorkerConfig {
-                    mtu: config.interface.mtu as usize,
-                    buffer_pool: worker_buffer_pool,
+                    mtu: config.interface.mtu,
                 },
                 udp_socket,
                 endpoint,
@@ -987,9 +985,6 @@ async fn run_gateway(
                 }
             });
 
-            let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
-            let worker_buffer_pool = buffer_pool::BufferPool::new(packet_buffer_size);
-
             let std_sock =
                 std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind client UDP socket");
             std_sock.set_nonblocking(true).unwrap();
@@ -1013,8 +1008,7 @@ async fn run_gateway(
                 worker_id,
                 rtc_loop::WorkerRole::Client,
                 rtc_loop::RtcWorkerConfig {
-                    mtu: config.interface.mtu as usize,
-                    buffer_pool: worker_buffer_pool,
+                    mtu: config.interface.mtu,
                 },
                 udp_socket,
                 endpoint,

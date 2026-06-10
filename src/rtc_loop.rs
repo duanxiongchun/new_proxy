@@ -1,12 +1,10 @@
-use crate::buffer_pool::BufferPool;
 use crate::tun_io::AsyncTunIo;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
 pub struct RtcWorkerConfig {
-    pub mtu: usize,
-    pub buffer_pool: BufferPool,
+    pub mtu: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -19,7 +17,6 @@ pub enum WorkerRole {
 pub struct RtcWorker {
     pub tun_io: Arc<AsyncTunIo>,
     pub worker_id: usize,
-    pub buffer_pool: BufferPool,
     pub packet_buffer_size: usize,
     pub worker_stats: Option<Arc<crate::telemetry::WorkerTelemetry>>,
     pub peer_telemetry: Option<Arc<crate::telemetry::TelemetryRegistry>>,
@@ -61,11 +58,10 @@ impl RtcWorker {
         >,
         shared_quic_registry: Option<crate::quic_pool::PeerConnRegistry>,
     ) -> Self {
-        let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(config.mtu as u16);
+        let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(config.mtu);
         Self {
             tun_io,
             worker_id,
-            buffer_pool: config.buffer_pool,
             packet_buffer_size,
             worker_stats: None,
             peer_telemetry: None,
@@ -940,7 +936,6 @@ mod tests {
             WorkerRole::Client,
             RtcWorkerConfig {
                 mtu: 1400,
-                buffer_pool: BufferPool::new(1500),
             },
             client_sock,
             client_endpoint,
@@ -955,7 +950,6 @@ mod tests {
             WorkerRole::Server,
             RtcWorkerConfig {
                 mtu: 1400,
-                buffer_pool: BufferPool::new(1500),
             },
             server_sock,
             server_endpoint,
