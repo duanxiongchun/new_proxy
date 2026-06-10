@@ -275,6 +275,9 @@ impl IpRateLimiter {
         if history.len() > 10000 {
             let now = Instant::now();
             history.retain(|_, (last_seen, _)| now.duration_since(*last_seen).as_secs() < 60);
+            if history.len() > 10000 {
+                history.clear();
+            }
         }
         let now = Instant::now();
         let (last_seen, tokens) = history.entry(ip).or_insert((now, 10.0));

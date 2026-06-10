@@ -378,11 +378,9 @@ impl RtcWorker {
                         local_stats.l3_bytes += payload_len;
 
                         if let Some(ref peer_telemetry) = self.peer_telemetry {
-                            if let Some(ip) = self.handle_to_ip.get(&handle) {
-                                if let Some(pub_key) = dp_snapshot.router.longest_match(*ip) {
-                                    let peer_stats = peer_telemetry.get_or_create(pub_key);
-                                    peer_stats.rx_bytes.add(payload_len);
-                                }
+                            if let Some(pub_key) = conn.peer_public_key {
+                                let peer_stats = peer_telemetry.get_or_create(pub_key);
+                                peer_stats.rx_bytes.add(payload_len);
                             }
                         }
                     }
@@ -451,7 +449,7 @@ impl RtcWorker {
                             local_stats.l3_bytes += packet_len;
 
                             if let Some(ref peer_telemetry) = self.peer_telemetry {
-                                if let Some(pub_key) = dp_snapshot.router.longest_match(dst_ip) {
+                                if let Some(pub_key) = conn.peer_public_key {
                                     let peer_stats = peer_telemetry.get_or_create(pub_key);
                                     peer_stats.tx_bytes.add(packet_len);
                                 }
