@@ -4,6 +4,7 @@ mod buffer_pool;
 mod client;
 mod config;
 mod control;
+mod mss_clamping;
 mod quic_pool;
 pub mod quic_proto_engine;
 mod routing;
@@ -727,6 +728,11 @@ async fn run_gateway(
             let std_sock =
                 std::net::UdpSocket::bind(bind_addr).expect("Failed to bind server UDP socket");
             std_sock.set_nonblocking(true).unwrap();
+            if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
+                log::error!("Failed to set outer mark on server UDP socket: {}", e);
+                cleanup_runtime(&config, &interface_name);
+                std::process::exit(1);
+            }
             let udp_socket =
                 tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
 
@@ -742,6 +748,11 @@ async fn run_gateway(
             transport
                 .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
             transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+            transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
+            transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
+            transport.send_window(16 * 1024 * 1024);
+            transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+            transport.datagram_send_buffer_size(8 * 1024 * 1024);
             server_proto_config.transport_config(Arc::new(transport));
 
             let endpoint_config = quinn_proto::EndpointConfig::default();
@@ -763,6 +774,7 @@ async fn run_gateway(
                 endpoint,
                 Some(session_cache.clone()),
                 Some(auth_nonce_cache.clone()),
+                Some(shared_quic_registry.clone()),
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
             worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
@@ -976,6 +988,12 @@ async fn run_gateway(
             let std_sock =
                 std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind client UDP socket");
             std_sock.set_nonblocking(true).unwrap();
+            if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
+                log::error!("Failed to set outer mark on client UDP socket: {}", e);
+                let cleanup_config = gateway_state.read().config.clone();
+                cleanup_runtime(&cleanup_config, &interface_name);
+                std::process::exit(1);
+            }
             let udp_socket =
                 tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
 
@@ -994,6 +1012,7 @@ async fn run_gateway(
                 endpoint,
                 None,
                 None,
+                Some(shared_quic_registry.clone()),
             );
             worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
             worker.set_peer_telemetry(peer_telemetries[worker_id].clone());

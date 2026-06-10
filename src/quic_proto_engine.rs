@@ -17,6 +17,7 @@ pub struct WorkerConnection {
     pub authenticated: bool,
     pub tx_bytes: Arc<std::sync::atomic::AtomicU64>,
     pub rx_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub peer_public_key: Option<[u8; 32]>,
 }
 
 /// Computes the HMAC-SHA256 of the given data using the provided key.

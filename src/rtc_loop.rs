@@ -15,6 +15,7 @@ pub enum WorkerRole {
     Server,
 }
 
+#[allow(clippy::type_complexity)]
 pub struct RtcWorker {
     pub tun_io: Arc<AsyncTunIo>,
     pub worker_id: usize,
@@ -38,9 +39,11 @@ pub struct RtcWorker {
     pub auth_nonce_cache: Option<
         Arc<parking_lot::Mutex<std::collections::HashMap<[u8; 32], crate::control::NonceCache>>>,
     >,
+    pub shared_quic_registry: Option<crate::quic_pool::PeerConnRegistry>,
 }
 
 impl RtcWorker {
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn new(
         tun_io: Arc<AsyncTunIo>,
         worker_id: usize,
@@ -56,6 +59,7 @@ impl RtcWorker {
                 parking_lot::Mutex<std::collections::HashMap<[u8; 32], crate::control::NonceCache>>,
             >,
         >,
+        shared_quic_registry: Option<crate::quic_pool::PeerConnRegistry>,
     ) -> Self {
         let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(config.mtu as u16);
         Self {
@@ -74,6 +78,7 @@ impl RtcWorker {
             handle_to_ip: std::collections::HashMap::new(),
             session_cache,
             auth_nonce_cache,
+            shared_quic_registry,
         }
     }
 
@@ -85,29 +90,53 @@ impl RtcWorker {
         self.peer_telemetry = Some(telemetry);
     }
 
+    async fn send_transmit(&mut self, transmit: quinn_proto::Transmit) {
+        let contents = &transmit.contents;
+        let dest = transmit.destination;
+        if let Some(seg_size) = transmit.segment_size {
+            for chunk in contents.chunks(seg_size) {
+                match self.udp_socket.try_send_to(chunk, dest) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Err(e) = self.udp_socket.send_to(chunk, dest).await {
+                            log::warn!("Failed to send UDP transmit packet: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to send UDP transmit packet: {}", e);
+                    }
+                }
+            }
+        } else {
+            match self.udp_socket.try_send_to(contents, dest) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Err(e) = self.udp_socket.send_to(contents, dest).await {
+                        log::warn!("Failed to send UDP transmit packet: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to send UDP transmit packet: {}", e);
+                }
+            }
+        }
+    }
+
     async fn process_endpoint_transmits(&mut self) {
         let now = std::time::Instant::now();
         // 1. Poll endpoint-level transmits
         while let Some(transmit) = self.endpoint.poll_transmit() {
-            if let Err(e) = self
-                .udp_socket
-                .send_to(&transmit.contents, transmit.destination)
-                .await
-            {
-                log::warn!("Failed to send UDP transmit packet: {}", e);
-            }
+            self.send_transmit(transmit).await;
         }
         // 2. Poll connection-level transmits from all active connections
-        for (&_handle, conn) in self.connections.iter_mut() {
-            while let Some(transmit) = conn.connection.poll_transmit(now, 10) {
-                if let Err(e) = self
-                    .udp_socket
-                    .send_to(&transmit.contents, transmit.destination)
-                    .await
-                {
-                    log::warn!("Failed to send UDP transmit packet: {}", e);
-                }
+        let mut transmits = Vec::new();
+        for conn in self.connections.values_mut() {
+            while let Some(transmit) = conn.connection.poll_transmit(now, 1024) {
+                transmits.push(transmit);
             }
+        }
+        for transmit in transmits {
+            self.send_transmit(transmit).await;
         }
     }
 
@@ -180,10 +209,11 @@ impl RtcWorker {
         dp_snapshot: &crate::L4DataPlaneSnapshot,
     ) {
         let mut found_info = None;
-        if let Some(server_ip) = self.handle_to_ip.get(&handle) {
-            for (pub_key, pool) in &dp_snapshot.client_quic_pools {
-                if pool.endpoints().iter().any(|addr| addr.ip() == *server_ip) {
-                    found_info = Some((*pub_key, pool.session_psk()));
+        if let Some(conn) = self.connections.get(&handle) {
+            let server_ip = conn.connection.remote_address().ip();
+            for pool in dp_snapshot.client_quic_pools.values() {
+                if pool.endpoints().iter().any(|addr| addr.ip() == server_ip) {
+                    found_info = Some((pool.client_public_key(), pool.session_psk()));
                     break;
                 }
             }
@@ -285,6 +315,7 @@ impl RtcWorker {
 
                     if let Some(conn) = self.connections.get_mut(&handle) {
                         conn.authenticated = true;
+                        conn.peer_public_key = Some(client_pub_key);
                     }
 
                     let ips = dp_snapshot.router.find_ips_for_value(&client_pub_key);
@@ -307,15 +338,19 @@ impl RtcWorker {
                         }
 
                         let mut found_pub_key = None;
-                        if let Some(server_ip) = self.handle_to_ip.get(&handle) {
+                        if let Some(conn) = self.connections.get(&handle) {
+                            let server_ip = conn.connection.remote_address().ip();
                             for (pub_key, pool) in &dp_snapshot.client_quic_pools {
-                                if pool.endpoints().iter().any(|addr| addr.ip() == *server_ip) {
+                                if pool.endpoints().iter().any(|addr| addr.ip() == server_ip) {
                                     found_pub_key = Some(*pub_key);
                                     break;
                                 }
                             }
                         }
                         if let Some(pub_key) = found_pub_key {
+                            if let Some(conn) = self.connections.get_mut(&handle) {
+                                conn.peer_public_key = Some(pub_key);
+                            }
                             let ips = dp_snapshot.router.find_ips_for_value(&pub_key);
                             for ip in ips {
                                 self.ip_to_handle.insert(ip, handle);
@@ -332,7 +367,13 @@ impl RtcWorker {
                     .map(|c| c.authenticated)
                     .unwrap_or(false);
                 if authenticated {
-                    if let Err(e) = self.tun_io.write_packet(&bytes[1..]).await {
+                    let mut write_res = self.tun_io.try_write_packet(&bytes[1..]);
+                    if let Err(ref e) = write_res {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            write_res = self.tun_io.write_packet(&bytes[1..]).await;
+                        }
+                    }
+                    if let Err(e) = write_res {
                         log::warn!("Failed to write data packet to TUN: {:?}", e);
                     } else if let Some(conn) = self.connections.get(&handle) {
                         let payload_len = (bytes.len() - 1) as u64;
@@ -409,15 +450,18 @@ impl RtcWorker {
                 let mut sent = false;
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     if conn.authenticated {
-                        let mut frame = Vec::with_capacity(1 + packet.len());
+                        let mut packet_data = packet.to_vec();
+                        crate::mss_clamping::clamp_tcp_mss(&mut packet_data, 1100);
+
+                        let mut frame = Vec::with_capacity(1 + packet_data.len());
                         frame.push(0x02);
-                        frame.extend_from_slice(packet);
+                        frame.extend_from_slice(&packet_data);
 
                         if let Err(e) = conn.connection.datagrams().send(bytes::Bytes::from(frame))
                         {
                             log::debug!("Failed to send datagram: {:?}", e);
                         } else {
-                            let packet_len = packet.len() as u64;
+                            let packet_len = packet_data.len() as u64;
                             conn.tx_bytes
                                 .fetch_add(packet_len, std::sync::atomic::Ordering::Relaxed);
                             local_stats.l3_packets += 1;
@@ -463,6 +507,7 @@ impl RtcWorker {
                         authenticated: false,
                         tx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         rx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        peer_public_key: None,
                     };
                     self.connections.insert(handle, worker_conn);
                     self.handle_to_ip.insert(handle, remote_addr.ip());
@@ -479,13 +524,26 @@ impl RtcWorker {
     }
 
     async fn check_and_connect_clients(&mut self, dp_snapshot: &crate::L4DataPlaneSnapshot) {
-        for (&_pub_key, pool) in &dp_snapshot.client_quic_pools {
+        for (&pub_key, pool) in &dp_snapshot.client_quic_pools {
             let endpoints = pool.endpoints();
             if endpoints.is_empty() {
                 continue;
             }
-            let server_addr = endpoints[0];
-            let already_connected = self.handle_to_ip.values().any(|ip| *ip == server_addr.ip());
+            let server_addr = match endpoints.get(self.worker_id) {
+                Some(&addr) => addr,
+                None => {
+                    log::warn!(
+                        "Worker {} has no corresponding endpoint in pool (total endpoints {})",
+                        self.worker_id,
+                        endpoints.len()
+                    );
+                    continue;
+                }
+            };
+            let already_connected = self
+                .connections
+                .values()
+                .any(|conn| conn.connection.remote_address() == server_addr);
             if !already_connected {
                 let client_config = build_client_proto_config(pool.server_cert_sha256());
                 match self
@@ -498,9 +556,9 @@ impl RtcWorker {
                             authenticated: false,
                             tx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                             rx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                            peer_public_key: Some(pub_key),
                         };
                         self.connections.insert(handle, worker_conn);
-                        self.handle_to_ip.insert(handle, server_addr.ip());
                     }
                     Err(e) => {
                         log::error!("Failed to connect to {}: {:?}", server_addr, e);
@@ -616,6 +674,41 @@ impl RtcWorker {
                     if self.role == WorkerRole::Client {
                         self.check_and_connect_clients(&dp_snapshot).await;
                         self.process_endpoint_transmits().await;
+                        let handles_to_abort: Vec<quinn_proto::ConnectionHandle> = self.connections.iter()
+                            .filter(|(_, conn)| {
+                                if let Some(pub_key) = conn.peer_public_key {
+                                    !dp_snapshot.client_quic_pools.contains_key(&pub_key)
+                                } else {
+                                    false
+                                }
+                            })
+                            .map(|(handle, _)| *handle)
+                            .collect();
+                        for handle in handles_to_abort {
+                            log::warn!("Closing client connection for removed peer");
+                            self.abort_connection(handle, b"Peer removed").await;
+                        }
+                    }
+                    if self.role == WorkerRole::Server {
+                        let handles_to_abort = if let Some(ref session_cache) = self.session_cache {
+                            let cache_guard = session_cache.read();
+                            self.connections.iter()
+                                .filter(|(_, conn)| {
+                                    if let Some(pub_key) = conn.peer_public_key {
+                                        !cache_guard.contains_key(&pub_key)
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .map(|(handle, _)| *handle)
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        for handle in handles_to_abort {
+                            log::warn!("Closing connection for removed or rotated peer");
+                            self.abort_connection(handle, b"Peer removed or session rotated").await;
+                        }
                     }
                 }
 
@@ -630,6 +723,29 @@ impl RtcWorker {
                         }
                         publish_stats.l3_bytes = total_tx + total_rx;
                         stats.publish(&publish_stats);
+                    }
+                    if let Some(ref registry) = self.shared_quic_registry {
+                        let mut reg_guard = registry.write();
+                        let local_port = self.udp_socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+                        for conns in reg_guard.values_mut() {
+                            conns.retain(|snap| snap.local_port != local_port);
+                        }
+                        for conn in self.connections.values() {
+                            if conn.authenticated {
+                                if let Some(pub_key) = conn.peer_public_key {
+                                    let remote_address = conn.connection.remote_address().to_string();
+                                    let active_streams = 0;
+                                    let snap = crate::quic_pool::QuicConnSnapshot {
+                                        remote_addr: remote_address,
+                                        local_port,
+                                        rx_bytes: conn.rx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                        tx_bytes: conn.tx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                        active_streams,
+                                    };
+                                    reg_guard.entry(pub_key).or_default().push(snap);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -718,6 +834,11 @@ mod tests {
         let mut transport = quinn_proto::TransportConfig::default();
         transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
+        transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
+        transport.send_window(16 * 1024 * 1024);
+        transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+        transport.datagram_send_buffer_size(8 * 1024 * 1024);
         server_proto_config.transport_config(Arc::new(transport));
 
         let server_endpoint = quinn_proto::Endpoint::new(
@@ -755,6 +876,7 @@ mod tests {
             client_endpoint,
             None,
             None,
+            None,
         );
 
         let mut server_worker = RtcWorker::new(
@@ -769,6 +891,7 @@ mod tests {
             server_endpoint,
             Some(session_cache.clone()),
             Some(auth_nonce_cache.clone()),
+            None,
         );
 
         let cert_fingerprint = crate::quic_pool::cert_sha256(&certs).unwrap();

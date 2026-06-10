@@ -182,14 +182,11 @@ fn combine_peer_telemetries(
 }
 
 fn quic_connection_snapshots(
-    quic_registry: &HashMap<[u8; 32], Vec<quic_pool::QuicConnRecord>>,
+    quic_registry: &std::collections::HashMap<[u8; 32], Vec<quic_pool::QuicConnSnapshot>>,
     client_quic_pools: &PeerQuicPools,
     pub_key: &[u8; 32],
 ) -> Vec<quic_pool::QuicConnSnapshot> {
-    let server_side = quic_registry
-        .get(pub_key)
-        .map(|conns| conns.iter().map(|conn| conn.snapshot()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let server_side = quic_registry.get(pub_key).cloned().unwrap_or_default();
     if !server_side.is_empty() {
         return server_side;
     }
@@ -732,11 +729,7 @@ async fn handle_add_peer(
             &context.client_quic_pools,
         );
     } else {
-        if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
-            for conn in conns {
-                conn.close(b"Peer replaced");
-            }
-        }
+        context.shared_quic_registry.write().remove(&parsed_pub_key);
     }
 
     let message = if quic_pool_unavailable {
@@ -817,11 +810,7 @@ async fn handle_remove_peer(
             pool.shutdown(b"Peer removed");
         }
     }
-    if let Some(conns) = context.shared_quic_registry.write().remove(&parsed_pub_key) {
-        for conn in conns {
-            conn.close(b"Peer removed");
-        }
-    }
+    context.shared_quic_registry.write().remove(&parsed_pub_key);
 
     {
         let mut state = context.state.write();

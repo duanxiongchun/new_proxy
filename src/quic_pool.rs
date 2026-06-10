@@ -1094,7 +1094,7 @@ impl QuicPoolClient {
 
 // 3. 服务端 QUIC 接收端与验证服务
 // 每个已认证的对端连接 → 聚合统计（按 client_pub_key）
-pub type PeerConnRegistry = Arc<RwLock<HashMap<[u8; 32], Vec<QuicConnRecord>>>>;
+pub type PeerConnRegistry = Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<QuicConnSnapshot>>>>;
 
 #[derive(Clone)]
 pub struct QuicConnRecord {
@@ -1294,24 +1294,28 @@ impl QuicPoolServer {
         let _ = send.shutdown().await;
 
         let client_pub_key = auth_packet.client_public_key;
-        let record_id = NEXT_QUIC_CONN_RECORD_ID.fetch_add(1, Ordering::Relaxed);
         let conn_stat = Arc::new(QuicConnStats::new(remote_addr, port));
         {
             let mut registry = peer_conn_registry.write();
             registry
                 .entry(client_pub_key)
                 .or_default()
-                .push(QuicConnRecord {
-                    id: record_id,
-                    stats: conn_stat.clone(),
-                    conn: conn.clone(),
-                });
+                .push(conn_stat.snapshot());
+        }
+
+        #[cfg(test)]
+        {
+            TEST_ACCEPTED_CONNECTIONS
+                .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .insert(port, conn.clone());
         }
 
         let _guard = TelemetryRegistryGuard {
             registry: peer_conn_registry.clone(),
             client_pub_key,
-            record_id,
+            remote_addr: remote_addr.to_string(),
+            local_port: port,
         };
 
         let mut streams = ServerFutures::new();
@@ -1413,20 +1417,28 @@ impl QuicPoolServer {
 struct TelemetryRegistryGuard {
     registry: PeerConnRegistry,
     client_pub_key: [u8; 32],
-    record_id: u64,
+    remote_addr: String,
+    local_port: u16,
 }
 
 impl Drop for TelemetryRegistryGuard {
     fn drop(&mut self) {
         let mut registry = self.registry.write();
         if let Some(conns) = registry.get_mut(&self.client_pub_key) {
-            conns.retain(|record| record.id != self.record_id);
+            conns.retain(|snap| {
+                snap.remote_addr != self.remote_addr || snap.local_port != self.local_port
+            });
             if conns.is_empty() {
                 registry.remove(&self.client_pub_key);
             }
         }
     }
 }
+
+#[cfg(test)]
+static TEST_ACCEPTED_CONNECTIONS: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<u16, quinn::Connection>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod tests {
@@ -1707,13 +1719,15 @@ mod tests {
 
         // 3. 服务端流处理逻辑 (Echo 服务)
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+        let peer_registry_clone = peer_registry.clone();
         let handler = Arc::new(
-            move |_pub_key: [u8; 32],
+            move |pub_key: [u8; 32],
                   mut send: quinn::SendStream,
                   mut recv: quinn::RecvStream,
                   stat: Arc<QuicConnStats>|
                   -> ServerFuture {
                 let tx = tx.clone();
+                let peer_registry_clone = peer_registry_clone.clone();
                 Box::pin(async move {
                     // 模拟接收数据并增加 rx 计数
                     let mut buf = vec![0u8; 1024];
@@ -1723,6 +1737,20 @@ mod tests {
                         // 回写数据并增加 tx 计数
                         if send.write_all(&buf).await.is_ok() {
                             stat.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        {
+                            let mut reg = peer_registry_clone.write();
+                            if let Some(snaps) = reg.get_mut(&pub_key) {
+                                for snap in snaps {
+                                    let snap: &mut QuicConnSnapshot = snap;
+                                    if snap.local_port == stat.local_port
+                                        && snap.remote_addr == stat.remote_addr.to_string()
+                                    {
+                                        snap.rx_bytes = stat.rx_bytes.load(Ordering::Relaxed);
+                                        snap.tx_bytes = stat.tx_bytes.load(Ordering::Relaxed);
+                                    }
+                                }
+                            }
                         }
                         let _ = send.finish().await;
                         let _ = tx.send(buf).await;
@@ -1771,12 +1799,10 @@ mod tests {
             assert!(registry.contains_key(&client_pub_key));
             let stats = &registry[&client_pub_key];
             assert_eq!(stats.len(), 1);
-            assert_eq!(stats[0].stats.local_port, port);
+            assert_eq!(stats[0].local_port, port);
 
-            let snapshot = stats[0].snapshot();
-            assert_eq!(snapshot.local_port, port);
-            assert!(snapshot.rx_bytes > 0);
-            assert!(snapshot.tx_bytes > 0);
+            assert!(stats[0].rx_bytes > 0);
+            assert!(stats[0].tx_bytes > 0);
         }
 
         // 8. 启动健康检查探针以实现代码覆盖 (验证不会崩溃即可)
@@ -1837,11 +1863,22 @@ mod tests {
 
         let (client_conn, _) = client.get_connection_by_slot(0).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let server_conn = {
-            let registry = peer_registry.read();
-            assert!(registry.contains_key(&client_pub_key));
-            registry[&client_pub_key][0].conn.clone()
+            let mut conn = None;
+            for _ in 0..50 {
+                let found = {
+                    let map = TEST_ACCEPTED_CONNECTIONS
+                        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                        .lock();
+                    map.get(&port).cloned()
+                };
+                if let Some(c) = found {
+                    conn = Some(c);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            conn.expect("Server connection not accepted in time")
         };
 
         let test_payload = Bytes::from_static(b"Hello Datagram!");

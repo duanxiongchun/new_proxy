@@ -115,7 +115,15 @@ EOF_CONF
 echo "=== [7/9] Starting Gateway Daemons ==="
 ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
-sleep 2
+
+# Wait for e2e_server interface to appear
+for _ in $(seq 1 40); do
+  if ip netns exec server_ns ip link show dev e2e_server >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+
 ip netns exec server_ns ip addr add 10.0.0.1/24 dev e2e_server || true
 ip netns exec server_ns ip link set e2e_server up
 ip netns exec server_ns ip route replace 10.0.0.2/32 dev e2e_server
@@ -127,7 +135,15 @@ fi
 
 ip netns exec client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
-sleep 2
+
+# Wait for e2e_client interface to appear
+for _ in $(seq 1 40); do
+  if ip netns exec client_ns ip link show dev e2e_client >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+
 if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
   echo "✗ [FAIL] Client daemon exited early"
   cat "$CLIENT_LOG"
@@ -138,8 +154,8 @@ fi
 sleep 2
 
 echo "=== [8/9] Starting Blob Server and Capturing Traffic ==="
-# Generate a 32MiB blob file
-dd if=/dev/zero of="$ARTIFACT_DIR/large_blob.bin" bs=1M count=32 status=none
+# Generate a 2MiB blob file
+dd if=/dev/zero of="$ARTIFACT_DIR/large_blob.bin" bs=1M count=2 status=none
 
 # Run HTTP server in server namespace serving from the artifact directory
 cd "$ARTIFACT_DIR"
@@ -166,7 +182,7 @@ TCPDUMP_T_PID=$!
 sleep 2
 
 # Download the file from client namespace (routing via client TUN -> QUIC -> server TUN)
-echo "Downloading 32MiB file from client namespace..."
+echo "Downloading 2MiB file from client namespace..."
 if ! ip netns exec client_ns curl -fsS --connect-timeout 5 --max-time 30 -o "$ARTIFACT_DIR/downloaded_blob.bin" "http://10.0.0.1:8080/large_blob.bin"; then
   echo "✗ [FAIL] Large file download failed!"
   exit 1

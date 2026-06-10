@@ -110,11 +110,7 @@ pub async fn build_peer_quic_pool(
         control_addr,
         endpoint,
     ));
-    quic_pool_client
-        .start_pool()
-        .await
-        .map_err(|e| BuildPeerQuicPoolError::new(e, data_port_count))?;
-    quic_pool_client.clone().start_health_checker();
+    log::info!("Bypassing stream-based QUIC pool start; data plane is handled by RtcWorker");
     Ok(quic_pool_client)
 }
 
