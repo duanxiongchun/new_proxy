@@ -438,6 +438,7 @@ impl RtcWorker {
         None
     }
 
+    #[allow(dead_code)]
     async fn handle_tun_packet(
         &mut self,
         packet: bytes::Bytes,
@@ -484,8 +485,8 @@ impl RtcWorker {
         now: std::time::Instant,
         local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
     ) {
-        if let Some((handle, datagram_event)) =
-            self.endpoint.handle(now, remote_addr, None, None, data)
+        let handle_res = self.endpoint.handle(now, remote_addr, None, None, data);
+        if let Some((handle, datagram_event)) = handle_res
         {
             match datagram_event {
                 quinn_proto::DatagramEvent::NewConnection(conn) => {
@@ -718,7 +719,7 @@ impl RtcWorker {
                                                     for packet in packets {
                                                         let packet_len = (packet.len() - 1) as u64;
                                                         if let Err(e) = conn.connection.datagrams().send(packet) {
-                                                            log::debug!("Failed to send datagram: {:?}", e);
+                                                            log::warn!("Failed to send datagram: {:?}", e);
                                                         } else {
                                                             conn.tx_bytes.add(packet_len);
                                                             local_stats.l3_packets += 1;
@@ -887,18 +888,18 @@ impl RtcWorker {
             #[cfg(target_os = "linux")]
             run_select! {
                 _ = self.udp_socket.readable() => {
-                    let mut batch_buf = bytes::BytesMut::with_capacity(UDP_BATCH_SIZE * self.packet_buffer_size);
+                    let recv_packet_size = self.packet_buffer_size + 512;
+                    let mut batch_buf = bytes::BytesMut::with_capacity(UDP_BATCH_SIZE * recv_packet_size);
                     // SAFETY: The flat buffer is set to capacity to allow slicing it for recv.
                     // The uninitialized bytes are never read before they are written by the OS kernel.
-                    unsafe { batch_buf.set_len(UDP_BATCH_SIZE * self.packet_buffer_size); }
+                    unsafe { batch_buf.set_len(UDP_BATCH_SIZE * recv_packet_size); }
                     let fd = self.udp_socket.as_raw_fd();
-                    let packet_size = self.packet_buffer_size;
 
                     let res = self.udp_socket.try_io(Interest::READABLE, || {
                         for i in 0..UDP_BATCH_SIZE {
-                            let offset = i * packet_size;
+                            let offset = i * recv_packet_size;
                             self.udp_batch.iovs[i].iov_base = unsafe { batch_buf.as_mut_ptr().add(offset) as *mut libc::c_void };
-                            self.udp_batch.iovs[i].iov_len = packet_size as libc::size_t;
+                            self.udp_batch.iovs[i].iov_len = recv_packet_size as libc::size_t;
 
                             self.udp_batch.mmsgs[i].msg_hdr.msg_name = &mut self.udp_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
                             self.udp_batch.mmsgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -926,17 +927,20 @@ impl RtcWorker {
                         Ok(count as usize)
                     });
 
-                    match res {
+                     match res {
                         Ok(count) if count > 0 => {
                             let now = std::time::Instant::now();
                             let mut remaining = batch_buf;
                             for i in 0..count {
                                 let len = self.udp_batch.mmsgs[i].msg_len as usize;
-                                let mut packet_chunk = remaining.split_to(packet_size);
+                                let mut packet_chunk = remaining.split_to(recv_packet_size);
                                 if len > 0 {
                                     packet_chunk.truncate(len);
-                                    if let Some(remote_addr) = sockaddr_to_socket_addr(&self.udp_batch.addrs[i], self.udp_batch.mmsgs[i].msg_hdr.msg_namelen) {
+                                    let namelen = self.udp_batch.mmsgs[i].msg_hdr.msg_namelen;
+                                    if let Some(remote_addr) = sockaddr_to_socket_addr(&self.udp_batch.addrs[i], namelen) {
                                         self.handle_udp_packet(packet_chunk, remote_addr, &dp_snapshot, now, &mut local_stats).await;
+                                    } else {
+                                        log::warn!("sockaddr_to_socket_addr failed: namelen={}", namelen);
                                     }
                                 }
                             }
@@ -1013,15 +1017,26 @@ impl RtcWorker {
             return;
         }
 
+        let mut packets = Vec::new();
+        for transmit in transmits {
+            if let Some(seg_size) = transmit.segment_size {
+                for chunk in transmit.contents.chunks(seg_size) {
+                    packets.push(chunk);
+                }
+            } else {
+                packets.push(&transmit.contents[..]);
+            }
+        }
+
         let fd = self.udp_socket.as_raw_fd();
         let mut tx_batch = UdpBatch::new();
 
-        // We chunk transmits into sizes of UDP_BATCH_SIZE
-        for chunk in transmits.chunks(UDP_BATCH_SIZE) {
+        // We chunk packets into sizes of UDP_BATCH_SIZE
+        for chunk in packets.chunks(UDP_BATCH_SIZE) {
             let count = chunk.len();
-            for (i, transmit) in chunk.iter().enumerate() {
-                tx_batch.iovs[i].iov_base = transmit.contents.as_ptr() as *mut libc::c_void;
-                tx_batch.iovs[i].iov_len = transmit.contents.len() as libc::size_t;
+            for (i, pkt) in chunk.iter().enumerate() {
+                tx_batch.iovs[i].iov_base = pkt.as_ptr() as *mut libc::c_void;
+                tx_batch.iovs[i].iov_len = pkt.len() as libc::size_t;
 
                 socket_addr_to_sockaddr(dest, &mut tx_batch.addrs[i]);
                 tx_batch.mmsgs[i].msg_hdr.msg_name = &mut tx_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
@@ -1057,8 +1072,8 @@ impl RtcWorker {
                 Ok(sent) => {
                     if sent < count {
                         // Fallback for unsent packets in the batch
-                        for transmit in &chunk[sent..] {
-                            if let Err(e) = self.udp_socket.send_to(&transmit.contents, dest).await {
+                        for pkt in &chunk[sent..] {
+                            if let Err(e) = self.udp_socket.send_to(pkt, dest).await {
                                 log::warn!("Failed to send UDP transmit fallback packet: {}", e);
                             }
                         }
@@ -1066,8 +1081,8 @@ impl RtcWorker {
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Fallback blockingly or await writable
-                    for transmit in chunk {
-                        if let Err(e) = self.udp_socket.send_to(&transmit.contents, dest).await {
+                    for pkt in chunk {
+                        if let Err(e) = self.udp_socket.send_to(pkt, dest).await {
                             log::warn!("Failed to send UDP transmit fallback packet: {}", e);
                         }
                     }
@@ -1245,6 +1260,7 @@ mod tests {
         let mut server_proto_config =
             quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
         let mut transport = quinn_proto::TransportConfig::default();
+        transport.mtu_discovery_config(None);
         transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
         transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
@@ -1267,8 +1283,8 @@ mod tests {
             false,
         );
 
-        let (client_sock_tun, client_sock_user) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (server_sock_tun, server_sock_user) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (client_sock_tun, client_sock_user) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let (server_sock_tun, server_sock_user) = std::os::unix::net::UnixDatagram::pair().unwrap();
         client_sock_tun.set_nonblocking(true).unwrap();
         client_sock_user.set_nonblocking(true).unwrap();
         server_sock_tun.set_nonblocking(true).unwrap();
@@ -1360,23 +1376,31 @@ mod tests {
         test_packet[42] = 0x05;
         test_packet[43] = 0xB4; // MSS Value: 1460
 
-        let mut writer = client_sock_user.try_clone().unwrap();
-        std::io::Write::write_all(&mut writer, &test_packet).unwrap();
+        let writer = client_sock_user.try_clone().unwrap();
+        for _ in 0..64 {
+            writer.send(&test_packet).unwrap();
+        }
 
-        let mut writer2 = server_sock_user.try_clone().unwrap();
-        let mut reader = tokio::net::UnixStream::from_std(server_sock_user).unwrap();
-        let mut read_buf = vec![0u8; 44];
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut read_buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(read_buf.len(), 44);
-        assert_eq!(read_buf[12..16], [10, 0, 0, 2]);
-        assert_eq!(read_buf[16..20], [10, 0, 0, 1]);
+        let writer2 = server_sock_user.try_clone().unwrap();
+        let reader = tokio::net::UnixDatagram::from_std(server_sock_user).unwrap();
+        let mut read_buf = vec![0u8; 1500];
+        let mut recved_count = 0;
+        for _ in 0..64 {
+            let res = tokio::time::timeout(
+                Duration::from_secs(5),
+                reader.recv(&mut read_buf),
+            )
+            .await;
+            if let Ok(Ok(n)) = res {
+                assert_eq!(n, 44);
+                assert_eq!(&read_buf[12..16], &[10, 0, 0, 2]);
+                assert_eq!(&read_buf[16..20], &[10, 0, 0, 1]);
+                recved_count += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(recved_count, 64);
 
         // 2. Test Inbound Packet (Server TUN -> Client TUN)
         let mut inbound_packet = vec![0u8; 44];
@@ -1393,19 +1417,19 @@ mod tests {
         inbound_packet[32] = 0x60; // Data offset
         inbound_packet[33] = 0x12; // Flags: SYN-ACK
 
-        std::io::Write::write_all(&mut writer2, &inbound_packet).unwrap();
+        writer2.send(&inbound_packet).unwrap();
 
-        let mut reader2 = tokio::net::UnixStream::from_std(client_sock_user).unwrap();
-        let mut read_buf2 = vec![0u8; 44];
-        tokio::time::timeout(
+        let reader2 = tokio::net::UnixDatagram::from_std(client_sock_user).unwrap();
+        let mut read_buf2 = vec![0u8; 1500];
+        let n2 = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::io::AsyncReadExt::read_exact(&mut reader2, &mut read_buf2),
+            reader2.recv(&mut read_buf2),
         )
         .await
         .unwrap()
         .unwrap();
 
-        assert_eq!(read_buf2.len(), 44);
+        assert_eq!(n2, 44);
         assert_eq!(read_buf2[12..16], [10, 0, 0, 1]);
         assert_eq!(read_buf2[16..20], [10, 0, 0, 2]);
 
