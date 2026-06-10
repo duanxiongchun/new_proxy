@@ -232,8 +232,8 @@ run_group() {
   local data_ports="$1"
   local cpus
   local server_cpus
-  local loader_cpus="8-15"
-  local target_cpus="16-23"
+  local loader_cpus="12-19"
+  local target_cpus="20-27"
   local server_conf="$ARTIFACT_DIR/server_${data_ports}.conf"
   local server_log="$ARTIFACT_DIR/server_${data_ports}.log"
   local client_log="$ARTIFACT_DIR/client_${data_ports}.log"
@@ -242,7 +242,7 @@ run_group() {
   server_cpus="$(python3 - "$data_ports" <<'PY'
 import sys
 dp = int(sys.argv[1])
-print(",".join(str(4 + i) for i in range(dp)))
+print(",".join(str(6 + i) for i in range(dp)))
 PY
 )"
   write_server_conf "$data_ports" "$server_conf"
