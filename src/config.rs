@@ -141,7 +141,12 @@ impl GatewayConfig {
             })
             .transpose()?;
 
-        let mtu = interface_section
+        let has_ipv6 = addresses
+            .iter()
+            .any(|addr| matches!(addr, ipnet::IpNet::V6(_)));
+        let default_mtu = if has_ipv6 { 1280 } else { 1100 };
+
+        let mut mtu = interface_section
             .get("MTU")
             .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid MTU: {}", e)))
             .transpose()?
