@@ -571,6 +571,7 @@ impl RtcWorker {
         }
 
         let mut tun_buf = bytes::BytesMut::with_capacity(256 * 1024);
+        #[cfg(not(target_os = "linux"))]
         let mut udp_buf = bytes::BytesMut::with_capacity(256 * 1024);
 
         let sleep = tokio::time::sleep(std::time::Duration::from_secs(3600));
@@ -590,17 +591,20 @@ impl RtcWorker {
                 tun_buf.set_len(cap);
             }
 
-            // Reset and prepare udp_buf
-            udp_buf.truncate(0);
-            if udp_buf.capacity() < 65536 {
-                udp_buf.reserve(256 * 1024);
-            }
-            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
-            // for read/recv_from. The uninitialized bytes are never read before they are
-            // overwritten by the OS kernel during the IO system call.
-            unsafe {
-                let cap = udp_buf.capacity();
-                udp_buf.set_len(cap);
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Reset and prepare udp_buf
+                udp_buf.truncate(0);
+                if udp_buf.capacity() < 65536 {
+                    udp_buf.reserve(256 * 1024);
+                }
+                // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                // for read/recv_from. The uninitialized bytes are never read before they are
+                // overwritten by the OS kernel during the IO system call.
+                unsafe {
+                    let cap = udp_buf.capacity();
+                    udp_buf.set_len(cap);
+                }
             }
 
             let mut next_timeout = None;
@@ -621,79 +625,235 @@ impl RtcWorker {
                     .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
             }
 
-            tokio::select! {
-                _ = &mut sleep => {
-                    let now = std::time::Instant::now();
-                    for conn in self.connections.values_mut() {
-                        conn.connection.handle_timeout(now);
-                    }
-                    let handles: Vec<_> = self.connections.keys().copied().collect();
-                    for handle in handles {
-                        self.drive_connection(handle, &dp_snapshot, now, &mut local_stats).await;
-                    }
-                    self.process_endpoint_transmits().await;
-                }
-
-                read_res = self.tun_io.read(&mut tun_buf[1..65536]) => {
-                    match read_res {
-                        Ok(0) => {
-                            tun_buf.truncate(0);
-                            return Err("TUN interface EOF".to_string());
-                        }
-                        Ok(n) => {
+            macro_rules! run_select {
+                ($binding:pat = $fut:expr => $body:block) => {
+                    tokio::select! {
+                        _ = &mut sleep => {
                             let now = std::time::Instant::now();
-                            local_stats.tun_rx_packets += 1;
-                            local_stats.tun_rx_bytes += n as u64;
-                            tun_buf[0] = 0x02;
-                            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
-                            // for read/recv_from. The uninitialized bytes are never read before they are
-                            // overwritten by the OS kernel during the IO system call.
-                            unsafe {
-                                tun_buf.set_len(1 + n);
+                            for conn in self.connections.values_mut() {
+                                conn.connection.handle_timeout(now);
                             }
-                            let frame = tun_buf.split_to(1 + n).freeze();
-                            self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
+                            let handles: Vec<_> = self.connections.keys().copied().collect();
+                            for handle in handles {
+                                self.drive_connection(handle, &dp_snapshot, now, &mut local_stats).await;
+                            }
+                            self.process_endpoint_transmits().await;
+                        }
 
-                            for _ in 0..63 {
-                                if tun_buf.capacity() < 65536 {
-                                    tun_buf.reserve(256 * 1024);
+                        read_res = self.tun_io.read(&mut tun_buf[1..65536]) => {
+                            match read_res {
+                                Ok(0) => {
+                                    tun_buf.truncate(0);
+                                    return Err("TUN interface EOF".to_string());
                                 }
-                                // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
-                                // for read/recv_from. The uninitialized bytes are never read before they are
-                                // overwritten by the OS kernel during the IO system call.
-                                unsafe {
-                                    let cap = tun_buf.capacity();
-                                    tun_buf.set_len(cap);
-                                }
-                                match self.tun_io.try_read(&mut tun_buf[1..65536]) {
-                                    Ok(Some(n)) if n > 0 => {
-                                        local_stats.tun_rx_packets += 1;
-                                        local_stats.tun_rx_bytes += n as u64;
-                                        tun_buf[0] = 0x02;
+                                Ok(n) => {
+                                    let now = std::time::Instant::now();
+                                    local_stats.tun_rx_packets += 1;
+                                    local_stats.tun_rx_bytes += n as u64;
+                                    tun_buf[0] = 0x02;
+                                    // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                    // for read/recv_from. The uninitialized bytes are never read before they are
+                                    // overwritten by the OS kernel during the IO system call.
+                                    unsafe {
+                                        tun_buf.set_len(1 + n);
+                                    }
+                                    let frame = tun_buf.split_to(1 + n).freeze();
+                                    self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
+
+                                    for _ in 0..63 {
+                                        if tun_buf.capacity() < 65536 {
+                                            tun_buf.reserve(256 * 1024);
+                                        }
                                         // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
                                         // for read/recv_from. The uninitialized bytes are never read before they are
                                         // overwritten by the OS kernel during the IO system call.
                                         unsafe {
-                                            tun_buf.set_len(1 + n);
+                                            let cap = tun_buf.capacity();
+                                            tun_buf.set_len(cap);
                                         }
-                                        let frame = tun_buf.split_to(1 + n).freeze();
-                                        self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
+                                        match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                                            Ok(Some(n)) if n > 0 => {
+                                                local_stats.tun_rx_packets += 1;
+                                                local_stats.tun_rx_bytes += n as u64;
+                                                tun_buf[0] = 0x02;
+                                                // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                                // for read/recv_from. The uninitialized bytes are never read before they are
+                                                // overwritten by the OS kernel during the IO system call.
+                                                unsafe {
+                                                    tun_buf.set_len(1 + n);
+                                                }
+                                                let frame = tun_buf.split_to(1 + n).freeze();
+                                                self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
+                                            }
+                                            _ => {
+                                                tun_buf.truncate(0);
+                                                break;
+                                            }
+                                        }
                                     }
-                                    _ => {
-                                        tun_buf.truncate(0);
-                                        break;
+                                    self.process_endpoint_transmits().await;
+                                }
+                                Err(e) => {
+                                    tun_buf.truncate(0);
+                                    log::warn!("TUN read error: {:?}", e);
+                                }
+                            }
+                        }
+
+                        $binding = $fut => $body
+
+                        _ = reload_timer.tick() => {
+                            dp_snapshot = data_plane.load();
+                            if self.role == WorkerRole::Client {
+                                self.check_and_connect_clients(&dp_snapshot).await;
+                                self.process_endpoint_transmits().await;
+                                let handles_to_abort: Vec<quinn_proto::ConnectionHandle> = self.connections.iter()
+                                    .filter(|(_, conn)| {
+                                        if let Some(pub_key) = conn.peer_public_key {
+                                            !dp_snapshot.client_quic_pools.contains_key(&pub_key)
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .map(|(handle, _)| *handle)
+                                    .collect();
+                                for handle in handles_to_abort {
+                                    log::warn!("Closing client connection for removed peer");
+                                    self.abort_connection(handle, b"Peer removed").await;
+                                }
+                            }
+                            if self.role == WorkerRole::Server {
+                                let handles_to_abort = if let Some(ref session_cache) = self.session_cache {
+                                    let cache_guard = session_cache.read();
+                                    self.connections.iter()
+                                        .filter(|(_, conn)| {
+                                            if let Some(pub_key) = conn.peer_public_key {
+                                                !cache_guard.contains_key(&pub_key)
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .map(|(handle, _)| *handle)
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                };
+                                for handle in handles_to_abort {
+                                    log::warn!("Closing connection for removed or rotated peer");
+                                    self.abort_connection(handle, b"Peer removed or session rotated").await;
+                                }
+                            }
+                        }
+
+                        _ = stats_timer.tick() => {
+                            if let Some(ref stats) = self.worker_stats {
+                                let mut publish_stats = local_stats.clone();
+                                let mut total_tx = 0;
+                                let mut total_rx = 0;
+                                for conn in self.connections.values() {
+                                    total_tx += conn.tx_bytes.load();
+                                    total_rx += conn.rx_bytes.load();
+                                }
+                                publish_stats.l3_bytes = total_tx + total_rx;
+                                stats.publish(&publish_stats);
+                            }
+                            if let Some(ref registry) = self.shared_quic_registry {
+                                let mut reg_guard = registry.write();
+                                let local_port = self.udp_socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+                                for conns in reg_guard.values_mut() {
+                                    conns.retain(|snap| snap.local_port != local_port);
+                                }
+                                for conn in self.connections.values() {
+                                    if conn.authenticated {
+                                        if let Some(pub_key) = conn.peer_public_key {
+                                            let remote_address = conn.connection.remote_address().to_string();
+                                            let active_streams = 0;
+                                            let snap = crate::quic_pool::QuicConnSnapshot {
+                                                remote_addr: remote_address,
+                                                local_port,
+                                                rx_bytes: conn.rx_bytes.load(),
+                                                tx_bytes: conn.tx_bytes.load(),
+                                                active_streams,
+                                            };
+                                            reg_guard.entry(pub_key).or_default().push(snap);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+            }
+
+            #[cfg(target_os = "linux")]
+            run_select! {
+                _ = self.udp_socket.readable() => {
+                    let mut batch_buf = bytes::BytesMut::with_capacity(UDP_BATCH_SIZE * self.packet_buffer_size);
+                    // SAFETY: The flat buffer is set to capacity to allow slicing it for recv.
+                    // The uninitialized bytes are never read before they are written by the OS kernel.
+                    unsafe { batch_buf.set_len(UDP_BATCH_SIZE * self.packet_buffer_size); }
+                    let fd = self.udp_socket.as_raw_fd();
+                    let packet_size = self.packet_buffer_size;
+
+                    let res = self.udp_socket.try_io(Interest::READABLE, || {
+                        for i in 0..UDP_BATCH_SIZE {
+                            let offset = i * packet_size;
+                            self.udp_batch.iovs[i].iov_base = unsafe { batch_buf.as_mut_ptr().add(offset) as *mut libc::c_void };
+                            self.udp_batch.iovs[i].iov_len = packet_size as libc::size_t;
+
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_name = &mut self.udp_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_iov = &mut self.udp_batch.iovs[i] as *mut libc::iovec;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_iovlen = 1;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_controllen = 0;
+                            self.udp_batch.mmsgs[i].msg_hdr.msg_flags = 0;
+                            self.udp_batch.mmsgs[i].msg_len = 0;
+                        }
+
+                        let count = unsafe {
+                            libc::recvmmsg(
+                                fd,
+                                self.udp_batch.mmsgs.as_mut_ptr(),
+                                UDP_BATCH_SIZE as libc::c_uint,
+                                libc::MSG_DONTWAIT,
+                                std::ptr::null_mut(),
+                            )
+                        };
+
+                        if count < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(count as usize)
+                    });
+
+                    match res {
+                        Ok(count) if count > 0 => {
+                            let now = std::time::Instant::now();
+                            let mut remaining = batch_buf;
+                            for i in 0..count {
+                                let len = self.udp_batch.mmsgs[i].msg_len as usize;
+                                let mut packet_chunk = remaining.split_to(packet_size);
+                                if len > 0 {
+                                    packet_chunk.truncate(len);
+                                    if let Some(remote_addr) = sockaddr_to_socket_addr(&self.udp_batch.addrs[i], self.udp_batch.mmsgs[i].msg_hdr.msg_namelen) {
+                                        self.handle_udp_packet(packet_chunk, remote_addr, &dp_snapshot, now, &mut local_stats).await;
                                     }
                                 }
                             }
                             self.process_endpoint_transmits().await;
                         }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
-                            tun_buf.truncate(0);
-                            log::warn!("TUN read error: {:?}", e);
+                            log::warn!("UDP recvmmsg error: {:?}", e);
                         }
+                        _ => {}
                     }
                 }
+            }
 
+            #[cfg(not(target_os = "linux"))]
+            run_select! {
                 read_res = self.udp_socket.recv_from(&mut udp_buf) => {
                     match read_res {
                         Ok((n, remote_addr)) if n > 0 => {
@@ -739,86 +899,6 @@ impl RtcWorker {
                         }
                         _ => {
                             udp_buf.truncate(0);
-                        }
-                    }
-                }
-
-                _ = reload_timer.tick() => {
-                    dp_snapshot = data_plane.load();
-                    if self.role == WorkerRole::Client {
-                        self.check_and_connect_clients(&dp_snapshot).await;
-                        self.process_endpoint_transmits().await;
-                        let handles_to_abort: Vec<quinn_proto::ConnectionHandle> = self.connections.iter()
-                            .filter(|(_, conn)| {
-                                if let Some(pub_key) = conn.peer_public_key {
-                                    !dp_snapshot.client_quic_pools.contains_key(&pub_key)
-                                } else {
-                                    false
-                                }
-                            })
-                            .map(|(handle, _)| *handle)
-                            .collect();
-                        for handle in handles_to_abort {
-                            log::warn!("Closing client connection for removed peer");
-                            self.abort_connection(handle, b"Peer removed").await;
-                        }
-                    }
-                    if self.role == WorkerRole::Server {
-                        let handles_to_abort = if let Some(ref session_cache) = self.session_cache {
-                            let cache_guard = session_cache.read();
-                            self.connections.iter()
-                                .filter(|(_, conn)| {
-                                    if let Some(pub_key) = conn.peer_public_key {
-                                        !cache_guard.contains_key(&pub_key)
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .map(|(handle, _)| *handle)
-                                .collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        for handle in handles_to_abort {
-                            log::warn!("Closing connection for removed or rotated peer");
-                            self.abort_connection(handle, b"Peer removed or session rotated").await;
-                        }
-                    }
-                }
-
-                _ = stats_timer.tick() => {
-                    if let Some(ref stats) = self.worker_stats {
-                        let mut publish_stats = local_stats.clone();
-                        let mut total_tx = 0;
-                        let mut total_rx = 0;
-                        for conn in self.connections.values() {
-                            total_tx += conn.tx_bytes.load();
-                            total_rx += conn.rx_bytes.load();
-                        }
-                        publish_stats.l3_bytes = total_tx + total_rx;
-                        stats.publish(&publish_stats);
-                    }
-                    if let Some(ref registry) = self.shared_quic_registry {
-                        let mut reg_guard = registry.write();
-                        let local_port = self.udp_socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
-                        for conns in reg_guard.values_mut() {
-                            conns.retain(|snap| snap.local_port != local_port);
-                        }
-                        for conn in self.connections.values() {
-                            if conn.authenticated {
-                                if let Some(pub_key) = conn.peer_public_key {
-                                    let remote_address = conn.connection.remote_address().to_string();
-                                    let active_streams = 0;
-                                    let snap = crate::quic_pool::QuicConnSnapshot {
-                                        remote_addr: remote_address,
-                                        local_port,
-                                        rx_bytes: conn.rx_bytes.load(),
-                                        tx_bytes: conn.tx_bytes.load(),
-                                        active_streams,
-                                    };
-                                    reg_guard.entry(pub_key).or_default().push(snap);
-                                }
-                            }
                         }
                     }
                 }
