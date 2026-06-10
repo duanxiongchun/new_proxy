@@ -649,51 +649,148 @@ impl RtcWorker {
                                     return Err("TUN interface EOF".to_string());
                                 }
                                 Ok(n) => {
-                                    let now = std::time::Instant::now();
-                                    local_stats.tun_rx_packets += 1;
-                                    local_stats.tun_rx_bytes += n as u64;
-                                    tun_buf[0] = 0x02;
-                                    // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
-                                    // for read/recv_from. The uninitialized bytes are never read before they are
-                                    // overwritten by the OS kernel during the IO system call.
-                                    unsafe {
-                                        tun_buf.set_len(1 + n);
-                                    }
-                                    let frame = tun_buf.split_to(1 + n).freeze();
-                                    self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        let now = std::time::Instant::now();
+                                        let mut batch = Vec::with_capacity(64);
 
-                                    for _ in 0..63 {
-                                        if tun_buf.capacity() < 65536 {
-                                            tun_buf.reserve(256 * 1024);
-                                        }
+                                        local_stats.tun_rx_packets += 1;
+                                        local_stats.tun_rx_bytes += n as u64;
+                                        tun_buf[0] = 0x02;
                                         // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
                                         // for read/recv_from. The uninitialized bytes are never read before they are
                                         // overwritten by the OS kernel during the IO system call.
                                         unsafe {
-                                            let cap = tun_buf.capacity();
-                                            tun_buf.set_len(cap);
+                                            tun_buf.set_len(1 + n);
                                         }
-                                        match self.tun_io.try_read(&mut tun_buf[1..65536]) {
-                                            Ok(Some(n)) if n > 0 => {
-                                                local_stats.tun_rx_packets += 1;
-                                                local_stats.tun_rx_bytes += n as u64;
-                                                tun_buf[0] = 0x02;
-                                                // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
-                                                // for read/recv_from. The uninitialized bytes are never read before they are
-                                                // overwritten by the OS kernel during the IO system call.
-                                                unsafe {
-                                                    tun_buf.set_len(1 + n);
+                                        let first_frame = tun_buf.split_to(1 + n).freeze();
+                                        batch.push(first_frame);
+
+                                        for _ in 0..63 {
+                                            if tun_buf.capacity() < 65536 {
+                                                tun_buf.reserve(256 * 1024);
+                                            }
+                                            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                            // for read/recv_from. The uninitialized bytes are never read before they are
+                                            // overwritten by the OS kernel during the IO system call.
+                                            unsafe {
+                                                let cap = tun_buf.capacity();
+                                                tun_buf.set_len(cap);
+                                            }
+                                            match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                                                Ok(Some(n_next)) if n_next > 0 => {
+                                                    local_stats.tun_rx_packets += 1;
+                                                    local_stats.tun_rx_bytes += n_next as u64;
+                                                    tun_buf[0] = 0x02;
+                                                    // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                                    // for read/recv_from. The uninitialized bytes are never read before they are
+                                                    // overwritten by the OS kernel during the IO system call.
+                                                    unsafe {
+                                                        tun_buf.set_len(1 + n_next);
+                                                    }
+                                                    let frame = tun_buf.split_to(1 + n_next).freeze();
+                                                    batch.push(frame);
                                                 }
-                                                let frame = tun_buf.split_to(1 + n).freeze();
-                                                self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
-                                            }
-                                            _ => {
-                                                tun_buf.truncate(0);
-                                                break;
+                                                _ => {
+                                                    break;
+                                                }
                                             }
                                         }
+                                        tun_buf.truncate(0);
+
+                                        // Look up destination IP and group packets by ConnectionHandle
+                                        let mut groups: std::collections::HashMap<quinn_proto::ConnectionHandle, Vec<bytes::Bytes>> = std::collections::HashMap::new();
+                                        for packet in batch {
+                                            if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
+                                                if let Some(handle) = self.find_handle_for_ip(dst_ip, &dp_snapshot) {
+                                                    groups.entry(handle).or_default().push(packet);
+                                                }
+                                            }
+                                        }
+
+                                        // For each peer connection group:
+                                        // - Batch write to Quinn: call datagrams().send(frame) in a loop
+                                        // - Increment stats (l3_packets, l3_bytes, tx_bytes)
+                                        for (handle, packets) in groups {
+                                            let mut sent = false;
+                                            if let Some(conn) = self.connections.get_mut(&handle) {
+                                                if conn.authenticated {
+                                                    for packet in packets {
+                                                        let packet_len = (packet.len() - 1) as u64;
+                                                        if let Err(e) = conn.connection.datagrams().send(packet) {
+                                                            log::debug!("Failed to send datagram: {:?}", e);
+                                                        } else {
+                                                            conn.tx_bytes.add(packet_len);
+                                                            local_stats.l3_packets += 1;
+                                                            local_stats.l3_bytes += packet_len;
+
+                                                            if let Some(ref peer_telemetry) = self.peer_telemetry {
+                                                                if let Some(pub_key) = conn.peer_public_key {
+                                                                    let peer_stats = peer_telemetry.get_or_create(pub_key);
+                                                                    peer_stats.tx_bytes.add(packet_len);
+                                                                }
+                                                            }
+                                                            sent = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if sent {
+                                                self.drive_connection(handle, &dp_snapshot, now, &mut local_stats).await;
+                                            }
+                                        }
+
+                                        self.process_endpoint_transmits().await;
                                     }
-                                    self.process_endpoint_transmits().await;
+
+                                    #[cfg(not(target_os = "linux"))]
+                                    {
+                                        let now = std::time::Instant::now();
+                                        local_stats.tun_rx_packets += 1;
+                                        local_stats.tun_rx_bytes += n as u64;
+                                        tun_buf[0] = 0x02;
+                                        // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                        // for read/recv_from. The uninitialized bytes are never read before they are
+                                        // overwritten by the OS kernel during the IO system call.
+                                        unsafe {
+                                            tun_buf.set_len(1 + n);
+                                        }
+                                        let frame = tun_buf.split_to(1 + n).freeze();
+                                        self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
+
+                                        for _ in 0..63 {
+                                            if tun_buf.capacity() < 65536 {
+                                                tun_buf.reserve(256 * 1024);
+                                            }
+                                            // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                            // for read/recv_from. The uninitialized bytes are never read before they are
+                                            // overwritten by the OS kernel during the IO system call.
+                                            unsafe {
+                                                let cap = tun_buf.capacity();
+                                                tun_buf.set_len(cap);
+                                            }
+                                            match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                                                Ok(Some(n)) if n > 0 => {
+                                                    local_stats.tun_rx_packets += 1;
+                                                    local_stats.tun_rx_bytes += n as u64;
+                                                    tun_buf[0] = 0x02;
+                                                    // SAFETY: The length of the buffer is set to capacity to allow slicing the buffer
+                                                    // for read/recv_from. The uninitialized bytes are never read before they are
+                                                    // overwritten by the OS kernel during the IO system call.
+                                                    unsafe {
+                                                        tun_buf.set_len(1 + n);
+                                                    }
+                                                    let frame = tun_buf.split_to(1 + n).freeze();
+                                                    self.handle_tun_packet(frame, &dp_snapshot, now, &mut local_stats).await;
+                                                }
+                                                _ => {
+                                                    tun_buf.truncate(0);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        self.process_endpoint_transmits().await;
+                                    }
                                 }
                                 Err(e) => {
                                     tun_buf.truncate(0);
