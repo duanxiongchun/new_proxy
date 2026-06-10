@@ -4,39 +4,41 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// 非原子型 U64 计数器包装类，通过 UnsafeCell 绕过 Rust 的内部可变性检查，
-// 从而在多线程环境的单线程独占写入（Worker 线程）场景中完全消除 LOCK 前缀指令的原子开销。
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// 线程安全的 U64 计数器包装类，使用 AtomicU64 替代 UnsafeCell 从而避免多线程并发读写下的 Undefined Behavior (数据竞争)。
+// 注意：本计数器的 `add` 操作使用 Relaxed 内存序的 load 和 store（非 fetch_add 组合），在 x86_64 架构下编译为普通的 mov 指令
+// 而不会产生 LOCK 前缀总线锁，从而与非原子变量具有相同的极致性能。
+// 
+// 关键约束：`add` 操作只能由单线程独占写入（单写入者场景，如各个独立的 RtcWorker 线程），不允许并发多线程写入，
+// 否则可能导致更新丢失。而读操作可以由任意线程（如 UDS 管控线程）并发安全读取。
 #[derive(Debug)]
-pub struct CellU64(core::cell::UnsafeCell<u64>);
+pub struct CellU64(AtomicU64);
 
 impl CellU64 {
     #[inline(always)]
     pub fn new(val: u64) -> Self {
-        Self(core::cell::UnsafeCell::new(val))
+        Self(AtomicU64::new(val))
     }
 
+    /// 增加计数器的值。
+    /// 警告：非多写入者安全！仅在单写入线程独占的情况下安全。
     #[inline(always)]
     pub fn add(&self, val: u64) {
-        unsafe {
-            *self.0.get() += val;
-        }
+        let current = self.0.load(Ordering::Relaxed);
+        self.0.store(current + val, Ordering::Relaxed);
     }
 
     #[inline(always)]
     pub fn load(&self) -> u64 {
-        unsafe { *self.0.get() }
+        self.0.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
     pub fn store(&self, val: u64) {
-        unsafe {
-            *self.0.get() = val;
-        }
+        self.0.store(val, Ordering::Relaxed);
     }
 }
-
-unsafe impl Send for CellU64 {}
-unsafe impl Sync for CellU64 {}
 
 impl Default for CellU64 {
     #[inline(always)]
