@@ -41,6 +41,8 @@ pub struct RtcWorker {
         Arc<parking_lot::Mutex<std::collections::HashMap<[u8; 32], crate::control::NonceCache>>>,
     >,
     pub shared_quic_registry: Option<crate::quic_pool::PeerConnRegistry>,
+    #[cfg(target_os = "linux")]
+    pub udp_batch: UdpBatch,
 }
 
 impl RtcWorker {
@@ -79,6 +81,8 @@ impl RtcWorker {
             session_cache,
             auth_nonce_cache,
             shared_quic_registry,
+            #[cfg(target_os = "linux")]
+            udp_batch: UdpBatch::new(),
         }
     }
 
