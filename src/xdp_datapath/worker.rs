@@ -765,6 +765,7 @@ struct XdpRouteState {
     peer_outer_port: u16,
     inner_mac_cache: Arc<RwLock<HashMap<std::net::Ipv4Addr, [u8; 6]>>>,
     intercept_local_macs: HashMap<u32, [u8; 6]>, // ifindex -> local MAC
+    last_resolve_attempts: HashMap<std::net::Ipv4Addr, std::time::Instant>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1867,6 +1868,7 @@ fn run_xdp_worker_loop(
         peer_outer_port: 40001 + worker_id as u16,  // default port matching BPF filter
         inner_mac_cache: shared_inner_mac_cache,
         intercept_local_macs,
+        last_resolve_attempts: HashMap::new(),
     };
 
     let chunks_per_worker = 4096 / queue_count;
@@ -1955,10 +1957,19 @@ fn run_xdp_worker_loop(
                                         src_ip,
                                         dst_ip
                                     );
-                                    route_state
-                                        .inner_mac_cache
-                                        .write()
-                                        .insert(src_ip, eth_header.src_mac);
+                                    let needs_update = {
+                                        let cache = route_state.inner_mac_cache.read();
+                                        match cache.get(&src_ip) {
+                                            Some(&mac) => mac != eth_header.src_mac,
+                                            None => true,
+                                        }
+                                    };
+                                    if needs_update {
+                                        route_state
+                                            .inner_mac_cache
+                                            .write()
+                                            .insert(src_ip, eth_header.src_mac);
+                                    }
                                     route_state
                                         .intercept_local_macs
                                         .insert(intercept.ifindex, eth_header.dst_mac);
@@ -2066,14 +2077,34 @@ fn run_xdp_worker_loop(
                                 let dst_mac = match dst_mac {
                                     Some(mac) => mac,
                                     None => {
-                                        let resolved = resolve_mac(&intercept_ifname, inner_dst_ip)
-                                            .or_else(|| get_interface_mac_by_ip(inner_dst_ip));
-                                        if let Some(mac) = resolved {
+                                        let mut attempt_allowed = true;
+                                        if let Some(&last_time) =
+                                            route_state.last_resolve_attempts.get(&inner_dst_ip)
+                                        {
+                                            if std::time::Instant::now().duration_since(last_time)
+                                                < std::time::Duration::from_secs(1)
+                                            {
+                                                attempt_allowed = false;
+                                            }
+                                        }
+                                        if attempt_allowed {
                                             route_state
-                                                .inner_mac_cache
-                                                .write()
-                                                .insert(inner_dst_ip, mac);
-                                            mac
+                                                .last_resolve_attempts
+                                                .insert(inner_dst_ip, std::time::Instant::now());
+                                            let resolved =
+                                                resolve_mac(&intercept_ifname, inner_dst_ip)
+                                                    .or_else(|| {
+                                                        get_interface_mac_by_ip(inner_dst_ip)
+                                                    });
+                                            if let Some(mac) = resolved {
+                                                route_state
+                                                    .inner_mac_cache
+                                                    .write()
+                                                    .insert(inner_dst_ip, mac);
+                                                mac
+                                            } else {
+                                                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+                                            }
                                         } else {
                                             [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
                                         }
