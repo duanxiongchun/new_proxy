@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export RUST_LOG="${RUST_LOG:-warn}"
 
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root / using sudo." >&2
@@ -114,6 +115,10 @@ cleanup() {
   ip netns delete scale_router_ns 2>/dev/null || true
   ip netns delete scale_client_ns 2>/dev/null || true
   ip netns delete scale_work_ns 2>/dev/null || true
+  ip link delete vs-s 2>/dev/null || true
+  ip link delete vs-c 2>/dev/null || true
+  ip link delete vs-w 2>/dev/null || true
+  ip link delete vs-s-w1 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -138,6 +143,7 @@ mkdir -p "$ARTIFACT_DIR"
 : > "$RESULTS_CSV"
 
 cleanup
+set -e
 mkdir -p /dev/net
 if [ ! -e /dev/net/tun ]; then
   mknod /dev/net/tun c 10 200
@@ -151,13 +157,19 @@ cat > "$CLIENT_CONF" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
 MTU = 1420
-Table = auto
+Table = off
+Mode = af_xdp
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
+
+[XDP]
+QuicInterface = vs-c
+InterceptInterfaces = vs-cw, lo
+XdpMode = native
 EOF_CONF
 
 write_server_conf() {
@@ -172,7 +184,8 @@ Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
 MTU = 1420
-Table = auto
+Table = off
+Mode = af_xdp
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
@@ -181,58 +194,116 @@ ListenPorts = ${listen_ports}
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
 AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
+
+[XDP]
+QuicInterface = vs-s
+InterceptInterfaces = vs-s-w2
+XdpMode = native
 EOF_CONF
 }
 
-ip netns add scale_server_ns
-ip netns add scale_router_ns
-ip netns add scale_client_ns
-ip netns add scale_work_ns
-
-ip link add vs-s numtxqueues 4 numrxqueues 4 type veth peer name vs-rs numtxqueues 4 numrxqueues 4
-ip link set vs-s netns scale_server_ns
-ip link set vs-rs netns scale_router_ns
-ip link add vs-c numtxqueues 4 numrxqueues 4 type veth peer name vs-rc numtxqueues 4 numrxqueues 4
-ip link set vs-c netns scale_client_ns
-ip link set vs-rc netns scale_router_ns
-ip link add vs-w numtxqueues 4 numrxqueues 4 type veth peer name vs-cw numtxqueues 4 numrxqueues 4
-ip link set vs-w netns scale_work_ns
-ip link set vs-cw netns scale_client_ns
-
-ip netns exec scale_server_ns ip addr add 10.0.2.2/24 dev vs-s
-ip netns exec scale_server_ns ip link set vs-s up txqueuelen 10000
-ip netns exec scale_server_ns ip link set lo up
-ip netns exec scale_server_ns ip route add default via 10.0.2.1
-
-ip netns exec scale_client_ns ip addr add 10.0.1.2/24 dev vs-c
-ip netns exec scale_client_ns ip addr add 10.0.4.1/24 dev vs-cw
-ip netns exec scale_client_ns ip link set vs-c up txqueuelen 10000
-ip netns exec scale_client_ns ip link set vs-cw up txqueuelen 10000
-ip netns exec scale_client_ns ip link set lo up
-ip netns exec scale_client_ns ip route add default via 10.0.1.1
-ip netns exec scale_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-ip netns exec scale_work_ns ip addr add 10.0.4.2/24 dev vs-w
-ip netns exec scale_work_ns ip link set vs-w up txqueuelen 10000
-ip netns exec scale_work_ns ip link set lo up
-ip netns exec scale_work_ns ip route add default via 10.0.4.1
-
-ip netns exec scale_router_ns ip addr add 10.0.2.1/24 dev vs-rs
-ip netns exec scale_router_ns ip addr add 10.0.1.1/24 dev vs-rc
-ip netns exec scale_router_ns ip link set vs-rs up txqueuelen 10000
-ip netns exec scale_router_ns ip link set vs-rc up txqueuelen 10000
-ip netns exec scale_router_ns ip link set lo up
-ip netns exec scale_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
-for ns in scale_server_ns scale_router_ns scale_client_ns scale_work_ns; do
-  ip netns exec $ns sysctl -w net.core.rmem_max=16777216 >/dev/null
-  ip netns exec $ns sysctl -w net.core.wmem_max=16777216 >/dev/null
-  ip netns exec $ns sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" >/dev/null
-  ip netns exec $ns sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" >/dev/null
-done
-ip netns exec scale_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
-ip netns exec scale_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
-
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count="$BLOB_MIB" status=none
+
+setup_topology() {
+  local nq="$1"
+
+  ip netns add scale_server_ns
+  ip netns add scale_router_ns
+  ip netns add scale_client_ns
+  ip netns add scale_work_ns
+
+  ip link add vs-s numtxqueues "$nq" numrxqueues "$nq" type veth peer name vs-rs numtxqueues "$nq" numrxqueues "$nq"
+  ip link set vs-s address 00:00:00:00:02:02
+  ip link set vs-rs address 00:00:00:00:02:01
+  ip link set vs-s netns scale_server_ns
+  ip link set vs-rs netns scale_router_ns
+  ip link add vs-c numtxqueues "$nq" numrxqueues "$nq" type veth peer name vs-rc numtxqueues "$nq" numrxqueues "$nq"
+  ip link set vs-c address 00:00:00:00:01:02
+  ip link set vs-rc address 00:00:00:00:01:01
+  ip link set vs-c netns scale_client_ns
+  ip link set vs-rc netns scale_router_ns
+  ip link add vs-w numtxqueues "$nq" numrxqueues "$nq" type veth peer name vs-cw numtxqueues "$nq" numrxqueues "$nq"
+  ip link set vs-w netns scale_work_ns
+  ip link set vs-cw netns scale_client_ns
+
+  ip netns exec scale_server_ns ip addr add 10.0.2.2/24 dev vs-s
+  ip netns exec scale_server_ns ip link set vs-s up txqueuelen 10000
+  ip netns exec scale_server_ns ip link set lo up
+  ip netns exec scale_server_ns ip route add default via 10.0.2.1
+
+  ip link add vs-s-w1 numtxqueues "$nq" numrxqueues "$nq" type veth peer name vs-s-w2 numtxqueues "$nq" numrxqueues "$nq"
+  ip link set vs-s-w1 address 00:00:00:00:00:11
+  ip link set vs-s-w2 address 00:00:00:00:00:22
+  ip link set vs-s-w1 netns scale_server_ns
+  ip link set vs-s-w2 netns scale_server_ns
+  ip netns exec scale_server_ns ip addr add 10.0.0.1/24 dev vs-s-w1
+  ip netns exec scale_server_ns ip link set vs-s-w1 mtu 1420 up txqueuelen 10000
+  ip netns exec scale_server_ns ip link set vs-s-w2 mtu 1420 up txqueuelen 10000
+  ip netns exec scale_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vs-s-w1
+  ip netns exec scale_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vs-s-w1
+
+  ip netns exec scale_client_ns ip addr add 10.0.1.2/24 dev vs-c
+  ip netns exec scale_client_ns ip addr add 10.0.4.1/24 dev vs-cw
+  ip netns exec scale_client_ns ip link set vs-c up txqueuelen 10000
+  ip netns exec scale_client_ns ip link set vs-cw mtu 1420 up txqueuelen 10000
+  ip netns exec scale_client_ns ip link set lo up
+  ip netns exec scale_client_ns ip route add default via 10.0.1.1
+  ip netns exec scale_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+
+  ip netns exec scale_work_ns ip addr add 10.0.4.2/24 dev vs-w
+  ip netns exec scale_work_ns ip link set vs-w mtu 1420 up txqueuelen 10000
+  ip netns exec scale_work_ns ip link set lo up
+  ip netns exec scale_work_ns ip route add default via 10.0.4.1
+
+  ip netns exec scale_router_ns ip addr add 10.0.2.1/24 dev vs-rs
+  ip netns exec scale_router_ns ip addr add 10.0.1.1/24 dev vs-rc
+  ip netns exec scale_router_ns ip link set vs-rs up txqueuelen 10000
+  ip netns exec scale_router_ns ip link set vs-rc up txqueuelen 10000
+  ip netns exec scale_router_ns ip link set lo up
+  ip netns exec scale_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+  for ns in scale_server_ns scale_router_ns scale_client_ns scale_work_ns; do
+    ip netns exec $ns sysctl -w net.core.rmem_max=16777216 >/dev/null || true
+    ip netns exec $ns sysctl -w net.core.wmem_max=16777216 >/dev/null || true
+    ip netns exec $ns sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" >/dev/null || true
+    ip netns exec $ns sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" >/dev/null || true
+  done
+  ip netns exec scale_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
+  ip netns exec scale_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
+
+  # Pre-populate ARP/neighbor mappings for outer networks
+  ip netns exec scale_server_ns ip neighbor add 10.0.2.1 lladdr 00:00:00:00:02:01 dev vs-s
+  ip netns exec scale_client_ns ip neighbor add 10.0.1.1 lladdr 00:00:00:00:01:01 dev vs-c
+  ip netns exec scale_router_ns ip neighbor add 10.0.2.2 lladdr 00:00:00:00:02:02 dev vs-rs
+  ip netns exec scale_router_ns ip neighbor add 10.0.1.2 lladdr 00:00:00:00:01:02 dev vs-rc
+
+  # Disable rp_filter in all namespaces (required for XDP routing)
+  for ns in scale_server_ns scale_router_ns scale_client_ns scale_work_ns; do
+    ip netns exec $ns sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
+    ip netns exec $ns sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true
+  done
+
+  # Disable TX/RX checksum offloading (required for AF_XDP on veth interfaces)
+  ip netns exec scale_server_ns ethtool -K vs-s tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_server_ns ethtool -K vs-s-w1 tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_server_ns ethtool -K vs-s-w2 tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_client_ns ethtool -K vs-c tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_client_ns ethtool -K vs-cw tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_work_ns ethtool -K vs-w tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_router_ns ethtool -K vs-rs tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_router_ns ethtool -K vs-rc tx off rx off >/dev/null 2>&1 || true
+}
+
+teardown_topology() {
+  ip netns delete scale_server_ns 2>/dev/null || true
+  ip netns delete scale_router_ns 2>/dev/null || true
+  ip netns delete scale_client_ns 2>/dev/null || true
+  ip netns delete scale_work_ns 2>/dev/null || true
+  ip link delete vs-s 2>/dev/null || true
+  ip link delete vs-c 2>/dev/null || true
+  ip link delete vs-w 2>/dev/null || true
+  ip link delete vs-s-w1 2>/dev/null || true
+  rm -rf /sys/fs/bpf/new_proxy_* 2>/dev/null || true
+}
 
 run_group() {
   local data_ports="$1"
@@ -253,7 +324,11 @@ PY
 )"
   write_server_conf "$data_ports" "$server_conf"
 
-  ip netns exec scale_server_ns taskset -c "$server_cpus" "$ROOT_DIR/target/release/new_proxy" -config "$server_conf" > "$server_log" 2>&1 &
+  # Create fresh topology with queues matching data_ports
+  teardown_topology
+  setup_topology "$data_ports"
+
+  ip netns exec scale_server_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec taskset -c \"$server_cpus\" \"$ROOT_DIR/target/release/new_proxy\" -config \"$server_conf\"" > "$server_log" 2>&1 &
   SERVER_PID=$!
   sleep 2
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -294,7 +369,7 @@ server.serve_forever()
 PY
   HTTP_PID=$!
 
-  ip netns exec scale_client_ns taskset -c "$cpus" "$ROOT_DIR/target/release/new_proxy" -config "$CLIENT_CONF" > "$client_log" 2>&1 &
+  ip netns exec scale_client_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec taskset -c \"$cpus\" \"$ROOT_DIR/target/release/new_proxy\" -config \"$CLIENT_CONF\"" > "$client_log" 2>&1 &
   CLIENT_PID=$!
   sleep 3
   if ! kill -0 "$CLIENT_PID" 2>/dev/null; then

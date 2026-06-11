@@ -227,7 +227,7 @@ pub fn select_quic_endpoint_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig};
+    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
 
     fn client_config(peers: Vec<PeerConfig>) -> GatewayConfig {
         GatewayConfig {
@@ -240,6 +240,7 @@ mod tests {
                 table: None,
                 pre_script: None,
                 post_script: None,
+                mode: "tun".to_string(),
             },
             peers,
             quic_pool: QUICPoolConfig {
@@ -247,6 +248,7 @@ mod tests {
                 public_ipv6: None,
                 listen_ports: vec![],
             },
+            xdp: XdpConfig::default(),
         }
     }
 
@@ -370,6 +372,7 @@ mod tests {
                 table: None,
                 pre_script: None,
                 post_script: None,
+                mode: "tun".to_string(),
             },
             peers: vec![PeerConfig {
                 public_key: [2u8; 32],
@@ -382,6 +385,7 @@ mod tests {
                 public_ipv6: None,
                 listen_ports: vec![40001, 40001],
             },
+            xdp: XdpConfig::default(),
         };
 
         assert!(validate_gateway_config(&server_config)

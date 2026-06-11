@@ -189,3 +189,157 @@ TUN 批接收 (read + try_read) ---> 批量路由与加密 (Quinn send) ---> UDP
 1. **TUN 批量读取（Batch Read）**：在事件循环中，首先通过异步 `read` 等待并读取第一个 TUN 报文。随后，通过非阻塞的 `try_read` 循环，将 TUN 驱动队列中当前所有立即可用的报文（最多 63 个）全部读取出来，组成一个最大 64 报文的批次。
 2. **按 Peer 批量分类与加密（Batch Routing & Peer Classification）**：对批次中的每一个报文，在无锁哈希表中检索其目的 Connection Handle 并归类到对应的 Peer。将属于相同 Peer 的报文聚合后，轮流调用对应 Peer 的 Datagram 发送队列 `send()` 批量写入该 Peer 的所有报文，触发 Quinn 内部的 AEAD 加密。
 3. **UDP 批量发送（Batch Send）**：对每个 Peer 独立收集其生成的所有待发送加密 UDP 报文（`Transmit`），并针对每个 Peer 分别使用 Linux 原生的 `sendmmsg` 系统调用将属于该 Peer 的报文批量发送出去。
+
+---
+
+## 11. AF_XDP 高性能零拷贝数据面 (AF_XDP High-Performance Zero-Copy Datapath)
+
+除了传统的 TUN 虚拟网卡后端，`new_proxy` 引入了基于原生 Linux AF_XDP (Address Family XDP) 的高性能零拷贝数据面。该设计专为高吞吐物理/虚拟网卡打造，完全绕过了内核 TCP/IP 协议栈，实现了用户态旁路数据面：
+
+```
+       [ 物理 / 虚拟网卡 (NIC) ]
+                   │
+                   ▼ (加载 eBPF XDP 过滤程序)
+         [ XDP_REDIRECT 重定向 ]
+                   │
+         ┌─────────┴─────────┐
+         ▼ (XSK RX 环)       ▼ (XDP_PASS 默认放行)
+    [ 拦截并读入 UMEM ]     [ 宿主机/其它应用流量 ]
+         │
+         ▼
+   [ RtcWorker (用户态) ] ── (共享 MAC 地址缓存查询/学习)
+         │
+         ▼ (QUIC 加密封装)
+    [ XSK TX 环发送 ] ── (批量生产 Fill 环 / 空闲立即 Flush)
+                   │
+                   ▼
+             [ 物理网卡发送 ]
+```
+
+### 11.1 eBPF 驱动过滤与重定向 (eBPF Filter)
+* **eBPF 过滤程序源码 (`src/xdp_datapath/xdp_filter.c`)**：
+  eBPF 过滤程序在网卡物理驱动层对以太网帧进行解析和判断，将符合条件的数据包通过 `XSKMAP` 重定向至用户态套接字，其它报文一律放行：
+  ```c
+  #include <linux/bpf.h>
+  #include <linux/if_ether.h>
+  #include <linux/ip.h>
+  #include <linux/udp.h>
+  #include <bpf/bpf_helpers.h>
+
+  struct {
+      __uint(type, BPF_MAP_TYPE_XSKMAP);
+      __uint(max_entries, 64);
+      __type(key, __u32);
+      __type(value, __u32);
+  } xsks_map SEC(".maps");
+
+  SEC("xdp")
+  int xdp_filter_prog(struct xdp_md *ctx) {
+      void *data_end = (void *)(long)ctx->data_end;
+      void *data = (void *)(long)ctx->data;
+
+      struct ethhdr *eth = data;
+      if (eth + 1 > data_end)
+          return XDP_PASS;
+
+      if (eth->h_proto == __constant_htons(ETH_P_IP)) {
+          struct iphdr *ip = (void *)(eth + 1);
+          if (ip + 1 > data_end)
+              return XDP_PASS;
+
+          // 1. 重定向 QUIC 加密 UDP 数据包（匹配端口 51820 或 40001）
+          if (ip->protocol == IPPROTO_UDP) {
+              struct udphdr *udp = (void *)(ip + 1);
+              if (udp + 1 > data_end)
+                  return XDP_PASS;
+
+              if (udp->dest == __constant_htons(51820) || udp->dest == __constant_htons(40001)) {
+                  return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+              }
+          }
+
+          // 2. 重定向内部明文业务数据包（匹配 10.0.0.0/8 目标网段）
+          __u32 dest_ip = __constant_ntohl(ip->daddr);
+          if ((dest_ip & 0xFF000000) == 0x0A000000) {
+              return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+          }
+      }
+      return XDP_PASS;
+  }
+  char _license[] SEC("license") = "GPL";
+  ```
+
+* **Loader 挂载与 enrollment 机制 (`src/xdp_datapath/loader.rs`)**：
+  在程序启动初始化时，`BpfLinkManager` 负责进行底层网络拓扑与 eBPF 的装载：
+  1. **ARP 禁用与静态邻居映射**：
+     * 执行 `ip link set dev <interface> arp off` 关闭接口的自动 ARP 响应。
+     * 执行 `ip neighbor add <peer_ip> lladdr <peer_mac> dev <interface>` 强制写入静态 IP 与 MAC 邻居映射，避免三层握手前因为缺少物理 MAC 导致包被默默丢弃。
+  2. **过滤程序加载**：
+     * 创建特定目录 `/sys/fs/bpf/new_proxy_<ifname>/` 并挂载 BPF 文件系统。
+     * 调用 `bpftool prog loadall src/xdp_datapath/xdp_filter.o /sys/fs/bpf/new_proxy_<ifname>/ pinmaps /sys/fs/bpf/new_proxy_<ifname>/maps/` 将 eBPF 程序和 MAP 实例化并 Pin 在系统目录中。
+     * 调用 `bpftool net attach xdpgeneric pinned /sys/fs/bpf/new_proxy_<ifname>/xdp_filter dev <ifname>` 将过滤程序绑定至对应网卡。
+  3. **XSK 套接字注册映射**：
+     * 打开 Pin 好的 `xsks_map` 文件描述符：`libc::open("/sys/fs/bpf/new_proxy_<ifname>/maps/xsks_map", libc::O_RDWR)`。
+     * 调用 `bpf` 系统调用的 `BPF_MAP_UPDATE_ELEM` 指令，将当前工作线程关联的 AF_XDP socket 文件描述符绑定至对应网卡 `queue_id` 的 Key 位置。
+
+### 11.2 用户态共享环（UMEM & Rings）与无锁内存屏障
+* **Rust 共享环结构定义 (`XskRing`)**：
+  AF_XDP 在用户态完全旁路内核系统调用，依靠四个共享的内存映射环（Rx / Tx / Fill / Completion）与内核网卡驱动直接进行数据交互：
+  ```rust
+  struct XskRing {
+      producer: *mut u32,
+      consumer: *mut u32,
+      desc: *mut u8,
+      mask: u32,
+      size: u32,
+  }
+  ```
+* **无锁索引同步与内存屏障控制**：
+  为确保用户态与网卡驱动在超高包率下并发读写环时不发生 CPU 乱序执行或编译器重排：
+  * **写环操作 (Producer Ring: Fill / Tx)**：
+    1. 使用 `Acquire` 内存屏障读取 `consumer` 索引，确定当前环中内核驱动已处理并释放的空闲槽位数。
+    2. 将可用的 UMEM 物理缓冲区地址或 `xdp_desc` 描述符写入 `producer` 索引所在位置。
+    3. 更新 `producer` 物理索引，并执行 `Release` 内存屏障，确保缓冲区写入操作在更新 producer 索引之前全部刷入主存。
+    4. 执行 `libc::sendto` 唤醒内核收发包。
+  * **读环操作 (Consumer Ring: Rx / Completion)**：
+    1. 执行 `Acquire` 内存屏障读取物理 `producer` 索引，确保读入的最新的网卡接收包描述符是完全有效的。
+    2. 依次读取描述符中记录的 UMEM 缓冲区偏移与报文长度。
+    3. 将处理完毕的槽位记录在 `consumer` 中，最终执行 `Release` 内存屏障更新 consumer 索引，通知网卡驱动当前缓冲区页可被回收重新利用。
+
+### 11.3 共享 MAC 地址缓存 (Shared MAC Cache)
+* **多核共享的 MAC 映射**：为了让各个并发绑定的工作线程（Workers）快速识别和封装二层以太网头部，设计了共享的二层缓存 `inner_mac_cache`，采用 `Arc<RwLock<HashMap<Ipv4Addr, [u8; 6]>>>` 结构。
+* **写时自动学习**：当工作线程从本地拦截套接字（Intercept XSK）读取到出站 Plaintext 报文时，自动提取源 IP 与源 MAC，写入缓存中进行热学习。
+* **读时无锁/慢查询回退**：当解密完成的 Plaintext 报文准备发送给本地接口时，工作线程优先读取缓存获取目的 MAC。若缓存未命中，则回退执行底层的 ARP 表查询或接口 MAC 检测，并将结果写回缓存，彻底避免了在转发热路径上频繁、同步调用慢系统查询的性能损耗。
+
+### 11.4 填充环批处理生产 (Fill Ring Batching)
+* **批量退还缓冲区**：在接收数据包时，Rx 环的缓冲区页必须归还给 Fill 环供内核重新接收包。
+* **减少内存屏障开销**：优化前的设计会逐包修改 Fill 环的 Producer 索引并进行 volatile 写入。优化后，`process_rx_ring` 在循环中仅在本地寄存器中累加已归还的缓冲地址，在处理完当前批次的所有报文（最多 64 包）后，**仅进行一次统一的 `fill.produce()` 生产提交和一次内存屏障**。这极大地降低了 CPU 缓存失效和总线锁（Lock Fences）的频率，使得 4 核高并发 TCP 吞吐量提升了 **23.3%**（吞吐量由 741.5 MiB/s 跃升至 **914.2 MiB/s**）。
+
+### 11.5 空闲时立即刷新 (Immediate Flush on Idle)
+* **批处理与低延迟的权衡**：由于系统采用了最大 64 包的批处理发送设计，如果在低吞吐（如 TCP 握手阶段、Ping）或者流量突发空闲时，强行等待填满 64 包才调用 `sendto` 发送，会导致往返时延（RTT）上升并阻碍 TCP 窗口扩展，使吞吐量下降。
+* **空闲即刻 Flush**：通过精细化调整工作线程的主循环，当检测到本次事件循环中没有新数据被处理（`!work_done`）或者自上次物理发送以来已空转（Spin）超过 500 次时，**无条件立即触发物理 `sendto` 系统调用进行 Flush**。这既保证了高负载下的系统调用批量化合并，又保证了空闲与低频状态下的超低 RTT 时延，单核 TCP 吞吐量成功突破 **308.3 MiB/s**（超过 300 MiB/s 的设计红线）。
+
+### 11.6 用户态以太网帧解析与封装细节 (Userspace L2 Packet Framing)
+* **明文拦截与隧道加密路径 (出站)**：
+  1. 工作线程轮询 Intercept XSK 的 RX 环，从中拉取由 eBPF 重定向的 Plaintext 二层以太网帧。
+  2. 解析二层 Ether Header（14字节），剥离以太网头，暴露出原始 IP 数据报。
+  3. 将原始 IP 包提交给底层连接绑定的 Quinn 加密套接字，输出密文 QUIC Datagram。
+  4. 从 TX UMEM 块分配一个空闲的 Buffer Chunk（4096字节）。
+  5. 重新组配物理网口发送的二层密文以太网帧：
+     * `[0..14] 字节`：填充物理外层以太网头（本地物理 MAC、网关 MAC，协议 `0x0800`）。
+     * `[14..34] 字节`：填充外层 IPv4 报头（本地外层 IP、Peer 物理 IP）。
+     * `[34..42] 字节`：填充外层 UDP 报头（物理端口及长度）。
+     * `[42..] 字节`：装入加密的 QUIC Datagram 报文载荷。
+  6. 将拼装好的密文描述符提交至 QUIC Tunnel XSK 的 TX 环中物理发送。
+* **物理隧道接收与明文投递路径 (入站)**：
+  1. 轮询 QUIC Tunnel XSK 的 RX 环，拉取从物理网卡收到的密文以太网帧。
+  2. 剥离外层的 Ethernet、IP 及 UDP 报头，将解密后的 Plaintext IP 数据报输入。
+  3. 解密得到明文 IP 包。
+  4. 从 TX UMEM 块分配一个空闲的 Buffer Chunk。
+  5. 组配投递给本地宿主应用的明文以太网帧：
+     * `[0..6] 字节`：填充目的 MAC（从 `inner_mac_cache` 缓存获取，未命中则回退执行本地 ARP 查询）。
+     * `[6..12] 字节`：填充源本地 MAC。
+     * `[12..14] 字节`：协议字填充 `0x0800`。
+     * `[14..] 字节`：装入原始明文 IP 包。
+  6. 将明文以太网帧提交至 Intercept XSK 的 TX 环，网卡接收后通过内核送达宿主应用。
+

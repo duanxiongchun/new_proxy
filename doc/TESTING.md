@@ -153,3 +153,30 @@ sudo ./script/acceptance/run_acceptance.sh
 * **内存碎片与泄漏**：由于全部数据包均复用线程专属的固定大小 BufferPool，**物理内存（RSS）自 Warmup 阶段结束起，在后续运行中增长斜率必须为 0**（波动 $\le 3\%$）。严禁出现因动态内存碎片累积导致的 RSS 缓慢攀升。
 * **文件描述符（FD）**：FD 数量必须保持静态恒定，不允许存在任何因临时连接销毁失败引起的 FD 泄漏。
 * **CPU 稳定性**：CPU 负载与吞吐量成正比，不允许在流量平稳时出现 CPU 占用率线性抬升的情况。
+
+---
+
+## 6. 测试安全性与超时防卡死机制 (Safety Timeouts & Exception Cleanup)
+
+为了防止测试用例或测试脚本在持续集成（CI）或本地运行中由于潜在的死锁、网络阻塞等原因无限期卡死（Hang），本架构设计引入了全局超时防护和自动捕获清理机制：
+
+### 6.1 测试场景超时机制 (Timeout Wrappers)
+* **E2E 脚本超时包裹**：统一验收测试脚本 [run_acceptance.sh](file:///home/duanxiongchun/new_proxy/script/acceptance/run_acceptance.sh) 在循环执行各个 E2E 场景测试时，强制使用 `timeout --kill-after=10s 300s` 包裹：
+  ```bash
+  timeout --kill-after=10s 300s sudo -E bash "script/acceptance/${test_name}.sh"
+  ```
+  如果某个测试脚本执行超过 5 分钟，`timeout` 工具将强制终止其进程并返回错误码 `124`，该错误码会被主控脚本识别并输出 `[TIMEOUT]`，同时阻断后续的发布流程。
+* **Makefile 编译与测试门禁**：
+  * 在 [Makefile](file:///home/duanxiongchun/new_proxy/Makefile) 的 `test` 目标中，添加 `timeout 300s cargo test`，防止本地或单元测试死锁。
+  * 在 `coverage` 目标中，添加 `timeout 600s cargo tarpaulin`，防止测试覆盖率分析挂起。
+
+### 6.2 退出与异常清理机制 (Trap Cleanup)
+* **命名空间与进程残留风险**：因为 E2E 测试严重依赖 Linux Network Namespace 和路由标记，如果测试因出错或超时异常终止，残留的后台进程（如 `new_proxy` 守护进程、Python HTTP 服务）以及未释放的 `netns` 可能会导致下一次测试运行发生端口冲突或路由混乱。
+* **自动 EXIT 信号捕获 (Trap EXIT)**：在核心端到端脚本（如 [e2e_multi_client.sh](file:///home/duanxiongchun/new_proxy/script/acceptance/e2e_multi_client.sh) 和 [e2e_udp_over_quic.sh](file:///home/duanxiongchun/new_proxy/script/acceptance/e2e_udp_over_quic.sh)）的头部注册：
+  ```bash
+  trap cleanup EXIT
+  ```
+  当脚本接收到退出信号（包括正常执行完毕、异常出错崩溃或因超时被 `timeout` 强制杀掉），操作系统会立即调用 `cleanup` 函数：
+  1. 依次向记录的后台服务进程 PID（`SERVER_PID`, `CLIENT_PID`, `HTTP_PID` 等）发送 `SIGTERM`，并在 1 秒后发送 `SIGKILL` 强杀。
+  2. 自动清理本次测试创建的所有 Network Namespaces（如 `scale_client_ns`, `scale_server_ns` 等），确保测试物理环境在任何情况下都能 100% 干净回滚。
+

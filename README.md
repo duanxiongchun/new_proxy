@@ -4,9 +4,11 @@
 
 ## 主要功能
 
+- **物理双数据面后端**：同时支持标准 Linux 多队列 TUN 设备以及先进的 eBPF 驱动级 **AF_XDP 零拷贝内核旁路数据面**，实现高效率的数据转发。
 - **纯 L3 隧道数据面**：摒弃用户态 SOCKS/TCP 流代理，采用 IP-over-QUIC Datagram 方式，无需任何用户态 SOCKS、WireGuard (boringtun) 或 TCP/IP 协议栈 (smoltcp)，纯粹在 IP 层高速透传。
-- **对称多队列多核心映射**：支持多物理 QUIC 数据面连接池，与多队列 TUN 设备队列一一对称绑定绑定物理 OS 线程，实现无共享状态、近线性的多核并发转发性能。
-- **操作系统自动 MSS 夹紧 (MSS Clamping)**：利用 TUN 网卡 MTU Clamping 强制内核在 TCP 握手阶段自动协商更小的 MSS 大小，防范 IP 分片并节省用户态包改写与校验和重算开销。
+- **AF_XDP 零拷贝内核旁路**：依托 eBPF 过滤程序，自动将目标流量在内核驱动层重定向至用户态共享内存环（UMEM Rings），并辅以共享二层 MAC 地址缓存、填充环批处理生产（Fill Ring Batching）以及空闲时立即 Flush 机制，突破 CPU 锁与总线屏障限制，榨干硬件转发性能。
+- **对称多队列多核心映射**：支持多物理 QUIC 数据面连接池，与多队列网卡通道（TUN/XSK）一一对称绑定物理 OS 线程，实现无共享状态、高并发的 RTC 转发流。
+- **操作系统自动 MSS 夹紧 (MSS Clamping)**：利用物理或 TUN 设备 MTU 强制内核在 TCP 握手阶段自动协商更小的 MSS 大小，防范 IP 分片并节省用户态包改写与校验和重算开销。
 - **集约化管控面单线程**：主运行时使用 `new_current_thread` 单线程调度，将 UDS CLI 服务、控制协商及 Failover 检测与高频数据工作线程进行物理隔离，避免调度开销与干扰。
 - **对等密钥认证与防重放**：复用 WireGuard 格式的密钥材料，通过 X25519 ECDH 派生共享密钥，并利用 HMAC-SHA256 签名校验和 Nonce 缓存防范控制面重放攻击。
 - **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端强校验建立可信 QUIC 数据物理连接。
@@ -83,9 +85,23 @@ target/release/new-proxy-cli
 * **`PreScript` / `pre_script`**：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
 * **`PostScript` / `post_script`**：在网关优雅退出并清理完所有路由和防火墙之后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
 
-### 纯 L3 IP-over-QUIC 数据面后端
+### 数据面后端模式 (TUN / AF_XDP)
 
-当前版本已移除了 `boringtun` (WireGuard) 和 `smoltcp`，改用纯 L3 IP-over-QUIC Datagram 异步转发。程序仍需要创建多队列 TUN 设备并配置路由，因此通常需要 root 权限或 `CAP_NET_ADMIN` 能力。
+`new_proxy` 支持两种物理数据面后端模式，可通过 `[Interface]` 部分中的 `Mode` 字段进行配置：
+
+* **TUN 模式** (`Mode = tun`，默认值)：
+  * 创建并配置 Linux 多队列 TUN 虚拟网卡设备。数据包经内核路由截获，通过异步读写 TUN FD 进行处理。
+  * 具备广泛的兼容性，支持各种通用虚拟/物理网卡和双栈网络。
+* **AF_XDP 模式** (`Mode = af_xdp`)：
+  * 使用 eBPF 驱动过滤程序将目标流量在内核驱动层直接重定向至用户态共享内存套接字（XSK），完全旁路内核 TCP/IP 协议栈。
+  * 提供零拷贝、低 CPU 损耗的极致包转发效率。需要宿主机配置 `[XDP]` 部分。
+
+#### AF_XDP 相关配置
+当 `Mode = af_xdp` 时，必须在配置文件中指定 `[XDP]` 选项段：
+* **`QuicInterface`**：指定运行外层 QUIC 加密隧道的物理/虚拟网卡接口名（如 `eth0`）。
+* **`InterceptInterfaces`**：逗号分隔的接口列表，指定需要挂载 eBPF 程序以截获本地业务流量的接口名（如 `eth0, lo`）。
+* **`XdpMode`**（`native` / `skb` / `driver`，默认 `native`）：eBPF 程序的加载模式。在虚拟测试环境（如 `veth`）或网卡不支持 native 模式时，可使用 `skb` 模式（Generic XDP）。
+
 
 ### 服务端配置
 
@@ -240,4 +256,33 @@ sudo ./script/acceptance/run_acceptance.sh
 sudo RUN_STABILITY=1 ./script/acceptance/run_acceptance.sh
 ```
 
-最新测试结果见 `doc/TEST_REPORT.md`。
+最新测试结果见 [doc/TEST_REPORT.md](file:///home/duanxiongchun/new_proxy/doc/TEST_REPORT.md)。
+
+## 性能与多核可扩展性指标
+
+在多物理核心（1..4 Cores）的并发高负载压测下，对 `new_proxy` 在 TUN 模式和 AF_XDP 模式下的吞吐性能进行了对比实测：
+
+### 1. TCP 吞吐性能 (MiB/s)
+
+| CPU 核心数 | AF_XDP 模式 (TCP) | TUN 模式 (TCP) | 相对增长率 (AF_XDP) | 线性扩展效率 |
+| :--- | :--- | :--- | :--- | :--- |
+| **1 Core** | **308.32 MiB/s** | 120.30 MiB/s | 1.00x | 100.0% |
+| **2 Cores** | **529.47 MiB/s** | 268.90 MiB/s | 1.72x | 85.9% |
+| **3 Cores** | **709.59 MiB/s** | 424.53 MiB/s | 2.30x | 76.7% |
+| **4 Cores** | **914.17 MiB/s** | 554.72 MiB/s | 2.96x | 74.1% |
+
+*   **单核突破红线**：AF_XDP 单核心吞吐达到 **308.32 MiB/s**，超越了 300 MiB/s 的设计指标。
+*   **四核极速吞吐**：AF_XDP 四核心并发吞吐达到 **914.17 MiB/s** (约合 **7.66 Gbps**)，较优化前（741.5 MiB/s）提升了 **23.3%**。
+
+### 2. UDP 吞吐性能 (MiB/s)
+
+*   **AF_XDP 模式**：1 Core = **39.43 MiB/s**，2 Cores = **86.04 MiB/s**，3 Cores = **131.77 MiB/s**，4 Cores = **175.28 MiB/s** (呈现完美的超线性扩展)。
+*   **TUN 模式**：1 Core = **39.34 MiB/s**，2 Cores = **85.71 MiB/s**，3 Cores = **131.25 MiB/s**，4 Cores = **175.86 MiB/s**。
+
+### 3. 数据面核心优化设计
+1.  **填充环批处理生产 (Fill Ring Batching)**：将归还已处理 RX 缓冲页的操作合并，在每次循环的批次结尾统一调用 `fill.produce()` 并仅执行一次物理内存屏障（Fence），有效消除了 CPU 缓存频繁失效与总线锁竞争开销。
+2.  **空闲时立即 Flush (Immediate Flush on Idle)**：当事件循环变为空闲（没有新包或 500 次空转）时，无条件立即执行 `sendto` 系统调用进行 Flush。这消除了批处理积压引起的 TCP RTT 抖动，使得单核 TCP 吞吐能够轻松跑满带宽上限。
+3.  **可扩展性深度解析**：
+    *   **TUN 超线性特征**：多物理队列绑定相互解耦，消除了单核下单个文件描述符（TUN FD）和 L1/L3 缓存抖动（Cache Eviction）的串行开销。
+    *   **AF_XDP 亚线性特征**：在虚拟机（`veth`）测试环境下由于不支持硬件 Zero-Copy，AF_XDP 以 `XDP_COPY` 模式运行，导致 SoftIRQ 软中断上下文切换与内存复制开销高昂（占 CPU 比例达 38.6%）。在近 8 Gbps 的极高吞吐下，总线带宽及 L3 缓存读写开始逼近物理硬件瓶颈。
+

@@ -925,7 +925,7 @@ async fn write_error(stream: &mut tokio::net::UnixStream, framed_response: bool,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GatewayConfig, InterfaceConfig, PeerConfig, QUICPoolConfig};
+    use crate::config::{GatewayConfig, InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
     use crate::routing::AllowedIPsRouter;
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -941,6 +941,7 @@ mod tests {
                 table: None,
                 pre_script: None,
                 post_script: None,
+                mode: "tun".to_string(),
             },
             peers: vec![PeerConfig {
                 public_key: [2u8; 32],
@@ -953,6 +954,7 @@ mod tests {
                 public_ipv6: None,
                 listen_ports: vec![],
             },
+            xdp: XdpConfig::default(),
         };
         let telemetry = Arc::new(TelemetryRegistry::new());
         let worker_telemetry = Arc::new(WorkerTelemetryRegistry::new());
