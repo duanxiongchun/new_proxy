@@ -758,7 +758,8 @@ async fn run_gateway(
             transport.min_mtu(quic_mtu);
             server_proto_config.transport_config(Arc::new(transport));
 
-            let endpoint_config = quinn_proto::EndpointConfig::default();
+            let mut endpoint_config = quinn_proto::EndpointConfig::default();
+            endpoint_config.max_udp_payload_size(65527).unwrap();
             let endpoint = quinn_proto::Endpoint::new(
                 Arc::new(endpoint_config),
                 Some(Arc::new(server_proto_config)),
@@ -999,7 +1000,8 @@ async fn run_gateway(
             let udp_socket =
                 tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
 
-            let endpoint_config = quinn_proto::EndpointConfig::default();
+            let mut endpoint_config = quinn_proto::EndpointConfig::default();
+            endpoint_config.max_udp_payload_size(65527).unwrap();
             let endpoint = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, false);
 
             let mut worker = rtc_loop::RtcWorker::new(

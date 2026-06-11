@@ -45,7 +45,22 @@ pub struct RtcWorker {
     #[cfg(target_os = "linux")]
     pub tx_batch: UdpBatch,
     pub tx_packet_run: Vec<bytes::Bytes>,
+    pub tun_rx_batch: Vec<bytes::Bytes>,
+    #[cfg(target_os = "linux")]
+    pub tx_packet_slices: Vec<SendSlicePtr>,
+    #[cfg(target_os = "linux")]
+    pub peer_transmits: std::collections::HashMap<std::net::SocketAddr, Vec<quinn_proto::Transmit>>,
+    #[cfg(target_os = "linux")]
+    pub active_handles: Vec<quinn_proto::ConnectionHandle>,
 }
+
+#[derive(Clone, Copy)]
+pub struct SendSlicePtr(pub *const [u8]);
+unsafe impl Send for SendSlicePtr {}
+unsafe impl Sync for SendSlicePtr {}
+
+unsafe impl Send for RtcWorker {}
+unsafe impl Sync for RtcWorker {}
 
 impl RtcWorker {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -87,6 +102,13 @@ impl RtcWorker {
             #[cfg(target_os = "linux")]
             tx_batch: UdpBatch::new(),
             tx_packet_run: Vec::with_capacity(64),
+            tun_rx_batch: Vec::with_capacity(128),
+            #[cfg(target_os = "linux")]
+            tx_packet_slices: Vec::with_capacity(128),
+            #[cfg(target_os = "linux")]
+            peer_transmits: std::collections::HashMap::with_capacity(8),
+            #[cfg(target_os = "linux")]
+            active_handles: Vec::with_capacity(8),
         }
     }
 
@@ -510,38 +532,6 @@ impl RtcWorker {
         }
     }
 
-    async fn handle_udp_packet(
-        &mut self,
-        data: bytes::BytesMut,
-        remote_addr: std::net::SocketAddr,
-        dp_snapshot: &crate::L4DataPlaneSnapshot,
-        now: std::time::Instant,
-        local_stats: &mut crate::telemetry::WorkerTelemetrySnapshot,
-    ) {
-        let handle_res = self.endpoint.handle(now, remote_addr, None, None, data);
-        if let Some((handle, datagram_event)) = handle_res {
-            match datagram_event {
-                quinn_proto::DatagramEvent::NewConnection(conn) => {
-                    let worker_conn = crate::quic_proto_engine::WorkerConnection {
-                        connection: conn,
-                        authenticated: false,
-                        tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
-                        rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
-                        peer_public_key: None,
-                    };
-                    self.connections.insert(handle, worker_conn);
-                }
-                quinn_proto::DatagramEvent::ConnectionEvent(conn_event) => {
-                    if let Some(conn) = self.connections.get_mut(&handle) {
-                        conn.connection.handle_event(conn_event);
-                    }
-                }
-            }
-            self.drive_connection(handle, dp_snapshot, now, local_stats)
-                .await;
-        }
-    }
-
     async fn check_and_connect_clients(&mut self, dp_snapshot: &crate::L4DataPlaneSnapshot) {
         for (&pub_key, pool) in &dp_snapshot.client_quic_pools {
             let endpoints = pool.endpoints();
@@ -590,7 +580,7 @@ impl RtcWorker {
 
     pub async fn run_loop(&mut self, data_plane: crate::L4DataPlane) -> Result<(), String> {
         let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut reload_timer = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut reload_timer = tokio::time::interval(std::time::Duration::from_secs(1));
 
         let mut local_stats = crate::telemetry::WorkerTelemetrySnapshot {
             worker_id: self.worker_id,
@@ -605,6 +595,10 @@ impl RtcWorker {
         }
 
         let mut tun_buf = bytes::BytesMut::with_capacity(256 * 1024);
+        #[cfg(target_os = "linux")]
+        let recv_packet_size = 1600;
+        #[cfg(target_os = "linux")]
+        let mut udp_recv_buf = bytes::BytesMut::with_capacity(UDP_BATCH_SIZE * recv_packet_size);
         #[cfg(not(target_os = "linux"))]
         let mut udp_buf = bytes::BytesMut::with_capacity(256 * 1024);
 
@@ -644,12 +638,14 @@ impl RtcWorker {
             }
 
             let mut processed = false;
-            if consecutive_polls < 32 {
+            if consecutive_polls < 1024 {
                 let now = std::time::Instant::now();
                 #[cfg(target_os = "linux")]
                 {
                     // A. Try reading from TUN non-blockingly
-                    match self.tun_io.try_read(&mut tun_buf[1..65536]) {
+                    let tun_res = self.tun_io.try_read(&mut tun_buf[1..65536]);
+
+                    match tun_res {
                         Ok(Some(n)) if n > 0 => {
                             processed = true;
                             local_stats.tun_rx_packets += 1;
@@ -659,10 +655,10 @@ impl RtcWorker {
                                 tun_buf.set_len(1 + n);
                             }
                             let first_frame = tun_buf.split_to(1 + n).freeze();
-                            let mut batch = Vec::with_capacity(64);
-                            batch.push(first_frame);
+                            self.tun_rx_batch.clear();
+                            self.tun_rx_batch.push(first_frame);
 
-                            for _ in 0..63 {
+                            for _ in 0..127 {
                                 if tun_buf.capacity() < 65536 {
                                     tun_buf.reserve(256 * 1024);
                                 }
@@ -679,7 +675,7 @@ impl RtcWorker {
                                             tun_buf.set_len(1 + n_next);
                                         }
                                         let frame = tun_buf.split_to(1 + n_next).freeze();
-                                        batch.push(frame);
+                                        self.tun_rx_batch.push(frame);
                                     }
                                     _ => {
                                         break;
@@ -688,17 +684,19 @@ impl RtcWorker {
                             }
                             tun_buf.truncate(0);
 
+                            let mut batch = std::mem::take(&mut self.tun_rx_batch);
+
                             self.tx_packet_run.clear();
                             let mut current_handle: Option<quinn_proto::ConnectionHandle> = None;
 
-                            for packet in batch {
+                            for packet in &batch {
                                 if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
                                     if let Some(handle) =
                                         self.find_handle_for_ip(dst_ip, &dp_snapshot)
                                     {
                                         if let Some(curr) = current_handle {
                                             if curr == handle {
-                                                self.tx_packet_run.push(packet);
+                                                self.tx_packet_run.push(packet.clone());
                                             } else {
                                                 let mut packets =
                                                     std::mem::take(&mut self.tx_packet_run);
@@ -713,11 +711,11 @@ impl RtcWorker {
                                                 packets.clear();
                                                 self.tx_packet_run = packets;
                                                 current_handle = Some(handle);
-                                                self.tx_packet_run.push(packet);
+                                                self.tx_packet_run.push(packet.clone());
                                             }
                                         } else {
                                             current_handle = Some(handle);
-                                            self.tx_packet_run.push(packet);
+                                            self.tx_packet_run.push(packet.clone());
                                         }
                                     }
                                 }
@@ -737,46 +735,50 @@ impl RtcWorker {
                             }
                             self.tx_packet_run.clear();
 
-                            self.process_endpoint_transmits().await;
+                            batch.clear();
+                            self.tun_rx_batch = batch;
                         }
                         _ => {}
                     }
 
                     // B. Try reading from UDP non-blockingly
-                    let recv_packet_size = self.packet_buffer_size + 512;
-                    let mut batch_buf =
-                        bytes::BytesMut::with_capacity(UDP_BATCH_SIZE * recv_packet_size);
-                    unsafe {
-                        batch_buf.set_len(UDP_BATCH_SIZE * recv_packet_size);
-                    }
                     let fd = self.udp_socket.as_raw_fd();
+                    let udp_batch = &mut self.udp_batch;
 
                     let res = self.udp_socket.try_io(Interest::READABLE, || {
+                        let mut batch_buf = std::mem::take(&mut udp_recv_buf);
+                        batch_buf.truncate(0);
+                        if batch_buf.capacity() < UDP_BATCH_SIZE * recv_packet_size {
+                            batch_buf.reserve(UDP_BATCH_SIZE * recv_packet_size);
+                        }
+                        unsafe {
+                            batch_buf.set_len(UDP_BATCH_SIZE * recv_packet_size);
+                        }
                         for i in 0..UDP_BATCH_SIZE {
-                            self.udp_batch.iovs[i].iov_base = unsafe {
+                            udp_batch.iovs[i].iov_base = unsafe {
                                 batch_buf.as_mut_ptr().add(i * recv_packet_size)
                                     as *mut libc::c_void
                             };
-                            self.udp_batch.iovs[i].iov_len = recv_packet_size as libc::size_t;
+                            udp_batch.iovs[i].iov_len = recv_packet_size as libc::size_t;
 
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_name = &mut self.udp_batch.addrs[i]
+                            udp_batch.mmsgs[i].msg_hdr.msg_name = &mut udp_batch.addrs[i]
                                 as *mut libc::sockaddr_storage
                                 as *mut libc::c_void;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_namelen =
+                            udp_batch.mmsgs[i].msg_hdr.msg_namelen =
                                 std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_iov =
-                                &mut self.udp_batch.iovs[i] as *mut libc::iovec;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_iovlen = 1;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_controllen = 0;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_flags = 0;
-                            self.udp_batch.mmsgs[i].msg_len = 0;
+                            udp_batch.mmsgs[i].msg_hdr.msg_iov =
+                                &mut udp_batch.iovs[i] as *mut libc::iovec;
+                            udp_batch.mmsgs[i].msg_hdr.msg_iovlen = 1;
+                            udp_batch.mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
+                            udp_batch.mmsgs[i].msg_hdr.msg_controllen = 0;
+                            udp_batch.mmsgs[i].msg_hdr.msg_flags = 0;
+                            udp_batch.mmsgs[i].msg_len = 0;
                         }
 
                         let count = unsafe {
                             libc::recvmmsg(
                                 fd,
-                                self.udp_batch.mmsgs.as_mut_ptr(),
+                                udp_batch.mmsgs.as_mut_ptr(),
                                 UDP_BATCH_SIZE as libc::c_uint,
                                 libc::MSG_DONTWAIT,
                                 std::ptr::null_mut(),
@@ -784,15 +786,18 @@ impl RtcWorker {
                         };
 
                         if count < 0 {
-                            return Err(std::io::Error::last_os_error());
+                            let err = std::io::Error::last_os_error();
+                            udp_recv_buf = batch_buf;
+                            return Err(err);
                         }
-                        Ok(count as usize)
+                        Ok((count as usize, batch_buf))
                     });
 
                     match res {
-                        Ok(count) if count > 0 => {
+                        Ok((count, batch_buf)) if count > 0 => {
                             processed = true;
                             let mut remaining = batch_buf;
+                            self.active_handles.clear();
                             for i in 0..count {
                                 let len = self.udp_batch.mmsgs[i].msg_len as usize;
                                 let mut packet_chunk = remaining.split_to(recv_packet_size);
@@ -802,14 +807,39 @@ impl RtcWorker {
                                     if let Some(remote_addr) =
                                         sockaddr_to_socket_addr(&self.udp_batch.addrs[i], namelen)
                                     {
-                                        self.handle_udp_packet(
-                                            packet_chunk,
-                                            remote_addr,
-                                            &dp_snapshot,
+                                        let handle_res = self.endpoint.handle(
                                             now,
-                                            &mut local_stats,
-                                        )
-                                        .await;
+                                            remote_addr,
+                                            None,
+                                            None,
+                                            packet_chunk,
+                                        );
+                                        if let Some((handle, datagram_event)) = handle_res {
+                                            match datagram_event {
+                                                quinn_proto::DatagramEvent::NewConnection(conn) => {
+                                                    let worker_conn = crate::quic_proto_engine::WorkerConnection {
+                                                        connection: conn,
+                                                        authenticated: false,
+                                                        tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                                                        rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                                                        peer_public_key: None,
+                                                    };
+                                                    self.connections.insert(handle, worker_conn);
+                                                }
+                                                quinn_proto::DatagramEvent::ConnectionEvent(
+                                                    conn_event,
+                                                ) => {
+                                                    if let Some(conn) =
+                                                        self.connections.get_mut(&handle)
+                                                    {
+                                                        conn.connection.handle_event(conn_event);
+                                                    }
+                                                }
+                                            }
+                                            if !self.active_handles.contains(&handle) {
+                                                self.active_handles.push(handle);
+                                            }
+                                        }
                                     } else {
                                         log::warn!(
                                             "sockaddr_to_socket_addr failed: namelen={}",
@@ -818,9 +848,19 @@ impl RtcWorker {
                                     }
                                 }
                             }
-                            self.process_endpoint_transmits().await;
+                            for handle in std::mem::take(&mut self.active_handles) {
+                                self.drive_connection(handle, &dp_snapshot, now, &mut local_stats)
+                                    .await;
+                            }
+                            udp_recv_buf = remaining;
+                        }
+                        Ok((_, batch_buf)) => {
+                            udp_recv_buf = batch_buf;
                         }
                         _ => {}
+                    }
+                    if processed {
+                        self.process_endpoint_transmits().await;
                     }
                 }
 
@@ -981,7 +1021,7 @@ impl RtcWorker {
                                     #[cfg(target_os = "linux")]
                                     {
                                         let now = std::time::Instant::now();
-                                        let mut batch = Vec::with_capacity(64);
+                                        self.tun_rx_batch.clear();
 
                                         local_stats.tun_rx_packets += 1;
                                         local_stats.tun_rx_bytes += n as u64;
@@ -993,9 +1033,9 @@ impl RtcWorker {
                                             tun_buf.set_len(1 + n);
                                         }
                                         let first_frame = tun_buf.split_to(1 + n).freeze();
-                                        batch.push(first_frame);
+                                        self.tun_rx_batch.push(first_frame);
 
-                                        for _ in 0..63 {
+                                        for _ in 0..127 {
                                             if tun_buf.capacity() < 65536 {
                                                 tun_buf.reserve(256 * 1024);
                                             }
@@ -1018,7 +1058,7 @@ impl RtcWorker {
                                                         tun_buf.set_len(1 + n_next);
                                                     }
                                                     let frame = tun_buf.split_to(1 + n_next).freeze();
-                                                    batch.push(frame);
+                                                    self.tun_rx_batch.push(frame);
                                                 }
                                                 _ => {
                                                     break;
@@ -1027,26 +1067,28 @@ impl RtcWorker {
                                         }
                                         tun_buf.truncate(0);
 
+                                        let mut batch = std::mem::take(&mut self.tun_rx_batch);
+
                                          self.tx_packet_run.clear();
                                          let mut current_handle: Option<quinn_proto::ConnectionHandle> = None;
 
-                                         for packet in batch {
+                                         for packet in &batch {
                                              if let Some(dst_ip) = parse_destination_ip(&packet[1..]) {
                                                  if let Some(handle) = self.find_handle_for_ip(dst_ip, &dp_snapshot) {
                                                      if let Some(curr) = current_handle {
                                                          if curr == handle {
-                                                             self.tx_packet_run.push(packet);
+                                                             self.tx_packet_run.push(packet.clone());
                                                          } else {
                                                              let mut packets = std::mem::take(&mut self.tx_packet_run);
                                                              self.send_batch_to_connection(curr, &packets, &mut local_stats, now, &dp_snapshot).await;
                                                              packets.clear();
                                                              self.tx_packet_run = packets;
                                                              current_handle = Some(handle);
-                                                             self.tx_packet_run.push(packet);
+                                                             self.tx_packet_run.push(packet.clone());
                                                          }
                                                      } else {
                                                          current_handle = Some(handle);
-                                                         self.tx_packet_run.push(packet);
+                                                         self.tx_packet_run.push(packet.clone());
                                                      }
                                                  }
                                              }
@@ -1058,6 +1100,9 @@ impl RtcWorker {
                                              self.tx_packet_run = packets;
                                          }
                                          self.tx_packet_run.clear();
+
+                                         batch.clear();
+                                         self.tun_rx_batch = batch;
 
                                         self.process_endpoint_transmits().await;
                                     }
@@ -1206,33 +1251,37 @@ impl RtcWorker {
             #[cfg(target_os = "linux")]
             run_select! {
                 _ = self.udp_socket.readable() => {
-                    let recv_packet_size = self.packet_buffer_size + 512;
-                    let mut batch_buf = bytes::BytesMut::with_capacity(UDP_BATCH_SIZE * recv_packet_size);
-                    // SAFETY: The flat buffer is set to capacity to allow slicing it for recv.
-                    // The uninitialized bytes are never read before they are written by the OS kernel.
-                    unsafe { batch_buf.set_len(UDP_BATCH_SIZE * recv_packet_size); }
                     let fd = self.udp_socket.as_raw_fd();
+                    let udp_batch = &mut self.udp_batch;
 
                     let res = self.udp_socket.try_io(Interest::READABLE, || {
+                        let mut batch_buf = std::mem::take(&mut udp_recv_buf);
+                        batch_buf.truncate(0);
+                        if batch_buf.capacity() < UDP_BATCH_SIZE * recv_packet_size {
+                            batch_buf.reserve(UDP_BATCH_SIZE * recv_packet_size);
+                        }
+                        // SAFETY: The flat buffer is set to capacity to allow slicing it for recv.
+                        // The uninitialized bytes are never read before they are written by the OS kernel.
+                        unsafe { batch_buf.set_len(UDP_BATCH_SIZE * recv_packet_size); }
                         for i in 0..UDP_BATCH_SIZE {
                             let offset = i * recv_packet_size;
-                            self.udp_batch.iovs[i].iov_base = unsafe { batch_buf.as_mut_ptr().add(offset) as *mut libc::c_void };
-                            self.udp_batch.iovs[i].iov_len = recv_packet_size as libc::size_t;
+                            udp_batch.iovs[i].iov_base = unsafe { batch_buf.as_mut_ptr().add(offset) as *mut libc::c_void };
+                            udp_batch.iovs[i].iov_len = recv_packet_size as libc::size_t;
 
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_name = &mut self.udp_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_iov = &mut self.udp_batch.iovs[i] as *mut libc::iovec;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_iovlen = 1;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_controllen = 0;
-                            self.udp_batch.mmsgs[i].msg_hdr.msg_flags = 0;
-                            self.udp_batch.mmsgs[i].msg_len = 0;
+                            udp_batch.mmsgs[i].msg_hdr.msg_name = &mut udp_batch.addrs[i] as *mut libc::sockaddr_storage as *mut libc::c_void;
+                            udp_batch.mmsgs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                            udp_batch.mmsgs[i].msg_hdr.msg_iov = &mut udp_batch.iovs[i] as *mut libc::iovec;
+                            udp_batch.mmsgs[i].msg_hdr.msg_iovlen = 1;
+                            udp_batch.mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
+                            udp_batch.mmsgs[i].msg_hdr.msg_controllen = 0;
+                            udp_batch.mmsgs[i].msg_hdr.msg_flags = 0;
+                            udp_batch.mmsgs[i].msg_len = 0;
                         }
 
                         let count = unsafe {
                             libc::recvmmsg(
                                 fd,
-                                self.udp_batch.mmsgs.as_mut_ptr(),
+                                udp_batch.mmsgs.as_mut_ptr(),
                                 UDP_BATCH_SIZE as libc::c_uint,
                                 libc::MSG_DONTWAIT,
                                 std::ptr::null_mut(),
@@ -1240,15 +1289,18 @@ impl RtcWorker {
                         };
 
                         if count < 0 {
-                            return Err(std::io::Error::last_os_error());
+                            let err = std::io::Error::last_os_error();
+                            udp_recv_buf = batch_buf;
+                            return Err(err);
                         }
-                        Ok(count as usize)
+                        Ok((count as usize, batch_buf))
                     });
 
-                     match res {
-                        Ok(count) if count > 0 => {
+                    match res {
+                        Ok((count, batch_buf)) if count > 0 => {
                             let now = std::time::Instant::now();
                             let mut remaining = batch_buf;
+                            self.active_handles.clear();
                             for i in 0..count {
                                 let len = self.udp_batch.mmsgs[i].msg_len as usize;
                                 let mut packet_chunk = remaining.split_to(recv_packet_size);
@@ -1256,19 +1308,47 @@ impl RtcWorker {
                                     packet_chunk.truncate(len);
                                     let namelen = self.udp_batch.mmsgs[i].msg_hdr.msg_namelen;
                                     if let Some(remote_addr) = sockaddr_to_socket_addr(&self.udp_batch.addrs[i], namelen) {
-                                        self.handle_udp_packet(packet_chunk, remote_addr, &dp_snapshot, now, &mut local_stats).await;
+                                        let handle_res = self.endpoint.handle(now, remote_addr, None, None, packet_chunk);
+                                        if let Some((handle, datagram_event)) = handle_res {
+                                            match datagram_event {
+                                                quinn_proto::DatagramEvent::NewConnection(conn) => {
+                                                    let worker_conn = crate::quic_proto_engine::WorkerConnection {
+                                                        connection: conn,
+                                                        authenticated: false,
+                                                        tx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                                                        rx_bytes: Arc::new(crate::telemetry::CellU64::new(0)),
+                                                        peer_public_key: None,
+                                                    };
+                                                    self.connections.insert(handle, worker_conn);
+                                                }
+                                                quinn_proto::DatagramEvent::ConnectionEvent(conn_event) => {
+                                                    if let Some(conn) = self.connections.get_mut(&handle) {
+                                                        conn.connection.handle_event(conn_event);
+                                                    }
+                                                }
+                                            }
+                                            if !self.active_handles.contains(&handle) {
+                                                self.active_handles.push(handle);
+                                            }
+                                        }
                                     } else {
                                         log::warn!("sockaddr_to_socket_addr failed: namelen={}", namelen);
                                     }
                                 }
                             }
+                            for handle in std::mem::take(&mut self.active_handles) {
+                                self.drive_connection(handle, &dp_snapshot, now, &mut local_stats).await;
+                            }
                             self.process_endpoint_transmits().await;
+                            udp_recv_buf = remaining;
+                        }
+                        Ok((_, batch_buf)) => {
+                            udp_recv_buf = batch_buf;
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             log::warn!("UDP recvmmsg error: {:?}", e);
                         }
-                        _ => {}
                     }
                 }
             }
@@ -1339,23 +1419,28 @@ impl RtcWorker {
             return;
         }
 
-        let mut packets = Vec::new();
+        self.tx_packet_slices.clear();
         for transmit in transmits {
             if let Some(seg_size) = transmit.segment_size {
                 for chunk in transmit.contents.chunks(seg_size) {
-                    packets.push(chunk);
+                    self.tx_packet_slices
+                        .push(SendSlicePtr(chunk as *const [u8]));
                 }
             } else {
-                packets.push(&transmit.contents[..]);
+                self.tx_packet_slices
+                    .push(SendSlicePtr(&transmit.contents[..] as *const [u8]));
             }
         }
 
         let fd = self.udp_socket.as_raw_fd();
         let tx_batch = &mut self.tx_batch;
         // We chunk packets into sizes of UDP_BATCH_SIZE
-        for chunk in packets.chunks(UDP_BATCH_SIZE) {
+        for chunk in self.tx_packet_slices.chunks(UDP_BATCH_SIZE) {
             let count = chunk.len();
-            for (i, pkt) in chunk.iter().enumerate() {
+            for (i, pkt_ptr) in chunk.iter().enumerate() {
+                // SAFETY: pkt_ptr is a valid raw pointer to a slice whose lifetime is valid
+                // for the duration of this function call.
+                let pkt = unsafe { &*pkt_ptr.0 };
                 tx_batch.iovs[i].iov_base = pkt.as_ptr() as *mut libc::c_void;
                 tx_batch.iovs[i].iov_len = pkt.len() as libc::size_t;
 
@@ -1392,17 +1477,28 @@ impl RtcWorker {
                 Ok(sent) => {
                     if sent < count {
                         // Fallback for unsent packets in the batch
-                        for pkt in &chunk[sent..] {
-                            if let Err(e) = self.udp_socket.send_to(pkt, dest).await {
+                        // Copy unsent slices to owned Send bytes to avoid non-Send pointers crossing await.
+                        let mut fallback_packets = Vec::with_capacity(count - sent);
+                        for pkt_ptr in &chunk[sent..] {
+                            let pkt = unsafe { &*pkt_ptr.0 };
+                            fallback_packets.push(bytes::Bytes::copy_from_slice(pkt));
+                        }
+                        for pkt in fallback_packets {
+                            if let Err(e) = self.udp_socket.send_to(&pkt, dest).await {
                                 log::warn!("Failed to send UDP transmit fallback packet: {}", e);
                             }
                         }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Fallback blockingly or await writable
-                    for pkt in chunk {
-                        if let Err(e) = self.udp_socket.send_to(pkt, dest).await {
+                    // Fallback asynchronously by copying slices to Send bytes to avoid non-Send pointers crossing await.
+                    let mut fallback_packets = Vec::with_capacity(count);
+                    for pkt_ptr in chunk {
+                        let pkt = unsafe { &*pkt_ptr.0 };
+                        fallback_packets.push(bytes::Bytes::copy_from_slice(pkt));
+                    }
+                    for pkt in fallback_packets {
+                        if let Err(e) = self.udp_socket.send_to(&pkt, dest).await {
                             log::warn!("Failed to send UDP transmit fallback packet: {}", e);
                         }
                     }
@@ -1416,11 +1512,9 @@ impl RtcWorker {
 
     async fn process_endpoint_transmits(&mut self) {
         let now = std::time::Instant::now();
-        // Group transmits by destination SocketAddr
-        let mut peer_transmits: std::collections::HashMap<
-            std::net::SocketAddr,
-            Vec<quinn_proto::Transmit>,
-        > = std::collections::HashMap::new();
+        // Group transmits by destination SocketAddr using preallocated HashMap
+        let mut peer_transmits = std::mem::take(&mut self.peer_transmits);
+        peer_transmits.clear();
 
         // 1. Poll endpoint-level transmits
         while let Some(transmit) = self.endpoint.poll_transmit() {
@@ -1441,9 +1535,12 @@ impl RtcWorker {
         }
 
         // 3. Batch send per peer
-        for (dest, transmits) in peer_transmits {
-            self.send_transmits_for_peer(dest, &transmits).await;
+        for (dest, transmits) in &peer_transmits {
+            self.send_transmits_for_peer(*dest, transmits).await;
         }
+
+        // 4. Restore the preallocated HashMap to self
+        self.peer_transmits = peer_transmits;
     }
 }
 
@@ -1458,9 +1555,22 @@ impl RtcWorker {
 ///
 /// We add 100 bytes of headroom to be safe.
 pub fn quic_initial_mtu_for_packet_buffer(packet_buffer_size: usize) -> u16 {
-    // QUIC minimum MTU is 1200; we need at least packet_buffer_size + overhead
-    let required = packet_buffer_size as u16 + 100;
-    required.max(1200)
+    // Prevent IP fragmentation by capping the initial MTU to fit within 1500-byte physical MTU.
+    // Specifically, for 1420 TUN MTU, the packet buffer size is 1420 + 256 = 1676.
+    // The maximum datagram size we actually send is 1421 bytes.
+    // With ~35-45 bytes QUIC/UDP/IP overhead, this fits perfectly in a 1450-byte QUIC MTU
+    // without causing IP fragmentation (which would occur if QUIC MTU > 1472).
+    if packet_buffer_size >= 256 {
+        let tun_mtu = packet_buffer_size - 256;
+        let required = tun_mtu + 45;
+        if tun_mtu <= 1420 {
+            (required as u16).clamp(1200, 1470)
+        } else {
+            (required as u16).max(1200)
+        }
+    } else {
+        (packet_buffer_size as u16 + 100).max(1200)
+    }
 }
 
 fn build_client_proto_config(
@@ -1512,7 +1622,7 @@ fn parse_destination_ip(packet: &[u8]) -> Option<IpAddr> {
 }
 
 #[cfg(target_os = "linux")]
-pub const UDP_BATCH_SIZE: usize = 64;
+pub const UDP_BATCH_SIZE: usize = 128;
 
 #[cfg(target_os = "linux")]
 pub struct UdpBatch {

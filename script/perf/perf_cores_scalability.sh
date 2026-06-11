@@ -200,29 +200,35 @@ ip link set vs-w netns scale_work_ns
 ip link set vs-cw netns scale_client_ns
 
 ip netns exec scale_server_ns ip addr add 10.0.2.2/24 dev vs-s
-ip netns exec scale_server_ns ip link set vs-s up
+ip netns exec scale_server_ns ip link set vs-s up txqueuelen 10000
 ip netns exec scale_server_ns ip link set lo up
 ip netns exec scale_server_ns ip route add default via 10.0.2.1
 
 ip netns exec scale_client_ns ip addr add 10.0.1.2/24 dev vs-c
 ip netns exec scale_client_ns ip addr add 10.0.4.1/24 dev vs-cw
-ip netns exec scale_client_ns ip link set vs-c up
-ip netns exec scale_client_ns ip link set vs-cw up
+ip netns exec scale_client_ns ip link set vs-c up txqueuelen 10000
+ip netns exec scale_client_ns ip link set vs-cw up txqueuelen 10000
 ip netns exec scale_client_ns ip link set lo up
 ip netns exec scale_client_ns ip route add default via 10.0.1.1
 ip netns exec scale_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 ip netns exec scale_work_ns ip addr add 10.0.4.2/24 dev vs-w
-ip netns exec scale_work_ns ip link set vs-w up
+ip netns exec scale_work_ns ip link set vs-w up txqueuelen 10000
 ip netns exec scale_work_ns ip link set lo up
 ip netns exec scale_work_ns ip route add default via 10.0.4.1
 
 ip netns exec scale_router_ns ip addr add 10.0.2.1/24 dev vs-rs
 ip netns exec scale_router_ns ip addr add 10.0.1.1/24 dev vs-rc
-ip netns exec scale_router_ns ip link set vs-rs up
-ip netns exec scale_router_ns ip link set vs-rc up
+ip netns exec scale_router_ns ip link set vs-rs up txqueuelen 10000
+ip netns exec scale_router_ns ip link set vs-rc up txqueuelen 10000
 ip netns exec scale_router_ns ip link set lo up
 ip netns exec scale_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
+for ns in scale_server_ns scale_router_ns scale_client_ns scale_work_ns; do
+  ip netns exec $ns sysctl -w net.core.rmem_max=16777216 >/dev/null
+  ip netns exec $ns sysctl -w net.core.wmem_max=16777216 >/dev/null
+  ip netns exec $ns sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" >/dev/null
+  ip netns exec $ns sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" >/dev/null
+done
 ip netns exec scale_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec scale_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 

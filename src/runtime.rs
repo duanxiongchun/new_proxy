@@ -191,6 +191,8 @@ fn setup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<Com
             "up".to_string(),
             "mtu".to_string(),
             config.interface.mtu.to_string(),
+            "txqueuelen".to_string(),
+            "10000".to_string(),
         ],
     ));
 
@@ -538,10 +540,19 @@ mod tests {
                 ),
                 CommandSpec::new(
                     "ip",
-                    vec!["link", "set", "np0", "up", "mtu", "1280"]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
+                    vec![
+                        "link",
+                        "set",
+                        "np0",
+                        "up",
+                        "mtu",
+                        "1280",
+                        "txqueuelen",
+                        "10000"
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
                 ),
                 CommandSpec::new(
                     "ip",
