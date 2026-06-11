@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use arc_swap::ArcSwap;
 
@@ -32,15 +33,18 @@ impl Drop for FdsGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct WorkerPanicGuard {
     exit_notify: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for WorkerPanicGuard {
     fn drop(&mut self) {
         self.exit_notify.notify_one();
     }
 }
+
 
 #[allow(dead_code)]
 pub struct XdpDatapath {
@@ -150,6 +154,54 @@ impl Drop for XskSetup {
 unsafe impl Send for XskSetup {}
 #[cfg(target_os = "linux")]
 unsafe impl Sync for XskSetup {}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct XskRing {
+    pub producer: *mut u32,
+    pub consumer: *mut u32,
+    pub desc: *mut u8,
+    pub mask: u32,
+    pub size: u32,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for XskRing {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for XskRing {}
+
+#[cfg(target_os = "linux")]
+impl XskRing {
+    /// # Safety
+    ///
+    /// The caller must ensure that the producer and consumer pointers are valid and aligned.
+    pub unsafe fn free_slots(&self) -> u32 {
+        let prod = std::ptr::read_volatile(self.producer);
+        let cons = std::ptr::read_volatile(self.consumer);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        self.size - (prod.wrapping_sub(cons))
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the desc pointer is valid, aligned, and points to a buffer
+    /// of at least size `(idx & mask) + 1` elements.
+    pub unsafe fn write_fill_addr(&mut self, idx: u32, addr: u64) {
+        let offset_ptr = (self.desc as *mut u64).offset((idx & self.mask) as isize);
+        std::ptr::write_volatile(offset_ptr, addr);
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the producer pointer is valid and aligned.
+    pub unsafe fn produce(&mut self, cnt: u32) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        let prod = std::ptr::read_volatile(self.producer);
+        std::ptr::write_volatile(self.producer, prod.wrapping_add(cnt));
+    }
+}
+
+
 
 #[cfg(target_os = "linux")]
 fn get_interface_queue_count(ifindex: u32) -> usize {
@@ -576,7 +628,8 @@ impl Datapath for XdpDatapath {
             };
 
             let mut worker_preps = Vec::new();
-            for (worker_id, &fd) in fd_guard.fds.clone().iter().enumerate() {
+            for worker_id in 0..fd_guard.fds.len() {
+                let fd = fd_guard.fds[worker_id];
                 let tun_io = Arc::new(match crate::tun_io::AsyncTunIo::new(fd) {
                     Ok(io) => {
                         fd_guard.fds[worker_id] = -1;
@@ -757,7 +810,8 @@ impl Datapath for XdpDatapath {
             let setup = setup_xsk_sockets(self.quic_ifindex, &self.intercept_ifindexes, queue_count)?;
 
             let mut worker_preps = Vec::new();
-            for (worker_id, &fd) in fd_guard.fds.clone().iter().enumerate() {
+            for worker_id in 0..fd_guard.fds.len() {
+                let fd = fd_guard.fds[worker_id];
                 let tun_io = Arc::new(match crate::tun_io::AsyncTunIo::new(fd) {
                     Ok(io) => {
                         fd_guard.fds[worker_id] = -1;
@@ -953,4 +1007,30 @@ mod tests {
         );
         assert!(res.is_err());
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_ring_produce_consume() {
+        let mut producer = 0u32;
+        let mut consumer = 0u32;
+        let mut descs = vec![0u64; 16];
+        
+        let mut ring = XskRing {
+            producer: &mut producer as *mut u32,
+            consumer: &mut consumer as *mut u32,
+            desc: descs.as_mut_ptr() as *mut u8,
+            mask: 15,
+            size: 16,
+        };
+
+        unsafe {
+            assert_eq!(ring.free_slots(), 16);
+            ring.write_fill_addr(0, 0x1000);
+            ring.write_fill_addr(1, 0x2000);
+            ring.produce(2);
+            assert_eq!(ring.free_slots(), 14);
+            assert_eq!(*ring.producer, 2);
+        }
+    }
 }
+
