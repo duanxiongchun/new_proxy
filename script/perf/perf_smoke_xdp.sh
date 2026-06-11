@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root / using sudo."
+  exit 1
+fi
+
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$ROOT_DIR/script/acceptance/test_key_material.sh"
+ARTIFACT_DIR="${PERF_SMOKE_ARTIFACT_DIR:-/tmp/new_proxy_perf_smoke_$(date +%Y%m%d_%H%M%S)}"
+mkdir -p "$ARTIFACT_DIR"
+
+if [ ! -x "$ROOT_DIR/target/release/new_proxy" ] || [ ! -x "$ROOT_DIR/target/release/new-proxy-cli" ]; then
+  echo "Missing release binaries. Run: cargo build --release --bins" >&2
+  exit 1
+fi
+
+SERVER_PID=""
+CLIENT_PID=""
+HTTP_PID=""
+
+cleanup() {
+  set +e
+  for pid in "$CLIENT_PID" "$SERVER_PID" "$HTTP_PID"; do
+    if [ -n "${pid:-}" ]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  for pid in "$CLIENT_PID" "$SERVER_PID" "$HTTP_PID"; do
+    if [ -n "${pid:-}" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  ip netns delete perf_server_ns 2>/dev/null || true
+  ip netns delete perf_router_ns 2>/dev/null || true
+  ip netns delete perf_client_ns 2>/dev/null || true
+  ip netns delete perf_work_ns 2>/dev/null || true
+}
+trap cleanup EXIT
+
+cleanup
+
+mkdir -p /dev/net
+if [ ! -e /dev/net/tun ]; then
+  mknod /dev/net/tun c 10 200
+fi
+chmod 666 /dev/net/tun
+
+export RUST_LOG=debug
+
+cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
+[Interface]
+PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
+Address = 10.0.0.1/24
+ListenPort = 51820
+ListenControlPort = 51821
+MTU = 1280
+Table = auto
+Mode = af_xdp
+
+[QUICPool]
+PublicIPv4 = 10.0.2.2
+ListenPorts = 40001, 40002, 40003, 40004
+
+[Peer]
+PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
+AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
+
+[XDP]
+QuicInterface = vp-s
+InterceptInterfaces = vp-s, lo
+XdpMode = native
+EOF_CONF
+
+cat > "$ARTIFACT_DIR/client_perf.conf" <<EOF_CONF
+[Interface]
+PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
+Address = 10.0.0.2/24
+MTU = 1280
+Table = auto
+Mode = af_xdp
+
+[Peer]
+PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
+Endpoint = 10.0.2.2:51820
+ProxyPort = 51821
+AllowedIPs = 10.0.0.1/32
+
+[XDP]
+QuicInterface = vp-c
+InterceptInterfaces = vp-c, vp-c-w, lo
+XdpMode = native
+EOF_CONF
+
+
+ip netns add perf_server_ns
+ip netns add perf_router_ns
+ip netns add perf_client_ns
+ip netns add perf_work_ns
+
+ip link add vp-s type veth peer name vp-rs
+ip link set vp-s netns perf_server_ns
+ip link set vp-rs netns perf_router_ns
+ip link add vp-c type veth peer name vp-rc
+ip link set vp-c netns perf_client_ns
+ip link set vp-rc netns perf_router_ns
+ip link add vp-w type veth peer name vp-c-w
+ip link set vp-w netns perf_work_ns
+ip link set vp-c-w netns perf_client_ns
+
+ip netns exec perf_server_ns ip addr add 10.0.2.2/24 dev vp-s
+ip netns exec perf_server_ns ip link set vp-s up
+ip netns exec perf_server_ns ip link set lo up
+ip netns exec perf_server_ns ip route add default via 10.0.2.1
+
+ip netns exec perf_client_ns ip addr add 10.0.1.2/24 dev vp-c
+ip netns exec perf_client_ns ip addr add 10.0.4.1/24 dev vp-c-w
+ip netns exec perf_client_ns ip addr add 10.0.0.2/32 dev lo
+ip netns exec perf_client_ns ip link set vp-c up
+ip netns exec perf_client_ns ip link set vp-c-w up
+ip netns exec perf_client_ns ip link set lo up
+ip netns exec perf_client_ns ip route add default via 10.0.1.1
+ip netns exec perf_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+ip netns exec perf_work_ns ip addr add 10.0.4.2/24 dev vp-w
+ip netns exec perf_work_ns ip link set vp-w up
+ip netns exec perf_work_ns ip link set lo up
+ip netns exec perf_work_ns ip route add default via 10.0.4.1
+
+ip netns exec perf_router_ns ip addr add 10.0.2.1/24 dev vp-rs
+ip netns exec perf_router_ns ip addr add 10.0.1.1/24 dev vp-rc
+ip netns exec perf_router_ns ip link set vp-rs up
+ip netns exec perf_router_ns ip link set vp-rc up
+ip netns exec perf_router_ns ip link set lo up
+ip netns exec perf_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
+ip netns exec perf_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
+ip netns exec perf_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
+
+dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count=8 status=none
+ip netns exec perf_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
+SERVER_PID=$!
+sleep 2
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "Server daemon exited early"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
+ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
+HTTP_PID=$!
+ip netns exec perf_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
+CLIENT_PID=$!
+sleep 3
+if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+  echo "Client daemon exited early"
+  cat "$ARTIFACT_DIR/client.log"
+  exit 1
+fi
+
+python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
+import json
+import os
+import time
+path = os.sys.argv[1]
+json.dump({"started_at": int(time.time())}, open(path, "w", encoding="utf-8"))
+PY
+
+echo "=== TTFB sample ==="
+if ! ip netns exec perf_work_ns python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
+import json
+import subprocess
+import sys
+import time
+
+out = sys.argv[1]
+samples = []
+for _ in range(20):
+    value = subprocess.check_output([
+        "curl", "-fsS", "-o", "/dev/null", "-w", "%{time_starttransfer}",
+        "--connect-timeout", "5", "--max-time", "10", "http://10.0.0.1:8080/"
+    ], text=True)
+    samples.append(float(value))
+samples.sort()
+data = json.load(open(out, encoding="utf-8"))
+data["ttfb_seconds"] = {
+    "p50": samples[len(samples)//2],
+    "p95": samples[int(len(samples)*0.95)-1],
+    "max": max(samples),
+}
+json.dump(data, open(out, "w", encoding="utf-8"), indent=2, sort_keys=True)
+print(json.dumps(data["ttfb_seconds"], sort_keys=True))
+PY
+then
+  echo "TTFB sample failed"
+  cat "$ARTIFACT_DIR/client.log"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
+
+echo "=== Throughput sample ==="
+if ! ip netns exec perf_work_ns python3 - "$ARTIFACT_DIR/perf_smoke.json" <<'PY'
+import json
+import subprocess
+import sys
+import time
+
+out = sys.argv[1]
+start = time.monotonic()
+subprocess.check_call([
+    "curl", "-fsS", "-o", "/dev/null", "--connect-timeout", "5", "--max-time", "20",
+    "http://10.0.0.1:8080/blob.bin"
+])
+elapsed = time.monotonic() - start
+size = 8 * 1024 * 1024
+data = json.load(open(out, encoding="utf-8"))
+data["throughput_mib_s"] = size / elapsed / 1024 / 1024
+json.dump(data, open(out, "w", encoding="utf-8"), indent=2, sort_keys=True)
+print(json.dumps({"throughput_mib_s": data["throughput_mib_s"]}, sort_keys=True))
+PY
+then
+  echo "Throughput sample failed"
+  cat "$ARTIFACT_DIR/client.log"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
+
+if ! ip netns exec perf_server_ns "$ROOT_DIR/target/release/new-proxy-cli" --interface server show > "$ARTIFACT_DIR/server_show.txt"; then
+  echo "Failed to query server telemetry"
+  cat "$ARTIFACT_DIR/server.log"
+  exit 1
+fi
+
+echo "Artifact directory: $ARTIFACT_DIR"
+cat "$ARTIFACT_DIR/perf_smoke.json"
+echo
+echo "✓ [SUCCESS] Perf smoke passed"

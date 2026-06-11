@@ -97,6 +97,7 @@ ListenPort = 51820
 ListenControlPort = 51821
 MTU = 1280
 Table = auto
+Mode = af_xdp
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
@@ -105,6 +106,11 @@ ListenPorts = 40001
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
 AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
+
+[XDP]
+QuicInterface = vp-s
+InterceptInterfaces = vp-s, lo
+XdpMode = native
 EOF_CONF
 
 cat > "$ARTIFACT_DIR/client.conf" <<EOF_CONF
@@ -113,12 +119,18 @@ PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
 MTU = 1280
 Table = auto
+Mode = af_xdp
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
 ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
+
+[XDP]
+QuicInterface = vp-c
+InterceptInterfaces = vp-c, vp-cw, lo
+XdpMode = native
 EOF_CONF
 
 # Start new_proxy server daemon first (creates 'server' TUN with 10.0.0.1)

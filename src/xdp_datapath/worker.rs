@@ -109,7 +109,7 @@ impl Drop for UmemRegion {
 
 #[cfg(target_os = "linux")]
 struct XskSetup {
-    _umem: UmemRegion,
+    _umems: Vec<UmemRegion>,
     sockets: Vec<libc::c_int>,
 }
 
@@ -132,10 +132,31 @@ unsafe impl Send for XskSetup {}
 unsafe impl Sync for XskSetup {}
 
 #[cfg(target_os = "linux")]
+fn get_interface_queue_count(ifindex: u32) -> usize {
+    let mut buf = [0u8; 32];
+    let name_ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr() as *mut libc::c_char) };
+    if name_ptr.is_null() {
+        return 1;
+    }
+    let ifname = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
+    let path = format!("/sys/class/net/{}/queues", ifname);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        let count = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("rx-"))
+            .count();
+        if count > 0 {
+            return count;
+        }
+    }
+    1
+}
+
+#[cfg(target_os = "linux")]
 fn setup_xsk_sockets(
     quic_ifindex: u32,
     intercept_ifindexes: &[u32],
-    queue_count: usize,
+    _queue_count: usize,
 ) -> Result<XskSetup, DatapathError> {
     use std::io;
 
@@ -146,12 +167,8 @@ fn setup_xsk_sockets(
         }
     }
 
-    // Allocate 8MB page-aligned memory for UMEM
-    let umem_size = 4096 * 2048;
-    let umem = UmemRegion::new(umem_size)?;
-
     let mut sockets = Vec::new();
-    let mut first_fd: Option<libc::c_int> = None;
+    let mut umems = Vec::new();
 
     const AF_XDP: libc::c_int = 44;
     const SOL_XDP: libc::c_int = 283;
@@ -161,20 +178,31 @@ fn setup_xsk_sockets(
     const XDP_RX_RING: libc::c_int = 2;
     const XDP_TX_RING: libc::c_int = 3;
     const XDP_SHARED_UMEM: u16 = 1;
+    const XDP_COPY: u16 = 2;
 
     for &ifindex in &ifindexes {
-        for queue_id in 0..queue_count {
+        let q_count = get_interface_queue_count(ifindex);
+        if q_count == 0 {
+            continue;
+        }
+
+        // Allocate UMEM region for this specific interface
+        let umem_size = 4096 * 2048;
+        let umem = UmemRegion::new(umem_size).map_err(|e| DatapathError::Config(format!("Failed to allocate UMEM mmap for ifindex {}: {}", ifindex, e)))?;
+        let mut first_fd_for_iface: Option<libc::c_int> = None;
+
+        for queue_id in 0..q_count {
             let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
             if fd < 0 {
                 let err = io::Error::last_os_error();
                 for &s_fd in &sockets {
                     unsafe { libc::close(s_fd); }
                 }
-                return Err(DatapathError::Io(err));
+                return Err(DatapathError::Config(format!("socket(AF_XDP) failed: {}", err)));
             }
 
-            if first_fd.is_none() {
-                // Register UMEM region on the first socket
+            if first_fd_for_iface.is_none() {
+                // Register UMEM region on the first socket of this interface
                 let umem_reg = xdp_umem_reg {
                     addr: umem.addr as u64,
                     len: umem.size as u64,
@@ -197,7 +225,7 @@ fn setup_xsk_sockets(
                     for &s_fd in &sockets {
                         unsafe { libc::close(s_fd); }
                     }
-                    return Err(DatapathError::Io(err));
+                    return Err(DatapathError::Config(format!("setsockopt(XDP_UMEM_REG) failed: {}", err)));
                 }
 
                 let ring_size: u32 = 2048;
@@ -217,13 +245,13 @@ fn setup_xsk_sockets(
                         for &s_fd in &sockets {
                             unsafe { libc::close(s_fd); }
                         }
-                        return Err(DatapathError::Io(err));
+                        return Err(DatapathError::Config(format!("setsockopt(opt={}) failed: {}", opt, err)));
                     }
                 }
 
                 let addr = sockaddr_xdp {
                     sxdp_family: AF_XDP as u16,
-                    sxdp_flags: 0,
+                    sxdp_flags: XDP_COPY,
                     sxdp_ifindex: ifindex,
                     sxdp_queue_id: queue_id as u32,
                     sxdp_shared_umem_fd: 0,
@@ -241,12 +269,12 @@ fn setup_xsk_sockets(
                     for &s_fd in &sockets {
                         unsafe { libc::close(s_fd); }
                     }
-                    return Err(DatapathError::Io(err));
+                    return Err(DatapathError::Config(format!("bind(ifindex={}, queue_id={}) failed: {}", ifindex, queue_id, err)));
                 }
 
-                first_fd = Some(fd);
+                first_fd_for_iface = Some(fd);
             } else {
-                // Secondary socket sharing UMEM
+                // Secondary socket sharing UMEM on this interface
                 let ring_size: u32 = 2048;
                 for opt in &[XDP_RX_RING, XDP_TX_RING] {
                     let ret = unsafe {
@@ -264,16 +292,16 @@ fn setup_xsk_sockets(
                         for &s_fd in &sockets {
                             unsafe { libc::close(s_fd); }
                         }
-                        return Err(DatapathError::Io(err));
+                        return Err(DatapathError::Config(format!("setsockopt(secondary opt={}) failed: {}", opt, err)));
                     }
                 }
 
                 let addr = sockaddr_xdp {
                     sxdp_family: AF_XDP as u16,
-                    sxdp_flags: XDP_SHARED_UMEM,
+                    sxdp_flags: XDP_SHARED_UMEM | XDP_COPY,
                     sxdp_ifindex: ifindex,
                     sxdp_queue_id: queue_id as u32,
-                    sxdp_shared_umem_fd: first_fd.unwrap() as u32,
+                    sxdp_shared_umem_fd: first_fd_for_iface.unwrap() as u32,
                 };
                 let ret = unsafe {
                     libc::bind(
@@ -288,15 +316,16 @@ fn setup_xsk_sockets(
                     for &s_fd in &sockets {
                         unsafe { libc::close(s_fd); }
                     }
-                    return Err(DatapathError::Io(err));
+                    return Err(DatapathError::Config(format!("bind(secondary ifindex={}, queue_id={}) failed: {}", ifindex, queue_id, err)));
                 }
             }
 
             sockets.push(fd);
         }
+        umems.push(umem);
     }
 
-    Ok(XskSetup { _umem: umem, sockets })
+    Ok(XskSetup { _umems: umems, sockets })
 }
 
 #[cfg(target_os = "linux")]
