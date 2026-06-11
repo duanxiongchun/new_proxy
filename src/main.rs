@@ -15,6 +15,7 @@ pub mod tun_device;
 pub mod tun_io;
 pub mod datapath;
 pub mod tun_datapath;
+pub mod xdp_datapath;
 use datapath::Datapath;
 use tun_datapath::TunDatapath;
 mod uds_server;
