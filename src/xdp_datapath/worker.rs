@@ -22,6 +22,7 @@ impl Drop for WorkerPanicGuard {
     }
 }
 
+#[allow(dead_code)]
 pub struct XdpDatapath {
     config: GatewayConfig,
     #[allow(dead_code)]
