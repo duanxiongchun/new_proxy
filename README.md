@@ -266,23 +266,25 @@ sudo RUN_STABILITY=1 ./script/acceptance/run_acceptance.sh
 
 | CPU 核心数 | AF_XDP 模式 (TCP) | TUN 模式 (TCP) | 相对增长率 (AF_XDP) | 线性扩展效率 |
 | :--- | :--- | :--- | :--- | :--- |
-| **1 Core** | **308.32 MiB/s** | 120.30 MiB/s | 1.00x | 100.0% |
-| **2 Cores** | **529.47 MiB/s** | 268.90 MiB/s | 1.72x | 85.9% |
-| **3 Cores** | **709.59 MiB/s** | 424.53 MiB/s | 2.30x | 76.7% |
-| **4 Cores** | **914.17 MiB/s** | 554.72 MiB/s | 2.96x | 74.1% |
+| **1 Core** | **333.04 MiB/s** | 115.69 MiB/s | 1.00x | 100.0% |
+| **2 Cores** | **534.48 MiB/s** | 298.19 MiB/s | 1.60x | 80.2% |
+| **3 Cores** | **682.42 MiB/s** | 476.72 MiB/s | 2.05x | 68.3% |
+| **4 Cores** | **969.97 MiB/s** | 639.62 MiB/s | 2.91x | 72.8% |
 
-*   **单核突破红线**：AF_XDP 单核心吞吐达到 **308.32 MiB/s**，超越了 300 MiB/s 的设计指标。
-*   **四核极速吞吐**：AF_XDP 四核心并发吞吐达到 **914.17 MiB/s** (约合 **7.66 Gbps**)，较优化前（741.5 MiB/s）提升了 **23.3%**。
+*   **单核突破红线**：AF_XDP 单核心吞吐达到 **333.04 MiB/s**，超越了 330 MiB/s 的设计指标与 300 MiB/s 红线。
+*   **四核极速吞吐**：AF_XDP 四核心并发吞吐达到 **969.97 MiB/s** (约合 **8.13 Gbps**)，较优化前（741.5 MiB/s）提升了 **30.8%**。
 
 ### 2. UDP 吞吐性能 (MiB/s)
 
-*   **AF_XDP 模式**：1 Core = **39.43 MiB/s**，2 Cores = **86.04 MiB/s**，3 Cores = **131.77 MiB/s**，4 Cores = **175.28 MiB/s** (呈现完美的超线性扩展)。
-*   **TUN 模式**：1 Core = **39.34 MiB/s**，2 Cores = **85.71 MiB/s**，3 Cores = **131.25 MiB/s**，4 Cores = **175.86 MiB/s**。
+*   **AF_XDP 模式**：1 Core = **39.35 MiB/s**，2 Cores = **85.93 MiB/s**，3 Cores = **132.11 MiB/s**，4 Cores = **176.85 MiB/s** (呈现完美的超线性扩展)。
+*   **TUN 模式**：1 Core = **39.36 MiB/s**，2 Cores = **85.65 MiB/s**，3 Cores = **131.60 MiB/s**，4 Cores = **176.28 MiB/s**。
 
 ### 3. 数据面核心优化设计
 1.  **填充环批处理生产 (Fill Ring Batching)**：将归还已处理 RX 缓冲页的操作合并，在每次循环的批次结尾统一调用 `fill.produce()` 并仅执行一次物理内存屏障（Fence），有效消除了 CPU 缓存频繁失效与总线锁竞争开销。
 2.  **空闲时立即 Flush (Immediate Flush on Idle)**：当事件循环变为空闲（没有新包或 500 次空转）时，无条件立即执行 `sendto` 系统调用进行 Flush。这消除了批处理积压引起的 TCP RTT 抖动，使得单核 TCP 吞吐能够轻松跑满带宽上限。
-3.  **可扩展性深度解析**：
+3.  **用户态 Ring 指针本地缓存与按需回收 (Rings Pointer Caching)**：在 worker 循环中完全缓存了 consumer/producer 指针，消除了空轮询中的 volatile 读；且仅在 `free_tx_chunks` 低于 64 时触发完成队列（Completion Ring）的批量回收，将多余的 volatile 读取减少了 99%。
+4.  **外层 IPv4 校验和常数预累加优化 (Checksum Precomputation)**：优化了 UDP 封装的外层 IP 报头校验和计算方法，从慢速的 20 字节循环累加计算改进为仅依赖 `total_len` 变量的单次常数增量运算，完全清空了包生成热路径中的冗余校验和开销。
+5.  **可扩展性深度解析**：
     *   **TUN 超线性特征**：多物理队列绑定相互解耦，消除了单核下单个文件描述符（TUN FD）和 L1/L3 缓存抖动（Cache Eviction）的串行开销。
-    *   **AF_XDP 亚线性特征**：在虚拟机（`veth`）测试环境下由于不支持硬件 Zero-Copy，AF_XDP 以 `XDP_COPY` 模式运行，导致 SoftIRQ 软中断上下文切换与内存复制开销高昂（占 CPU 比例达 38.6%）。在近 8 Gbps 的极高吞吐下，总线带宽及 L3 缓存读写开始逼近物理硬件瓶颈。
+    *   **AF_XDP 亚线性特征**：在虚拟机（`veth`）测试环境下由于不支持硬件 Zero-Copy，AF_XDP 以 `XDP_COPY` 模式运行，导致 SoftIRQ 软中断上下文切换与内存复制开销高昂（占 CPU 比例达 30.6%）。在近 8 Gbps 的极高吞吐下，总线带宽及 L3 缓存读写开始逼近物理硬件瓶颈。
 

@@ -62,6 +62,18 @@ ip netns exec profile_server_ns ip link set vp-s up
 ip netns exec profile_server_ns ip link set lo up
 ip netns exec profile_server_ns ip route add default via 10.0.2.1
 
+# Configure Server Inner Virtual Interface
+ip link add vp-s-w1 type veth peer name vp-s-w2
+ip link set vp-s-w1 address 00:00:00:00:00:11
+ip link set vp-s-w2 address 00:00:00:00:00:22
+ip link set vp-s-w1 netns profile_server_ns
+ip link set vp-s-w2 netns profile_server_ns
+ip netns exec profile_server_ns ip addr add 10.0.0.1/24 dev vp-s-w1
+ip netns exec profile_server_ns ip link set vp-s-w1 mtu 1280 up
+ip netns exec profile_server_ns ip link set vp-s-w2 mtu 1280 up
+ip netns exec profile_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vp-s-w1
+ip netns exec profile_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vp-s-w1
+
 # Configure Client NS
 ip netns exec profile_client_ns ip addr add 10.0.1.2/24 dev vp-c
 ip netns exec profile_client_ns ip addr add 10.0.4.1/24 dev vp-cw
@@ -88,15 +100,31 @@ ip netns exec profile_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec profile_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec profile_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 
-# Write configs with MTU 1280
+# Disable rp_filter in all namespaces
+for ns in profile_server_ns profile_router_ns profile_client_ns profile_work_ns; do
+  ip netns exec $ns sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+  ip netns exec $ns sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+done
+
+# Disable checksum/GRO offloads on veth interfaces
+ip netns exec profile_server_ns ethtool -K vp-s tx off rx off 2>/dev/null || true
+ip netns exec profile_server_ns ethtool -K vp-s-w1 tx off rx off 2>/dev/null || true
+ip netns exec profile_server_ns ethtool -K vp-s-w2 tx off rx off 2>/dev/null || true
+ip netns exec profile_client_ns ethtool -K vp-c tx off rx off 2>/dev/null || true
+ip netns exec profile_client_ns ethtool -K vp-cw tx off rx off 2>/dev/null || true
+ip netns exec profile_work_ns ethtool -K vp-w tx off rx off 2>/dev/null || true
+ip netns exec profile_router_ns ethtool -K vp-rs tx off rx off 2>/dev/null || true
+ip netns exec profile_router_ns ethtool -K vp-rc tx off rx off 2>/dev/null || true
+
+# Write configs with MTU 1420
 cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
-MTU = 1280
-Table = auto
+MTU = 1420
+Table = off
 Mode = af_xdp
 
 [QUICPool]
@@ -109,7 +137,7 @@ AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 
 [XDP]
 QuicInterface = vp-s
-InterceptInterfaces = vp-s, lo
+InterceptInterfaces = vp-s-w2
 XdpMode = native
 EOF_CONF
 
@@ -117,8 +145,8 @@ cat > "$ARTIFACT_DIR/client.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
-MTU = 1280
-Table = auto
+MTU = 1420
+Table = off
 Mode = af_xdp
 
 [Peer]
@@ -129,12 +157,12 @@ AllowedIPs = 10.0.0.1/32
 
 [XDP]
 QuicInterface = vp-c
-InterceptInterfaces = vp-c, vp-cw, lo
+InterceptInterfaces = vp-cw, lo
 XdpMode = native
 EOF_CONF
 
 # Start new_proxy server daemon first (creates 'server' TUN with 10.0.0.1)
-ip netns exec profile_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
+ip netns exec profile_server_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec \"$ROOT_DIR/target/release/new_proxy\" -config \"$ARTIFACT_DIR/server.conf\"" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 
@@ -197,7 +225,7 @@ if ! kill -0 "$HTTP_PID" 2>/dev/null; then
 fi
 
 # Start new_proxy client daemon
-ip netns exec profile_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
+ip netns exec profile_client_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec \"$ROOT_DIR/target/release/new_proxy\" -config \"$ARTIFACT_DIR/client.conf\"" > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
 
