@@ -14,6 +14,7 @@ mod telemetry;
 pub mod tun_device;
 pub mod tun_io;
 pub mod datapath;
+pub mod tun_datapath;
 mod uds_server;
 
 
