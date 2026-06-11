@@ -18,6 +18,7 @@ pub mod tun_datapath;
 pub mod xdp_datapath;
 use datapath::Datapath;
 use tun_datapath::TunDatapath;
+use xdp_datapath::XdpDatapath;
 mod uds_server;
 
 
@@ -639,22 +640,41 @@ async fn run_gateway(
         );
     }
 
-    let datapath = Arc::new(TunDatapath::new(
-        config.clone(),
-        interface_name.clone(),
-        runtime_mode,
-        fixed_client_quic_data_port_count,
-        peer_telemetries,
-        worker_telemetry_registry,
-        gateway_state.clone(),
-        peer_secrets,
-        session_cache,
-        auth_nonce_cache,
-        shared_quic_registry,
-        client_quic_pools,
-        client_quic_data_port_baseline,
-        peer_mutation_lock,
-    ).expect("failed to construct TunDatapath"));
+    let datapath: Arc<dyn Datapath> = if config.interface.mode == "af_xdp" {
+        Arc::new(XdpDatapath::new(
+            config.clone(),
+            interface_name.clone(),
+            runtime_mode,
+            fixed_client_quic_data_port_count,
+            peer_telemetries,
+            worker_telemetry_registry,
+            gateway_state.clone(),
+            peer_secrets,
+            session_cache,
+            auth_nonce_cache,
+            shared_quic_registry,
+            client_quic_pools,
+            client_quic_data_port_baseline,
+            peer_mutation_lock,
+        ).expect("failed to construct XdpDatapath"))
+    } else {
+        Arc::new(TunDatapath::new(
+            config.clone(),
+            interface_name.clone(),
+            runtime_mode,
+            fixed_client_quic_data_port_count,
+            peer_telemetries,
+            worker_telemetry_registry,
+            gateway_state.clone(),
+            peer_secrets,
+            session_cache,
+            auth_nonce_cache,
+            shared_quic_registry,
+            client_quic_pools,
+            client_quic_data_port_baseline,
+            peer_mutation_lock,
+        ).expect("failed to construct TunDatapath"))
+    };
 
     let run_res = datapath.run_loop(l4_data_plane, exit_notify).await;
 
@@ -663,7 +683,7 @@ async fn run_gateway(
     cleanup_runtime(&cleanup_config, &interface_name);
 
     if let Err(e) = run_res {
-        log::error!("TunDatapath run_loop failed: {:?}", e);
+        log::error!("Datapath run_loop failed: {:?}", e);
     }
 }
 
