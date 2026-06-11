@@ -13,7 +13,9 @@ mod stats_cli;
 mod telemetry;
 pub mod tun_device;
 pub mod tun_io;
+pub mod datapath;
 mod uds_server;
+
 
 use arc_swap::ArcSwap;
 use client::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
