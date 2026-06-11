@@ -3,6 +3,7 @@
 VERSION = 5.0.0
 ARCH ?= $(shell if command -v dpkg >/dev/null 2>&1; then dpkg --print-architecture; else machine=$$(uname -m); if [ "$$machine" = x86_64 ]; then echo amd64; elif [ "$$machine" = aarch64 ] || [ "$$machine" = arm64 ]; then echo arm64; elif [ "$${machine#armv7}" != "$$machine" ]; then echo armhf; else echo "$$machine"; fi; fi)
 CARGO_TARGET ?=
+MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 CARGO_BUILD_FLAGS := --release --bins
 ifdef CARGO_TARGET
 CARGO_BUILD_FLAGS += --target $(CARGO_TARGET)
@@ -13,7 +14,7 @@ endif
 DEB_DIR = target/deb-pkg
 DEB_FILE = target/new-proxy_$(VERSION)_$(ARCH).deb
 
-.PHONY: all build package coverage clean test test-acceptance setup-git-hooks
+.PHONY: all build build-bpf package coverage clean test test-acceptance setup-git-hooks
 
 all: build
 
@@ -22,6 +23,11 @@ build: setup-git-hooks
 
 test:
 	cargo test
+
+src/xdp_datapath/xdp_filter.o: src/xdp_datapath/xdp_filter.c
+	clang -target bpf -O2 -I/usr/include/$(MULTIARCH) -c src/xdp_datapath/xdp_filter.c -o src/xdp_datapath/xdp_filter.o
+
+build-bpf: src/xdp_datapath/xdp_filter.o
 
 test-acceptance:
 	sudo ./script/acceptance/run_acceptance.sh
