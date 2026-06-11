@@ -669,7 +669,7 @@ async fn run_gateway(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig};
+    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
 
     fn peer(public_key: [u8; 32], endpoint: Option<&str>, proxy_port: Option<u16>) -> PeerConfig {
         PeerConfig {
@@ -694,6 +694,7 @@ mod tests {
                 table: None,
                 pre_script: None,
                 post_script: None,
+                mode: "tun".to_string(),
             },
             peers,
             quic_pool: QUICPoolConfig {
@@ -701,6 +702,7 @@ mod tests {
                 public_ipv6: None,
                 listen_ports: Vec::new(),
             },
+            xdp: XdpConfig::default(),
         }
     }
 

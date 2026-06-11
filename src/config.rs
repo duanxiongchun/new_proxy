@@ -18,6 +18,24 @@ pub struct InterfaceConfig {
     pub table: Option<String>,
     pub pre_script: Option<String>,
     pub post_script: Option<String>,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct XdpConfig {
+    pub quic_interface: Option<String>,
+    pub intercept_interfaces: Vec<String>,
+    pub xdp_mode: String,
+}
+
+impl Default for XdpConfig {
+    fn default() -> Self {
+        Self {
+            quic_interface: None,
+            intercept_interfaces: Vec::new(),
+            xdp_mode: "native".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +58,7 @@ pub struct GatewayConfig {
     pub interface: InterfaceConfig,
     pub peers: Vec<PeerConfig>,
     pub quic_pool: QUICPoolConfig,
+    pub xdp: XdpConfig,
 }
 
 pub fn packet_buffer_size_for_mtu(mtu: u16) -> usize {
@@ -104,7 +123,16 @@ impl GatewayConfig {
     pub fn load_from_file(path: &str) -> Result<Self, String> {
         let ini =
             Ini::load_from_file(path).map_err(|e| format!("Failed to parse config file: {}", e))?;
+        Self::load_from_ini(ini)
+    }
 
+    pub fn load_from_str(content: &str) -> Result<Self, String> {
+        let ini =
+            Ini::load_from_str(content).map_err(|e| format!("Failed to parse config string: {}", e))?;
+        Self::load_from_ini(ini)
+    }
+
+    pub fn load_from_ini(ini: Ini) -> Result<Self, String> {
         // 1. 解析 Interface
         let interface_section = ini
             .section(Some("Interface"))
@@ -162,6 +190,12 @@ impl GatewayConfig {
             .or_else(|| interface_section.get("post_script"))
             .map(|s| s.trim().to_string());
 
+        let mode = interface_section
+            .get("Mode")
+            .or_else(|| interface_section.get("mode"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "tun".to_string());
+
         let interface = InterfaceConfig {
             private_key,
             addresses,
@@ -171,6 +205,7 @@ impl GatewayConfig {
             table,
             pre_script,
             post_script,
+            mode,
         };
 
         // 2. 解析 Peers
@@ -244,10 +279,39 @@ impl GatewayConfig {
             listen_ports,
         };
 
+        // 4. 解析 XDP
+        let xdp_section = ini.section(Some("XDP"));
+        let quic_interface = xdp_section
+            .and_then(|s| s.get("QuicInterface").or_else(|| s.get("quic_interface")))
+            .map(|v| v.trim().to_string());
+
+        let intercept_interfaces = xdp_section
+            .and_then(|s| s.get("InterceptInterfaces").or_else(|| s.get("intercept_interfaces")))
+            .map(|interfaces_str| {
+                interfaces_str
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+
+        let xdp_mode = xdp_section
+            .and_then(|s| s.get("XdpMode").or_else(|| s.get("xdp_mode")))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| "native".to_string());
+
+        let xdp = XdpConfig {
+            quic_interface,
+            intercept_interfaces,
+            xdp_mode,
+        };
+
         Ok(GatewayConfig {
             interface,
             peers,
             quic_pool,
+            xdp,
         })
     }
 }
@@ -414,5 +478,32 @@ Address = 10.0.0.1/24
         assert_eq!(config_no_mtu.interface.mtu, 1280); // Defaults to 1280
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_xdp_config_parse() {
+        let key = test_key();
+        let conf = format!(
+            r#"
+[Interface]
+PrivateKey = {}
+Address = 10.0.0.1/24
+Mode = af_xdp
+
+[XDP]
+QuicInterface = eth0
+InterceptInterfaces = eth0, lo
+XdpMode = native
+"#,
+            key
+        );
+        let gateway_conf = GatewayConfig::load_from_str(&conf).unwrap();
+        assert_eq!(gateway_conf.interface.mode, "af_xdp");
+        assert_eq!(gateway_conf.xdp.quic_interface, Some("eth0".to_string()));
+        assert_eq!(
+            gateway_conf.xdp.intercept_interfaces,
+            vec!["eth0".to_string(), "lo".to_string()]
+        );
+        assert_eq!(gateway_conf.xdp.xdp_mode, "native");
     }
 }

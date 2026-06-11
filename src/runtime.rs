@@ -461,7 +461,7 @@ fn run_command_best_effort(program: &str, args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig};
+    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
 
     fn config_with_table(table: Option<&str>) -> GatewayConfig {
         GatewayConfig {
@@ -474,6 +474,7 @@ mod tests {
                 table: table.map(str::to_string),
                 pre_script: None,
                 post_script: None,
+                mode: "tun".to_string(),
             },
             peers: Vec::new(),
             quic_pool: QUICPoolConfig {
@@ -481,6 +482,7 @@ mod tests {
                 public_ipv6: None,
                 listen_ports: Vec::new(),
             },
+            xdp: XdpConfig::default(),
         }
     }
 

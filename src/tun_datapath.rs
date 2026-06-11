@@ -572,7 +572,7 @@ impl Datapath for TunDatapath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InterfaceConfig, QUICPoolConfig};
+    use crate::config::{InterfaceConfig, QUICPoolConfig, XdpConfig};
 
     fn dummy_config() -> GatewayConfig {
         GatewayConfig {
@@ -585,6 +585,7 @@ mod tests {
                 table: None,
                 pre_script: None,
                 post_script: None,
+                mode: "tun".to_string(),
             },
             peers: Vec::new(),
             quic_pool: QUICPoolConfig {
@@ -592,6 +593,7 @@ mod tests {
                 public_ipv6: None,
                 listen_ports: Vec::new(),
             },
+            xdp: XdpConfig::default(),
         }
     }
 
