@@ -32,6 +32,111 @@ impl Drop for WorkerPanicGuard {
     }
 }
 
+struct FdsGuard {
+    fds: Vec<std::os::unix::io::RawFd>,
+}
+
+impl Drop for FdsGuard {
+    fn drop(&mut self) {
+        for &fd in &self.fds {
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+}
+
+fn setup_udp_socket(port: Option<u16>) -> Result<tokio::net::UdpSocket, DatapathError> {
+    let bind_addr = match port {
+        Some(p) => format!("0.0.0.0:{}", p).parse::<std::net::SocketAddr>().unwrap(),
+        None => "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap(),
+    };
+    
+    let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+    std_sock.set_nonblocking(true)?;
+    let sock_ref = socket2::SockRef::from(&std_sock);
+    let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
+    let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
+    
+    if let Err(e) = crate::socket_mark::set_outer_mark(&std_sock) {
+        return Err(DatapathError::Config(e));
+    }
+    
+    let udp_socket = tokio::net::UdpSocket::from_std(std_sock)?;
+    Ok(udp_socket)
+}
+
+fn setup_server_endpoint(
+    quic_certs: &[rustls::Certificate],
+    quic_key: &rustls::PrivateKey,
+    packet_buffer_size: usize,
+) -> Result<quinn_proto::Endpoint, String> {
+    let mut rustls_config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(quic_certs.to_vec(), quic_key.clone())
+        .map_err(|e| format!("Failed to build rustls ServerConfig: {}", e))?;
+    rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
+    let mut server_proto_config =
+        quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
+    let mut transport = quinn_proto::TransportConfig::default();
+    let quic_mtu = crate::rtc_loop::quic_initial_mtu_for_packet_buffer(packet_buffer_size);
+    transport
+        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
+    transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
+    transport.send_window(16 * 1024 * 1024);
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.initial_mtu(quic_mtu);
+    transport.min_mtu(quic_mtu);
+    server_proto_config.transport_config(Arc::new(transport));
+
+    let mut endpoint_config = quinn_proto::EndpointConfig::default();
+    endpoint_config.max_udp_payload_size(65527).unwrap();
+    let endpoint = quinn_proto::Endpoint::new(
+        Arc::new(endpoint_config),
+        Some(Arc::new(server_proto_config)),
+        false,
+    );
+    Ok(endpoint)
+}
+
+fn setup_client_endpoint() -> quinn_proto::Endpoint {
+    let mut endpoint_config = quinn_proto::EndpointConfig::default();
+    endpoint_config.max_udp_payload_size(65527).unwrap();
+    quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, false)
+}
+
+fn spawn_worker_thread(
+    mut worker: crate::rtc_loop::RtcWorker,
+    worker_id: usize,
+    role_name: &'static str,
+    l4_data_plane: Arc<ArcSwap<crate::L4DataPlaneSnapshot>>,
+    exit_notify: Arc<tokio::sync::Notify>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(format!("new-proxy-{}-worker-{}", role_name, worker_id))
+        .spawn(move || {
+            let _panic_guard = WorkerPanicGuard {
+                exit_notify,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build worker local Tokio runtime");
+            rt.block_on(async {
+                if let Err(e) = worker.run_loop(l4_data_plane).await {
+                    log::error!("{} RtcWorker loop failed: {}", role_name, e);
+                }
+            });
+        })
+        .expect("Failed to spawn RtcWorker thread")
+}
+
 pub struct TunDatapath {
     config: GatewayConfig,
     interface_name: String,
@@ -122,6 +227,8 @@ impl Datapath for TunDatapath {
                 }
             };
 
+            let mut fd_guard = FdsGuard { fds: tun_fds };
+
             if let Err(e) = setup_routes(&self.config, &self.interface_name) {
                 eprintln!("Failed to setup userspace routes: {}", e);
                 cleanup_runtime(&self.config, &self.interface_name);
@@ -146,104 +253,6 @@ impl Datapath for TunDatapath {
                     return Err(DatapathError::Config(format!("Failed to fingerprint QUIC certificate: {}", e)));
                 }
             };
-
-            let mut l3_tasks = Vec::new();
-            for (worker_id, fd) in tun_fds.into_iter().enumerate() {
-                let tun_io = Arc::new(match crate::tun_io::AsyncTunIo::new(fd) {
-                    Ok(io) => io,
-                    Err(e) => {
-                        log::error!("Failed to wrap server TUN FD in AsyncTunIo: {}", e);
-                        cleanup_runtime(&self.config, &self.interface_name);
-                        return Err(DatapathError::Io(e));
-                    }
-                });
-                let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(self.config.interface.mtu);
-
-                let local_port = self.config.quic_pool.listen_ports[worker_id];
-                let bind_addr = format!("0.0.0.0:{}", local_port)
-                    .parse::<std::net::SocketAddr>()
-                    .unwrap();
-                let std_sock =
-                    std::net::UdpSocket::bind(bind_addr).expect("Failed to bind server UDP socket");
-                std_sock.set_nonblocking(true).unwrap();
-                let sock_ref = socket2::SockRef::from(&std_sock);
-                let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
-                let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
-                if let Err(e) = crate::socket_mark::set_outer_mark(&std_sock) {
-                    log::error!("Failed to set outer mark on server UDP socket: {}", e);
-                    cleanup_runtime(&self.config, &self.interface_name);
-                    return Err(DatapathError::Config(e));
-                }
-                let udp_socket =
-                    tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
-
-                let mut rustls_config = rustls::ServerConfig::builder()
-                    .with_safe_defaults()
-                    .with_no_client_auth()
-                    .with_single_cert(quic_certs.clone(), quic_key.clone())
-                    .expect("Failed to build rustls ServerConfig");
-                rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
-                let mut server_proto_config =
-                    quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
-                let mut transport = quinn_proto::TransportConfig::default();
-                let quic_mtu = crate::rtc_loop::quic_initial_mtu_for_packet_buffer(packet_buffer_size);
-                transport
-                    .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
-                transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-                transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
-                transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
-                transport.send_window(16 * 1024 * 1024);
-                transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-                transport.datagram_send_buffer_size(8 * 1024 * 1024);
-                transport.initial_mtu(quic_mtu);
-                transport.min_mtu(quic_mtu);
-                server_proto_config.transport_config(Arc::new(transport));
-
-                let mut endpoint_config = quinn_proto::EndpointConfig::default();
-                endpoint_config.max_udp_payload_size(65527).unwrap();
-                let endpoint = quinn_proto::Endpoint::new(
-                    Arc::new(endpoint_config),
-                    Some(Arc::new(server_proto_config)),
-                    false,
-                );
-
-                let mut worker = crate::rtc_loop::RtcWorker::new(
-                    tun_io,
-                    worker_id,
-                    crate::rtc_loop::WorkerRole::Server,
-                    crate::rtc_loop::RtcWorkerConfig {
-                        mtu: self.config.interface.mtu,
-                    },
-                    udp_socket,
-                    endpoint,
-                    Some(self.session_cache.clone()),
-                    Some(self.auth_nonce_cache.clone()),
-                    Some(self.shared_quic_registry.clone()),
-                );
-                worker.set_worker_stats(self.worker_telemetry_registry.get_or_create(worker_id));
-                worker.set_peer_telemetry(self.peer_telemetries[worker_id].clone());
-                let l4_data_plane_for_worker = dp_snapshot.clone();
-                let exit_notify_clone = exit_notify.clone();
-                let thread = std::thread::Builder::new()
-                    .name(format!("new-proxy-server-worker-{}", worker_id))
-                    .spawn(move || {
-                        let _panic_guard = WorkerPanicGuard {
-                            exit_notify: exit_notify_clone,
-                        };
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("Failed to build server worker local Tokio runtime");
-                        rt.block_on(async {
-                            if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
-                                log::error!("Server RtcWorker loop failed: {}", e);
-                            }
-                        });
-                    })
-                    .expect("Failed to spawn Server RtcWorker thread");
-                let task = WorkerTask { _thread: thread };
-                l3_tasks.push(task);
-            }
 
             let listen_control_port = self.config
                 .interface
@@ -271,6 +280,72 @@ impl Datapath for TunDatapath {
                     return Err(DatapathError::Config(format!("Control plane server failed to start: {}", e)));
                 }
             };
+
+            let mut worker_preps = Vec::new();
+            for (worker_id, &fd) in fd_guard.fds.clone().iter().enumerate() {
+                let tun_io = Arc::new(match crate::tun_io::AsyncTunIo::new(fd) {
+                    Ok(io) => {
+                        fd_guard.fds[worker_id] = -1;
+                        io
+                    }
+                    Err(e) => {
+                        log::error!("Failed to wrap server TUN FD in AsyncTunIo: {}", e);
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        control_task.abort();
+                        return Err(DatapathError::Io(e));
+                    }
+                });
+
+                let local_port = self.config.quic_pool.listen_ports[worker_id];
+                let udp_socket = match setup_udp_socket(Some(local_port)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        control_task.abort();
+                        return Err(e);
+                    }
+                };
+
+                let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(self.config.interface.mtu);
+                let endpoint = match setup_server_endpoint(&quic_certs, &quic_key, packet_buffer_size) {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        control_task.abort();
+                        return Err(DatapathError::Config(e));
+                    }
+                };
+
+                worker_preps.push((tun_io, udp_socket, endpoint));
+            }
+
+            let mut l3_tasks = Vec::new();
+            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate() {
+                let mut worker = crate::rtc_loop::RtcWorker::new(
+                    tun_io,
+                    worker_id,
+                    crate::rtc_loop::WorkerRole::Server,
+                    crate::rtc_loop::RtcWorkerConfig {
+                        mtu: self.config.interface.mtu,
+                    },
+                    udp_socket,
+                    endpoint,
+                    Some(self.session_cache.clone()),
+                    Some(self.auth_nonce_cache.clone()),
+                    Some(self.shared_quic_registry.clone()),
+                );
+                worker.set_worker_stats(self.worker_telemetry_registry.get_or_create(worker_id));
+                worker.set_peer_telemetry(self.peer_telemetries[worker_id].clone());
+
+                let thread = spawn_worker_thread(
+                    worker,
+                    worker_id,
+                    "server",
+                    dp_snapshot.clone(),
+                    exit_notify.clone(),
+                );
+                l3_tasks.push(WorkerTask { _thread: thread });
+            }
 
             tokio::select! {
                 _ = crate::wait_for_shutdown() => {},
@@ -380,15 +455,6 @@ impl Datapath for TunDatapath {
                 ),
             }
 
-            let userspace_tcp_failover_task = crate::start_userspace_tcp_failover_manager(
-                self.gateway_state.clone(),
-                self.client_quic_pools.clone(),
-                dp_snapshot.clone(),
-                self.config.interface.private_key,
-                self.client_quic_data_port_baseline.clone(),
-                self.peer_mutation_lock.clone(),
-            );
-
             log::info!(
                 "Opening userspace multiqueue TUN device: {} with {} queues",
                 self.interface_name,
@@ -404,47 +470,52 @@ impl Datapath for TunDatapath {
                 }
             };
 
+            let mut fd_guard = FdsGuard { fds: tun_fds };
+
             if let Err(e) = setup_routes(&self.config, &self.interface_name) {
                 log::error!("Failed to setup userspace routes: {}", e);
-                for fd in tun_fds {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                }
                 let cleanup_config = self.gateway_state.read().config.clone();
                 cleanup_runtime(&cleanup_config, &self.interface_name);
                 return Err(DatapathError::Config(e));
             }
 
-            let mut worker_tasks = Vec::new();
-            for (worker_id, fd) in tun_fds.into_iter().enumerate() {
+            let mut worker_preps = Vec::new();
+            for (worker_id, &fd) in fd_guard.fds.clone().iter().enumerate() {
                 let tun_io = Arc::new(match crate::tun_io::AsyncTunIo::new(fd) {
-                    Ok(io) => io,
+                    Ok(io) => {
+                        fd_guard.fds[worker_id] = -1;
+                        io
+                    }
                     Err(e) => {
                         log::error!("Failed to wrap TUN FD in AsyncTunIo: {}", e);
                         return Err(DatapathError::Io(e));
                     }
                 });
 
-                let std_sock =
-                    std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind client UDP socket");
-                std_sock.set_nonblocking(true).unwrap();
-                let sock_ref = socket2::SockRef::from(&std_sock);
-                let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
-                let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
-                if let Err(e) = crate::socket_mark::set_outer_mark(&std_sock) {
-                    log::error!("Failed to set outer mark on client UDP socket: {}", e);
-                    let cleanup_config = self.gateway_state.read().config.clone();
-                    cleanup_runtime(&cleanup_config, &self.interface_name);
-                    return Err(DatapathError::Config(e));
-                }
-                let udp_socket =
-                    tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
+                let udp_socket = match setup_udp_socket(None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let cleanup_config = self.gateway_state.read().config.clone();
+                        cleanup_runtime(&cleanup_config, &self.interface_name);
+                        return Err(e);
+                    }
+                };
 
-                let mut endpoint_config = quinn_proto::EndpointConfig::default();
-                endpoint_config.max_udp_payload_size(65527).unwrap();
-                let endpoint = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, false);
+                let endpoint = setup_client_endpoint();
+                worker_preps.push((tun_io, udp_socket, endpoint));
+            }
 
+            let userspace_tcp_failover_task = crate::start_userspace_tcp_failover_manager(
+                self.gateway_state.clone(),
+                self.client_quic_pools.clone(),
+                dp_snapshot.clone(),
+                self.config.interface.private_key,
+                self.client_quic_data_port_baseline.clone(),
+                self.peer_mutation_lock.clone(),
+            );
+
+            let mut worker_tasks = Vec::new();
+            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate() {
                 let mut worker = crate::rtc_loop::RtcWorker::new(
                     tun_io,
                     worker_id,
@@ -461,27 +532,14 @@ impl Datapath for TunDatapath {
                 worker.set_worker_stats(self.worker_telemetry_registry.get_or_create(worker_id));
                 worker.set_peer_telemetry(self.peer_telemetries[worker_id].clone());
 
-                let l4_data_plane_for_worker = dp_snapshot.clone();
-                let exit_notify_clone = exit_notify.clone();
-                let thread = std::thread::Builder::new()
-                    .name(format!("new-proxy-client-worker-{}", worker_id))
-                    .spawn(move || {
-                        let _panic_guard = WorkerPanicGuard {
-                            exit_notify: exit_notify_clone,
-                        };
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("Failed to build client worker local Tokio runtime");
-                        rt.block_on(async {
-                            if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
-                                log::error!("RtcWorker loop failed: {}", e);
-                            }
-                        });
-                    })
-                    .expect("Failed to spawn Client RtcWorker thread");
-                let handle = WorkerTask { _thread: thread };
-                worker_tasks.push(handle);
+                let thread = spawn_worker_thread(
+                    worker,
+                    worker_id,
+                    "client",
+                    dp_snapshot.clone(),
+                    exit_notify.clone(),
+                );
+                worker_tasks.push(WorkerTask { _thread: thread });
             }
 
             log::info!("------------------------------------------------------");
