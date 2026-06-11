@@ -114,6 +114,19 @@ struct XskSetup {
 }
 
 #[cfg(target_os = "linux")]
+impl Drop for XskSetup {
+    fn drop(&mut self) {
+        for &fd in &self.sockets {
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 unsafe impl Send for XskSetup {}
 #[cfg(target_os = "linux")]
 unsafe impl Sync for XskSetup {}
