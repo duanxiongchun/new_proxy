@@ -15,6 +15,7 @@ pub struct BpfLinkManager;
 impl BpfLinkManager {
     pub fn new(interface: &str, mode: &str) -> Result<Self, io::Error> {
         use std::ffi::CString;
+        #[cfg(not(test))]
         use std::process::Command;
 
         let c_interface =
@@ -44,12 +45,14 @@ impl BpfLinkManager {
             mode: mode.to_string(),
         };
 
-        let cmds = manager.build_load_commands();
         #[cfg(not(test))]
-        for cmd in cmds {
-            let status = Command::new("sh").arg("-c").arg(&cmd).status()?;
-            if !status.success() {
-                log::warn!("Command failed: {}", cmd);
+        {
+            let cmds = manager.build_load_commands();
+            for cmd in cmds {
+                let status = Command::new("sh").arg("-c").arg(&cmd).status()?;
+                if !status.success() {
+                    log::warn!("Command failed: {}", cmd);
+                }
             }
         }
 
