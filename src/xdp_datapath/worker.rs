@@ -645,9 +645,13 @@ unsafe fn populate_fill_ring(fill: &mut XskRing, start_chunk: u32, num_chunks: u
 ///
 /// The caller must ensure that the `comp` ring is backed by valid, mapped memory-mapped pointers.
 #[cfg(target_os = "linux")]
-unsafe fn reclaim_tx_buffers(comp: &mut XskRing, free_tx_chunks: &mut Vec<u64>) {
+unsafe fn reclaim_tx_buffers(
+    comp: &mut XskRing,
+    comp_cons: &mut u32,
+    free_tx_chunks: &mut Vec<u64>,
+) {
     let prod = std::ptr::read_volatile(comp.producer);
-    let cons = std::ptr::read_volatile(comp.consumer);
+    let cons = *comp_cons;
     let cnt = prod.wrapping_sub(cons);
     if cnt > 0 {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
@@ -656,7 +660,9 @@ unsafe fn reclaim_tx_buffers(comp: &mut XskRing, free_tx_chunks: &mut Vec<u64>) 
             let addr = comp.read_comp_addr(idx);
             free_tx_chunks.push(addr);
         }
-        comp.consume(cnt);
+        *comp_cons = cons.wrapping_add(cnt);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        std::ptr::write_volatile(comp.consumer, *comp_cons);
     }
 }
 
@@ -667,33 +673,41 @@ unsafe fn reclaim_tx_buffers(comp: &mut XskRing, free_tx_chunks: &mut Vec<u64>) 
 #[cfg(target_os = "linux")]
 unsafe fn process_rx_ring(
     rx: &mut XskRing,
+    rx_cons: &mut u32,
     fill: &mut XskRing,
+    fill_prod: &mut u32,
     rx_umem_base: *mut libc::c_void,
     mut process_packet: impl FnMut(&[u8], &mut [u8]) -> Option<usize>,
     tx: &mut XskRing,
+    tx_prod: &mut u32,
     comp: &mut XskRing,
+    comp_cons: &mut u32,
     free_tx_chunks: &mut Vec<u64>,
     tx_umem_base: *mut libc::c_void,
 ) -> u32 {
     let prod = std::ptr::read_volatile(rx.producer);
-    let cons = std::ptr::read_volatile(rx.consumer);
+    let cons = *rx_cons;
     let cnt = prod.wrapping_sub(cons);
     let mut tx_produced = 0;
     if cnt > 0 {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        // Unconditionally reclaim completed TX buffers first to maximize available chunks.
-        reclaim_tx_buffers(comp, free_tx_chunks);
+        // Reclaim completed TX buffers only when our free pool is running low.
+        if free_tx_chunks.len() < 64 {
+            reclaim_tx_buffers(comp, comp_cons, free_tx_chunks);
+        }
+
+        let fill_cons = std::ptr::read_volatile(fill.consumer);
+        let fill_prod_idx = *fill_prod;
+        let fill_free = fill.size - (fill_prod_idx.wrapping_sub(fill_cons));
 
         let mut fill_produced = 0;
-        let fill_free = fill.free_slots();
-        let fill_prod_idx = std::ptr::read_volatile(fill.producer);
 
         for i in 0..cnt {
             let idx = cons.wrapping_add(i);
             let (addr, len) = rx.read_rx_desc(idx);
 
             // Bounds check UMEM read address
-            assert!(
+            debug_assert!(
                 addr + len as u64 <= 4096 * 4096,
                 "RX UMEM access out of bounds"
             );
@@ -703,12 +717,12 @@ unsafe fn process_rx_ring(
             let pkt_slice = std::slice::from_raw_parts(pkt_ptr, len as usize);
 
             if free_tx_chunks.is_empty() {
-                reclaim_tx_buffers(comp, free_tx_chunks);
+                reclaim_tx_buffers(comp, comp_cons, free_tx_chunks);
             }
 
             if let Some(tx_addr) = free_tx_chunks.pop() {
                 // Bounds check UMEM write address
-                assert!(
+                debug_assert!(
                     tx_addr + 4096 <= 4096 * 4096,
                     "TX UMEM access out of bounds"
                 );
@@ -718,7 +732,7 @@ unsafe fn process_rx_ring(
                 let out_slice = std::slice::from_raw_parts_mut(tx_ptr, 4096);
 
                 if let Some(written_len) = process_packet(pkt_slice, out_slice) {
-                    let tx_idx = (*tx.producer).wrapping_add(tx_produced);
+                    let tx_idx = tx_prod.wrapping_add(tx_produced);
                     tx.write_tx_desc(tx_idx, tx_addr, written_len as u32);
                     tx_produced += 1;
                 } else {
@@ -733,12 +747,19 @@ unsafe fn process_rx_ring(
             }
         }
 
-        rx.consume(cnt);
+        *rx_cons = cons.wrapping_add(cnt);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        std::ptr::write_volatile(rx.consumer, *rx_cons);
+
         if tx_produced > 0 {
-            tx.produce(tx_produced);
+            *tx_prod = tx_prod.wrapping_add(tx_produced);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            std::ptr::write_volatile(tx.producer, *tx_prod);
         }
         if fill_produced > 0 {
-            fill.produce(fill_produced);
+            *fill_prod = fill_prod.wrapping_add(fill_produced);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            std::ptr::write_volatile(fill.producer, *fill_prod);
         }
     }
     tx_produced
@@ -939,18 +960,6 @@ fn parse_ip_src_dst(packet: &[u8]) -> Option<(std::net::Ipv4Addr, std::net::Ipv4
     }
 }
 
-fn calculate_ipv4_checksum(hdr: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for i in 0..10 {
-        let word = u16::from_be_bytes([hdr[2 * i], hdr[2 * i + 1]]);
-        sum += word as u32;
-    }
-    while sum > 0xFFFF {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !sum as u16
-}
-
 pub fn wrap_plaintext_to_quic_slice(
     plaintext_ip: &[u8],
     dst_mac: [u8; 6],
@@ -980,12 +989,25 @@ pub fn wrap_plaintext_to_quic_slice(
     out_buf[20..22].copy_from_slice(&0u16.to_be_bytes());
     out_buf[22] = 64;
     out_buf[23] = 17; // UDP
-    out_buf[24..26].copy_from_slice(&0u16.to_be_bytes()); // Clear Checksum
-    out_buf[26..30].copy_from_slice(&src_ip.octets());
-    out_buf[30..34].copy_from_slice(&dst_ip.octets());
 
-    let checksum = calculate_ipv4_checksum(&out_buf[14..34]);
+    // Fast checksum calculation using precomputed constant fields
+    let s_oct = src_ip.octets();
+    let d_oct = dst_ip.octets();
+    let src_high = u16::from_be_bytes([s_oct[0], s_oct[1]]) as u32;
+    let src_low = u16::from_be_bytes([s_oct[2], s_oct[3]]) as u32;
+    let dst_high = u16::from_be_bytes([d_oct[0], d_oct[1]]) as u32;
+    let dst_low = u16::from_be_bytes([d_oct[2], d_oct[3]]) as u32;
+
+    let mut sum =
+        0x4500u32 + 0x4011u32 + src_high + src_low + dst_high + dst_low + total_len as u32;
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let checksum = !sum as u16;
+
     out_buf[24..26].copy_from_slice(&checksum.to_be_bytes());
+    out_buf[26..30].copy_from_slice(&s_oct);
+    out_buf[30..34].copy_from_slice(&d_oct);
 
     // UDP header
     out_buf[34..36].copy_from_slice(&src_port.to_be_bytes());
@@ -1914,14 +1936,24 @@ fn run_xdp_worker_loop(
     let mut intercept_pending_tx = 0;
     let mut quic_spins_since_tx = 0;
     let mut intercept_spins_since_tx = 0;
+
+    let mut quic_rx_cons = unsafe { std::ptr::read_volatile(quic_rx.consumer) };
+    let mut quic_tx_prod = unsafe { std::ptr::read_volatile(quic_tx.producer) };
+    let mut quic_fill_prod = unsafe { std::ptr::read_volatile(quic_fill.producer) };
+    let mut quic_comp_cons = unsafe { std::ptr::read_volatile(quic_comp.consumer) };
+
+    let mut intercept_rx_cons = unsafe { std::ptr::read_volatile(intercept_rx.consumer) };
+    let mut intercept_tx_prod = unsafe { std::ptr::read_volatile(intercept_tx.producer) };
+    let mut intercept_fill_prod = unsafe { std::ptr::read_volatile(intercept_fill.producer) };
+    let mut intercept_comp_cons = unsafe { std::ptr::read_volatile(intercept_comp.consumer) };
+
     while !exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
         let mut work_done = false;
 
         unsafe {
             // Process Intercept RX (plaintext packets from app) -> Strip L2, Wrap to QUIC -> Transmit on QUIC TX
             let int_prod = std::ptr::read_volatile(intercept_rx.producer);
-            let int_cons = std::ptr::read_volatile(intercept_rx.consumer);
-            let int_rx_len = int_prod.wrapping_sub(int_cons);
+            let int_rx_len = int_prod.wrapping_sub(intercept_rx_cons);
             if int_rx_len > 0 {
                 // Sync peer IP/MAC from shared state if ours is None
                 if route_state.peer_outer_ip.is_none() {
@@ -1945,7 +1977,9 @@ fn run_xdp_worker_loop(
 
                 let tx_produced = process_rx_ring(
                     &mut intercept_rx,
+                    &mut intercept_rx_cons,
                     &mut intercept_fill,
+                    &mut intercept_fill_prod,
                     intercept_umem_addr,
                     |pkt_data, out_slice| {
                         // Strip Ethernet header
@@ -2021,7 +2055,9 @@ fn run_xdp_worker_loop(
                         }
                     },
                     &mut quic_tx,
+                    &mut quic_tx_prod,
                     &mut quic_comp,
+                    &mut quic_comp_cons,
                     &mut quic_free_tx_chunks,
                     quic_umem_addr,
                 );
@@ -2038,12 +2074,13 @@ fn run_xdp_worker_loop(
 
             // Process QUIC RX (encrypted QUIC packets from NIC) -> Unwrap / Decrypt -> Prepend L2 -> Transmit on Intercept TX
             let quic_prod = std::ptr::read_volatile(quic_rx.producer);
-            let quic_cons = std::ptr::read_volatile(quic_rx.consumer);
-            let quic_rx_len = quic_prod.wrapping_sub(quic_cons);
+            let quic_rx_len = quic_prod.wrapping_sub(quic_rx_cons);
             if quic_rx_len > 0 {
                 let tx_produced = process_rx_ring(
                     &mut quic_rx,
+                    &mut quic_rx_cons,
                     &mut quic_fill,
+                    &mut quic_fill_prod,
                     quic_umem_addr,
                     |pkt_data, out_slice| {
                         log::debug!(
@@ -2157,7 +2194,9 @@ fn run_xdp_worker_loop(
                         }
                     },
                     &mut intercept_tx,
+                    &mut intercept_tx_prod,
                     &mut intercept_comp,
+                    &mut intercept_comp_cons,
                     &mut intercept_free_tx_chunks,
                     intercept_umem_addr,
                 );
@@ -2173,7 +2212,7 @@ fn run_xdp_worker_loop(
             }
 
             // Flush pending TX packets if we've accumulated enough or if we spun enough/went idle
-            if quic_pending_tx >= 64
+            if quic_pending_tx >= 256
                 || (quic_pending_tx > 0 && (quic_spins_since_tx >= 500 || !work_done))
             {
                 libc::sendto(
@@ -2187,7 +2226,7 @@ fn run_xdp_worker_loop(
                 quic_pending_tx = 0;
                 quic_spins_since_tx = 0;
             }
-            if intercept_pending_tx >= 64
+            if intercept_pending_tx >= 256
                 || (intercept_pending_tx > 0 && (intercept_spins_since_tx >= 500 || !work_done))
             {
                 libc::sendto(
