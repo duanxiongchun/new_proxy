@@ -11,6 +11,26 @@ use crate::quic_pool::{cert_sha256, generate_self_signed_cert};
 use crate::control::ControlServer;
 use crate::client::build_peer_quic_pool;
 use crate::{PeerQuicPools, ClientQuicDataPortBaseline};
+use crate::runtime::{cleanup_runtime, setup_routes};
+use crate::tun_datapath::{setup_udp_socket, setup_server_endpoint, setup_client_endpoint, spawn_worker_thread};
+
+#[cfg(target_os = "linux")]
+struct FdsGuard {
+    fds: Vec<std::os::unix::io::RawFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FdsGuard {
+    fn drop(&mut self) {
+        for &fd in &self.fds {
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+}
 
 struct WorkerPanicGuard {
     exit_notify: Arc<tokio::sync::Notify>,
@@ -486,10 +506,29 @@ impl Datapath for XdpDatapath {
             let queue_count = self.config.quic_pool.listen_ports.len();
             let queue_count = if queue_count == 0 { 1 } else { queue_count };
 
-            let (quic_certs, _quic_key) = match generate_self_signed_cert() {
+            // Open TUN device for the server plaintext L3 datapath
+            let tun_fds = match crate::tun_device::open_tun(&self.interface_name, queue_count) {
+                Ok(fds) => fds,
+                Err(e) => {
+                    log::error!("Failed to open server TUN device: {}", e);
+                    cleanup_runtime(&self.config, &self.interface_name);
+                    return Err(DatapathError::Io(e));
+                }
+            };
+
+            let mut fd_guard = FdsGuard { fds: tun_fds };
+
+            if let Err(e) = setup_routes(&self.config, &self.interface_name) {
+                log::error!("Failed to setup userspace routes: {}", e);
+                cleanup_runtime(&self.config, &self.interface_name);
+                return Err(DatapathError::Config(e));
+            }
+
+            let (quic_certs, quic_key) = match generate_self_signed_cert() {
                 Ok(cert) => cert,
                 Err(e) => {
                     log::error!("Failed to generate QUIC certificate: {}", e);
+                    cleanup_runtime(&self.config, &self.interface_name);
                     return Err(DatapathError::Config(format!("Failed to generate QUIC certificate: {}", e)));
                 }
             };
@@ -497,6 +536,7 @@ impl Datapath for XdpDatapath {
                 Ok(fingerprint) => fingerprint,
                 Err(e) => {
                     log::error!("Failed to fingerprint QUIC certificate: {}", e);
+                    cleanup_runtime(&self.config, &self.interface_name);
                     return Err(DatapathError::Config(format!("Failed to fingerprint QUIC certificate: {}", e)));
                 }
             };
@@ -521,6 +561,7 @@ impl Datapath for XdpDatapath {
                 Ok(handle) => handle,
                 Err(e) => {
                     log::error!("Control plane server failed to start: {}", e);
+                    cleanup_runtime(&self.config, &self.interface_name);
                     return Err(DatapathError::Config(format!("Control plane server failed to start: {}", e)));
                 }
             };
@@ -528,10 +569,49 @@ impl Datapath for XdpDatapath {
             let setup = match setup_xsk_sockets(self.quic_ifindex, &self.intercept_ifindexes, queue_count) {
                 Ok(s) => s,
                 Err(e) => {
+                    cleanup_runtime(&self.config, &self.interface_name);
                     control_task.abort();
                     return Err(e);
                 }
             };
+
+            let mut worker_preps = Vec::new();
+            for (worker_id, &fd) in fd_guard.fds.clone().iter().enumerate() {
+                let tun_io = Arc::new(match crate::tun_io::AsyncTunIo::new(fd) {
+                    Ok(io) => {
+                        fd_guard.fds[worker_id] = -1;
+                        io
+                    }
+                    Err(e) => {
+                        log::error!("Failed to wrap server TUN FD in AsyncTunIo: {}", e);
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        control_task.abort();
+                        return Err(DatapathError::Io(e));
+                    }
+                });
+
+                let local_port = self.config.quic_pool.listen_ports[worker_id];
+                let udp_socket = match setup_udp_socket(Some(local_port)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        control_task.abort();
+                        return Err(e);
+                    }
+                };
+
+                let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(self.config.interface.mtu);
+                let endpoint = match setup_server_endpoint(&quic_certs, &quic_key, packet_buffer_size) {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        control_task.abort();
+                        return Err(DatapathError::Config(e));
+                    }
+                };
+
+                worker_preps.push((tun_io, udp_socket, endpoint));
+            }
 
             let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut join_handles = Vec::new();
@@ -551,6 +631,34 @@ impl Datapath for XdpDatapath {
                 join_handles.push(handle);
             }
 
+            let mut l3_tasks = Vec::new();
+            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate() {
+                let mut worker = crate::rtc_loop::RtcWorker::new(
+                    tun_io,
+                    worker_id,
+                    crate::rtc_loop::WorkerRole::Server,
+                    crate::rtc_loop::RtcWorkerConfig {
+                        mtu: self.config.interface.mtu,
+                    },
+                    udp_socket,
+                    endpoint,
+                    Some(self.session_cache.clone()),
+                    Some(self.auth_nonce_cache.clone()),
+                    Some(self.shared_quic_registry.clone()),
+                );
+                worker.set_worker_stats(self.worker_telemetry_registry.get_or_create(worker_id));
+                worker.set_peer_telemetry(self.peer_telemetries[worker_id].clone());
+
+                let thread = spawn_worker_thread(
+                    worker,
+                    worker_id,
+                    "server",
+                    dp_snapshot.clone(),
+                    exit_notify.clone(),
+                );
+                l3_tasks.push(thread);
+            }
+
             tokio::select! {
                 _ = crate::wait_for_shutdown() => {},
                 _ = exit_notify.notified() => {
@@ -563,6 +671,10 @@ impl Datapath for XdpDatapath {
             for handle in join_handles {
                 let _ = handle.join();
             }
+            for handle in l3_tasks {
+                let _ = handle.join();
+            }
+            cleanup_runtime(&self.config, &self.interface_name);
         } else {
             log::info!("------------------------------------------------------");
             log::info!("         STARTING GATEWAY IN [ CLIENT MODE ]         ");
@@ -625,7 +737,50 @@ impl Datapath for XdpDatapath {
 
             let queue_count = if queue_count == 0 { 1 } else { queue_count };
 
+            // Open TUN device for the client L3 datapath
+            let tun_fds = match crate::tun_device::open_tun(&self.interface_name, queue_count) {
+                Ok(fds) => fds,
+                Err(e) => {
+                    log::error!("Failed to open TUN device: {}", e);
+                    cleanup_runtime(&self.config, &self.interface_name);
+                    return Err(DatapathError::Io(e));
+                }
+            };
+            let mut fd_guard = FdsGuard { fds: tun_fds };
+
+            if let Err(e) = setup_routes(&self.config, &self.interface_name) {
+                log::error!("Failed to setup userspace routes: {}", e);
+                cleanup_runtime(&self.config, &self.interface_name);
+                return Err(DatapathError::Config(e));
+            }
+
             let setup = setup_xsk_sockets(self.quic_ifindex, &self.intercept_ifindexes, queue_count)?;
+
+            let mut worker_preps = Vec::new();
+            for (worker_id, &fd) in fd_guard.fds.clone().iter().enumerate() {
+                let tun_io = Arc::new(match crate::tun_io::AsyncTunIo::new(fd) {
+                    Ok(io) => {
+                        fd_guard.fds[worker_id] = -1;
+                        io
+                    }
+                    Err(e) => {
+                        log::error!("Failed to wrap TUN FD in AsyncTunIo: {}", e);
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        return Err(DatapathError::Io(e));
+                    }
+                });
+
+                let udp_socket = match setup_udp_socket(None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        cleanup_runtime(&self.config, &self.interface_name);
+                        return Err(e);
+                    }
+                };
+
+                let endpoint = setup_client_endpoint();
+                worker_preps.push((tun_io, udp_socket, endpoint));
+            }
 
             let userspace_tcp_failover_task = crate::start_userspace_tcp_failover_manager(
                 self.gateway_state.clone(),
@@ -654,6 +809,34 @@ impl Datapath for XdpDatapath {
                 join_handles.push(handle);
             }
 
+            let mut worker_tasks = Vec::new();
+            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate() {
+                let mut worker = crate::rtc_loop::RtcWorker::new(
+                    tun_io,
+                    worker_id,
+                    crate::rtc_loop::WorkerRole::Client,
+                    crate::rtc_loop::RtcWorkerConfig {
+                        mtu: self.config.interface.mtu,
+                    },
+                    udp_socket,
+                    endpoint,
+                    None,
+                    None,
+                    Some(self.shared_quic_registry.clone()),
+                );
+                worker.set_worker_stats(self.worker_telemetry_registry.get_or_create(worker_id));
+                worker.set_peer_telemetry(self.peer_telemetries[worker_id].clone());
+
+                let thread = spawn_worker_thread(
+                    worker,
+                    worker_id,
+                    "client",
+                    dp_snapshot.clone(),
+                    exit_notify.clone(),
+                );
+                worker_tasks.push(thread);
+            }
+
             tokio::select! {
                 _ = crate::wait_for_shutdown() => {},
                 _ = exit_notify.notified() => {
@@ -665,7 +848,11 @@ impl Datapath for XdpDatapath {
             for handle in join_handles {
                 let _ = handle.join();
             }
+            for handle in worker_tasks {
+                let _ = handle.join();
+            }
             userspace_tcp_failover_task.abort();
+            cleanup_runtime(&self.config, &self.interface_name);
         }
 
         Ok(())

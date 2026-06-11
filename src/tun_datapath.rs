@@ -48,7 +48,7 @@ impl Drop for FdsGuard {
     }
 }
 
-fn setup_udp_socket(port: Option<u16>) -> Result<tokio::net::UdpSocket, DatapathError> {
+pub(crate) fn setup_udp_socket(port: Option<u16>) -> Result<tokio::net::UdpSocket, DatapathError> {
     let bind_addr = match port {
         Some(p) => format!("0.0.0.0:{}", p).parse::<std::net::SocketAddr>().unwrap(),
         None => "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap(),
@@ -68,7 +68,7 @@ fn setup_udp_socket(port: Option<u16>) -> Result<tokio::net::UdpSocket, Datapath
     Ok(udp_socket)
 }
 
-fn setup_server_endpoint(
+pub(crate) fn setup_server_endpoint(
     quic_certs: &[rustls::Certificate],
     quic_key: &rustls::PrivateKey,
     packet_buffer_size: usize,
@@ -105,13 +105,13 @@ fn setup_server_endpoint(
     Ok(endpoint)
 }
 
-fn setup_client_endpoint() -> quinn_proto::Endpoint {
+pub(crate) fn setup_client_endpoint() -> quinn_proto::Endpoint {
     let mut endpoint_config = quinn_proto::EndpointConfig::default();
     endpoint_config.max_udp_payload_size(65527).unwrap();
     quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, false)
 }
 
-fn spawn_worker_thread(
+pub(crate) fn spawn_worker_thread(
     mut worker: crate::rtc_loop::RtcWorker,
     worker_id: usize,
     role_name: &'static str,
