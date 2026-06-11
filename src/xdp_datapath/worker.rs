@@ -25,6 +25,8 @@ impl Drop for FdsGuard {
     fn drop(&mut self) {
         for &fd in &self.fds {
             if fd >= 0 {
+                // SAFETY: The FDs stored in the vector are valid and non-negative.
+                // When FDs are handed over or managed, they are reset to -1 in the vector.
                 unsafe {
                     libc::close(fd);
                 }
@@ -105,6 +107,8 @@ unsafe impl Sync for UmemRegion {}
 #[cfg(target_os = "linux")]
 impl UmemRegion {
     fn new(size: usize) -> Result<Self, std::io::Error> {
+        // SAFETY: mmap is called with MAP_ANONYMOUS | MAP_PRIVATE to allocate a private,
+        // zero-initialized, anonymous memory block of the requested size.
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -125,6 +129,7 @@ impl UmemRegion {
 #[cfg(target_os = "linux")]
 impl Drop for UmemRegion {
     fn drop(&mut self) {
+        // SAFETY: munmap is called on a valid anonymous memory block allocated by mmap in `new`.
         unsafe {
             libc::munmap(self.addr, self.size);
         }
@@ -206,10 +211,14 @@ impl XskRing {
 #[cfg(target_os = "linux")]
 fn get_interface_queue_count(ifindex: u32) -> usize {
     let mut buf = [0u8; 32];
+    // SAFETY: libc::if_indextoname is called with an output buffer `buf` of 32 bytes,
+    // which is larger than IFNAMSIZ (16 bytes). On success, name_ptr returns a pointer
+    // to a valid null-terminated string contained inside `buf`.
     let name_ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr() as *mut libc::c_char) };
     if name_ptr.is_null() {
         return 1;
     }
+    // SAFETY: name_ptr is non-null and points to the valid null-terminated string inside `buf`.
     let ifname = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
     let path = format!("/sys/class/net/{}/queues", ifname);
     if let Ok(entries) = std::fs::read_dir(path) {
@@ -222,6 +231,82 @@ fn get_interface_queue_count(ifindex: u32) -> usize {
         }
     }
     1
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct bpf_attr_update_elem {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct bpf_attr_obj_get {
+    pathname: u64,
+    bpf_fd: u32,
+    file_flags: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn register_xsk_in_map(map_fd: libc::c_int, queue_id: u32, xsk_fd: libc::c_int) -> Result<(), std::io::Error> {
+    let key = queue_id;
+    let value = xsk_fd as u32;
+
+    let attr = bpf_attr_update_elem {
+        map_fd: map_fd as u32,
+        _pad: 0,
+        key: &key as *const u32 as u64,
+        value: &value as *const u32 as u64,
+        flags: 0, // BPF_ANY
+    };
+
+    // SAFETY: The synchronous bpf syscall takes a valid pointer to the `bpf_attr_update_elem`
+    // and its internal pointers (key and value) which are guaranteed to live for the scope of the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            2, // BPF_MAP_UPDATE_ELEM
+            &attr as *const bpf_attr_update_elem as *const libc::c_void,
+            std::mem::size_of::<bpf_attr_update_elem>() as libc::size_t,
+        )
+    };
+
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bpf_obj_get(pathname: &str) -> Result<libc::c_int, std::io::Error> {
+    let c_path = CString::new(pathname)?;
+    let attr = bpf_attr_obj_get {
+        pathname: c_path.as_ptr() as u64,
+        bpf_fd: 0,
+        file_flags: 0,
+    };
+    // SAFETY: The synchronous bpf syscall takes a valid pointer to the `bpf_attr_obj_get`
+    // and the path string pointer which are guaranteed to live for the scope of the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            7, // BPF_OBJ_GET
+            &attr as *const bpf_attr_obj_get as *const libc::c_void,
+            std::mem::size_of::<bpf_attr_obj_get>() as libc::size_t,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ret as libc::c_int)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -258,15 +343,46 @@ fn setup_xsk_sockets(
             continue;
         }
 
+        let mut buf = [0u8; 32];
+        let name_ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr() as *mut libc::c_char) };
+        if name_ptr.is_null() {
+            for &s_fd in &sockets {
+                unsafe { libc::close(s_fd); }
+            }
+            return Err(DatapathError::Config(format!("Failed to get interface name for index {}", ifindex)));
+        }
+        let ifname = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
+        let map_path = format!("/sys/fs/bpf/new_proxy_{}/maps/xsks_map", ifname);
+
+        let map_fd = match bpf_obj_get(&map_path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                for &s_fd in &sockets {
+                    unsafe { libc::close(s_fd); }
+                }
+                return Err(DatapathError::Config(format!("Failed to open pinned map at {}: {}", map_path, e)));
+            }
+        };
+
         // Allocate UMEM region for this specific interface
         let umem_size = 4096 * 2048;
-        let umem = UmemRegion::new(umem_size).map_err(|e| DatapathError::Config(format!("Failed to allocate UMEM mmap for ifindex {}: {}", ifindex, e)))?;
+        let umem = match UmemRegion::new(umem_size) {
+            Ok(u) => u,
+            Err(e) => {
+                unsafe { libc::close(map_fd); }
+                for &s_fd in &sockets {
+                    unsafe { libc::close(s_fd); }
+                }
+                return Err(DatapathError::Config(format!("Failed to allocate UMEM mmap for ifindex {}: {}", ifindex, e)));
+            }
+        };
         let mut first_fd_for_iface: Option<libc::c_int> = None;
 
         for queue_id in 0..q_count {
             let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
             if fd < 0 {
                 let err = io::Error::last_os_error();
+                unsafe { libc::close(map_fd); }
                 for &s_fd in &sockets {
                     unsafe { libc::close(s_fd); }
                 }
@@ -294,6 +410,7 @@ fn setup_xsk_sockets(
                 if ret < 0 {
                     let err = io::Error::last_os_error();
                     unsafe { libc::close(fd); }
+                    unsafe { libc::close(map_fd); }
                     for &s_fd in &sockets {
                         unsafe { libc::close(s_fd); }
                     }
@@ -314,6 +431,7 @@ fn setup_xsk_sockets(
                     if ret < 0 {
                         let err = io::Error::last_os_error();
                         unsafe { libc::close(fd); }
+                        unsafe { libc::close(map_fd); }
                         for &s_fd in &sockets {
                             unsafe { libc::close(s_fd); }
                         }
@@ -338,6 +456,7 @@ fn setup_xsk_sockets(
                 if ret < 0 {
                     let err = io::Error::last_os_error();
                     unsafe { libc::close(fd); }
+                    unsafe { libc::close(map_fd); }
                     for &s_fd in &sockets {
                         unsafe { libc::close(s_fd); }
                     }
@@ -361,6 +480,7 @@ fn setup_xsk_sockets(
                     if ret < 0 {
                         let err = io::Error::last_os_error();
                         unsafe { libc::close(fd); }
+                        unsafe { libc::close(map_fd); }
                         for &s_fd in &sockets {
                             unsafe { libc::close(s_fd); }
                         }
@@ -385,6 +505,7 @@ fn setup_xsk_sockets(
                 if ret < 0 {
                     let err = io::Error::last_os_error();
                     unsafe { libc::close(fd); }
+                    unsafe { libc::close(map_fd); }
                     for &s_fd in &sockets {
                         unsafe { libc::close(s_fd); }
                     }
@@ -392,8 +513,18 @@ fn setup_xsk_sockets(
                 }
             }
 
+            if let Err(e) = register_xsk_in_map(map_fd, queue_id as u32, fd) {
+                unsafe { libc::close(fd); }
+                unsafe { libc::close(map_fd); }
+                for &s_fd in &sockets {
+                    unsafe { libc::close(s_fd); }
+                }
+                return Err(DatapathError::Config(format!("Failed to register XSK socket FD {} in BPF map: {}", fd, e)));
+            }
+
             sockets.push(fd);
         }
+        unsafe { libc::close(map_fd); }
         umems.push(umem);
     }
 
@@ -1031,6 +1162,13 @@ mod tests {
             assert_eq!(ring.free_slots(), 14);
             assert_eq!(*ring.producer, 2);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bpf_map_registration_fail_on_invalid_fd() {
+        let res = register_xsk_in_map(-1, 0, -1);
+        assert!(res.is_err());
     }
 }
 
