@@ -15,6 +15,8 @@ pub mod tun_device;
 pub mod tun_io;
 pub mod datapath;
 pub mod tun_datapath;
+use datapath::Datapath;
+use tun_datapath::TunDatapath;
 mod uds_server;
 
 
@@ -30,16 +32,15 @@ use app_config::{
     RuntimeMode,
 };
 use config::GatewayConfig;
-use control::ControlServer;
-use quic_pool::{cert_sha256, generate_self_signed_cert, PoolState, QuicPoolClient};
+use quic_pool::{PoolState, QuicPoolClient};
 use routing::AllowedIPsRouter;
-use runtime::{cleanup_runtime, run_script, setup_routes};
+use runtime::{cleanup_runtime, run_script};
 use stats_cli::run_cli_stats;
 use telemetry::{TelemetryRegistry, UserspaceWgRegistry};
 
-type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
-type L4DataPlane = Arc<ArcSwap<L4DataPlaneSnapshot>>;
-type ClientQuicDataPortBaseline = Arc<parking_lot::Mutex<usize>>;
+pub(crate) type PeerQuicPools = Arc<parking_lot::RwLock<HashMap<[u8; 32], Arc<QuicPoolClient>>>>;
+pub(crate) type L4DataPlane = Arc<ArcSwap<L4DataPlaneSnapshot>>;
+pub(crate) type ClientQuicDataPortBaseline = Arc<parking_lot::Mutex<usize>>;
 
 // 动态网关共享运行时状态 (支持 AllowedIPs 路由基数树热重载)
 pub struct GatewayState {
@@ -67,7 +68,7 @@ fn build_l4_data_plane_snapshot(
     }
 }
 
-fn current_l4_data_plane_snapshot(
+pub(crate) fn current_l4_data_plane_snapshot(
     state: &Arc<parking_lot::RwLock<GatewayState>>,
     pools: &PeerQuicPools,
 ) -> L4DataPlaneSnapshot {
@@ -114,7 +115,7 @@ fn parse_startup_args(args: &[String]) -> StartupArgs {
     parsed
 }
 
-fn should_enable_userspace_tcp_for_pool_states(
+pub(crate) fn should_enable_userspace_tcp_for_pool_states(
     expected_proxy_peer_count: usize,
     states: &[PoolState],
 ) -> bool {
@@ -126,7 +127,7 @@ fn should_enable_userspace_tcp_for_pool_states(
 }
 
 #[cfg(not(tarpaulin))]
-fn start_userspace_tcp_failover_manager(
+pub(crate) fn start_userspace_tcp_failover_manager(
     state: Arc<parking_lot::RwLock<GatewayState>>,
     pools: PeerQuicPools,
     data_plane: L4DataPlane,
@@ -271,15 +272,15 @@ fn start_userspace_tcp_failover_manager(
     })
 }
 
-fn effective_server_tun_queues(listen_ports: &[u16]) -> usize {
+pub(crate) fn effective_server_tun_queues(listen_ports: &[u16]) -> usize {
     listen_ports.len().max(1)
 }
 
-fn effective_client_tun_queues(quic_data_port_count: usize) -> usize {
+pub(crate) fn effective_client_tun_queues(quic_data_port_count: usize) -> usize {
     quic_data_port_count.max(1)
 }
 
-fn client_quic_data_port_count(
+pub(crate) fn client_quic_data_port_count(
     pools: &PeerQuicPools,
     startup_expected_count: Option<usize>,
 ) -> Option<usize> {
@@ -291,7 +292,7 @@ fn client_quic_data_port_count(
         .or(startup_expected_count)
 }
 
-fn record_startup_quic_data_port_count(
+pub(crate) fn record_startup_quic_data_port_count(
     expected_count: &mut Option<usize>,
     candidate_count: usize,
 ) -> Result<(), String> {
@@ -311,7 +312,7 @@ fn record_startup_quic_data_port_count(
     }
 }
 
-fn validate_client_quic_data_port_count(
+pub(crate) fn validate_client_quic_data_port_count(
     pools: &PeerQuicPools,
     candidate_count: usize,
 ) -> Result<(), String> {
@@ -334,7 +335,7 @@ fn validate_client_quic_data_port_count(
     }
 }
 
-fn validate_client_quic_data_port_count_matches_baseline(
+pub(crate) fn validate_client_quic_data_port_count_matches_baseline(
     candidate_count: usize,
     baseline_count: usize,
 ) -> Result<(), String> {
@@ -360,7 +361,7 @@ pub fn record_client_quic_data_port_baseline_if_unset(
     }
 }
 
-fn record_initial_client_quic_data_port_baseline(
+pub(crate) fn record_initial_client_quic_data_port_baseline(
     client_quic_data_port_baseline: &parking_lot::Mutex<usize>,
     quic_data_port_count: Option<usize>,
 ) {
@@ -393,7 +394,7 @@ fn derive_peer_secrets(config: &GatewayConfig) -> HashMap<[u8; 32], [u8; 32]> {
         .collect()
 }
 
-fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
+pub(crate) fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
     config
         .peers
         .iter()
@@ -403,7 +404,7 @@ fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
 }
 
 #[cfg(all(unix, not(tarpaulin)))]
-async fn wait_for_shutdown() {
+pub(crate) async fn wait_for_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
@@ -418,7 +419,7 @@ async fn wait_for_shutdown() {
 }
 
 #[cfg(all(not(unix), not(tarpaulin)))]
-async fn wait_for_shutdown() {
+pub(crate) async fn wait_for_shutdown() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl_c");
@@ -488,25 +489,7 @@ fn main() {
     ));
 }
 
-struct WorkerTask {
-    _thread: std::thread::JoinHandle<()>,
-}
 
-impl WorkerTask {
-    fn abort(&self) {
-        // No-op. Process exit terminates all background threads.
-    }
-}
-
-struct WorkerPanicGuard {
-    exit_notify: Arc<tokio::sync::Notify>,
-}
-
-impl Drop for WorkerPanicGuard {
-    fn drop(&mut self) {
-        self.exit_notify.notify_one();
-    }
-}
 
 #[cfg(not(tarpaulin))]
 fn build_tokio_runtime() -> tokio::runtime::Runtime {
@@ -655,417 +638,32 @@ async fn run_gateway(
         );
     }
 
-    if runtime_mode == RuntimeMode::Server {
-        log::info!("------------------------------------------------------");
-        log::info!("         STARTING GATEWAY IN [ SERVER MODE ]         ");
-        log::info!("------------------------------------------------------");
+    let datapath = Arc::new(TunDatapath::new(
+        config.clone(),
+        interface_name.clone(),
+        runtime_mode,
+        fixed_client_quic_data_port_count,
+        peer_telemetries,
+        worker_telemetry_registry,
+        gateway_state.clone(),
+        peer_secrets,
+        session_cache,
+        auth_nonce_cache,
+        shared_quic_registry,
+        client_quic_pools,
+        client_quic_data_port_baseline,
+        peer_mutation_lock,
+    ).expect("failed to construct TunDatapath"));
 
-        let _listen_port = match config.interface.listen_port {
-            Some(port) => port,
-            None => {
-                log::error!("Server userspace WireGuard L3 requires Interface.ListenPort");
-                cleanup_runtime(&config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        let tun_queue_count = effective_server_tun_queues(&config.quic_pool.listen_ports);
-        log::info!(
-            "Server TUN queue count follows QUIC listen port count: using {}",
-            tun_queue_count
-        );
-
-        let tun_fds = match tun_device::open_tun(&interface_name, tun_queue_count) {
-            Ok(fds) => fds,
-            Err(e) => {
-                log::error!("Failed to open server TUN device: {}", e);
-                cleanup_runtime(&config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        if let Err(e) = setup_routes(&config, &interface_name) {
-            eprintln!("Failed to setup userspace routes: {}", e);
-            cleanup_runtime(&config, &interface_name);
-            std::process::exit(1);
-        }
-
-        let (quic_certs, quic_key) = match generate_self_signed_cert() {
-            Ok(cert) => cert,
-            Err(e) => {
-                log::error!("Failed to generate QUIC certificate: {}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-        let quic_cert_sha256 = match cert_sha256(&quic_certs) {
-            Ok(fingerprint) => fingerprint,
-            Err(e) => {
-                log::error!("Failed to fingerprint QUIC certificate: {}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        let mut l3_tasks = Vec::new();
-        for (worker_id, fd) in tun_fds.into_iter().enumerate() {
-            let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
-                Ok(io) => io,
-                Err(e) => {
-                    log::error!("Failed to wrap server TUN FD in AsyncTunIo: {}", e);
-                    cleanup_runtime(&config, &interface_name);
-                    std::process::exit(1);
-                }
-            });
-            let packet_buffer_size = config::packet_buffer_size_for_mtu(config.interface.mtu);
-
-            let local_port = config.quic_pool.listen_ports[worker_id];
-            let bind_addr = format!("0.0.0.0:{}", local_port)
-                .parse::<std::net::SocketAddr>()
-                .unwrap();
-            let std_sock =
-                std::net::UdpSocket::bind(bind_addr).expect("Failed to bind server UDP socket");
-            std_sock.set_nonblocking(true).unwrap();
-            let sock_ref = socket2::SockRef::from(&std_sock);
-            let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
-            let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
-            if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
-                log::error!("Failed to set outer mark on server UDP socket: {}", e);
-                cleanup_runtime(&config, &interface_name);
-                std::process::exit(1);
-            }
-            let udp_socket =
-                tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
-
-            let mut rustls_config = rustls::ServerConfig::builder()
-                .with_safe_defaults()
-                .with_no_client_auth()
-                .with_single_cert(quic_certs.clone(), quic_key.clone())
-                .expect("Failed to build rustls ServerConfig");
-            rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
-            let mut server_proto_config =
-                quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
-            let mut transport = quinn_proto::TransportConfig::default();
-            let quic_mtu = rtc_loop::quic_initial_mtu_for_packet_buffer(packet_buffer_size);
-            transport
-                .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
-            transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-            transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
-            transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
-            transport.send_window(16 * 1024 * 1024);
-            transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-            transport.datagram_send_buffer_size(8 * 1024 * 1024);
-            transport.initial_mtu(quic_mtu);
-            transport.min_mtu(quic_mtu);
-            server_proto_config.transport_config(Arc::new(transport));
-
-            let mut endpoint_config = quinn_proto::EndpointConfig::default();
-            endpoint_config.max_udp_payload_size(65527).unwrap();
-            let endpoint = quinn_proto::Endpoint::new(
-                Arc::new(endpoint_config),
-                Some(Arc::new(server_proto_config)),
-                false,
-            );
-
-            let mut worker = rtc_loop::RtcWorker::new(
-                tun_io,
-                worker_id,
-                rtc_loop::WorkerRole::Server,
-                rtc_loop::RtcWorkerConfig {
-                    mtu: config.interface.mtu,
-                },
-                udp_socket,
-                endpoint,
-                Some(session_cache.clone()),
-                Some(auth_nonce_cache.clone()),
-                Some(shared_quic_registry.clone()),
-            );
-            worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
-            worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
-            let l4_data_plane_for_worker = l4_data_plane.clone();
-            let exit_notify_clone = exit_notify.clone();
-            let thread = std::thread::Builder::new()
-                .name(format!("new-proxy-server-worker-{}", worker_id))
-                .spawn(move || {
-                    let _panic_guard = WorkerPanicGuard {
-                        exit_notify: exit_notify_clone,
-                    };
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Failed to build server worker local Tokio runtime");
-                    rt.block_on(async {
-                        if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
-                            log::error!("Server RtcWorker loop failed: {}", e);
-                        }
-                    });
-                })
-                .expect("Failed to spawn Server RtcWorker thread");
-            let task = WorkerTask { _thread: thread };
-            l3_tasks.push(task);
-        }
-
-        let listen_control_port = config
-            .interface
-            .listen_control_port
-            .or(config.interface.listen_port)
-            .expect("Server config validation failed to enforce control port");
-
-        // 启动用户态独立公网控制通道协商服务器 (传递动态 peer_secrets 哈希表)
-        let control_server = ControlServer::new(
-            listen_control_port,
-            peer_secrets.clone(),
-            config.quic_pool.listen_ports.clone(),
-            config.quic_pool.public_ipv4.clone(),
-            config.quic_pool.public_ipv6.clone(),
-            quic_cert_sha256,
-            session_cache.clone(),
-        );
-
-        let control_task = match control_server.start().await {
-            Ok(handle) => handle,
-            Err(e) => {
-                log::error!("Control plane server failed to start: {}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        tokio::select! {
-            _ = wait_for_shutdown() => {},
-            _ = exit_notify.notified() => {
-                log::error!("A server worker thread exited prematurely; shutting down.");
-            }
-        }
-        control_task.abort();
-        for task in l3_tasks {
-            task.abort();
-        }
-    } else {
-        log::info!("------------------------------------------------------");
-        log::info!("         STARTING GATEWAY IN [ CLIENT MODE ]         ");
-        log::info!("------------------------------------------------------");
-
-        let proxy_peers = proxy_peers(&config);
-        if proxy_peers.is_empty() {
-            log::warn!("No QUIC proxy peers configured; userspace TCP offload remains inactive.");
-        }
-
-        let mut initial_pool_failures = 0usize;
-        let mut startup_quic_data_port_count = fixed_client_quic_data_port_count;
-        for peer in &proxy_peers {
-            match build_peer_quic_pool(config.interface.private_key, peer).await {
-                Ok(pool) => {
-                    if let Err(e) = record_startup_quic_data_port_count(
-                        &mut startup_quic_data_port_count,
-                        pool.endpoint_count(),
-                    ) {
-                        pool.shutdown(b"QUIC data port count mismatch");
-                        log::error!(
-                            "Failed to establish initial QUIC pool for peer {}: {}",
-                            encode_base64_32(&peer.public_key),
-                            e
-                        );
-                        let cleanup_config = gateway_state.read().config.clone();
-                        cleanup_runtime(&cleanup_config, &interface_name);
-                        std::process::exit(1);
-                    }
-                    if let Err(e) = validate_client_quic_data_port_count(
-                        &client_quic_pools,
-                        pool.endpoint_count(),
-                    ) {
-                        pool.shutdown(b"QUIC data port count mismatch");
-                        log::error!(
-                            "Failed to establish initial QUIC pool for peer {}: {}",
-                            encode_base64_32(&peer.public_key),
-                            e
-                        );
-                        let cleanup_config = gateway_state.read().config.clone();
-                        cleanup_runtime(&cleanup_config, &interface_name);
-                        std::process::exit(1);
-                    }
-                    client_quic_pools.write().insert(peer.public_key, pool);
-                }
-                Err(e) => {
-                    initial_pool_failures += 1;
-                    if let Some(data_port_count) = e.data_port_count() {
-                        if let Err(mismatch) = record_startup_quic_data_port_count(
-                            &mut startup_quic_data_port_count,
-                            data_port_count,
-                        ) {
-                            log::error!(
-                                "Failed to establish initial QUIC pool for peer {}: {}; {}",
-                                encode_base64_32(&peer.public_key),
-                                e,
-                                mismatch
-                            );
-                            let cleanup_config = gateway_state.read().config.clone();
-                            cleanup_runtime(&cleanup_config, &interface_name);
-                            std::process::exit(1);
-                        }
-                    }
-                    log::warn!(
-                        "Failed to establish initial QUIC pool for peer {}; starting in WireGuard L3 fallback and retrying in background: {}",
-                        encode_base64_32(&peer.public_key),
-                        e
-                    );
-                }
-            }
-        }
-        if initial_pool_failures > 0 {
-            gateway_state.write().userspace_tcp_offload_enabled = false;
-            log::warn!(
-                "Disabled userspace TCP offload because {} initial QUIC pool(s) failed; traffic will use userspace WireGuard L3 until QUIC recovers",
-                initial_pool_failures
-            );
-        }
-        publish_l4_data_plane_snapshot(&l4_data_plane, &gateway_state, &client_quic_pools);
-        let quic_data_port_count =
-            client_quic_data_port_count(&client_quic_pools, startup_quic_data_port_count);
-        let tun_queue_count = effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
-        record_initial_client_quic_data_port_baseline(
-            &client_quic_data_port_baseline,
-            quic_data_port_count,
-        );
-        match quic_data_port_count {
-            Some(count) => log::info!(
-                "Client TUN queue count follows negotiated QUIC data port count: data_ports {}, using {}",
-                count,
-                tun_queue_count
-            ),
-            None => log::info!(
-                "Client TUN queue count has no negotiated QUIC data port count yet; using {} initial queue",
-                tun_queue_count
-            ),
-        }
-
-        let userspace_tcp_failover_task = start_userspace_tcp_failover_manager(
-            gateway_state.clone(),
-            client_quic_pools.clone(),
-            l4_data_plane.clone(),
-            config.interface.private_key,
-            client_quic_data_port_baseline.clone(),
-            peer_mutation_lock.clone(),
-        );
-
-        log::info!(
-            "Opening userspace multiqueue TUN device: {} with {} queues",
-            interface_name,
-            tun_queue_count
-        );
-        let tun_fds = match tun_device::open_tun(&interface_name, tun_queue_count) {
-            Ok(fds) => fds,
-            Err(e) => {
-                log::error!("Failed to open TUN device: {}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-        };
-
-        if let Err(e) = setup_routes(&config, &interface_name) {
-            log::error!("Failed to setup userspace routes: {}", e);
-            for fd in tun_fds {
-                unsafe {
-                    libc::close(fd);
-                }
-            }
-            let cleanup_config = gateway_state.read().config.clone();
-            cleanup_runtime(&cleanup_config, &interface_name);
-            std::process::exit(1);
-        }
-
-        let mut worker_tasks = Vec::new();
-        for (worker_id, fd) in tun_fds.into_iter().enumerate() {
-            let tun_io = Arc::new(match tun_io::AsyncTunIo::new(fd) {
-                Ok(io) => io,
-                Err(e) => {
-                    log::error!("Failed to wrap TUN FD in AsyncTunIo: {}", e);
-                    std::process::exit(1);
-                }
-            });
-
-            let std_sock =
-                std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind client UDP socket");
-            std_sock.set_nonblocking(true).unwrap();
-            let sock_ref = socket2::SockRef::from(&std_sock);
-            let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
-            let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
-            if let Err(e) = socket_mark::set_outer_mark(&std_sock) {
-                log::error!("Failed to set outer mark on client UDP socket: {}", e);
-                let cleanup_config = gateway_state.read().config.clone();
-                cleanup_runtime(&cleanup_config, &interface_name);
-                std::process::exit(1);
-            }
-            let udp_socket =
-                tokio::net::UdpSocket::from_std(std_sock).expect("Failed to convert UDP socket");
-
-            let mut endpoint_config = quinn_proto::EndpointConfig::default();
-            endpoint_config.max_udp_payload_size(65527).unwrap();
-            let endpoint = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, false);
-
-            let mut worker = rtc_loop::RtcWorker::new(
-                tun_io,
-                worker_id,
-                rtc_loop::WorkerRole::Client,
-                rtc_loop::RtcWorkerConfig {
-                    mtu: config.interface.mtu,
-                },
-                udp_socket,
-                endpoint,
-                None,
-                None,
-                Some(shared_quic_registry.clone()),
-            );
-            worker.set_worker_stats(worker_telemetry_registry.get_or_create(worker_id));
-            worker.set_peer_telemetry(peer_telemetries[worker_id].clone());
-
-            let l4_data_plane_for_worker = l4_data_plane.clone();
-            let exit_notify_clone = exit_notify.clone();
-            let thread = std::thread::Builder::new()
-                .name(format!("new-proxy-client-worker-{}", worker_id))
-                .spawn(move || {
-                    let _panic_guard = WorkerPanicGuard {
-                        exit_notify: exit_notify_clone,
-                    };
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Failed to build client worker local Tokio runtime");
-                    rt.block_on(async {
-                        if let Err(e) = worker.run_loop(l4_data_plane_for_worker).await {
-                            log::error!("RtcWorker loop failed: {}", e);
-                        }
-                    });
-                })
-                .expect("Failed to spawn Client RtcWorker thread");
-            let handle = WorkerTask { _thread: thread };
-            worker_tasks.push(handle);
-        }
-
-        log::info!("------------------------------------------------------");
-        log::info!("  Userspace multiqueue TUN transparent proxy running  ");
-        log::info!("  All L3 and L4 traffic processed in userspace.       ");
-        log::info!("------------------------------------------------------");
-
-        tokio::select! {
-            _ = wait_for_shutdown() => {},
-            _ = exit_notify.notified() => {
-                log::error!("A client worker thread exited prematurely; shutting down.");
-            }
-        }
-        for t in worker_tasks {
-            t.abort();
-        }
-        userspace_tcp_failover_task.abort();
-    }
+    let run_res = datapath.run_loop(l4_data_plane, exit_notify).await;
 
     // 自动清理 userspace TUN 路由
     let cleanup_config = gateway_state.read().config.clone();
     cleanup_runtime(&cleanup_config, &interface_name);
+
+    if let Err(e) = run_res {
+        log::error!("TunDatapath run_loop failed: {:?}", e);
+    }
 }
 
 #[cfg(test)]
