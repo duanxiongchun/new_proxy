@@ -1957,10 +1957,19 @@ fn run_xdp_worker_loop(
                                         src_ip,
                                         dst_ip
                                     );
-                                    route_state
-                                        .inner_mac_cache
-                                        .write()
-                                        .insert(src_ip, eth_header.src_mac);
+                                    let needs_update = {
+                                        let cache = route_state.inner_mac_cache.read();
+                                        match cache.get(&src_ip) {
+                                            Some(&mac) => mac != eth_header.src_mac,
+                                            None => true,
+                                        }
+                                    };
+                                    if needs_update {
+                                        route_state
+                                            .inner_mac_cache
+                                            .write()
+                                            .insert(src_ip, eth_header.src_mac);
+                                    }
                                     route_state
                                         .intercept_local_macs
                                         .insert(intercept.ifindex, eth_header.dst_mac);
