@@ -25,14 +25,17 @@ impl BpfLinkManager {
         }
 
         // Create BPF directories
-        let status = Command::new("mkdir")
-            .args(["-p", &format!("/sys/fs/bpf/new_proxy_{}/maps", interface)])
-            .status()?;
-        if !status.success() {
-            log::warn!(
-                "Failed to create BPF maps directory for interface {}",
-                interface
-            );
+        #[cfg(not(test))]
+        {
+            let status = Command::new("mkdir")
+                .args(["-p", &format!("/sys/fs/bpf/new_proxy_{}/maps", interface)])
+                .status()?;
+            if !status.success() {
+                log::warn!(
+                    "Failed to create BPF maps directory for interface {}",
+                    interface
+                );
+            }
         }
 
         let manager = Self {
@@ -42,6 +45,7 @@ impl BpfLinkManager {
         };
 
         let cmds = manager.build_load_commands();
+        #[cfg(not(test))]
         for cmd in cmds {
             let status = Command::new("sh").arg("-c").arg(&cmd).status()?;
             if !status.success() {
@@ -74,46 +78,49 @@ impl BpfLinkManager {
 #[cfg(target_os = "linux")]
 impl Drop for BpfLinkManager {
     fn drop(&mut self) {
-        use std::process::Command;
-        let attach_type = if self.mode == "native" {
-            "xdp"
-        } else {
-            "xdpgeneric"
-        };
+        #[cfg(not(test))]
+        {
+            use std::process::Command;
+            let attach_type = if self.mode == "native" {
+                "xdp"
+            } else {
+                "xdpgeneric"
+            };
 
-        // Detach XDP program from interface
-        let status = Command::new("bpftool")
-            .args(["net", "detach", attach_type, "dev", &self.interface])
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                log::info!(
-                    "Successfully detached XDP program from interface {}",
-                    self.interface
-                );
+            // Detach XDP program from interface
+            let status = Command::new("bpftool")
+                .args(["net", "detach", attach_type, "dev", &self.interface])
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    log::info!(
+                        "Successfully detached XDP program from interface {}",
+                        self.interface
+                    );
+                }
+                other => {
+                    log::warn!(
+                        "Failed to detach XDP program from interface {}: {:?}",
+                        self.interface,
+                        other
+                    );
+                }
             }
-            other => {
-                log::warn!(
-                    "Failed to detach XDP program from interface {}: {:?}",
-                    self.interface,
-                    other
-                );
-            }
-        }
 
-        // Remove pinned BPF directory
-        let path = format!("/sys/fs/bpf/new_proxy_{}", self.interface);
-        let status = Command::new("rm").args(["-rf", &path]).status();
-        match status {
-            Ok(s) if s.success() => {
-                log::info!("Successfully removed pinned BPF directory {}", path);
-            }
-            other => {
-                log::warn!(
-                    "Failed to remove pinned BPF directory {}: {:?}",
-                    path,
-                    other
-                );
+            // Remove pinned BPF directory
+            let path = format!("/sys/fs/bpf/new_proxy_{}", self.interface);
+            let status = Command::new("rm").args(["-rf", &path]).status();
+            match status {
+                Ok(s) if s.success() => {
+                    log::info!("Successfully removed pinned BPF directory {}", path);
+                }
+                other => {
+                    log::warn!(
+                        "Failed to remove pinned BPF directory {}: {:?}",
+                        path,
+                        other
+                    );
+                }
             }
         }
     }

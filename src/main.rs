@@ -127,7 +127,6 @@ pub(crate) fn should_enable_userspace_tcp_for_pool_states(
             .all(|state| matches!(state, PoolState::Active))
 }
 
-#[cfg(not(tarpaulin))]
 pub(crate) fn start_userspace_tcp_failover_manager(
     state: Arc<parking_lot::RwLock<GatewayState>>,
     pools: PeerQuicPools,
@@ -404,7 +403,7 @@ pub(crate) fn proxy_peers(config: &GatewayConfig) -> Vec<config::PeerConfig> {
         .collect()
 }
 
-#[cfg(all(unix, not(tarpaulin)))]
+#[cfg(unix)]
 pub(crate) async fn wait_for_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
@@ -419,7 +418,7 @@ pub(crate) async fn wait_for_shutdown() {
     }
 }
 
-#[cfg(all(not(unix), not(tarpaulin)))]
+#[cfg(not(unix))]
 pub(crate) async fn wait_for_shutdown() {
     tokio::signal::ctrl_c()
         .await
