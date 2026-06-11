@@ -13,6 +13,13 @@ struct {
     __type(value, __u32);
 } xsks_map SEC(".maps") __attribute__((unused));
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, __u8);
+} local_ips SEC(".maps") __attribute__((unused));
+
 SEC("xdp")
 int xdp_filter_prog(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -41,15 +48,46 @@ int xdp_filter_prog(struct xdp_md *ctx) {
             if ((void *)(udp + 1) > data_end)
                 return XDP_PASS;
 
-            if (udp->dest == bpf_htons(51820) || udp->dest == bpf_htons(40001)) {
-                return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+            if (udp->dest == bpf_htons(51821) || udp->source == bpf_htons(51821)) {
+                return XDP_PASS;
+            }
+
+            __u16 dport = bpf_ntohs(udp->dest);
+            if (dport >= 40001 && dport <= 40064) {
+                __u8 *payload = (void *)(udp + 1);
+                if ((void *)(payload + 20) <= data_end) {
+                    __u8 ip_ver = payload[0];
+                    __u16 ip_len = (payload[2] << 8) | payload[3];
+                    __u16 udp_payload_len = bpf_ntohs(udp->len) - 8;
+                    if (ip_ver == 0x45 && ip_len == udp_payload_len) {
+                        return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
+                    }
+                }
+                return XDP_PASS;
+            }
+            if (dport == 51820) {
+                __u8 *payload = (void *)(udp + 1);
+                if ((void *)(payload + 20) <= data_end) {
+                    __u8 ip_ver = payload[0];
+                    __u16 ip_len = (payload[2] << 8) | payload[3];
+                    __u16 udp_payload_len = bpf_ntohs(udp->len) - 8;
+                    if (ip_ver == 0x45 && ip_len == udp_payload_len) {
+                        return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
+                    }
+                }
+                return XDP_PASS;
             }
         }
 
-        // 2. Redirect client plaintext IPs (10.0.0.0/8 subnet)
+        // If the destination IP is one of our local IPs, let it pass to the kernel stack
         __u32 dest_ip = ip->daddr;
+        if (bpf_map_lookup_elem(&local_ips, &dest_ip)) {
+            return XDP_PASS;
+        }
+
+        // 2. Redirect client plaintext IPs (10.0.0.0/8 subnet)
         if ((dest_ip & bpf_htonl(0xFF000000)) == bpf_htonl(0x0A000000)) {
-            return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+            return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
         }
     }
 

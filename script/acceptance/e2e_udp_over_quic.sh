@@ -45,7 +45,7 @@ cleanup() {
 }
 
 # Do not run cleanup automatically on exit during debug so we can inspect logs
-# trap cleanup EXIT
+trap cleanup EXIT
 
 mkdir -p "$ARTIFACT_DIR"
 ip netns add client_ns
@@ -168,7 +168,6 @@ echo "=== Client Log ==="
 cat "$CLIENT_LOG"
 echo "=== Server Log ==="
 cat "$SERVER_LOG"
-
-cleanup
+# Cleanup will be automatically executed by trap EXIT
 echo "=== [SUCCESS] E2E UDP-over-QUIC Test Passed ==="
 exit 0

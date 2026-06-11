@@ -22,10 +22,10 @@ build: setup-git-hooks
 	cargo build $(CARGO_BUILD_FLAGS)
 
 test:
-	cargo test
+	timeout 300s cargo test
 
 src/xdp_datapath/xdp_filter.o: src/xdp_datapath/xdp_filter.c
-	clang -target bpf -O2 -I/usr/include/$(MULTIARCH) -c src/xdp_datapath/xdp_filter.c -o src/xdp_datapath/xdp_filter.o
+	clang -target bpf -g -O2 -I/usr/include/$(MULTIARCH) -c src/xdp_datapath/xdp_filter.c -o src/xdp_datapath/xdp_filter.o
 
 build-bpf: src/xdp_datapath/xdp_filter.o
 
@@ -78,7 +78,7 @@ package: build
 	@echo "Debian package created successfully: $(DEB_FILE)"
 
 coverage:
-	cargo tarpaulin
+	timeout 600s cargo tarpaulin
 
 clean:
 	cargo clean

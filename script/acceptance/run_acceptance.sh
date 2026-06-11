@@ -120,10 +120,19 @@ for test_name in "${TESTS[@]}"; do
   echo " Running E2E Test: $test_name"
   echo "======================================================================"
   
-  if sudo -E bash "script/acceptance/${test_name}.sh"; then
+  # Set a timeout of 300 seconds (5 minutes) for each test scenario to prevent hanging indefinitely.
+  # If a timeout occurs, timeout will exit with status 124.
+  if timeout --kill-after=10s 300s sudo -E bash "script/acceptance/${test_name}.sh"; then
     RESULTS["$test_name"]="PASS"
   else
-    RESULTS["$test_name"]="FAIL"
+    local exit_status=$?
+    if [ $exit_status -eq 124 ]; then
+      echo "❌ [TIMEOUT] E2E Test $test_name timed out after 300 seconds (5 minutes)!" >&2
+      RESULTS["$test_name"]="TIMEOUT"
+    else
+      echo "❌ [FAIL] E2E Test $test_name failed!" >&2
+      RESULTS["$test_name"]="FAIL"
+    fi
     FAILED=$((FAILED + 1))
   fi
 done

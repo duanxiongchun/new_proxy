@@ -48,7 +48,7 @@ if [ ! -e /dev/net/tun ]; then
 fi
 chmod 666 /dev/net/tun
 
-export RUST_LOG=debug
+export RUST_LOG=info
 
 cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
 [Interface]
@@ -57,12 +57,12 @@ Address = 10.0.0.1/24
 ListenPort = 51820
 ListenControlPort = 51821
 MTU = 1280
-Table = auto
+Table = off
 Mode = af_xdp
 
 [QUICPool]
 PublicIPv4 = 10.0.2.2
-ListenPorts = 40001, 40002, 40003, 40004
+ListenPorts = 40001
 
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_CLIENT1_PUBLIC_KEY}
@@ -70,7 +70,7 @@ AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 
 [XDP]
 QuicInterface = vp-s
-InterceptInterfaces = vp-s, lo
+InterceptInterfaces = vp-s-w2
 XdpMode = native
 EOF_CONF
 
@@ -79,7 +79,7 @@ cat > "$ARTIFACT_DIR/client_perf.conf" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
 MTU = 1280
-Table = auto
+Table = off
 Mode = af_xdp
 
 [Peer]
@@ -90,7 +90,7 @@ AllowedIPs = 10.0.0.1/32
 
 [XDP]
 QuicInterface = vp-c
-InterceptInterfaces = vp-c, vp-c-w, lo
+InterceptInterfaces = vp-c-w, lo
 XdpMode = native
 EOF_CONF
 
@@ -115,17 +115,29 @@ ip netns exec perf_server_ns ip link set vp-s up
 ip netns exec perf_server_ns ip link set lo up
 ip netns exec perf_server_ns ip route add default via 10.0.2.1
 
+ip link add vp-s-w1 type veth peer name vp-s-w2
+ip link set vp-s-w1 address 00:00:00:00:00:11
+ip link set vp-s-w2 address 00:00:00:00:00:22
+ip link set vp-s-w1 netns perf_server_ns
+ip link set vp-s-w2 netns perf_server_ns
+ip netns exec perf_server_ns ip addr add 10.0.0.1/24 dev vp-s-w1
+ip netns exec perf_server_ns ip link set vp-s-w1 mtu 1280 up
+ip netns exec perf_server_ns ip link set vp-s-w2 mtu 1280 up
+ip netns exec perf_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vp-s-w1
+ip netns exec perf_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vp-s-w1
+
 ip netns exec perf_client_ns ip addr add 10.0.1.2/24 dev vp-c
 ip netns exec perf_client_ns ip addr add 10.0.4.1/24 dev vp-c-w
 ip netns exec perf_client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec perf_client_ns ip link set vp-c up
-ip netns exec perf_client_ns ip link set vp-c-w up
+ip netns exec perf_client_ns ip link set vp-c-w mtu 1280 up
 ip netns exec perf_client_ns ip link set lo up
 ip netns exec perf_client_ns ip route add default via 10.0.1.1
+ip netns exec perf_client_ns ip route add 10.0.0.1/32 dev lo
 ip netns exec perf_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 ip netns exec perf_work_ns ip addr add 10.0.4.2/24 dev vp-w
-ip netns exec perf_work_ns ip link set vp-w up
+ip netns exec perf_work_ns ip link set vp-w mtu 1280 up
 ip netns exec perf_work_ns ip link set lo up
 ip netns exec perf_work_ns ip route add default via 10.0.4.1
 
@@ -138,8 +150,28 @@ ip netns exec perf_router_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 ip netns exec perf_router_ns ip route add 10.0.0.1/32 via 10.0.2.2
 ip netns exec perf_router_ns ip route add 10.0.0.2/32 via 10.0.1.2
 
+# Disable rp_filter in all namespaces
+ip netns exec perf_server_ns sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+ip netns exec perf_server_ns sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+ip netns exec perf_client_ns sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+ip netns exec perf_client_ns sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+ip netns exec perf_work_ns sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+ip netns exec perf_work_ns sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+ip netns exec perf_router_ns sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+ip netns exec perf_router_ns sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+
+
+ip netns exec perf_server_ns ethtool -K vp-s tx off rx off 2>/dev/null || true
+ip netns exec perf_server_ns ethtool -K vp-s-w1 tx off rx off 2>/dev/null || true
+ip netns exec perf_server_ns ethtool -K vp-s-w2 tx off rx off 2>/dev/null || true
+ip netns exec perf_client_ns ethtool -K vp-c tx off rx off 2>/dev/null || true
+ip netns exec perf_client_ns ethtool -K vp-c-w tx off rx off 2>/dev/null || true
+ip netns exec perf_work_ns ethtool -K vp-w tx off rx off 2>/dev/null || true
+ip netns exec perf_router_ns ethtool -K vp-rs tx off rx off 2>/dev/null || true
+ip netns exec perf_router_ns ethtool -K vp-rc tx off rx off 2>/dev/null || true
+
 dd if=/dev/zero of="$ARTIFACT_DIR/blob.bin" bs=1M count=8 status=none
-ip netns exec perf_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
+ip netns exec perf_server_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -149,12 +181,28 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
-ip netns exec perf_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
+ip netns exec perf_client_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
 if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
   echo "Client daemon exited early"
   cat "$ARTIFACT_DIR/client.log"
+  exit 1
+fi
+
+# Wait for HTTP server to become fully ready
+ready=0
+for i in {1..20}; do
+  if ip netns exec perf_work_ns curl -fsS --connect-timeout 1 --max-time 2 -o /dev/null "http://10.0.0.1:8080/" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 0.5
+done
+if [ "$ready" -ne 1 ]; then
+  echo "Failed to connect to HTTP server at 10.0.0.1:8080" >&2
+  cat "$ARTIFACT_DIR/client.log" >&2
+  cat "$ARTIFACT_DIR/server.log" >&2
   exit 1
 fi
 

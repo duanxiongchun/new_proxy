@@ -20,6 +20,33 @@ fi
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT_DIR/script/acceptance/test_key_material.sh"
 
+HTTP_PID=""
+SERVER_PID=""
+CLIENT1_PID=""
+
+cleanup() {
+  set +e
+  echo "=== Tearing down namespaces and processes ==="
+  for pid in "$HTTP_PID" "$SERVER_PID" "$CLIENT1_PID"; do
+    if [ -n "${pid:-}" ]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  for pid in "$HTTP_PID" "$SERVER_PID" "$CLIENT1_PID"; do
+    if [ -n "${pid:-}" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  ip netns delete server_ns 2>/dev/null || true
+  ip netns delete router_ns 2>/dev/null || true
+  ip netns delete client1_ns 2>/dev/null || true
+  ip netns delete client2_ns 2>/dev/null || true
+  rm -f /run/new_proxy/server_multi.sock /run/new_proxy/client1.sock
+  rm -f /tmp/server_multi.conf /tmp/client1.conf
+}
+trap cleanup EXIT
+
 echo "======================================================================"
 echo "=== [1/8] Cleaning Up Pre-Existing Network Namespaces ==="
 echo "======================================================================"
@@ -186,14 +213,7 @@ echo ""
 echo ">> Fetching Server Telemetry for all concurrent Clients..."
 ip netns exec server_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface server_multi show
 
-# Cleanup
-echo "Tearing down namespaces and processes..."
-kill $HTTP_PID $SERVER_PID $CLIENT1_PID 2>/dev/null || true
-ip netns delete server_ns
-ip netns delete router_ns
-ip netns delete client1_ns
-ip netns delete client2_ns
-rm -f /tmp/server_multi.conf /tmp/client1.conf
+# Cleanup will be automatically executed by trap EXIT
 
 echo "======================================================================"
 echo "✓ [ALL PASS] Concurrent Multi-Client E2E Test Completed Successfully!"

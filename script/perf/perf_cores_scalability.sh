@@ -238,8 +238,8 @@ run_group() {
   local data_ports="$1"
   local cpus
   local server_cpus
-  local loader_cpus="12-19"
-  local target_cpus="20-27"
+  local loader_cpus="10-13"
+  local target_cpus="14-15"
   local server_conf="$ARTIFACT_DIR/server_${data_ports}.conf"
   local server_log="$ARTIFACT_DIR/server_${data_ports}.log"
   local client_log="$ARTIFACT_DIR/client_${data_ports}.log"
@@ -303,14 +303,28 @@ PY
     exit 1
   fi
 
-  ip netns exec scale_work_ns curl -fsS --connect-timeout 5 --max-time 30 -o /dev/null "http://10.0.0.1:8080/blob.bin"
+  # Wait for HTTP server to become fully ready
+  local ready=0
+  for i in {1..20}; do
+    if ip netns exec scale_work_ns curl -fsS --connect-timeout 1 --max-time 2 -o /dev/null "http://10.0.0.1:8080/blob.bin" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "Failed to connect to HTTP server at 10.0.0.1:8080" >&2
+    cat "$client_log" >&2
+    cat "$server_log" >&2
+    exit 1
+  fi
 
   echo "Starting perf record on client ($CLIENT_PID) and server ($SERVER_PID) for 10 seconds..." >&2
   perf record -F 99 -g -p "$CLIENT_PID" -o "$ARTIFACT_DIR/perf_client_${data_ports}.data" -- sleep 10 >/dev/null 2>&1 &
   perf record -F 99 -g -p "$SERVER_PID" -o "$ARTIFACT_DIR/perf_server_${data_ports}.data" -- sleep 10 >/dev/null 2>&1 &
 
   local line
-  if ! line="$(ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$data_ports" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
+  if ! line="$(timeout 120s ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$data_ports" "$PARALLEL" "$ROUNDS" "$BLOB_MIB" <<'PY'
 import concurrent.futures
 import subprocess
 import sys
@@ -324,7 +338,7 @@ url = "http://10.0.0.1:8080/blob.bin"
 
 def one(_):
     subprocess.check_call(
-        ["curl", "-fsS", "--connect-timeout", "5", "--max-time", "90", "-o", "/dev/null", url],
+        ["curl", "-fsS", "--connect-timeout", "5", "--max-time", "15", "-o", "/dev/null", url],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -350,7 +364,7 @@ PY
   fi
 
   # Run UDP benchmark
-  ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$data_ports" "$target_cpus" <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
+  timeout 130s ip netns exec scale_server_ns taskset -c "$target_cpus" python3 - "$data_ports" "$target_cpus" <<'PY' > "$ARTIFACT_DIR/udp_recv_${data_ports}.log" 2>&1 &
 import socket
 import sys
 import time
@@ -429,7 +443,7 @@ PY
   UDP_RECV_PID=$!
   sleep 1
 
-  ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$PARALLEL" "$data_ports" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
+  timeout 120s ip netns exec scale_work_ns taskset -c "$loader_cpus" python3 - "$PARALLEL" "$data_ports" <<'PY' > "$ARTIFACT_DIR/udp_send_${data_ports}.log" 2>&1
 import socket
 import sys
 import multiprocessing

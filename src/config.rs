@@ -127,8 +127,8 @@ impl GatewayConfig {
     }
 
     pub fn load_from_str(content: &str) -> Result<Self, String> {
-        let ini =
-            Ini::load_from_str(content).map_err(|e| format!("Failed to parse config string: {}", e))?;
+        let ini = Ini::load_from_str(content)
+            .map_err(|e| format!("Failed to parse config string: {}", e))?;
         Self::load_from_ini(ini)
     }
 
@@ -286,7 +286,10 @@ impl GatewayConfig {
             .map(|v| v.trim().to_string());
 
         let intercept_interfaces = xdp_section
-            .and_then(|s| s.get("InterceptInterfaces").or_else(|| s.get("intercept_interfaces")))
+            .and_then(|s| {
+                s.get("InterceptInterfaces")
+                    .or_else(|| s.get("intercept_interfaces"))
+            })
             .map(|interfaces_str| {
                 interfaces_str
                     .split(',')

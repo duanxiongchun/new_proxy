@@ -1,16 +1,16 @@
-use std::sync::Arc;
-use std::collections::HashMap;
 use arc_swap::ArcSwap;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::datapath::{Datapath, DatapathError, DatapathStats};
-use crate::config::GatewayConfig;
 use crate::app_config::RuntimeMode;
-use crate::telemetry::TelemetryRegistry;
-use crate::quic_pool::{cert_sha256, generate_self_signed_cert};
-use crate::control::ControlServer;
-use crate::runtime::{cleanup_runtime, setup_routes};
 use crate::client::build_peer_quic_pool;
-use crate::{PeerQuicPools, ClientQuicDataPortBaseline};
+use crate::config::GatewayConfig;
+use crate::control::ControlServer;
+use crate::datapath::{Datapath, DatapathError, DatapathStats};
+use crate::quic_pool::{cert_sha256, generate_self_signed_cert};
+use crate::runtime::{cleanup_runtime, setup_routes};
+use crate::telemetry::TelemetryRegistry;
+use crate::{ClientQuicDataPortBaseline, PeerQuicPools};
 
 struct WorkerTask {
     _thread: std::thread::JoinHandle<()>,
@@ -50,20 +50,22 @@ impl Drop for FdsGuard {
 
 pub(crate) fn setup_udp_socket(port: Option<u16>) -> Result<tokio::net::UdpSocket, DatapathError> {
     let bind_addr = match port {
-        Some(p) => format!("0.0.0.0:{}", p).parse::<std::net::SocketAddr>().unwrap(),
+        Some(p) => format!("0.0.0.0:{}", p)
+            .parse::<std::net::SocketAddr>()
+            .unwrap(),
         None => "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap(),
     };
-    
+
     let std_sock = std::net::UdpSocket::bind(bind_addr)?;
     std_sock.set_nonblocking(true)?;
     let sock_ref = socket2::SockRef::from(&std_sock);
     let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
     let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
-    
+
     if let Err(e) = crate::socket_mark::set_outer_mark(&std_sock) {
         return Err(DatapathError::Config(e));
     }
-    
+
     let udp_socket = tokio::net::UdpSocket::from_std(std_sock)?;
     Ok(udp_socket)
 }
@@ -79,12 +81,10 @@ pub(crate) fn setup_server_endpoint(
         .with_single_cert(quic_certs.to_vec(), quic_key.clone())
         .map_err(|e| format!("Failed to build rustls ServerConfig: {}", e))?;
     rustls_config.alpn_protocols = vec![b"new_proxy_mux".to_vec()];
-    let mut server_proto_config =
-        quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
+    let mut server_proto_config = quinn_proto::ServerConfig::with_crypto(Arc::new(rustls_config));
     let mut transport = quinn_proto::TransportConfig::default();
     let quic_mtu = crate::rtc_loop::quic_initial_mtu_for_packet_buffer(packet_buffer_size);
-    transport
-        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport.stream_receive_window(quinn_proto::VarInt::from(8 * 1024 * 1024u32));
     transport.receive_window(quinn_proto::VarInt::from(16 * 1024 * 1024u32));
@@ -121,9 +121,7 @@ pub(crate) fn spawn_worker_thread(
     std::thread::Builder::new()
         .name(format!("new-proxy-{}-worker-{}", role_name, worker_id))
         .spawn(move || {
-            let _panic_guard = WorkerPanicGuard {
-                exit_notify,
-            };
+            let _panic_guard = WorkerPanicGuard { exit_notify };
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -208,11 +206,14 @@ impl Datapath for TunDatapath {
                 None => {
                     log::error!("Server userspace WireGuard L3 requires Interface.ListenPort");
                     cleanup_runtime(&self.config, &self.interface_name);
-                    return Err(DatapathError::Config("Server userspace WireGuard L3 requires Interface.ListenPort".into()));
+                    return Err(DatapathError::Config(
+                        "Server userspace WireGuard L3 requires Interface.ListenPort".into(),
+                    ));
                 }
             };
 
-            let tun_queue_count = crate::effective_server_tun_queues(&self.config.quic_pool.listen_ports);
+            let tun_queue_count =
+                crate::effective_server_tun_queues(&self.config.quic_pool.listen_ports);
             log::info!(
                 "Server TUN queue count follows QUIC listen port count: using {}",
                 tun_queue_count
@@ -241,7 +242,10 @@ impl Datapath for TunDatapath {
                     log::error!("Failed to generate QUIC certificate: {}", e);
                     let cleanup_config = self.gateway_state.read().config.clone();
                     cleanup_runtime(&cleanup_config, &self.interface_name);
-                    return Err(DatapathError::Config(format!("Failed to generate QUIC certificate: {}", e)));
+                    return Err(DatapathError::Config(format!(
+                        "Failed to generate QUIC certificate: {}",
+                        e
+                    )));
                 }
             };
             let quic_cert_sha256 = match cert_sha256(&quic_certs) {
@@ -250,11 +254,15 @@ impl Datapath for TunDatapath {
                     log::error!("Failed to fingerprint QUIC certificate: {}", e);
                     let cleanup_config = self.gateway_state.read().config.clone();
                     cleanup_runtime(&cleanup_config, &self.interface_name);
-                    return Err(DatapathError::Config(format!("Failed to fingerprint QUIC certificate: {}", e)));
+                    return Err(DatapathError::Config(format!(
+                        "Failed to fingerprint QUIC certificate: {}",
+                        e
+                    )));
                 }
             };
 
-            let listen_control_port = self.config
+            let listen_control_port = self
+                .config
                 .interface
                 .listen_control_port
                 .or(self.config.interface.listen_port)
@@ -277,7 +285,10 @@ impl Datapath for TunDatapath {
                     log::error!("Control plane server failed to start: {}", e);
                     let cleanup_config = self.gateway_state.read().config.clone();
                     cleanup_runtime(&cleanup_config, &self.interface_name);
-                    return Err(DatapathError::Config(format!("Control plane server failed to start: {}", e)));
+                    return Err(DatapathError::Config(format!(
+                        "Control plane server failed to start: {}",
+                        e
+                    )));
                 }
             };
 
@@ -306,21 +317,24 @@ impl Datapath for TunDatapath {
                     }
                 };
 
-                let packet_buffer_size = crate::config::packet_buffer_size_for_mtu(self.config.interface.mtu);
-                let endpoint = match setup_server_endpoint(&quic_certs, &quic_key, packet_buffer_size) {
-                    Ok(ep) => ep,
-                    Err(e) => {
-                        cleanup_runtime(&self.config, &self.interface_name);
-                        control_task.abort();
-                        return Err(DatapathError::Config(e));
-                    }
-                };
+                let packet_buffer_size =
+                    crate::config::packet_buffer_size_for_mtu(self.config.interface.mtu);
+                let endpoint =
+                    match setup_server_endpoint(&quic_certs, &quic_key, packet_buffer_size) {
+                        Ok(ep) => ep,
+                        Err(e) => {
+                            cleanup_runtime(&self.config, &self.interface_name);
+                            control_task.abort();
+                            return Err(DatapathError::Config(e));
+                        }
+                    };
 
                 worker_preps.push((tun_io, udp_socket, endpoint));
             }
 
             let mut l3_tasks = Vec::new();
-            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate() {
+            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate()
+            {
                 let mut worker = crate::rtc_loop::RtcWorker::new(
                     tun_io,
                     worker_id,
@@ -364,7 +378,9 @@ impl Datapath for TunDatapath {
 
             let proxy_peers = crate::proxy_peers(&self.config);
             if proxy_peers.is_empty() {
-                log::warn!("No QUIC proxy peers configured; userspace TCP offload remains inactive.");
+                log::warn!(
+                    "No QUIC proxy peers configured; userspace TCP offload remains inactive."
+                );
             }
 
             let mut initial_pool_failures = 0usize;
@@ -435,10 +451,17 @@ impl Datapath for TunDatapath {
                     initial_pool_failures
                 );
             }
-            crate::publish_l4_data_plane_snapshot(&dp_snapshot, &self.gateway_state, &self.client_quic_pools);
-            let quic_data_port_count =
-                crate::client_quic_data_port_count(&self.client_quic_pools, startup_quic_data_port_count);
-            let tun_queue_count = crate::effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
+            crate::publish_l4_data_plane_snapshot(
+                &dp_snapshot,
+                &self.gateway_state,
+                &self.client_quic_pools,
+            );
+            let quic_data_port_count = crate::client_quic_data_port_count(
+                &self.client_quic_pools,
+                startup_quic_data_port_count,
+            );
+            let tun_queue_count =
+                crate::effective_client_tun_queues(quic_data_port_count.unwrap_or(0));
             crate::record_initial_client_quic_data_port_baseline(
                 &self.client_quic_data_port_baseline,
                 quic_data_port_count,
@@ -515,7 +538,8 @@ impl Datapath for TunDatapath {
             );
 
             let mut worker_tasks = Vec::new();
-            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate() {
+            for (worker_id, (tun_io, udp_socket, endpoint)) in worker_preps.into_iter().enumerate()
+            {
                 let mut worker = crate::rtc_loop::RtcWorker::new(
                     tun_io,
                     worker_id,
@@ -564,8 +588,13 @@ impl Datapath for TunDatapath {
 
     fn get_stats(&self) -> DatapathStats {
         let snapshots = self.worker_telemetry_registry.snapshot();
-        let total_rx_bytes = snapshots.iter().map(|s| s.tun_rx_bytes + s.tcp_offload_bytes + s.l3_bytes).sum();
-        DatapathStats { rx_bytes: total_rx_bytes }
+        let total_rx_bytes = snapshots
+            .iter()
+            .map(|s| s.tun_rx_bytes + s.tcp_offload_bytes + s.l3_bytes)
+            .sum();
+        DatapathStats {
+            rx_bytes: total_rx_bytes,
+        }
     }
 }
 
@@ -605,7 +634,7 @@ mod tests {
             router: crate::routing::AllowedIPsRouter::new(),
             userspace_tcp_offload_enabled: true,
         }));
-        
+
         let res = TunDatapath::new(
             config,
             "test_if".to_string(),

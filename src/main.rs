@@ -3,6 +3,7 @@ mod app_config;
 mod client;
 mod config;
 mod control;
+pub mod datapath;
 mod quic_pool;
 pub mod quic_proto_engine;
 mod routing;
@@ -11,16 +12,14 @@ mod runtime;
 mod socket_mark;
 mod stats_cli;
 mod telemetry;
+pub mod tun_datapath;
 pub mod tun_device;
 pub mod tun_io;
-pub mod datapath;
-pub mod tun_datapath;
 pub mod xdp_datapath;
 use datapath::Datapath;
 use tun_datapath::TunDatapath;
 use xdp_datapath::XdpDatapath;
 mod uds_server;
-
 
 use arc_swap::ArcSwap;
 use client::{build_peer_quic_pool, negotiate_peer_quic_data_port_count};
@@ -491,8 +490,6 @@ fn main() {
     ));
 }
 
-
-
 #[cfg(not(tarpaulin))]
 fn build_tokio_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -641,39 +638,45 @@ async fn run_gateway(
     }
 
     let datapath: Arc<dyn Datapath> = if config.interface.mode == "af_xdp" {
-        Arc::new(XdpDatapath::new(
-            config.clone(),
-            interface_name.clone(),
-            runtime_mode,
-            fixed_client_quic_data_port_count,
-            peer_telemetries,
-            worker_telemetry_registry,
-            gateway_state.clone(),
-            peer_secrets,
-            session_cache,
-            auth_nonce_cache,
-            shared_quic_registry,
-            client_quic_pools,
-            client_quic_data_port_baseline,
-            peer_mutation_lock,
-        ).expect("failed to construct XdpDatapath"))
+        Arc::new(
+            XdpDatapath::new(
+                config.clone(),
+                interface_name.clone(),
+                runtime_mode,
+                fixed_client_quic_data_port_count,
+                peer_telemetries,
+                worker_telemetry_registry,
+                gateway_state.clone(),
+                peer_secrets,
+                session_cache,
+                auth_nonce_cache,
+                shared_quic_registry,
+                client_quic_pools,
+                client_quic_data_port_baseline,
+                peer_mutation_lock,
+            )
+            .expect("failed to construct XdpDatapath"),
+        )
     } else {
-        Arc::new(TunDatapath::new(
-            config.clone(),
-            interface_name.clone(),
-            runtime_mode,
-            fixed_client_quic_data_port_count,
-            peer_telemetries,
-            worker_telemetry_registry,
-            gateway_state.clone(),
-            peer_secrets,
-            session_cache,
-            auth_nonce_cache,
-            shared_quic_registry,
-            client_quic_pools,
-            client_quic_data_port_baseline,
-            peer_mutation_lock,
-        ).expect("failed to construct TunDatapath"))
+        Arc::new(
+            TunDatapath::new(
+                config.clone(),
+                interface_name.clone(),
+                runtime_mode,
+                fixed_client_quic_data_port_count,
+                peer_telemetries,
+                worker_telemetry_registry,
+                gateway_state.clone(),
+                peer_secrets,
+                session_cache,
+                auth_nonce_cache,
+                shared_quic_registry,
+                client_quic_pools,
+                client_quic_data_port_baseline,
+                peer_mutation_lock,
+            )
+            .expect("failed to construct TunDatapath"),
+        )
     };
 
     let run_res = datapath.run_loop(l4_data_plane, exit_notify).await;
