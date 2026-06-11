@@ -766,6 +766,7 @@ struct XdpRouteState {
     inner_mac_cache: Arc<RwLock<HashMap<std::net::Ipv4Addr, [u8; 6]>>>,
     intercept_local_macs: HashMap<u32, [u8; 6]>, // ifindex -> local MAC
     last_resolve_attempts: HashMap<std::net::Ipv4Addr, std::time::Instant>,
+    local_mac_cache: HashMap<std::net::Ipv4Addr, [u8; 6]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1869,6 +1870,7 @@ fn run_xdp_worker_loop(
         inner_mac_cache: shared_inner_mac_cache,
         intercept_local_macs,
         last_resolve_attempts: HashMap::new(),
+        local_mac_cache: HashMap::new(),
     };
 
     let chunks_per_worker = 4096 / queue_count;
@@ -1957,18 +1959,28 @@ fn run_xdp_worker_loop(
                                         src_ip,
                                         dst_ip
                                     );
-                                    let needs_update = {
-                                        let cache = route_state.inner_mac_cache.read();
-                                        match cache.get(&src_ip) {
+                                    let needs_local_update =
+                                        match route_state.local_mac_cache.get(&src_ip) {
                                             Some(&mac) => mac != eth_header.src_mac,
                                             None => true,
-                                        }
-                                    };
-                                    if needs_update {
+                                        };
+                                    if needs_local_update {
                                         route_state
-                                            .inner_mac_cache
-                                            .write()
+                                            .local_mac_cache
                                             .insert(src_ip, eth_header.src_mac);
+                                        let needs_shared_update = {
+                                            let cache = route_state.inner_mac_cache.read();
+                                            match cache.get(&src_ip) {
+                                                Some(&mac) => mac != eth_header.src_mac,
+                                                None => true,
+                                            }
+                                        };
+                                        if needs_shared_update {
+                                            route_state
+                                                .inner_mac_cache
+                                                .write()
+                                                .insert(src_ip, eth_header.src_mac);
+                                        }
                                     }
                                     route_state
                                         .intercept_local_macs
@@ -2068,12 +2080,22 @@ fn run_xdp_worker_loop(
                                     .get(&intercept.ifindex)
                                     .cloned()
                                     .unwrap_or([0x00, 0x01, 0x02, 0x03, 0x04, 0x05]);
-                                // Look up the destination IP in local cache, fallback to ARP query, then interface IP
+                                // Look up the destination IP in thread-local cache, fallback to shared cache, then ARP
                                 let dst_mac = route_state
-                                    .inner_mac_cache
-                                    .read()
+                                    .local_mac_cache
                                     .get(&inner_dst_ip)
-                                    .cloned();
+                                    .cloned()
+                                    .or_else(|| {
+                                        let shared_mac = route_state
+                                            .inner_mac_cache
+                                            .read()
+                                            .get(&inner_dst_ip)
+                                            .cloned();
+                                        if let Some(mac) = shared_mac {
+                                            route_state.local_mac_cache.insert(inner_dst_ip, mac);
+                                        }
+                                        shared_mac
+                                    });
                                 let dst_mac = match dst_mac {
                                     Some(mac) => mac,
                                     None => {
@@ -2097,6 +2119,9 @@ fn run_xdp_worker_loop(
                                                         get_interface_mac_by_ip(inner_dst_ip)
                                                     });
                                             if let Some(mac) = resolved {
+                                                route_state
+                                                    .local_mac_cache
+                                                    .insert(inner_dst_ip, mac);
                                                 route_state
                                                     .inner_mac_cache
                                                     .write()
