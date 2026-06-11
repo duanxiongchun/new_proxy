@@ -8,11 +8,16 @@ use crate::datapath::{Datapath, DatapathError, DatapathStats};
 use crate::config::GatewayConfig;
 use crate::app_config::RuntimeMode;
 use crate::telemetry::TelemetryRegistry;
+#[cfg(target_os = "linux")]
 use crate::quic_pool::{cert_sha256, generate_self_signed_cert};
+#[cfg(target_os = "linux")]
 use crate::control::ControlServer;
+#[cfg(target_os = "linux")]
 use crate::client::build_peer_quic_pool;
 use crate::{PeerQuicPools, ClientQuicDataPortBaseline};
+#[cfg(target_os = "linux")]
 use crate::runtime::{cleanup_runtime, setup_routes};
+#[cfg(target_os = "linux")]
 use crate::tun_datapath::{setup_udp_socket, setup_server_endpoint, setup_client_endpoint, spawn_worker_thread};
 
 #[cfg(target_os = "linux")]
@@ -138,15 +143,26 @@ impl Drop for UmemRegion {
 
 #[cfg(target_os = "linux")]
 struct XskSetup {
-    _umems: Vec<UmemRegion>,
-    sockets: Vec<libc::c_int>,
+    #[allow(dead_code)]
+    umems: Vec<UmemRegion>,
+    quic_sockets: Vec<(libc::c_int, SendPtr)>,
+    intercept_sockets: Vec<(libc::c_int, SendPtr)>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for XskSetup {
     fn drop(&mut self) {
-        for &fd in &self.sockets {
+        for &(fd, _) in &self.quic_sockets {
             if fd >= 0 {
+                // SAFETY: close valid socket FD.
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+        for &(fd, _) in &self.intercept_sockets {
+            if fd >= 0 {
+                // SAFETY: close valid socket FD.
                 unsafe {
                     libc::close(fd);
                 }
@@ -159,6 +175,64 @@ impl Drop for XskSetup {
 unsafe impl Send for XskSetup {}
 #[cfg(target_os = "linux")]
 unsafe impl Sync for XskSetup {}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct SendPtr(pub *mut libc::c_void);
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for SendPtr {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for SendPtr {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EthernetHeader {
+    pub dst_mac: [u8; 6],
+    pub src_mac: [u8; 6],
+    pub ether_type: u16,
+}
+
+impl EthernetHeader {
+    pub fn parse(packet: &[u8]) -> Option<(Self, &[u8])> {
+        if packet.len() < 14 {
+            return None;
+        }
+        let mut dst_mac = [0u8; 6];
+        dst_mac.copy_from_slice(&packet[0..6]);
+        let mut src_mac = [0u8; 6];
+        src_mac.copy_from_slice(&packet[6..12]);
+        let ether_type = u16::from_be_bytes([packet[12], packet[13]]);
+        Some((
+            Self {
+                dst_mac,
+                src_mac,
+                ether_type,
+            },
+            &packet[14..],
+        ))
+    }
+
+    pub fn serialize(&self, buffer: &mut [u8]) -> Option<usize> {
+        if buffer.len() < 14 {
+            return None;
+        }
+        buffer[0..6].copy_from_slice(&self.dst_mac);
+        buffer[6..12].copy_from_slice(&self.src_mac);
+        let be_type = self.ether_type.to_be_bytes();
+        buffer[12] = be_type[0];
+        buffer[13] = be_type[1];
+        Some(14)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct xdp_desc {
+    addr: u64,
+    len: u32,
+    options: u32,
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
@@ -203,6 +277,44 @@ impl XskRing {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         let prod = std::ptr::read_volatile(self.producer);
         std::ptr::write_volatile(self.producer, prod.wrapping_add(cnt));
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the desc pointer is valid, aligned, and points to a buffer
+    /// of at least size `(idx & mask) + 1` elements of type `xdp_desc`.
+    pub unsafe fn read_rx_desc(&self, idx: u32) -> (u64, u32) {
+        let desc_ptr = (self.desc as *const xdp_desc).offset((idx & self.mask) as isize);
+        let desc = std::ptr::read_volatile(desc_ptr);
+        (desc.addr, desc.len)
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the desc pointer is valid, aligned, and points to a buffer
+    /// of at least size `(idx & mask) + 1` elements of type `xdp_desc`.
+    pub unsafe fn write_tx_desc(&mut self, idx: u32, addr: u64, len: u32) {
+        let desc_ptr = (self.desc as *mut xdp_desc).offset((idx & self.mask) as isize);
+        let desc = xdp_desc { addr, len, options: 0 };
+        std::ptr::write_volatile(desc_ptr, desc);
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the consumer pointer is valid and aligned.
+    pub unsafe fn consume(&mut self, cnt: u32) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        let cons = std::ptr::read_volatile(self.consumer);
+        std::ptr::write_volatile(self.consumer, cons.wrapping_add(cnt));
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the desc pointer is valid, aligned, and points to a buffer
+    /// of at least size `(idx & mask) + 1` elements of type `u64`.
+    pub unsafe fn read_comp_addr(&self, idx: u32) -> u64 {
+        let addr_ptr = (self.desc as *const u64).offset((idx & self.mask) as isize);
+        std::ptr::read_volatile(addr_ptr)
     }
 }
 
@@ -310,6 +422,270 @@ fn bpf_obj_get(pathname: &str) -> Result<libc::c_int, std::io::Error> {
 }
 
 #[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct xdp_ring_offset {
+    producer: u64,
+    consumer: u64,
+    desc: u64,
+    flags: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct xdp_mmap_offsets {
+    rx: xdp_ring_offset,
+    tx: xdp_ring_offset,
+    fr: xdp_ring_offset,
+    cr: xdp_ring_offset,
+}
+
+/// # Safety
+///
+/// The caller must ensure that `fd` is a valid, open AF_XDP socket file descriptor,
+/// and that the `offsets` structure contains correct field offsets retrieved from the kernel.
+#[cfg(target_os = "linux")]
+unsafe fn mmap_ring(
+    fd: libc::c_int,
+    offsets: &xdp_ring_offset,
+    pgoff: u64,
+    ring_size: u32,
+    is_desc_u64: bool,
+) -> Result<XskRing, std::io::Error> {
+    let desc_sz = if is_desc_u64 {
+        std::mem::size_of::<u64>()
+    } else {
+        std::mem::size_of::<xdp_desc>()
+    };
+    
+    let ring_map_sz = (offsets.desc as usize) + (ring_size as usize) * desc_sz;
+    
+    // SAFETY: mmap is called with MAP_SHARED and MAP_POPULATE to map kernel rings into userspace.
+    let ptr = libc::mmap(
+        std::ptr::null_mut(),
+        ring_map_sz,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED | libc::MAP_POPULATE,
+        fd,
+        pgoff as libc::off_t,
+    );
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    
+    Ok(XskRing {
+        producer: (ptr as usize + offsets.producer as usize) as *mut u32,
+        consumer: (ptr as usize + offsets.consumer as usize) as *mut u32,
+        desc: (ptr as usize + offsets.desc as usize) as *mut u8,
+        mask: ring_size - 1,
+        size: ring_size,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn mmap_socket_rings(fd: libc::c_int) -> Result<(XskRing, XskRing, XskRing, XskRing), std::io::Error> {
+    const SOL_XDP: libc::c_int = 283;
+    const XDP_MMAP_OFFSETS: libc::c_int = 1;
+    const XDP_PGOFF_RX_RING: u64 = 0;
+    const XDP_PGOFF_TX_RING: u64 = 0x80000000;
+    const XDP_UMEM_PGOFF_FILL_RING: u64 = 0x100000000;
+    const XDP_UMEM_PGOFF_COMPLETION_RING: u64 = 0x180000000;
+
+    let mut offsets = unsafe {
+        // SAFETY: Zeroing is safe for POD layout struct containing u64 fields.
+        std::mem::zeroed::<xdp_mmap_offsets>()
+    };
+    let mut optlen = std::mem::size_of::<xdp_mmap_offsets>() as libc::socklen_t;
+    // SAFETY: getsockopt fetches XSK ring offsets from the Linux kernel.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_XDP,
+            XDP_MMAP_OFFSETS,
+            &mut offsets as *mut _ as *mut libc::c_void,
+            &mut optlen,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let ring_size: u32 = 2048;
+
+    let rx = unsafe { mmap_ring(fd, &offsets.rx, XDP_PGOFF_RX_RING, ring_size, false)? };
+    let tx = unsafe { mmap_ring(fd, &offsets.tx, XDP_PGOFF_TX_RING, ring_size, false)? };
+    let fill = unsafe { mmap_ring(fd, &offsets.fr, XDP_UMEM_PGOFF_FILL_RING, ring_size, true)? };
+    let comp = unsafe { mmap_ring(fd, &offsets.cr, XDP_UMEM_PGOFF_COMPLETION_RING, ring_size, true)? };
+
+    Ok((rx, tx, fill, comp))
+}
+
+/// # Safety
+///
+/// The caller must ensure that the `fill` ring is backed by valid, mapped memory-mapped pointers.
+#[cfg(target_os = "linux")]
+unsafe fn populate_fill_ring(fill: &mut XskRing, start_chunk: u32, num_chunks: u32) {
+    let free = fill.free_slots();
+    let cnt = std::cmp::min(free, num_chunks);
+    for i in 0..cnt {
+        let addr = ((start_chunk + i) as u64) * 4096;
+        fill.write_fill_addr((*fill.producer).wrapping_add(i), addr);
+    }
+    if cnt > 0 {
+        fill.produce(cnt);
+    }
+}
+
+/// # Safety
+///
+/// The caller must ensure that the `fill` ring is backed by valid, mapped memory-mapped pointers.
+#[cfg(target_os = "linux")]
+unsafe fn return_rx_buf(fill: &mut XskRing, addr: u64) {
+    if fill.free_slots() > 0 {
+        let prod = *fill.producer;
+        fill.write_fill_addr(prod, addr);
+        fill.produce(1);
+    }
+}
+
+/// # Safety
+///
+/// The caller must ensure that the `comp` ring is backed by valid, mapped memory-mapped pointers.
+#[cfg(target_os = "linux")]
+unsafe fn reclaim_tx_buffers(comp: &mut XskRing, free_tx_chunks: &mut Vec<u64>) {
+    let prod = std::ptr::read_volatile(comp.producer);
+    let cons = std::ptr::read_volatile(comp.consumer);
+    let cnt = prod.wrapping_sub(cons);
+    if cnt > 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        for i in 0..cnt {
+            let idx = cons.wrapping_add(i);
+            let addr = comp.read_comp_addr(idx);
+            free_tx_chunks.push(addr);
+        }
+        comp.consume(cnt);
+    }
+}
+
+/// # Safety
+///
+/// The caller must ensure that `rx`, `fill`, `tx`, and `comp` rings are backed by valid, mapped
+/// memory-mapped pointers, and that `rx_umem_base` and `tx_umem_base` point to valid UMEM areas.
+#[cfg(target_os = "linux")]
+unsafe fn process_rx_ring(
+    rx: &mut XskRing,
+    fill: &mut XskRing,
+    rx_umem_base: *mut libc::c_void,
+    mut process_packet: impl FnMut(&[u8]) -> Option<Vec<u8>>,
+    tx: &mut XskRing,
+    comp: &mut XskRing,
+    free_tx_chunks: &mut Vec<u64>,
+    tx_umem_base: *mut libc::c_void,
+    tx_fd: libc::c_int,
+) {
+    let prod = std::ptr::read_volatile(rx.producer);
+    let cons = std::ptr::read_volatile(rx.consumer);
+    let cnt = prod.wrapping_sub(cons);
+    if cnt > 0 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let mut tx_produced = 0;
+        for i in 0..cnt {
+            let idx = cons.wrapping_add(i);
+            let (addr, len) = rx.read_rx_desc(idx);
+            
+            // Bounds check UMEM read address
+            assert!(addr + len as u64 <= 4096 * 2048, "RX UMEM access out of bounds");
+            
+            // SAFETY: rx_umem_base + addr points to a valid mapped packet buffer.
+            let pkt_ptr = (rx_umem_base as usize + addr as usize) as *const u8;
+            let pkt_slice = std::slice::from_raw_parts(pkt_ptr, len as usize);
+            
+            if let Some(out_pkt) = process_packet(pkt_slice) {
+                if free_tx_chunks.is_empty() {
+                    reclaim_tx_buffers(comp, free_tx_chunks);
+                }
+                
+                if let Some(tx_addr) = free_tx_chunks.pop() {
+                    // Bounds check UMEM write address
+                    assert!(tx_addr + out_pkt.len() as u64 <= 4096 * 2048, "TX UMEM access out of bounds");
+                    
+                    // SAFETY: tx_umem_base + tx_addr points to a valid mapped packet buffer.
+                    let tx_ptr = (tx_umem_base as usize + tx_addr as usize) as *mut u8;
+                    std::ptr::copy_nonoverlapping(out_pkt.as_ptr(), tx_ptr, out_pkt.len());
+                    
+                    let tx_idx = (*tx.producer).wrapping_add(tx_produced);
+                    tx.write_tx_desc(tx_idx, tx_addr, out_pkt.len() as u32);
+                    tx_produced += 1;
+                }
+            }
+            
+            return_rx_buf(fill, addr);
+        }
+        
+        rx.consume(cnt);
+        if tx_produced > 0 {
+            tx.produce(tx_produced);
+            // SAFETY: sendto triggers kernel processing of TX rings.
+            libc::sendto(tx_fd, std::ptr::null(), 0, libc::MSG_DONTWAIT, std::ptr::null(), 0);
+        }
+    }
+}
+
+pub fn wrap_plaintext_to_quic(plaintext_ip: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(14 + 20 + 8 + plaintext_ip.len());
+    
+    let eth = EthernetHeader {
+        dst_mac: [0x00, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e],
+        src_mac: [0x00, 0x01, 0x02, 0x03, 0x04, 0x05],
+        ether_type: 0x0800,
+    };
+    let mut eth_buf = [0u8; 14];
+    eth.serialize(&mut eth_buf).expect("Eth serialization failed");
+    pkt.extend_from_slice(&eth_buf);
+
+    let mut ip_hdr = [0u8; 20];
+    ip_hdr[0] = 0x45;
+    ip_hdr[8] = 64;
+    ip_hdr[9] = 17;
+    ip_hdr[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    ip_hdr[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    let total_len = (20 + 8 + plaintext_ip.len()) as u16;
+    ip_hdr[2..4].copy_from_slice(&total_len.to_be_bytes());
+    pkt.extend_from_slice(&ip_hdr);
+
+    let mut udp_hdr = [0u8; 8];
+    udp_hdr[0..2].copy_from_slice(&40001u16.to_be_bytes());
+    udp_hdr[2..4].copy_from_slice(&40002u16.to_be_bytes());
+    let udp_len = (8 + plaintext_ip.len()) as u16;
+    udp_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes());
+    pkt.extend_from_slice(&udp_hdr);
+
+    pkt.extend_from_slice(plaintext_ip);
+    pkt
+}
+
+pub fn unwrap_quic_to_plaintext(quic_packet: &[u8]) -> Option<Vec<u8>> {
+    if quic_packet.len() < 42 {
+        return None;
+    }
+    let plaintext_ip = &quic_packet[42..];
+    
+    let mut pkt = Vec::with_capacity(14 + plaintext_ip.len());
+    let eth = EthernetHeader {
+        dst_mac: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        src_mac: [0x00, 0x01, 0x02, 0x03, 0x04, 0x05],
+        ether_type: 0x0800,
+    };
+    let mut eth_buf = [0u8; 14];
+    eth.serialize(&mut eth_buf).expect("Eth serialization failed");
+    pkt.extend_from_slice(&eth_buf);
+    pkt.extend_from_slice(plaintext_ip);
+    
+    Some(pkt)
+}
+
+#[cfg(target_os = "linux")]
 fn setup_xsk_sockets(
     quic_ifindex: u32,
     intercept_ifindexes: &[u32],
@@ -317,14 +693,8 @@ fn setup_xsk_sockets(
 ) -> Result<XskSetup, DatapathError> {
     use std::io;
 
-    let mut ifindexes = vec![quic_ifindex];
-    for &index in intercept_ifindexes {
-        if !ifindexes.contains(&index) {
-            ifindexes.push(index);
-        }
-    }
-
-    let mut sockets = Vec::new();
+    let mut quic_sockets = Vec::new();
+    let mut intercept_sockets = Vec::new();
     let mut umems = Vec::new();
 
     const AF_XDP: libc::c_int = 44;
@@ -337,60 +707,261 @@ fn setup_xsk_sockets(
     const XDP_SHARED_UMEM: u16 = 1;
     const XDP_COPY: u16 = 2;
 
-    for &ifindex in &ifindexes {
+    let cleanup = |quic: &[(libc::c_int, SendPtr)], intercept: &[(libc::c_int, SendPtr)]| {
+        for &(s_fd, _) in quic {
+            if s_fd >= 0 {
+                // SAFETY: closing a valid open socket FD.
+                unsafe { libc::close(s_fd); }
+            }
+        }
+        for &(s_fd, _) in intercept {
+            if s_fd >= 0 {
+                // SAFETY: closing a valid open socket FD.
+                unsafe { libc::close(s_fd); }
+            }
+        }
+    };
+
+    // 1. Process quic_ifindex
+    {
+        let ifindex = quic_ifindex;
+        let q_count = get_interface_queue_count(ifindex);
+        if q_count > 0 {
+            let mut buf = [0u8; 32];
+            // SAFETY: libc::if_indextoname is called with an output buffer `buf` of 32 bytes,
+            // which is larger than IFNAMSIZ (16 bytes). On success, name_ptr returns a pointer
+            // to a valid null-terminated string contained inside `buf`.
+            let name_ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr() as *mut libc::c_char) };
+            if name_ptr.is_null() {
+                cleanup(&quic_sockets, &intercept_sockets);
+                return Err(DatapathError::Config(format!("Failed to get interface name for index {}", ifindex)));
+            }
+            // SAFETY: name_ptr is non-null and points to the valid null-terminated string inside `buf`.
+            let ifname = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
+            let map_path = format!("/sys/fs/bpf/new_proxy_{}/maps/xsks_map", ifname);
+
+            let map_fd = match bpf_obj_get(&map_path) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    cleanup(&quic_sockets, &intercept_sockets);
+                    return Err(DatapathError::Config(format!("Failed to open pinned map at {}: {}", map_path, e)));
+                }
+            };
+
+            let umem_size = 4096 * 2048;
+            let umem = match UmemRegion::new(umem_size) {
+                Ok(u) => u,
+                Err(e) => {
+                    // SAFETY: close map FD.
+                    unsafe { libc::close(map_fd); }
+                    cleanup(&quic_sockets, &intercept_sockets);
+                    return Err(DatapathError::Config(format!("Failed to allocate UMEM mmap for ifindex {}: {}", ifindex, e)));
+                }
+            };
+            let mut first_fd_for_iface: Option<libc::c_int> = None;
+
+            for queue_id in 0..q_count {
+                // SAFETY: socket call with standard constants.
+                let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
+                if fd < 0 {
+                    let err = io::Error::last_os_error();
+                    // SAFETY: close map FD.
+                    unsafe { libc::close(map_fd); }
+                    cleanup(&quic_sockets, &intercept_sockets);
+                    return Err(DatapathError::Config(format!("socket(AF_XDP) failed: {}", err)));
+                }
+
+                if first_fd_for_iface.is_none() {
+                    let umem_reg = xdp_umem_reg {
+                        addr: umem.addr as u64,
+                        len: umem.size as u64,
+                        chunk_size: 4096,
+                        headroom: 0,
+                        flags: 0,
+                    };
+                    // SAFETY: setsockopt configures UMEM mapping on the first socket FD of the interface.
+                    let ret = unsafe {
+                        libc::setsockopt(
+                            fd,
+                            SOL_XDP,
+                            XDP_UMEM_REG,
+                            &umem_reg as *const _ as *const libc::c_void,
+                            std::mem::size_of::<xdp_umem_reg>() as libc::socklen_t,
+                        )
+                    };
+                    if ret < 0 {
+                        let err = io::Error::last_os_error();
+                        // SAFETY: clean up local and map FDs.
+                        unsafe { libc::close(fd); }
+                        unsafe { libc::close(map_fd); }
+                        cleanup(&quic_sockets, &intercept_sockets);
+                        return Err(DatapathError::Config(format!("setsockopt(XDP_UMEM_REG) failed: {}", err)));
+                    }
+
+                    let ring_size: u32 = 2048;
+                    for opt in &[XDP_UMEM_FILL_RING, XDP_UMEM_COMPLETION_RING, XDP_RX_RING, XDP_TX_RING] {
+                        // SAFETY: setsockopt configures ring sizes for the first socket FD of the interface.
+                        let ret = unsafe {
+                            libc::setsockopt(
+                                fd,
+                                SOL_XDP,
+                                *opt,
+                                &ring_size as *const _ as *const libc::c_void,
+                                std::mem::size_of::<u32>() as libc::socklen_t,
+                            )
+                        };
+                        if ret < 0 {
+                            let err = io::Error::last_os_error();
+                            // SAFETY: clean up local and map FDs.
+                            unsafe { libc::close(fd); }
+                            unsafe { libc::close(map_fd); }
+                            cleanup(&quic_sockets, &intercept_sockets);
+                            return Err(DatapathError::Config(format!("setsockopt(opt={}) failed: {}", opt, err)));
+                        }
+                    }
+
+                    let addr = sockaddr_xdp {
+                        sxdp_family: AF_XDP as u16,
+                        sxdp_flags: XDP_COPY,
+                        sxdp_ifindex: ifindex,
+                        sxdp_queue_id: queue_id as u32,
+                        sxdp_shared_umem_fd: 0,
+                    };
+                    // SAFETY: bind binds the XSK raw socket to the interface index and queue ID.
+                    let ret = unsafe {
+                        libc::bind(
+                            fd,
+                            &addr as *const _ as *const libc::sockaddr,
+                            std::mem::size_of::<sockaddr_xdp>() as libc::socklen_t,
+                        )
+                    };
+                    if ret < 0 {
+                        let err = io::Error::last_os_error();
+                        // SAFETY: clean up local and map FDs.
+                        unsafe { libc::close(fd); }
+                        unsafe { libc::close(map_fd); }
+                        cleanup(&quic_sockets, &intercept_sockets);
+                        return Err(DatapathError::Config(format!("bind(ifindex={}, queue_id={}) failed: {}", ifindex, queue_id, err)));
+                    }
+
+                    first_fd_for_iface = Some(fd);
+                } else {
+                    let ring_size: u32 = 2048;
+                    for opt in &[XDP_RX_RING, XDP_TX_RING] {
+                        // SAFETY: setsockopt configures secondary socket ring sizes.
+                        let ret = unsafe {
+                            libc::setsockopt(
+                                fd,
+                                SOL_XDP,
+                                *opt,
+                                &ring_size as *const _ as *const libc::c_void,
+                                std::mem::size_of::<u32>() as libc::socklen_t,
+                            )
+                        };
+                        if ret < 0 {
+                            let err = io::Error::last_os_error();
+                            // SAFETY: clean up local and map FDs.
+                            unsafe { libc::close(fd); }
+                            unsafe { libc::close(map_fd); }
+                            cleanup(&quic_sockets, &intercept_sockets);
+                            return Err(DatapathError::Config(format!("setsockopt(secondary opt={}) failed: {}", opt, err)));
+                        }
+                    }
+
+                    let addr = sockaddr_xdp {
+                        sxdp_family: AF_XDP as u16,
+                        sxdp_flags: XDP_SHARED_UMEM | XDP_COPY,
+                        sxdp_ifindex: ifindex,
+                        sxdp_queue_id: queue_id as u32,
+                        sxdp_shared_umem_fd: first_fd_for_iface.expect("first_fd_for_iface is missing") as u32,
+                    };
+                    // SAFETY: bind binds secondary XSK raw socket sharing UMEM with the primary socket.
+                    let ret = unsafe {
+                        libc::bind(
+                            fd,
+                            &addr as *const _ as *const libc::sockaddr,
+                            std::mem::size_of::<sockaddr_xdp>() as libc::socklen_t,
+                        )
+                    };
+                    if ret < 0 {
+                        let err = io::Error::last_os_error();
+                        // SAFETY: clean up local and map FDs.
+                        unsafe { libc::close(fd); }
+                        unsafe { libc::close(map_fd); }
+                        cleanup(&quic_sockets, &intercept_sockets);
+                        return Err(DatapathError::Config(format!("bind(secondary ifindex={}, queue_id={}) failed: {}", ifindex, queue_id, err)));
+                    }
+                }
+
+                if let Err(e) = register_xsk_in_map(map_fd, queue_id as u32, fd) {
+                    // SAFETY: close FD.
+                    unsafe { libc::close(fd); }
+                    // SAFETY: close map FD.
+                    unsafe { libc::close(map_fd); }
+                    cleanup(&quic_sockets, &intercept_sockets);
+                    return Err(DatapathError::Config(format!("Failed to register XSK socket FD {} in BPF map: {}", fd, e)));
+                }
+
+                quic_sockets.push((fd, SendPtr(umem.addr)));
+            }
+            // SAFETY: close map FD.
+            unsafe { libc::close(map_fd); }
+            umems.push(umem);
+        }
+    }
+
+    // 2. Process intercept_ifindexes
+    for &ifindex in intercept_ifindexes {
         let q_count = get_interface_queue_count(ifindex);
         if q_count == 0 {
             continue;
         }
 
         let mut buf = [0u8; 32];
+        // SAFETY: libc::if_indextoname is called with an output buffer `buf` of 32 bytes,
+        // which is larger than IFNAMSIZ (16 bytes). On success, name_ptr returns a pointer
+        // to a valid null-terminated string contained inside `buf`.
         let name_ptr = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr() as *mut libc::c_char) };
         if name_ptr.is_null() {
-            for &s_fd in &sockets {
-                unsafe { libc::close(s_fd); }
-            }
+            cleanup(&quic_sockets, &intercept_sockets);
             return Err(DatapathError::Config(format!("Failed to get interface name for index {}", ifindex)));
         }
+        // SAFETY: name_ptr is non-null and points to the valid null-terminated string inside `buf`.
         let ifname = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
         let map_path = format!("/sys/fs/bpf/new_proxy_{}/maps/xsks_map", ifname);
 
         let map_fd = match bpf_obj_get(&map_path) {
             Ok(fd) => fd,
             Err(e) => {
-                for &s_fd in &sockets {
-                    unsafe { libc::close(s_fd); }
-                }
+                cleanup(&quic_sockets, &intercept_sockets);
                 return Err(DatapathError::Config(format!("Failed to open pinned map at {}: {}", map_path, e)));
             }
         };
 
-        // Allocate UMEM region for this specific interface
         let umem_size = 4096 * 2048;
         let umem = match UmemRegion::new(umem_size) {
             Ok(u) => u,
             Err(e) => {
+                // SAFETY: close map FD.
                 unsafe { libc::close(map_fd); }
-                for &s_fd in &sockets {
-                    unsafe { libc::close(s_fd); }
-                }
+                cleanup(&quic_sockets, &intercept_sockets);
                 return Err(DatapathError::Config(format!("Failed to allocate UMEM mmap for ifindex {}: {}", ifindex, e)));
             }
         };
         let mut first_fd_for_iface: Option<libc::c_int> = None;
 
         for queue_id in 0..q_count {
+            // SAFETY: socket call with standard constants.
             let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
             if fd < 0 {
                 let err = io::Error::last_os_error();
+                // SAFETY: close map FD.
                 unsafe { libc::close(map_fd); }
-                for &s_fd in &sockets {
-                    unsafe { libc::close(s_fd); }
-                }
+                cleanup(&quic_sockets, &intercept_sockets);
                 return Err(DatapathError::Config(format!("socket(AF_XDP) failed: {}", err)));
             }
 
             if first_fd_for_iface.is_none() {
-                // Register UMEM region on the first socket of this interface
                 let umem_reg = xdp_umem_reg {
                     addr: umem.addr as u64,
                     len: umem.size as u64,
@@ -398,6 +969,7 @@ fn setup_xsk_sockets(
                     headroom: 0,
                     flags: 0,
                 };
+                // SAFETY: setsockopt configures UMEM mapping on the first socket FD of the interface.
                 let ret = unsafe {
                     libc::setsockopt(
                         fd,
@@ -409,16 +981,16 @@ fn setup_xsk_sockets(
                 };
                 if ret < 0 {
                     let err = io::Error::last_os_error();
+                    // SAFETY: clean up local and map FDs.
                     unsafe { libc::close(fd); }
                     unsafe { libc::close(map_fd); }
-                    for &s_fd in &sockets {
-                        unsafe { libc::close(s_fd); }
-                    }
+                    cleanup(&quic_sockets, &intercept_sockets);
                     return Err(DatapathError::Config(format!("setsockopt(XDP_UMEM_REG) failed: {}", err)));
                 }
 
                 let ring_size: u32 = 2048;
                 for opt in &[XDP_UMEM_FILL_RING, XDP_UMEM_COMPLETION_RING, XDP_RX_RING, XDP_TX_RING] {
+                    // SAFETY: setsockopt configures ring sizes for the first socket FD of the interface.
                     let ret = unsafe {
                         libc::setsockopt(
                             fd,
@@ -430,11 +1002,10 @@ fn setup_xsk_sockets(
                     };
                     if ret < 0 {
                         let err = io::Error::last_os_error();
+                        // SAFETY: clean up local and map FDs.
                         unsafe { libc::close(fd); }
                         unsafe { libc::close(map_fd); }
-                        for &s_fd in &sockets {
-                            unsafe { libc::close(s_fd); }
-                        }
+                        cleanup(&quic_sockets, &intercept_sockets);
                         return Err(DatapathError::Config(format!("setsockopt(opt={}) failed: {}", opt, err)));
                     }
                 }
@@ -446,6 +1017,7 @@ fn setup_xsk_sockets(
                     sxdp_queue_id: queue_id as u32,
                     sxdp_shared_umem_fd: 0,
                 };
+                // SAFETY: bind binds the XSK raw socket to the interface index and queue ID.
                 let ret = unsafe {
                     libc::bind(
                         fd,
@@ -455,19 +1027,18 @@ fn setup_xsk_sockets(
                 };
                 if ret < 0 {
                     let err = io::Error::last_os_error();
+                    // SAFETY: clean up local and map FDs.
                     unsafe { libc::close(fd); }
                     unsafe { libc::close(map_fd); }
-                    for &s_fd in &sockets {
-                        unsafe { libc::close(s_fd); }
-                    }
+                    cleanup(&quic_sockets, &intercept_sockets);
                     return Err(DatapathError::Config(format!("bind(ifindex={}, queue_id={}) failed: {}", ifindex, queue_id, err)));
                 }
 
                 first_fd_for_iface = Some(fd);
             } else {
-                // Secondary socket sharing UMEM on this interface
                 let ring_size: u32 = 2048;
                 for opt in &[XDP_RX_RING, XDP_TX_RING] {
+                    // SAFETY: setsockopt configures secondary socket ring sizes.
                     let ret = unsafe {
                         libc::setsockopt(
                             fd,
@@ -479,11 +1050,10 @@ fn setup_xsk_sockets(
                     };
                     if ret < 0 {
                         let err = io::Error::last_os_error();
+                        // SAFETY: clean up local and map FDs.
                         unsafe { libc::close(fd); }
                         unsafe { libc::close(map_fd); }
-                        for &s_fd in &sockets {
-                            unsafe { libc::close(s_fd); }
-                        }
+                        cleanup(&quic_sockets, &intercept_sockets);
                         return Err(DatapathError::Config(format!("setsockopt(secondary opt={}) failed: {}", opt, err)));
                     }
                 }
@@ -493,8 +1063,9 @@ fn setup_xsk_sockets(
                     sxdp_flags: XDP_SHARED_UMEM | XDP_COPY,
                     sxdp_ifindex: ifindex,
                     sxdp_queue_id: queue_id as u32,
-                    sxdp_shared_umem_fd: first_fd_for_iface.unwrap() as u32,
+                    sxdp_shared_umem_fd: first_fd_for_iface.expect("first_fd_for_iface is missing") as u32,
                 };
+                // SAFETY: bind binds secondary XSK raw socket sharing UMEM with the primary socket.
                 let ret = unsafe {
                     libc::bind(
                         fd,
@@ -504,47 +1075,81 @@ fn setup_xsk_sockets(
                 };
                 if ret < 0 {
                     let err = io::Error::last_os_error();
+                    // SAFETY: clean up local and map FDs.
                     unsafe { libc::close(fd); }
                     unsafe { libc::close(map_fd); }
-                    for &s_fd in &sockets {
-                        unsafe { libc::close(s_fd); }
-                    }
+                    cleanup(&quic_sockets, &intercept_sockets);
                     return Err(DatapathError::Config(format!("bind(secondary ifindex={}, queue_id={}) failed: {}", ifindex, queue_id, err)));
                 }
             }
 
             if let Err(e) = register_xsk_in_map(map_fd, queue_id as u32, fd) {
+                // SAFETY: close FD.
                 unsafe { libc::close(fd); }
+                // SAFETY: close map FD.
                 unsafe { libc::close(map_fd); }
-                for &s_fd in &sockets {
-                    unsafe { libc::close(s_fd); }
-                }
+                cleanup(&quic_sockets, &intercept_sockets);
                 return Err(DatapathError::Config(format!("Failed to register XSK socket FD {} in BPF map: {}", fd, e)));
             }
 
-            sockets.push(fd);
+            intercept_sockets.push((fd, SendPtr(umem.addr)));
         }
+        // SAFETY: close map FD.
         unsafe { libc::close(map_fd); }
         umems.push(umem);
     }
 
-    Ok(XskSetup { _umems: umems, sockets })
+    Ok(XskSetup { umems, quic_sockets, intercept_sockets })
 }
 
 #[cfg(target_os = "linux")]
 fn run_xdp_worker_loop(
     worker_id: usize,
-    sockets: Vec<libc::c_int>,
+    quic_fd: libc::c_int,
+    quic_umem_addr: SendPtr,
+    intercept_fd: libc::c_int,
+    intercept_umem_addr: SendPtr,
     exit_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let mut poll_fds: Vec<libc::pollfd> = sockets
-        .iter()
-        .map(|&fd| libc::pollfd {
-            fd,
+    let quic_umem_addr = quic_umem_addr.0;
+    let intercept_umem_addr = intercept_umem_addr.0;
+    let (mut quic_rx, mut quic_tx, mut quic_fill, mut quic_comp) = match mmap_socket_rings(quic_fd) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("XDP Worker {} failed to mmap QUIC socket rings: {}", worker_id, e);
+            return;
+        }
+    };
+
+    let (mut intercept_rx, mut intercept_tx, mut intercept_fill, mut intercept_comp) = match mmap_socket_rings(intercept_fd) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("XDP Worker {} failed to mmap Intercept socket rings: {}", worker_id, e);
+            return;
+        }
+    };
+
+    // Populate Fill rings
+    unsafe {
+        populate_fill_ring(&mut quic_fill, 0, 1024);
+        populate_fill_ring(&mut intercept_fill, 0, 1024);
+    }
+
+    let mut quic_free_tx_chunks: Vec<u64> = (1024..2048).map(|i| (i as u64) * 4096).collect();
+    let mut intercept_free_tx_chunks: Vec<u64> = (1024..2048).map(|i| (i as u64) * 4096).collect();
+
+    let mut poll_fds = [
+        libc::pollfd {
+            fd: quic_fd,
             events: libc::POLLIN,
             revents: 0,
-        })
-        .collect();
+        },
+        libc::pollfd {
+            fd: intercept_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
 
     while !exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
         for pfd in &mut poll_fds {
@@ -560,10 +1165,47 @@ fn run_xdp_worker_loop(
         };
 
         if ret > 0 {
-            for pfd in &poll_fds {
-                if pfd.revents & libc::POLLIN != 0 {
-                    // Decoupled polling logic. In real setups, we read from Shared UMEM via RX Ring.
-                }
+            unsafe {
+                // Process Intercept RX (plaintext packets from app) -> Strip L2, Wrap to QUIC -> Transmit on QUIC TX
+                process_rx_ring(
+                    &mut intercept_rx,
+                    &mut intercept_fill,
+                    intercept_umem_addr,
+                    |pkt_data| {
+                        // Strip Ethernet header
+                        if let Some((eth_header, ip_payload)) = EthernetHeader::parse(pkt_data) {
+                            if eth_header.ether_type == 0x0800 {
+                                // Strip L2 and wrap to QUIC UDP
+                                Some(wrap_plaintext_to_quic(ip_payload))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    },
+                    &mut quic_tx,
+                    &mut quic_comp,
+                    &mut quic_free_tx_chunks,
+                    quic_umem_addr,
+                    quic_fd,
+                );
+
+                // Process QUIC RX (encrypted QUIC packets from NIC) -> Unwrap / Decrypt -> Prepend L2 -> Transmit on Intercept TX
+                process_rx_ring(
+                    &mut quic_rx,
+                    &mut quic_fill,
+                    quic_umem_addr,
+                    |pkt_data| {
+                        // Strip UDP/QUIC headers and prepend new Ethernet header
+                        unwrap_quic_to_plaintext(pkt_data)
+                    },
+                    &mut intercept_tx,
+                    &mut intercept_comp,
+                    &mut intercept_free_tx_chunks,
+                    intercept_umem_addr,
+                    intercept_fd,
+                );
             }
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -803,13 +1445,21 @@ impl Datapath for XdpDatapath {
             for worker_id in 0..queue_count {
                 let exit_notify_clone = exit_notify.clone();
                 let exit_flag_clone = exit_flag.clone();
-                let sockets_clone = setup.sockets.clone();
+                let (quic_fd, quic_umem_addr) = setup.quic_sockets[worker_id % setup.quic_sockets.len()];
+                let (intercept_fd, intercept_umem_addr) = setup.intercept_sockets[worker_id % setup.intercept_sockets.len()];
                 
                 let handle = std::thread::Builder::new()
                     .name(format!("new-proxy-server-xdp-worker-{}", worker_id))
                     .spawn(move || {
                         let _panic_guard = WorkerPanicGuard { exit_notify: exit_notify_clone };
-                        run_xdp_worker_loop(worker_id, sockets_clone, exit_flag_clone);
+                        run_xdp_worker_loop(
+                            worker_id,
+                            quic_fd,
+                            quic_umem_addr,
+                            intercept_fd,
+                            intercept_umem_addr,
+                            exit_flag_clone,
+                        );
                     })
                     .expect("Failed to spawn XDP worker thread");
                 join_handles.push(handle);
@@ -982,13 +1632,21 @@ impl Datapath for XdpDatapath {
             for worker_id in 0..queue_count {
                 let exit_notify_clone = exit_notify.clone();
                 let exit_flag_clone = exit_flag.clone();
-                let sockets_clone = setup.sockets.clone();
+                let (quic_fd, quic_umem_addr) = setup.quic_sockets[worker_id % setup.quic_sockets.len()];
+                let (intercept_fd, intercept_umem_addr) = setup.intercept_sockets[worker_id % setup.intercept_sockets.len()];
                 
                 let handle = std::thread::Builder::new()
                     .name(format!("new-proxy-client-xdp-worker-{}", worker_id))
                     .spawn(move || {
                         let _panic_guard = WorkerPanicGuard { exit_notify: exit_notify_clone };
-                        run_xdp_worker_loop(worker_id, sockets_clone, exit_flag_clone);
+                        run_xdp_worker_loop(
+                            worker_id,
+                            quic_fd,
+                            quic_umem_addr,
+                            intercept_fd,
+                            intercept_umem_addr,
+                            exit_flag_clone,
+                        );
                     })
                     .expect("Failed to spawn XDP worker thread");
                 join_handles.push(handle);
@@ -1169,6 +1827,26 @@ mod tests {
     fn test_bpf_map_registration_fail_on_invalid_fd() {
         let res = register_xsk_in_map(-1, 0, -1);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_ethernet_header_processing() {
+        let mut packet = vec![0u8; 100];
+        packet[0..6].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        packet[6..12].copy_from_slice(&[0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c]);
+        packet[12..14].copy_from_slice(&[0x08, 0x00]);
+        packet[14..18].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+
+        let parsed = EthernetHeader::parse(&packet).unwrap();
+        assert_eq!(parsed.0.dst_mac, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        assert_eq!(parsed.0.src_mac, [0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c]);
+        assert_eq!(parsed.0.ether_type, 0x0800);
+        assert_eq!(&parsed.1[0..4], &[0xaa, 0xbb, 0xcc, 0xdd]);
+
+        let mut out_buf = vec![0u8; 14];
+        let bytes_written = parsed.0.serialize(&mut out_buf).unwrap();
+        assert_eq!(bytes_written, 14);
+        assert_eq!(&out_buf[0..14], &packet[0..14]);
     }
 }
 
