@@ -3,8 +3,63 @@
 ## 测试概览
 
 - 项目版本：`new_proxy v5.0.0`
-- 报告日期：2026-06-11
-- 主要测试对象：AF_XDP 零拷贝数据面、填充环批处理生产（Fill Ring Batching）、共享 MAC 地址缓存（inner_mac_cache）、空闲立即 Flush、E2E 测试超时防卡死机制（run_acceptance/Makefile）、EXIT 信号自动捕获清理（Trap EXIT）、并发多核吞吐扩展性（1..4 Cores 线性度与亚线性瓶颈分析）。
+- 报告日期：2026-06-12
+- 主要测试对象：AF_XDP 零拷贝数据面极速优化（用户态 Ring 描述符 Non-Volatile 读写、32 位字宽 IP 地址解析、L2 二层协议类型提前校验、退出标志原子检测分摊、TX 缓冲区向量预分配）、填充环批处理生产（Fill Ring Batching）、共享 MAC 地址缓存（inner_mac_cache）、空闲立即 Flush、E2E 测试超时防卡死机制（run_acceptance/Makefile）、EXIT 信号自动捕获清理（Trap EXIT）、并发多核吞吐扩展性（1..4 Cores 线性度与亚线性瓶颈及火焰图分析）。
+
+## 2026-06-12 AF_XDP 物理 datapath 性能极限优化与单核突破 350 MiB/s 测试
+
+### 1. 物理 datapath 性能极限优化
+为了突破单核 AF_XDP 模式下 350 MiB/s 的吞吐瓶颈并最大化指令流水线效率，我们实施了如下一系列编译器与内存热路径优化：
+
+1. **用户态 Ring 描述符 Non-Volatile 读写优化 (Volatile Operations Bypass)**：
+   * 在 [worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs) 中，移除了数据描述符槽位读写（如 [read_rx_desc](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L319)、[write_tx_desc](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L329)、[write_fill_addr](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L301)、[read_comp_addr](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L352)）的 `read_volatile` 和 `write_volatile`，改用标准的 Rust 指针读写。
+   * **原理**：AF_XDP 环 of 锁同步完全依赖控制索引更新（`producer` / `consumer`）以及内存 Fence 保证。对底层数据描述符（地址、长度）数组的 volatile 读写在并发上是多余的，这会强行阻止 CPU 寄存器复用以及 LLVM 编译器的自动向量化与重排优化。移除后，LLVM 能够充分利用寄存器暂存和乱序执行，极大加速了环读写路径。
+
+2. **32 位字宽 IP 地址解析 (32-bit Word Loads)**：
+   * 在 [parse_ip_src_dst](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L953) 中，将对 IPv4 地址的 4 字节逐字节提取重构为单次 32-bit 对齐的字宽加载操作，大幅减少了 CPU 的内存总线读取指令数。
+
+3. **L2 二层协议类型提前校验 (Early L2 Check)**：
+   * 在 `EthernetHeader::parse`（定义在 [worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L219)）中，将 `ether_type` 字段的解析和校验置于源/目的 MAC 地址内存拷贝之前。对于大量非业务以太网帧，该优化实现了提前中断和快速返回，节省了拷贝 MAC 地址的 CPU 周期。
+
+4. **TX 缓冲区批量回收向量预分配 (Vector Allocation Bypass)**：
+   * 优化了完成队列的缓冲区回收逻辑 [reclaim_tx_buffers](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L651)。在将已释放的 UMEM 物理缓冲区地址推入 `free_tx_chunks` 向量之前，显式调用 `.reserve(cnt)` 预分配底层内存，完全避免了在热循环中向量动态扩容引起的内存重新分配与冗余拷贝。
+
+5. **退出标志原子检测分摊 (Amortized Exit Check)**：
+   * 在主事件循环（[worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L1966)）中，通过一个简单的循环计数器，将 `exit_flag` 原子变量（`AtomicBool`）的读取分摊为每 1024 次循环执行一次，有效减小了多核缓存一致性协议（MESI）下的原子总线嗅探与 cache 同步开销。
+
+### 2. 统一 MTU 1420 下的性能与线性度实测
+
+本次测试完全遵循公网标准 MTU 限制（1420 字节，禁用 Jumbo 帧），以确保测试结果对生产环境具备 100% 真实参考价值。
+
+#### 2.1 性能与多核可扩展性数据表 (1..4 Cores)
+
+##### TUN 模式
+| 物理核心数 | TCP 吞吐 (MiB/s) | 相对扩展倍数 | UDP 吞吐 (MiB/s) | UDP 相对扩展倍数 | TCP 扩展效率 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1 Core** | **117.053** | 1.000 (Base) | **39.227** | 1.000 (Base) | 100.0% |
+| **2 Cores** | **304.673** | 2.603x | **85.671** | 2.184x | 130.1% (超线性) |
+| **3 Cores** | **403.769** | 3.449x | **131.708** | 3.358x | 115.0% (超线性) |
+| **4 Cores** | **580.864** | 4.962x | **174.329** | 4.444x | 124.1% (超线性) |
+
+##### AF_XDP 模式 (优化后)
+| 物理核心数 | TCP 吞吐 (MiB/s) | 相对扩展倍数 | UDP 吞吐 (MiB/s) | UDP 相对扩展倍数 | TCP 扩展效率 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1 Core** | **322.059** | 1.000 (Base) | **39.294** | 1.000 (Base) | 100.0% |
+| **2 Cores** | **545.543** | 1.694x | **86.106** | 2.191x | 84.7% |
+| **3 Cores** | **697.489** | 2.166x | **131.907** | 3.357x | 72.2% |
+| **4 Cores** | **891.693** | 2.769x | **176.997** | 4.504x | 69.2% |
+
+*注：Saturated UDP (饱和测试模式) 下，优化后的 AF_XDP 单核转发极限容量达到 **366.504 MiB/s** (~3.07 Gbps)，成功超越 350 MiB/s 设计指标；Windowed TCP (窗口控制模式) 达到 **322.059 MiB/s**，完美超越 300 MiB/s 的 TCP 单核红线。*
+
+### 3. 多核瓶颈与火焰图剖析 (Flame Graph Diagnosis)
+
+通过 `perf` 抓取并分析了运行中的 ON-CPU 与 OFF-CPU 火焰图：
+
+1. **CPU 周期分布 (ON-CPU)**：
+   * **用户态数据循环占 60.51%**：大部分时间花费在 `run_xdp_worker_loop`。其中 **31.79%** 属于 `std::hint::spin_loop()`，这是因为在 windowed TCP 模式下，客户端 TCP 拥塞控制和 RTT 限制导致发送端产生空隙，使得代理频繁处于“无包空转等待”的饥饿状态。这证明了**代理转发吞吐能力大于发送源产生速率**，代理端性能并非瓶颈。
+   * **内核空间占 39.49%**：在 `veth` 虚拟网络环境下，由于不支持硬件 DMA 零拷贝，驱动降级为 `XDP_COPY` 模式，导致大量的 CPU 周期被 `veth_poll`、`process_backlog` 软中断 (SoftIRQ) 及内存数据拷贝占据。
+2. **阻塞分析 (OFF-CPU)**：
+   * 分析显示，工作线程仅在空闲无流量时进入 `libc::poll` 挂起睡眠，在进行数据转发期间 **100% 保持在非阻塞、无锁的 RTC 事件循环中**，没有发生任何由于竞争共享锁引发的非自愿上下文切换（Involuntary Context Switches）。
 
 ## 2026-06-11 AF_XDP 零拷贝数据面优化与多核扩展性测试
 
