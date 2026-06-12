@@ -227,11 +227,14 @@ impl EthernetHeader {
         if packet.len() < 14 {
             return None;
         }
+        let ether_type = u16::from_be_bytes([packet[12], packet[13]]);
+        if ether_type != 0x0800 {
+            return None;
+        }
         let mut dst_mac = [0u8; 6];
         dst_mac.copy_from_slice(&packet[0..6]);
         let mut src_mac = [0u8; 6];
         src_mac.copy_from_slice(&packet[6..12]);
-        let ether_type = u16::from_be_bytes([packet[12], packet[13]]);
         Some((
             Self {
                 dst_mac,
@@ -297,7 +300,7 @@ impl XskRing {
     /// of at least size `(idx & mask) + 1` elements.
     pub unsafe fn write_fill_addr(&mut self, idx: u32, addr: u64) {
         let offset_ptr = (self.desc as *mut u64).offset((idx & self.mask) as isize);
-        std::ptr::write_volatile(offset_ptr, addr);
+        std::ptr::write(offset_ptr, addr);
     }
 
     /// # Safety
@@ -315,7 +318,7 @@ impl XskRing {
     /// of at least size `(idx & mask) + 1` elements of type `xdp_desc`.
     pub unsafe fn read_rx_desc(&self, idx: u32) -> (u64, u32) {
         let desc_ptr = (self.desc as *const xdp_desc).offset((idx & self.mask) as isize);
-        let desc = std::ptr::read_volatile(desc_ptr);
+        let desc = std::ptr::read(desc_ptr);
         (desc.addr, desc.len)
     }
 
@@ -330,7 +333,7 @@ impl XskRing {
             len,
             options: 0,
         };
-        std::ptr::write_volatile(desc_ptr, desc);
+        std::ptr::write(desc_ptr, desc);
     }
 
     /// # Safety
@@ -348,7 +351,7 @@ impl XskRing {
     /// of at least size `(idx & mask) + 1` elements of type `u64`.
     pub unsafe fn read_comp_addr(&self, idx: u32) -> u64 {
         let addr_ptr = (self.desc as *const u64).offset((idx & self.mask) as isize);
-        std::ptr::read_volatile(addr_ptr)
+        std::ptr::read(addr_ptr)
     }
 }
 
@@ -655,6 +658,7 @@ unsafe fn reclaim_tx_buffers(
     let cnt = prod.wrapping_sub(cons);
     if cnt > 0 {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        free_tx_chunks.reserve(cnt as usize);
         for i in 0..cnt {
             let idx = cons.wrapping_add(i);
             let addr = comp.read_comp_addr(idx);
@@ -692,7 +696,7 @@ unsafe fn process_rx_ring(
     if cnt > 0 {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         // Reclaim completed TX buffers only when our free pool is running low.
-        if free_tx_chunks.len() < 64 {
+        if free_tx_chunks.len() < 256 {
             reclaim_tx_buffers(comp, comp_cons, free_tx_chunks);
         }
 
@@ -952,9 +956,18 @@ fn parse_ip_src_dst(packet: &[u8]) -> Option<(std::net::Ipv4Addr, std::net::Ipv4
     }
     let version = packet[0] >> 4;
     if version == 4 {
-        let src = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-        let dst = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-        Some((src, dst))
+        let src_bytes: [u8; 4] = match packet[12..16].try_into() {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        let dst_bytes: [u8; 4] = match packet[16..20].try_into() {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        Some((
+            std::net::Ipv4Addr::from(src_bytes),
+            std::net::Ipv4Addr::from(dst_bytes),
+        ))
     } else {
         None
     }
@@ -991,12 +1004,12 @@ pub fn wrap_plaintext_to_quic_slice(
     out_buf[23] = 17; // UDP
 
     // Fast checksum calculation using precomputed constant fields
-    let s_oct = src_ip.octets();
-    let d_oct = dst_ip.octets();
-    let src_high = u16::from_be_bytes([s_oct[0], s_oct[1]]) as u32;
-    let src_low = u16::from_be_bytes([s_oct[2], s_oct[3]]) as u32;
-    let dst_high = u16::from_be_bytes([d_oct[0], d_oct[1]]) as u32;
-    let dst_low = u16::from_be_bytes([d_oct[2], d_oct[3]]) as u32;
+    let src_u32 = u32::from(src_ip);
+    let dst_u32 = u32::from(dst_ip);
+    let src_high = src_u32 >> 16;
+    let src_low = src_u32 & 0xFFFF;
+    let dst_high = dst_u32 >> 16;
+    let dst_low = dst_u32 & 0xFFFF;
 
     let mut sum =
         0x4500u32 + 0x4011u32 + src_high + src_low + dst_high + dst_low + total_len as u32;
@@ -1006,8 +1019,8 @@ pub fn wrap_plaintext_to_quic_slice(
     let checksum = !sum as u16;
 
     out_buf[24..26].copy_from_slice(&checksum.to_be_bytes());
-    out_buf[26..30].copy_from_slice(&s_oct);
-    out_buf[30..34].copy_from_slice(&d_oct);
+    out_buf[26..30].copy_from_slice(&src_u32.to_be_bytes());
+    out_buf[30..34].copy_from_slice(&dst_u32.to_be_bytes());
 
     // UDP header
     out_buf[34..36].copy_from_slice(&src_port.to_be_bytes());
@@ -1947,7 +1960,16 @@ fn run_xdp_worker_loop(
     let mut intercept_fill_prod = unsafe { std::ptr::read_volatile(intercept_fill.producer) };
     let mut intercept_comp_cons = unsafe { std::ptr::read_volatile(intercept_comp.consumer) };
 
-    while !exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
+    let mut exit_check_counter = 0;
+    while {
+        exit_check_counter += 1;
+        if exit_check_counter >= 1024 {
+            exit_check_counter = 0;
+            !exit_flag.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            true
+        }
+    } {
         let mut work_done = false;
 
         unsafe {

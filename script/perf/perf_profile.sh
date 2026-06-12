@@ -69,8 +69,8 @@ ip link set vp-s-w2 address 00:00:00:00:00:22
 ip link set vp-s-w1 netns profile_server_ns
 ip link set vp-s-w2 netns profile_server_ns
 ip netns exec profile_server_ns ip addr add 10.0.0.1/24 dev vp-s-w1
-ip netns exec profile_server_ns ip link set vp-s-w1 mtu 1280 up
-ip netns exec profile_server_ns ip link set vp-s-w2 mtu 1280 up
+ip netns exec profile_server_ns ip link set vp-s-w1 mtu 1420 up
+ip netns exec profile_server_ns ip link set vp-s-w2 mtu 1420 up
 ip netns exec profile_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vp-s-w1
 ip netns exec profile_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vp-s-w1
 
@@ -79,14 +79,14 @@ ip netns exec profile_client_ns ip addr add 10.0.1.2/24 dev vp-c
 ip netns exec profile_client_ns ip addr add 10.0.4.1/24 dev vp-cw
 ip netns exec profile_client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec profile_client_ns ip link set vp-c up
-ip netns exec profile_client_ns ip link set vp-cw up
+ip netns exec profile_client_ns ip link set vp-cw mtu 1420 up
 ip netns exec profile_client_ns ip link set lo up
 ip netns exec profile_client_ns ip route add default via 10.0.1.1
 ip netns exec profile_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # Configure Work NS
 ip netns exec profile_work_ns ip addr add 10.0.4.2/24 dev vp-w
-ip netns exec profile_work_ns ip link set vp-w up
+ip netns exec profile_work_ns ip link set vp-w mtu 1420 up
 ip netns exec profile_work_ns ip link set lo up
 ip netns exec profile_work_ns ip route add default via 10.0.4.1
 
