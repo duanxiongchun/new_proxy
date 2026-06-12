@@ -1,4 +1,4 @@
-# new_proxy 架构说明（Pure L3 IP-over-QUIC Datagram 架构）
+﻿﻿# new_proxy 架构说明（Pure L3 IP-over-QUIC Datagram 架构）
 
 本文档描述 `new_proxy` 的全新纯 L3 IP-over-QUIC Datagram 数据面架构。所有数据包（TCP、UDP、ICMP）均通过无状态、无延迟的 QUIC Datagram 进行传输，并依托多队列网卡实现对称多核并行处理。
 

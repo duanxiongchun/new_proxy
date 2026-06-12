@@ -1,4 +1,4 @@
-# new_proxy 测试说明与覆盖矩阵（Pure L3 IP-over-QUIC Datagram 架构）
+﻿# new_proxy 测试说明与覆盖矩阵（Pure L3 IP-over-QUIC Datagram 架构）
 
 本文档详细描述了 `new_proxy` 纯 L3 IP-over-QUIC Datagram 隧道网关架构下的测试体系。所有单元测试、端到端测试（E2E）、性能测试和稳定性测试均围绕此全新设计展开，废弃原有的 `boringtun` (WireGuard) 和 `smoltcp` (流代理) 相关测试。
 

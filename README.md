@@ -1,4 +1,4 @@
-# new_proxy
+﻿# new_proxy
 
 `new_proxy` 是一个高性能纯 L3 IP-over-QUIC Datagram 异步隧道安全网关。所有数据流量（TCP, UDP, ICMP）均被无状态、零额外分流处理地封装进 QUIC Datagram 报文进行公网加密传输。依托 Linux 多队列 TUN 网卡与对称多核绑定哈希设计，实现无全局锁竞争的高并发 RTC 转发流，彻底消除 TCP-over-TCP 的队头阻塞及拥塞崩溃瓶颈。
 
