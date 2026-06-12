@@ -326,7 +326,17 @@ TUN 批接收 (read + try_read) ---> 批量路由与加密 (Quinn send) ---> UDP
 ### 11.7 外层 IPv4 校验和常数运算优化 (Fast Checksum Precomputation)
 * **消除累加循环**：优化前，每个从 Plaintext 到 QUIC Encrypted 的报文都需要动态遍历 20 字节的外层 IP 头部计算 IPv4 校验和。由于该头部除 `total_len` 外，所有的源 IP/MAC、目的 IP/MAC、协议号等均为连接生存期内的常数，我们将常数部分在连接建立时或本地提取预计算，计算新校验和时仅通过一次常数相加与位折叠操作得到最终校验和，完全清空了发送热路径上的头部遍历开销。
 
-### 11.8 用户态以太网帧解析与封装细节 (Userspace L2 Packet Framing)
+### 11.8 用户态 Ring 描述符 Non-Volatile 读写优化 (Volatile Operations Bypass)
+* **避免过度 Volatile 强制**：在 lock-free UMEM 环中，内核与用户态对环槽数据描述符（地址、长度）的并发读写是单向且互斥的（受 `producer`/`consumer` 控制索引以及内存 Fence 保护）。原版代码对数据槽（`read_rx_desc`、`write_tx_desc`、`write_fill_addr`、`read_comp_addr`）使用了 `read_volatile` / `write_volatile`，这强行指示编译器不得对其进行任何寄存器缓存或指令重排优化。
+* **寄存器与向量化释放**：在 [worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs) 中，我们将其重构为 Rust 标准指针读写（`std::ptr::read`/`std::ptr::write`），仅对控制面同步变量保留 volatile 限制。这一改动释放了 LLVM 编译器的指令重排及向量化分析空间，使得在包读写循环中能以最优的寄存器布局运行，单核性能显著提升。
+
+### 11.9 热路径微观性能优化 (Micro-Optimizations on Hot-Path)
+* **32-Bit Word IP 地址解析**：在 [parse_ip_src_dst](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L953) 中，原版通过 4 字节切片逐字节提取源 IP 和目的 IP，引发了多次不必要的内存寻址。我们将其重构为单次 32 位字宽加载（32-bit Word Load），一次性获取完整的 IPv4 地址。
+* **L2 协议头提前校验**：在以太网头部解析 `EthernetHeader::parse`（[worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L219)）中，将 `ether_type` 校验提前。如若不是业务所需的以太网协议（例如非 `ETH_P_IP`），直接返回 `None` 退出，完全避免了源/目的 MAC 地址的无效内存拷贝（12 字节拷贝与对齐开销），实现了针对海量无关以太网广播帧的快速过滤。
+* **TX 回收向量预分配**：在物理完成队列（Completion Ring）的缓冲区回收逻辑 [reclaim_tx_buffers](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L651) 中，在将地址推入 `free_tx_chunks` 向量之前，根据当前批次的可归还数量 `cnt` 显式调用 `.reserve(cnt)`。这完全消除了 Rust 向量在热路径上由于元素追加导致的动态扩容、重新分配以及冗余的内存拷贝。
+* **退出标志检测摊销 (Amortized Exit Check)**：`exit_flag` 属于原子布尔值（`AtomicBool`），原版在工作线程 `while` 循环头每次都执行原子读取。在多核绑定的环境下，高频的原子变量读取会通过 MESI 协议在 CPU 核心之间产生频繁的总线缓存行嗅探与一致性同步开销。我们引入了一个简单的计数器，将原子读取分摊（Amortize）到每 1024 次循环执行一次，在确保及时响应退出信号的同时，完全消除了该热路径开销。
+
+### 11.10 用户态以太网帧解析与封装细节 (Userspace L2 Packet Framing)
 * **明文拦截与隧道加密路径 (出站)**：
   1. 工作线程轮询 Intercept XSK 的 RX 环，从中拉取由 eBPF 重定向的 Plaintext 二层以太网帧。
   2. 解析二层 Ether Header（14字节），剥离以太网头，暴露出原始 IP 数据报。

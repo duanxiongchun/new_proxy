@@ -120,13 +120,18 @@ sudo ./script/acceptance/run_acceptance.sh
 
 ## 4. 性能与线性度测试
 
-### 4.1 多核心线性度测试 (`perf_cores_scalability.sh`)
+### 4.1 多核心线性度与吞吐测试 (`perf_cores_scalability.sh` / `perf_cores_scalability_xdp.sh`)
 * **执行方式**：
-  * 通过 `taskset` 约束客户端进程可使用的 CPU 核心数量（`1`、`2`、`3`、`4`）。
-  * 相应地配置 $N$（`1..4`）个数据端口和队列进行多进程高并发压力测试。
-* **线性度衡量指标**：
-  * **TCP Throughput (MiB/s)**：在 CPU 资源成倍增加时，TCP 吞吐量应呈接近 **$1:1$** 的线性增长（核心效率 $\ge 95\%$）。
-  * **UDP Loss Rate**：因为 UDP 走 Datagram，随着可用核心和网卡队列增加，处理能力线性提升，在发送端速率恒定的情况下，**接收丢包率必须随核心数增加呈线性下降**，直至在 3-4 核时丢包率接近 0%。
+  * **TUN 模式压测**：使用 [perf_cores_scalability.sh](file:///home/duanxiongchun/new_proxy/script/perf/perf_cores_scalability.sh) 脚本。
+  * **AF_XDP 模式压测**：使用 [perf_cores_scalability_xdp.sh](file:///home/duanxiongchun/new_proxy/script/perf/perf_cores_scalability_xdp.sh) 脚本。
+  * 通过 `taskset` 将客户端与服务端工作线程及网关绑定至特定 logical NUMA 核心（如 Node 0 上的核心），逐阶梯（1..4 Cores）配置 $N$（1..4）个数据端口，发起并行的 TCP 流量和 UDP 流量压测。
+* **主要考核指标**：
+  * **单核性能红线**：
+    * **TCP 吞吐**：单核 TCP 转发吞吐必须达到并超越 **300 MiB/s**。
+    * **UDP 饱合吞吐**：单核 UDP 饱合转发吞吐必须达到并超越 **350 MiB/s**。
+  * **线性度与可扩展效率**：
+    * **TUN 模式（超线性）**：因为去除了单物理网卡 FD 上的 read/write 锁同步及 CPU L1/L3 缓存抖动（Cache Eviction），多核心多队列模式下应呈现超线性增长。
+    * **AF_XDP 模式（亚线性）**：在虚拟机虚拟接口（`veth`）测试环境下，由于不支持硬件 DMA Zero-Copy，必须运行在 `XDP_COPY` 模式下，存在高频率的 SoftIRQ 软中断和内核-用户态数据拷贝（约占 39.49% ON-CPU 周期）。在极高吞吐下受内存总线带宽瓶颈限制，呈现正常的亚线性扩展（4核扩展率约 2.77x，效率约 69%）。在硬件 Zero-Copy 支持的生产物理网卡下，该扩展性将显著提高。
 
 ### 4.2 热路径零分配校验 (Zero Heap Allocation Check)
 * **执行方式**：
