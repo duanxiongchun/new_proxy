@@ -2352,8 +2352,14 @@ impl XdpDatapath {
             index
         };
 
+        let intercept_names = if config.xdp.intercept_interfaces.is_empty() {
+            vec![interface_name.clone()]
+        } else {
+            config.xdp.intercept_interfaces.clone()
+        };
+
         let mut intercept_ifindexes = Vec::new();
-        for ifname in &config.xdp.intercept_interfaces {
+        for ifname in &intercept_names {
             let index = unsafe {
                 let c_ifname = CString::new(ifname.as_str())
                     .map_err(|e| DatapathError::Config(e.to_string()))?;
@@ -2376,7 +2382,7 @@ impl XdpDatapath {
             })?;
         bpf_managers.push(manager);
 
-        for ifname in &config.xdp.intercept_interfaces {
+        for ifname in &intercept_names {
             if ifname == &quic_interface {
                 continue;
             }
