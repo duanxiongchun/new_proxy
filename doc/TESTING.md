@@ -1,4 +1,4 @@
-﻿# new_proxy 测试说明与覆盖矩阵（Pure L3 IP-over-QUIC Datagram 架构）
+# new_proxy 测试说明与覆盖矩阵（Pure L3 IP-over-QUIC Datagram 架构）
 
 本文档详细描述了 `new_proxy` 纯 L3 IP-over-QUIC Datagram 隧道网关架构下的测试体系。所有单元测试、端到端测试（E2E）、性能测试和稳定性测试均围绕此全新设计展开，废弃原有的 `boringtun` (WireGuard) 和 `smoltcp` (流代理) 相关测试。
 
@@ -60,6 +60,11 @@ cargo test
 * **`src/uds_server.rs` & `src/stats_cli.rs`**：
   * 校验 UDS API 的 `Stats` 和 `Dump` 命令。
   * 断言导出的遥测指标（如 `sent_datagrams`、`recv_datagrams`、`dropped_packets`、`active_connections`）数值准确。
+  * **验证内核态 WireGuard 遥测聚合**：通过 Mock/控制通道注入或读取真实的内核态 WireGuard 流量指标，断言其能正确汇入 `UnifiedTelemetry` 并对 `new-proxy-cli` 返回。
+* **`src/runtime.rs` & `src/config.rs`（混合与 Netlink 模块）**：
+  * **配置解析测试**：验证 `Type = wireguard` 与 `Type = quic` 对等体类型的正确识别，以及 `WgListenPort`（若缺失则默认为 `ListenPort + 1`）的动态端口推导。
+  * **自动命名逻辑**：验证在不同数据面模式下，虚拟网卡名是否自动按 `<config_name>-tun`、`<config_name>-veth` 以及 `<config_name>-wg` 生成。
+  * **Netlink 接口交互验证**：验证接口创建（`RTM_NEWLINK`）、参数设置（私钥、端口、对等体配置）的逻辑流程是否在没有外部 `wg` 依赖下能够独立正常跑通。
 
 ---
 
@@ -115,6 +120,27 @@ sudo ./script/acceptance/run_acceptance.sh
 #### 8. UDP-over-QUIC 性能极限吞吐 (`e2e_udp_over_quic.sh`)
 * **验证点**：
   * 验证 UDP 数据流量在 QUIC Datagram 物理下的传输吞吐能力。
+
+#### 9. 混合网关与内核 WireGuard 接入验证 (`e2e_hybrid_wireguard.sh`)
+* **拓扑**：建立 `mobile_ns` (模拟标准 WG 客户端，IP `10.0.0.3`) <-> `client_ns` (运行 `new_proxy` 混合模式，拥有 `client-wg` 内核设备和 `client-tun` 用户态 QUIC 设备，网卡共享 IP `10.0.0.2`) <-> `server_ns` (运行 `new_proxy` 服务端，IP `10.0.0.1`)。
+* **验证点**：
+  * **WireGuard 直接接入**：`mobile_ns` 的标准 WireGuard 握手直连 `client_ns` 的 `client-wg` 接口并建立原生加密隧道。
+  * **最长前缀路由分流**：从 `mobile_ns` 发起对 `server_ns` 的 ping，包在 `client_ns` 被内核解密后，通过本地主机路由匹配 `10.0.0.1/32` 发送给 `client-tun` 用户态接口，被 `new_proxy` 成功封装进 QUIC Datagram 并转发给服务端，实现双重隧道桥接和流量互通。
+  * **遥测标记与统计**：使用 `new-proxy-cli` 执行 stats 查询，验证移动端对等体被标记为 `source: wireguard` 并且 `wireguard` 收发字节与握手时间数据非零。
+
+#### 10. 混合网关高可用与自愈重连验证 (`e2e_hybrid_ha_reconnect.sh`)
+* **验证点**：
+  * **服务端意外重启自愈**：
+    * 启动服务端与两类对等体（QUIC 与 WireGuard）并确保正常通信。
+    * 杀死并重新拉起服务端进程。
+    * **QUIC 客户端**：其后台 `Health Checker` 自动检测到物理连接中断，并触发独立的 Slot 控制面预协商，应在 10s 内自动完成重连自愈。
+    * **WireGuard 客户端**：由于 WireGuard 协议在内核的无状态特性，其在发送新报文时自动触发握手，当服务端重新上线后，连接应即刻无缝恢复。
+    * 验证重连后两端数据传输自动恢复。
+  * **客户端重启与会话接管**：
+    * 意外中止并重新拉起客户端（QUIC 或 WireGuard）进程，验证服务端能安全接管新会话，对旧物理连接/槽位进行安全释放或覆盖，且不会出现路由重复安装或网口独占冲突错误。
+  * **混合客户端并发与转发隔离**：
+    * 同时拉起 `Type = quic` 与 `Type = wireguard` 的客户端并发向服务端发送高吞吐流量。
+    * 验证服务端能够在物理数据通道中正确进行多队列解复用与对称流哈希，两类客户端流量并行工作，互不干扰、不引发 CPU 死锁或套接字竞争。
 
 ---
 
