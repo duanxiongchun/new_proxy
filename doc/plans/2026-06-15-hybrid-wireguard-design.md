@@ -42,6 +42,13 @@ We will add `defguard_wireguard_rs = "0.10.0"` to `Cargo.toml`. This crate inter
 3. **Shutdown**: During `cleanup_routes`, delete the `<config_name>-wg` interface from the kernel via Netlink.
 4. **Dynamic Changes**: On dynamic UDS `AddPeer` or `RemovePeer` requests, immediately synchronize the peer updates to the kernel WireGuard interface using Netlink.
 
+### 3.3 wireguard-go Adaptive Fallback
+If the running Linux kernel lacks native WireGuard support (e.g., `CONFIG_WIREGUARD` is not set):
+* **Detection**: Netlink interface creation (`create_interface`) will return a link-type-not-supported error.
+* **Fallback**: When the error is caught, the gateway launches the userspace implementation by spawning `wireguard-go <config_name>-wg` as a background process.
+* **Uniform Configuration**: Once the virtual TUN device is created by `wireguard-go`, the gateway configures its parameters (private key, peers, port) and retrieves telemetry via the same Netlink socket, as `wireguard-go` exposes a standard netlink interface.
+* **Cleanup**: On process shutdown, deleting the link via Netlink or killing the spawned `wireguard-go` process cleans up the interface automatically.
+
 ---
 
 ## 4. LPM Routing Integration
