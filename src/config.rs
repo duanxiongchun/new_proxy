@@ -13,6 +13,7 @@ pub struct InterfaceConfig {
     pub private_key: [u8; 32],
     pub addresses: Vec<IpNet>,
     pub listen_port: Option<u16>,
+    pub wg_listen_port: Option<u16>,
     pub listen_control_port: Option<u16>,
     pub mtu: u16,
     pub table: Option<String>,
@@ -38,12 +39,21 @@ impl Default for XdpConfig {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerType {
+    #[serde(rename = "quic")]
+    Quic,
+    #[serde(rename = "wireguard")]
+    Wireguard,
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
     pub public_key: [u8; 32],
     pub allowed_ips: Vec<IpNet>,
     pub endpoint: Option<SocketAddr>,
     pub proxy_port: Option<u16>,
+    pub r#type: PeerType,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +179,16 @@ impl GatewayConfig {
             })
             .transpose()?;
 
+        let wg_listen_port = interface_section
+            .get("WgListenPort")
+            .or_else(|| interface_section.get("wg_listen_port"))
+            .or_else(|| interface_section.get("wglistenport"))
+            .map(|s| {
+                s.parse::<u16>()
+                    .map_err(|e| format!("Invalid WgListenPort: {}", e))
+            })
+            .transpose()?;
+
         let mtu = interface_section
             .get("MTU")
             .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid MTU: {}", e)))
@@ -200,6 +220,7 @@ impl GatewayConfig {
             private_key,
             addresses,
             listen_port,
+            wg_listen_port,
             listen_control_port,
             mtu,
             table,
@@ -243,11 +264,22 @@ impl GatewayConfig {
                     })
                     .transpose()?;
 
+                let peer_type_str = section
+                    .get("Type")
+                    .or_else(|| section.get("type"))
+                    .or_else(|| section.get("peertype"))
+                    .or_else(|| section.get("peer_type"));
+                let r#type = match peer_type_str {
+                    Some(s) if s.eq_ignore_ascii_case("wireguard") => PeerType::Wireguard,
+                    _ => PeerType::Quic,
+                };
+
                 peers.push(PeerConfig {
                     public_key,
                     allowed_ips,
                     endpoint,
                     proxy_port,
+                    r#type,
                 });
             }
         }
@@ -403,12 +435,78 @@ ListenPorts = 40001, 40002
 
         let config = GatewayConfig::load_from_file(path).unwrap();
         assert_eq!(config.interface.listen_port, Some(51820));
+        assert_eq!(config.interface.wg_listen_port, None);
         assert_eq!(config.interface.listen_control_port, Some(51821));
         assert_eq!(config.interface.mtu, 1280);
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].proxy_port, Some(40001));
+        assert_eq!(config.peers[0].r#type, PeerType::Quic);
         assert_eq!(config.quic_pool.public_ipv4, Some("1.2.3.4".to_string()));
         assert_eq!(config.quic_pool.listen_ports, vec![40001, 40002]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_load_config_hybrid_wg() {
+        let path = "test_temp_hybrid_wg.conf";
+        let key = test_key();
+
+        // Test Type = wireguard
+        let content1 = format!(
+            r#"
+[Interface]
+PrivateKey = {key}
+Address = 10.0.0.1/24
+WgListenPort = 51822
+
+[Peer]
+PublicKey = {key}
+AllowedIPs = 10.0.0.2/32
+Type = wireguard
+"#
+        );
+        fs::write(path, content1).unwrap();
+        let config = GatewayConfig::load_from_file(path).unwrap();
+        assert_eq!(config.interface.wg_listen_port, Some(51822));
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].r#type, PeerType::Wireguard);
+
+        // Test peertype = wireguard
+        let content2 = format!(
+            r#"
+[Interface]
+PrivateKey = {key}
+Address = 10.0.0.1/24
+WgListenPort = 51822
+
+[Peer]
+PublicKey = {key}
+AllowedIPs = 10.0.0.2/32
+peertype = wireguard
+"#
+        );
+        fs::write(path, content2).unwrap();
+        let config = GatewayConfig::load_from_file(path).unwrap();
+        assert_eq!(config.peers[0].r#type, PeerType::Wireguard);
+
+        // Test peer_type = wireguard
+        let content3 = format!(
+            r#"
+[Interface]
+PrivateKey = {key}
+Address = 10.0.0.1/24
+WgListenPort = 51822
+
+[Peer]
+PublicKey = {key}
+AllowedIPs = 10.0.0.2/32
+peer_type = wireguard
+"#
+        );
+        fs::write(path, content3).unwrap();
+        let config = GatewayConfig::load_from_file(path).unwrap();
+        assert_eq!(config.peers[0].r#type, PeerType::Wireguard);
 
         let _ = fs::remove_file(path);
     }

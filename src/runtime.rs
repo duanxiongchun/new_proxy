@@ -461,7 +461,7 @@ fn run_command_best_effort(program: &str, args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
+    use crate::config::{InterfaceConfig, PeerConfig, PeerType, QUICPoolConfig, XdpConfig};
 
     fn config_with_table(table: Option<&str>) -> GatewayConfig {
         GatewayConfig {
@@ -469,6 +469,7 @@ mod tests {
                 private_key: [1u8; 32],
                 addresses: vec!["10.0.0.2/24".parse().unwrap()],
                 listen_port: None,
+                wg_listen_port: None,
                 listen_control_port: None,
                 mtu: 1400,
                 table: table.map(str::to_string),
@@ -495,6 +496,7 @@ mod tests {
                 .collect(),
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         }
     }
 

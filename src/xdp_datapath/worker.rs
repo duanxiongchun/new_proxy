@@ -2988,6 +2988,7 @@ mod tests {
                 private_key: [1u8; 32],
                 addresses: vec!["10.0.0.1/24".parse().unwrap()],
                 listen_port: Some(40000),
+                wg_listen_port: None,
                 listen_control_port: Some(40001),
                 mtu: 1400,
                 table: None,

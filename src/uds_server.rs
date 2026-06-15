@@ -497,6 +497,7 @@ async fn handle_add_peer(
         allowed_ips: parsed_allowed_ips,
         endpoint: parsed_endpoint,
         proxy_port,
+        r#type: config::PeerType::Quic,
     };
 
     if context.runtime_mode == RuntimeMode::Client
@@ -925,7 +926,9 @@ async fn write_error(stream: &mut tokio::net::UnixStream, framed_response: bool,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GatewayConfig, InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
+    use crate::config::{
+        GatewayConfig, InterfaceConfig, PeerConfig, PeerType, QUICPoolConfig, XdpConfig,
+    };
     use crate::routing::AllowedIPsRouter;
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -936,6 +939,7 @@ mod tests {
                 private_key: [1u8; 32],
                 addresses: vec![],
                 listen_port: Some(0),
+                wg_listen_port: None,
                 listen_control_port: Some(51820),
                 mtu: 1420,
                 table: None,
@@ -948,6 +952,7 @@ mod tests {
                 allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
                 endpoint: Some("1.2.3.4:51820".parse().unwrap()),
                 proxy_port: Some(40001),
+                r#type: PeerType::Quic,
             }],
             quic_pool: QUICPoolConfig {
                 public_ipv4: None,
@@ -1065,6 +1070,7 @@ mod tests {
                 allowed_ips: vec!["10.0.9.0/24".parse().unwrap()],
                 endpoint: None,
                 proxy_port: None,
+                r#type: PeerType::Quic,
             });
         }
         start(listener, context);
@@ -1400,12 +1406,14 @@ mod tests {
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         };
         let mut new_peer = PeerConfig {
             public_key: [3u8; 32],
             allowed_ips: vec!["10.0.0.128/25".parse().unwrap()],
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         };
 
         assert!(
