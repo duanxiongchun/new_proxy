@@ -1,3 +1,4 @@
+use crate::app_config::quic_interface_name;
 use crate::config::{GatewayConfig, PeerConfig};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -80,9 +81,11 @@ pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), 
         return Ok(());
     }
 
+    let quic_name = quic_interface_name(interface_name, &config.interface.mode);
+
     log::info!(
         "Setting up userspace TUN addresses and routes for interface: {}",
-        interface_name
+        quic_name
     );
 
     for command in cleanup_policy_rule_commands(config) {
@@ -92,7 +95,7 @@ pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), 
         run_command_best_effort(command.program, &command.args);
     }
 
-    for command in setup_route_commands(config, interface_name) {
+    for command in setup_route_commands(config, &quic_name) {
         run_command_checked(command.program, &command.args)?;
     }
 
@@ -139,17 +142,18 @@ pub fn cleanup_peer_routes(_peer: &PeerConfig, _interface_name: &str) -> Result<
 
 #[cfg(not(tarpaulin))]
 fn cleanup_routes(config: &GatewayConfig, interface_name: &str) {
+    let quic_name = quic_interface_name(interface_name, &config.interface.mode);
     if table_is_off(config) {
-        cleanup_tun_link(interface_name);
+        cleanup_tun_link(&quic_name);
         return;
     }
 
     log::info!(
         "Cleaning up userspace routing for interface: {}",
-        interface_name
+        quic_name
     );
 
-    for command in cleanup_route_commands(config, interface_name) {
+    for command in cleanup_route_commands(config, &quic_name) {
         run_command_best_effort(command.program, &command.args);
     }
 }

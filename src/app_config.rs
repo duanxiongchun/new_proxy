@@ -68,6 +68,18 @@ pub fn api_socket_path(interface_name: &str) -> String {
     format!("/run/new_proxy/{}.sock", interface_name)
 }
 
+pub fn quic_interface_name(name: &str, mode: &str) -> String {
+    if mode.eq_ignore_ascii_case("af_xdp") {
+        format!("{}-veth", name)
+    } else {
+        format!("{}-tun", name)
+    }
+}
+
+pub fn wg_interface_name(name: &str) -> String {
+    format!("{}-wg", name)
+}
+
 pub fn validate_gateway_config(config: &GatewayConfig) -> Result<RuntimeMode, String> {
     if let Some(table) = config.interface.table.as_deref() {
         if !table.eq_ignore_ascii_case("auto") && !table.eq_ignore_ascii_case("off") {
@@ -535,5 +547,16 @@ mod tests {
             sources.get(&[2u8; 32]).map(String::as_str),
             Some("wireguard")
         );
+    }
+
+    #[test]
+    fn test_automatic_interface_naming_helpers() {
+        assert_eq!(quic_interface_name("client", "tun"), "client-tun");
+        assert_eq!(quic_interface_name("client", "TUN"), "client-tun");
+        assert_eq!(quic_interface_name("client", "af_xdp"), "client-veth");
+        assert_eq!(quic_interface_name("client", "AF_XDP"), "client-veth");
+        assert_eq!(quic_interface_name("client", "other"), "client-tun");
+
+        assert_eq!(wg_interface_name("client"), "client-wg");
     }
 }

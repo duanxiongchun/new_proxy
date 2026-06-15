@@ -2,7 +2,7 @@ use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::app_config::RuntimeMode;
+use crate::app_config::{quic_interface_name, RuntimeMode};
 use crate::client::build_peer_quic_pool;
 use crate::config::GatewayConfig;
 use crate::control::ControlServer;
@@ -219,7 +219,8 @@ impl Datapath for TunDatapath {
                 tun_queue_count
             );
 
-            let tun_fds = match crate::tun_device::open_tun(&self.interface_name, tun_queue_count) {
+            let quic_name = quic_interface_name(&self.interface_name, &self.config.interface.mode);
+            let tun_fds = match crate::tun_device::open_tun(&quic_name, tun_queue_count) {
                 Ok(fds) => fds,
                 Err(e) => {
                     log::error!("Failed to open server TUN device: {}", e);
@@ -483,7 +484,8 @@ impl Datapath for TunDatapath {
                 self.interface_name,
                 tun_queue_count
             );
-            let tun_fds = match crate::tun_device::open_tun(&self.interface_name, tun_queue_count) {
+            let quic_name = quic_interface_name(&self.interface_name, &self.config.interface.mode);
+            let tun_fds = match crate::tun_device::open_tun(&quic_name, tun_queue_count) {
                 Ok(fds) => fds,
                 Err(e) => {
                     log::error!("Failed to open TUN device: {}", e);

@@ -454,6 +454,9 @@ fn main() {
         }
     };
 
+    // The parsed interface_name acts as the base name (e.g. "client").
+    // The runtime resolves it to "client-tun"/"client-veth" for the userspace QUIC datapath
+    // and "client-wg" for the kernel WireGuard datapath to avoid interface clashes.
     let interface_name = match interface_name_from_config_path(&startup_args.config_path) {
         Ok(name) => name,
         Err(e) => {
