@@ -47,6 +47,7 @@ parking_lot = "0.12"
 arc-swap = "1.7"
 async-trait = "0.1"
 thiserror = "1.0"
+defguard_wireguard_rs = "0.10.0"
 
 
 

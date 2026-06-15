@@ -372,7 +372,8 @@ TUN 批接收 (read + try_read) ---> 批量路由与加密 (Quinn send) ---> UDP
 
 ### 12.1 网卡生命周期与 Netlink 驱动
 * **网卡创建与销毁**：使用 Netlink (`RTM_NEWLINK`) 接口向 Linux 内核发送请求，动态创建类型为 `wireguard` 的虚拟网口 `<config_name>-wg`。在进程优雅退出或通过 UDS 触发销毁时，向内核发送 `RTM_DELLINK` 请求安全销毁该网卡。
-* **物理地址与状态配置**：通过 Netlink 绑定配置的 `Address` 到该网口，并发送 UP 指令将网卡置为活跃状态，设置对应 MTU。
+* **wireguard-go 自动降级适配**：如果运行环境的 Linux 内核未开启/编译原生 `wireguard` 模块，程序在创建原生网卡失败后将**自动降级**，在后台拉起 `wireguard-go <config_name>-wg` 用户态守护进程以创建该虚拟设备。
+* **物理地址与状态配置**：通过 Netlink 绑定配置的 `Address` 到该网口，并发送 UP 指令将网卡置为活跃状态，设置对应 MTU。无论是内核原生网卡还是由 `wireguard-go` 创建的设备，程序后期的 Netlink 配置管理与遥测读取机制完全一致。
 
 ### 12.2 网卡参数与对等体（Peer）配置
 * 主进程通过 Generic Netlink 的 `wireguard` 协议族发送参数更新包：
