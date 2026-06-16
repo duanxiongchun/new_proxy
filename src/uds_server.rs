@@ -198,7 +198,7 @@ async fn handle_stats(
     framed_response: bool,
 ) {
     let mut l3_stats = context.l3_registry.snapshot();
-    let aggregated = {
+    let response = {
         let mut aggregated = Vec::new();
         let mut seen = HashSet::new();
         let peers = {
@@ -240,6 +240,12 @@ async fn handle_stats(
                             .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
+                        if let Some(endpoint) = peer_data.endpoint {
+                            let ip = endpoint.ip();
+                            if !ip.is_unspecified() && endpoint.port() != 0 {
+                                stats.endpoint = Some(endpoint.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -377,10 +383,33 @@ async fn handle_stats(
             });
         }
 
-        aggregated
+        let response = {
+            let state = context.state.read();
+            let pub_key_bytes =
+                *PublicKey::from(&StaticSecret::from(state.config.interface.private_key))
+                    .as_bytes();
+            let public_key = encode_base64_32(&pub_key_bytes);
+            crate::telemetry::UnifiedStatsResponse {
+                interface_name: context.interface_name.clone(),
+                public_key,
+                listen_port: state.config.interface.listen_port,
+                wg_listen_port: state.config.interface.wg_listen_port,
+                addresses: state
+                    .config
+                    .interface
+                    .addresses
+                    .iter()
+                    .map(|ipnet| ipnet.to_string())
+                    .collect(),
+                mode: state.config.interface.mode.clone(),
+                peers: aggregated,
+            }
+        };
+
+        response
     };
 
-    let _ = write_uds_json(stream, &aggregated, framed_response).await;
+    let _ = write_uds_json(stream, &response, framed_response).await;
 }
 
 async fn handle_dump(
@@ -1081,7 +1110,11 @@ mod tests {
         let listener = UnixListener::bind(path).unwrap();
         start(listener, test_context());
 
-        let stats: Vec<UnifiedTelemetry> = send_raw_command(path, &CommandInput::Stats).await;
+        let stats_resp: crate::telemetry::UnifiedStatsResponse =
+            send_raw_command(path, &CommandInput::Stats).await;
+        assert_eq!(stats_resp.interface_name, "nonexistent_interface");
+        assert_eq!(stats_resp.mode, "tun");
+        let stats = stats_resp.peers;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].public_key, encode_base64_32(&[2u8; 32]));
         assert_eq!(stats[0].allowed_ips, vec!["10.0.0.2/32"]);
