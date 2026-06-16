@@ -36,6 +36,17 @@ pub struct UnifiedTelemetry {
     pub source: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UnifiedStatsResponse {
+    pub interface_name: String,
+    pub public_key: String,
+    pub listen_port: Option<u16>,
+    pub wg_listen_port: Option<u16>,
+    pub addresses: Vec<String>,
+    pub mode: String,
+    pub peers: Vec<UnifiedTelemetry>,
+}
+
 const DEFAULT_SERVER_UDS_PATH: &str = "/run/new_proxy/tun0.sock";
 const DEFAULT_CLIENT_UDS_PATH: &str = "/run/new_proxy/client.sock";
 
@@ -142,28 +153,37 @@ fn fmt_handshake_ago(ts: u64) -> String {
 }
 
 /// WireGuard 风格的 show 展示（每个 peer 独立块，缩进文本）
-fn print_wg_style(peers: &[UnifiedTelemetry]) {
+fn print_wg_style(stats: &UnifiedStatsResponse) {
     let out = std::io::stdout();
     let mut w = std::io::BufWriter::new(out.lock());
-    print_wg_style_to(&mut w, peers);
+    print_wg_style_to(&mut w, stats);
 }
 
-fn print_wg_style_to<W: std::io::Write>(w: &mut W, peers: &[UnifiedTelemetry]) {
-    writeln!(w, "interface: new-proxy").unwrap();
-    writeln!(
-        w,
-        "  mode: hybrid secure gateway (WireGuard L3 + QUIC L4 offload)"
-    )
-    .unwrap();
-    writeln!(w, "  peers: {}", peers.len()).unwrap();
+fn print_wg_style_to<W: std::io::Write>(w: &mut W, stats: &UnifiedStatsResponse) {
+    writeln!(w, "interface: {}", stats.interface_name).unwrap();
+    if stats.public_key != "unknown" {
+        writeln!(w, "  public key: {}", stats.public_key).unwrap();
+        writeln!(w, "  private key: (hidden)").unwrap();
+    }
+    if let Some(port) = stats.listen_port {
+        writeln!(w, "  listening port: {}", port).unwrap();
+    }
+    if let Some(port) = stats.wg_listen_port {
+        writeln!(w, "  wireguard listening port: {}", port).unwrap();
+    }
+    if !stats.addresses.is_empty() {
+        writeln!(w, "  addresses: {}", stats.addresses.join(", ")).unwrap();
+    }
+    writeln!(w, "  mode: {}", stats.mode).unwrap();
+    writeln!(w, "  peers: {}", stats.peers.len()).unwrap();
     writeln!(w).unwrap();
 
-    if peers.is_empty() {
+    if stats.peers.is_empty() {
         writeln!(w, "  (no peers configured)").unwrap();
         return;
     }
 
-    for peer in peers {
+    for peer in &stats.peers {
         writeln!(w, "peer: {}", peer.public_key).unwrap();
         writeln!(w, "  source: {}", peer.source).unwrap();
 
@@ -193,25 +213,50 @@ fn print_wg_style_to<W: std::io::Write>(w: &mut W, peers: &[UnifiedTelemetry]) {
             fmt_bytes(total_tx)
         )
         .unwrap();
-        writeln!(
-            w,
-            "  wireguard: {} received, {} sent",
-            fmt_bytes(peer.l3_rx_bytes),
-            fmt_bytes(peer.l3_tx_bytes)
-        )
-        .unwrap();
-        if peer.l3_unknown_handshake_drops > 0 {
+
+        if peer.source == "wireguard" || peer.source == "both" {
             writeln!(
                 w,
-                "  wireguard unknown handshake drops: {}",
-                peer.l3_unknown_handshake_drops
+                "  wireguard: {} received, {} sent",
+                fmt_bytes(peer.l3_rx_bytes),
+                fmt_bytes(peer.l3_tx_bytes)
             )
             .unwrap();
+            if peer.l3_unknown_handshake_drops > 0 {
+                writeln!(
+                    w,
+                    "  wireguard unknown handshake drops: {}",
+                    peer.l3_unknown_handshake_drops
+                )
+                .unwrap();
+            }
         }
 
-        if peer.quic_connections.is_empty() {
-            if peer.l4_rx_bytes > 0 || peer.l4_tx_bytes > 0 {
-                writeln!(w, "  quic: inactive (disconnected)").unwrap();
+        if peer.source == "proxy" || peer.source == "both" {
+            if peer.quic_connections.is_empty() {
+                if peer.l4_rx_bytes > 0 || peer.l4_tx_bytes > 0 {
+                    writeln!(w, "  quic: inactive (disconnected)").unwrap();
+                    writeln!(
+                        w,
+                        "  quic transfer: {} received, {} sent",
+                        fmt_bytes(peer.l4_rx_bytes),
+                        fmt_bytes(peer.l4_tx_bytes)
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(w, "  quic: inactive").unwrap();
+                }
+            } else {
+                let conn_count = peer.quic_connections.len();
+                writeln!(
+                    w,
+                    "  quic: active, {} physical connection{}, {} active stream{}",
+                    conn_count,
+                    if conn_count == 1 { "" } else { "s" },
+                    peer.active_streams,
+                    if peer.active_streams == 1 { "" } else { "s" }
+                )
+                .unwrap();
                 writeln!(
                     w,
                     "  quic transfer: {} received, {} sent",
@@ -219,40 +264,20 @@ fn print_wg_style_to<W: std::io::Write>(w: &mut W, peers: &[UnifiedTelemetry]) {
                     fmt_bytes(peer.l4_tx_bytes)
                 )
                 .unwrap();
-            } else {
-                writeln!(w, "  quic: inactive").unwrap();
-            }
-        } else {
-            let conn_count = peer.quic_connections.len();
-            writeln!(
-                w,
-                "  quic: active, {} physical connection{}, {} active stream{}",
-                conn_count,
-                if conn_count == 1 { "" } else { "s" },
-                peer.active_streams,
-                if peer.active_streams == 1 { "" } else { "s" }
-            )
-            .unwrap();
-            writeln!(
-                w,
-                "  quic transfer: {} received, {} sent",
-                fmt_bytes(peer.l4_rx_bytes),
-                fmt_bytes(peer.l4_tx_bytes)
-            )
-            .unwrap();
 
-            for (i, conn) in peer.quic_connections.iter().enumerate() {
-                writeln!(w, "  quic connection {}:", i).unwrap();
-                writeln!(w, "    endpoint: {}", conn.remote_addr).unwrap();
-                writeln!(w, "    local port: {}", conn.local_port).unwrap();
-                writeln!(
-                    w,
-                    "    transfer: {} received, {} sent",
-                    fmt_bytes(conn.rx_bytes),
-                    fmt_bytes(conn.tx_bytes)
-                )
-                .unwrap();
-                writeln!(w, "    active streams: {}", conn.active_streams).unwrap();
+                for (i, conn) in peer.quic_connections.iter().enumerate() {
+                    writeln!(w, "  quic connection {}:", i).unwrap();
+                    writeln!(w, "    endpoint: {}", conn.remote_addr).unwrap();
+                    writeln!(w, "    local port: {}", conn.local_port).unwrap();
+                    writeln!(
+                        w,
+                        "    transfer: {} received, {} sent",
+                        fmt_bytes(conn.rx_bytes),
+                        fmt_bytes(conn.tx_bytes)
+                    )
+                    .unwrap();
+                    writeln!(w, "    active streams: {}", conn.active_streams).unwrap();
+                }
             }
         }
 
@@ -262,10 +287,31 @@ fn print_wg_style_to<W: std::io::Write>(w: &mut W, peers: &[UnifiedTelemetry]) {
 
 pub fn run_cli_stats(socket_path: &str) -> Result<(), String> {
     let json = send_command(socket_path, &CommandInput::Stats)?;
-    let peers = serde_json::from_str::<Vec<UnifiedTelemetry>>(&json)
-        .map_err(|e| format!("Failed to parse gateway response: {}\nRaw: {}", e, json))?;
-    print_wg_style(&peers);
-    Ok(())
+    match serde_json::from_str::<UnifiedStatsResponse>(&json) {
+        Ok(stats) => {
+            print_wg_style(&stats);
+            Ok(())
+        }
+        Err(_) => match serde_json::from_str::<Vec<UnifiedTelemetry>>(&json) {
+            Ok(peers) => {
+                let dummy_stats = UnifiedStatsResponse {
+                    interface_name: "new-proxy".to_string(),
+                    public_key: "unknown".to_string(),
+                    listen_port: None,
+                    wg_listen_port: None,
+                    addresses: Vec::new(),
+                    mode: "unknown".to_string(),
+                    peers,
+                };
+                print_wg_style(&dummy_stats);
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "Failed to parse gateway response: {}\nRaw: {}",
+                e, json
+            )),
+        },
+    }
 }
 
 pub fn run_cli_dump(socket_path: &str) -> Result<(), String> {
@@ -462,8 +508,16 @@ mod tests {
 
     #[test]
     fn test_print_wg_style_no_peers() {
-        // 不崩溃即可
-        print_wg_style(&[]);
+        let stats = UnifiedStatsResponse {
+            interface_name: "new-proxy".to_string(),
+            public_key: "unknown".to_string(),
+            listen_port: None,
+            wg_listen_port: None,
+            addresses: Vec::new(),
+            mode: "unknown".to_string(),
+            peers: Vec::new(),
+        };
+        print_wg_style(&stats);
     }
 
     #[test]
@@ -482,7 +536,16 @@ mod tests {
             quic_connections: vec![],
             source: "both".to_string(),
         };
-        print_wg_style(&[peer]); // 应打印 L3-only 行
+        let stats = UnifiedStatsResponse {
+            interface_name: "new-proxy".to_string(),
+            public_key: "unknown".to_string(),
+            listen_port: None,
+            wg_listen_port: None,
+            addresses: Vec::new(),
+            mode: "unknown".to_string(),
+            peers: vec![peer],
+        };
+        print_wg_style(&stats); // 应打印 L3-only 行
     }
 
     #[test]
@@ -508,7 +571,16 @@ mod tests {
             quic_connections: vec![conn],
             source: "both".to_string(),
         };
-        print_wg_style(&[peer]);
+        let stats = UnifiedStatsResponse {
+            interface_name: "new-proxy".to_string(),
+            public_key: "unknown".to_string(),
+            listen_port: None,
+            wg_listen_port: None,
+            addresses: Vec::new(),
+            mode: "unknown".to_string(),
+            peers: vec![peer],
+        };
+        print_wg_style(&stats);
     }
 
     #[test]
@@ -605,8 +677,17 @@ mod tests {
             quic_connections: vec![],
             source: "both".to_string(),
         };
+        let stats_resp = UnifiedStatsResponse {
+            interface_name: "new-proxy".to_string(),
+            public_key: "unknown".to_string(),
+            listen_port: None,
+            wg_listen_port: None,
+            addresses: Vec::new(),
+            mode: "unknown".to_string(),
+            peers: vec![peer],
+        };
         let mut buf = Vec::new();
-        print_wg_style_to(&mut buf, &[peer]);
+        print_wg_style_to(&mut buf, &stats_resp);
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("quic: inactive (disconnected)"));
         assert!(out.contains("quic transfer: 3.42 KiB received, 231 B sent"));

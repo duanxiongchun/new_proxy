@@ -33,17 +33,17 @@ pub async fn run_cli_stats() -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to read stats from socket: {}", e))?;
 
-    let stats = parse_stats_payload(&buf)?;
+    let stats_resp = parse_stats_payload(&buf)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    print!("{}", format_stats_table(&stats, now));
+    print!("{}", format_stats_table(&stats_resp, now));
     Ok(())
 }
 
-fn parse_stats_payload(buf: &[u8]) -> Result<Vec<UnifiedTelemetry>, String> {
+fn parse_stats_payload(buf: &[u8]) -> Result<crate::telemetry::UnifiedStatsResponse, String> {
     let body = if buf.len() >= 4 {
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         if len == buf.len().saturating_sub(4) {
@@ -55,14 +55,43 @@ fn parse_stats_payload(buf: &[u8]) -> Result<Vec<UnifiedTelemetry>, String> {
         buf
     };
 
-    serde_json::from_slice(body).map_err(|e| format!("Failed to parse JSON stats: {}", e))
+    match serde_json::from_slice::<crate::telemetry::UnifiedStatsResponse>(body) {
+        Ok(stats) => Ok(stats),
+        Err(_) => match serde_json::from_slice::<Vec<UnifiedTelemetry>>(body) {
+            Ok(peers) => Ok(crate::telemetry::UnifiedStatsResponse {
+                interface_name: "new-proxy".to_string(),
+                public_key: "unknown".to_string(),
+                listen_port: None,
+                wg_listen_port: None,
+                addresses: Vec::new(),
+                mode: "unknown".to_string(),
+                peers,
+            }),
+            Err(e) => Err(format!("Failed to parse JSON stats: {}", e)),
+        },
+    }
 }
 
-fn format_stats_table(stats: &[UnifiedTelemetry], now: u64) -> String {
+fn format_stats_table(stats_resp: &crate::telemetry::UnifiedStatsResponse, now: u64) -> String {
     let mut out = String::new();
     out.push_str("\n+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
-    out.push_str("|                                             HYBRID SECURE PROXY GATEWAY TELEMETRY                                                         |\n");
+    out.push_str(&format!(
+        "|                                     HYBRID SECURE PROXY GATEWAY TELEMETRY ({:<7})                                                  |\n",
+        stats_resp.interface_name.to_uppercase()
+    ));
     out.push_str("+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
+    if stats_resp.public_key != "unknown" {
+        out.push_str(&format!(
+            "| Mode: {:<10} | Public Key: {:<44} | Listen Port: {:<12} |\n",
+            stats_resp.mode,
+            stats_resp.public_key,
+            stats_resp
+                .listen_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str("+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
+    }
     out.push_str(&format!(
         "| {:<44} | {:<8} | {:<20} | {:<20} | {:<20} | {:<12} |\n",
         "Peer Public Key",
@@ -74,7 +103,7 @@ fn format_stats_table(stats: &[UnifiedTelemetry], now: u64) -> String {
     ));
     out.push_str("+-------------------------------------------------------------------------------------------------------------------------------------------+\n");
 
-    for s in stats {
+    for s in &stats_resp.peers {
         let l3_str = format!(
             "{}/{}",
             format_bytes(s.l3_rx_bytes),
@@ -146,24 +175,33 @@ mod tests {
     #[test]
     fn parse_stats_payload_accepts_raw_and_framed_json() {
         let payload = serde_json::to_vec(&vec![telemetry(0)]).unwrap();
-        assert_eq!(parse_stats_payload(&payload).unwrap().len(), 1);
+        assert_eq!(parse_stats_payload(&payload).unwrap().peers.len(), 1);
 
         let mut framed = Vec::new();
         framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         framed.extend_from_slice(&payload);
-        assert_eq!(parse_stats_payload(&framed).unwrap().len(), 1);
+        assert_eq!(parse_stats_payload(&framed).unwrap().peers.len(), 1);
     }
 
     #[test]
     fn parse_stats_payload_falls_back_to_raw_when_length_prefix_does_not_match() {
         let payload = serde_json::to_vec(&vec![telemetry(0)]).unwrap();
         let parsed = parse_stats_payload(&payload).unwrap();
-        assert_eq!(parsed[0].public_key, "peer-key");
+        assert_eq!(parsed.peers[0].public_key, "peer-key");
     }
 
     #[test]
     fn format_stats_table_renders_never_past_and_future_handshakes() {
-        let table = format_stats_table(&[telemetry(0), telemetry(90), telemetry(120)], 100);
+        let stats_resp = crate::telemetry::UnifiedStatsResponse {
+            interface_name: "new-proxy".to_string(),
+            public_key: "unknown".to_string(),
+            listen_port: None,
+            wg_listen_port: None,
+            addresses: Vec::new(),
+            mode: "unknown".to_string(),
+            peers: vec![telemetry(0), telemetry(90), telemetry(120)],
+        };
+        let table = format_stats_table(&stats_resp, 100);
 
         assert!(table.contains("peer-key"));
         assert!(table.contains("1.00 KB/2.00 KB"));

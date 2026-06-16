@@ -81,6 +81,17 @@ pub struct UnifiedTelemetry {
     pub source: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UnifiedStatsResponse {
+    pub interface_name: String,
+    pub public_key: String,
+    pub listen_port: Option<u16>,
+    pub wg_listen_port: Option<u16>,
+    pub addresses: Vec<String>,
+    pub mode: String,
+    pub peers: Vec<UnifiedTelemetry>,
+}
+
 const TELEMETRY_SHARDS: usize = 64;
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
