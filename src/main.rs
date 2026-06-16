@@ -454,6 +454,9 @@ fn main() {
         }
     };
 
+    // The parsed interface_name acts as the base name (e.g. "client").
+    // The runtime resolves it to "client-tun"/"client-veth" for the userspace QUIC datapath
+    // and "client-wg" for the kernel WireGuard datapath to avoid interface clashes.
     let interface_name = match interface_name_from_config_path(&startup_args.config_path) {
         Ok(name) => name,
         Err(e) => {
@@ -692,7 +695,7 @@ async fn run_gateway(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
+    use crate::config::{InterfaceConfig, PeerConfig, PeerType, QUICPoolConfig, XdpConfig};
 
     fn peer(public_key: [u8; 32], endpoint: Option<&str>, proxy_port: Option<u16>) -> PeerConfig {
         PeerConfig {
@@ -700,6 +703,7 @@ mod tests {
             allowed_ips: vec!["10.10.0.0/16".parse().unwrap()],
             endpoint: endpoint.map(|addr| addr.parse().unwrap()),
             proxy_port,
+            r#type: PeerType::Quic,
         }
     }
 
@@ -712,6 +716,7 @@ mod tests {
                     "fd00::2/64".parse().unwrap(),
                 ],
                 listen_port: None,
+                wg_listen_port: None,
                 listen_control_port: None,
                 mtu: 1400,
                 table: None,

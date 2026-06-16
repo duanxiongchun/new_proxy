@@ -155,12 +155,12 @@ EOF_CONF
 ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 sleep 2
-ip netns exec server_ns ip addr add 10.0.0.1/24 dev e2e_server || true
-ip netns exec server_ns ip addr add fd00::1/64 dev e2e_server || true
-ip netns exec server_ns ip link set e2e_server up
-ip netns exec server_ns ip route replace 10.0.0.2/32 dev e2e_server
-ip netns exec server_ns ip -6 route replace fd00::2/128 dev e2e_server
-ip netns exec server_ns ip -6 route replace fd00:1::/64 dev e2e_server
+ip netns exec server_ns ip addr add 10.0.0.1/24 dev e2e_server-tun || true
+ip netns exec server_ns ip addr add fd00::1/64 dev e2e_server-tun || true
+ip netns exec server_ns ip link set e2e_server-tun up
+ip netns exec server_ns ip route replace 10.0.0.2/32 dev e2e_server-tun
+ip netns exec server_ns ip -6 route replace fd00::2/128 dev e2e_server-tun
+ip netns exec server_ns ip -6 route replace fd00:1::/64 dev e2e_server-tun
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "✗ [FAIL] Server daemon exited early"
   cat "$SERVER_LOG"

@@ -1,19 +1,23 @@
-﻿﻿# new_proxy 架构说明（Pure L3 IP-over-QUIC Datagram 架构）
+# new_proxy 架构说明（混合隧道架构）
 
-本文档描述 `new_proxy` 的全新纯 L3 IP-over-QUIC Datagram 数据面架构。所有数据包（TCP、UDP、ICMP）均通过无状态、无延迟的 QUIC Datagram 进行传输，并依托多队列网卡实现对称多核并行处理。
+本文档描述 `new_proxy` 的全新混合网关架构。系统支持在保持原有的纯 L3 IP-over-QUIC Datagram 用户态高性能数据面的同时，通过 Rust Netlink 接口在 Linux 内核中创建并管控原生内核态 WireGuard 网卡，构建支持多协议隧道的一体化安全网关。
 
 ---
 
 ## 1. 总体模型
 
-`new_proxy` 是一个纯粹的 **L3 IP-over-QUIC 隧道网关**，完全运行在用户态，通过 QUIC 协议栈提供安全加密的 VPN 功能：
+`new_proxy` 是一个**混合型 L3 隧道网关**，集成了用户态 IP-over-QUIC 隧道与内核态 WireGuard 隧道：
 
-* **纯 L3 隧道数据面**：
-  * **客户端**：创建多队列 TUN 网卡，截获所有发往 Peer `AllowedIPs` 的 IP 数据包（IPv4/IPv6）。代理不解析应用层协议，直接将 IP 报文封装进 QUIC Datagram 帧中发送。
-  * **服务端**：同样建立多队列 TUN 网卡。接收到 QUIC Datagram 后，解出原始 IP 数据包，直接写入服务端的 TUN 网卡，由系统内核完成最终的路由和转发。回程流量通过相同路径镜像传回。
-  * **去 WireGuard / smoltcp 化**：新架构完全移除了原有的用户态 WireGuard 协议栈（`boringtun`）和用户态 TCP/IP 协议栈（`smoltcp`），极大地简化了数据路径，并消除了流代理机制下的队头阻塞（Head-of-Line Blocking）和 TCP-over-TCP 拥塞冲突。
+* **混合隧道数据面**：
+  * **用户态 IP-over-QUIC 隧道**：创建多队列 TUN/veth 网卡，将发往 QUIC 对等体（`Type = quic`）的 IP 报文（IPv4/IPv6）无状态、零额外协议栈包装地封装进 QUIC Datagram 帧中进行高速传输。
+  * **内核态 WireGuard 隧道**：针对移动端（如手机、iPad 等）以及常规 WireGuard 对等体（`Type = wireguard`），主进程直接在 Linux 内核中拉起 WireGuard 接口，通过原生 Netlink 协议管理网卡、私钥与 Peer，让流量直接通过 Linux 内核 WireGuard 驱动进行加解密。
+* **物理网卡自动命名与约定**：网卡接口名称无需用户在配置中手动指定，系统自动根据配置文件名 `<config_name>`（如 `client`）生成：
+  * TUN 模式 (`Mode = tun`) 用户态网卡：`<config_name>-tun`
+  * AF_XDP 模式 (`Mode = af_xdp`) 用户态网卡：`<config_name>-veth`
+  * 内核 WireGuard 网卡：`<config_name>-wg`
+* **最长前缀匹配（LPM）混合路由**：若用户态网卡与内核 WireGuard 网卡配置了相同的 IP 地址（例如 `10.0.0.2/24`），虽然会有冲突的网段路由，但系统在路由表中下发的 Peer 允许网段（`AllowedIPs`）是更具体的 `/32`（或 `/128`）主机路由。根据 Linux 内核的最长前缀匹配原则，去往不同 Peer 的数据包会精准流向各自对应的物理/虚拟网卡，实现无冲突的并行流转。
 * **控制面**：独立的 UDP 报文协议，使用协商好的私钥/公钥材料派生 X25519 共享密钥，并用 HMAC-SHA256 对 JSON 格式的配置交换进行签名和认证。
-* **运行期 API**：通过 Unix Domain Socket 提供运行时 `Stats`、`Dump`、`AddPeer` 和 `RemovePeer` 等 API 支持。
+* **运行期 API 与遥测收集**：通过 Unix Domain Socket 提供运行时 `Stats`、`Dump` 和 Peer 增删 API 支持。针对内核 WireGuard 的 Peer，主进程通过 Netlink 获取其实时传输量（Bytes rx/tx）和握手时间，合并呈现到遥测信息中。
 
 ---
 
@@ -380,4 +384,29 @@ TUN 批接收 (read + try_read) ---> 批量路由与加密 (Quinn send) ---> UDP
      * `[12..14] 字节`：协议字填充 `0x0800`。
      * `[14..] 字节`：装入原始明文 IP 包。
   6. 将明文以太网帧提交至 Intercept XSK 的 TX 环，网卡接收后通过内核送达宿主应用。
+
+---
+
+## 12. 内核态 WireGuard 管理与 Netlink 集成
+
+为了不依赖外部的 `wg` 命令行工具实现环境的安全沙盒化，`new_proxy` 引入了基于 Netlink 通信协议的原生 WireGuard 管理逻辑。
+
+### 12.1 网卡生命周期与 Netlink 驱动
+* **网卡创建与销毁**：使用 Netlink (`RTM_NEWLINK`) 接口向 Linux 内核发送请求，动态创建类型为 `wireguard` 的虚拟网口 `<config_name>-wg`。在进程优雅退出或通过 UDS 触发销毁时，向内核发送 `RTM_DELLINK` 请求安全销毁该网卡。
+* **wireguard-go 自动降级适配**：如果运行环境的 Linux 内核未开启/编译原生 `wireguard` 模块，程序在创建原生网卡失败后将**自动降级**，在后台拉起 `wireguard-go <config_name>-wg` 用户态守护进程以创建该虚拟设备。
+* **物理地址与状态配置**：通过 Netlink 绑定配置的 `Address` 到该网口，并发送 UP 指令将网卡置为活跃状态，设置对应 MTU。无论是内核原生网卡还是由 `wireguard-go` 创建的设备，程序后期的 Netlink 配置管理与遥测读取机制完全一致。
+
+### 12.2 网卡参数与对等体（Peer）配置
+* 主进程通过 Generic Netlink 的 `wireguard` 协议族发送参数更新包：
+  * **接口级配置**：安全地将 `PrivateKey` 以及 `WgListenPort` 刷入内核 WireGuard 驱动。
+  * **Peer 动态更新**：遍历所有 `Type = wireguard` 的 Peer，通过 Netlink 的 `WGDEVICE_A_PEERS` 属性序列化写入每个 Peer 的 `PublicKey`、`AllowedIPs` 以及 `Endpoint` 等信息。
+  * **动态热插拔**：当通过 UDS API 动态执行 `AddPeer` / `RemovePeer` 时，除修改内存配置外，会立即触发 Netlink 的增量/删除事务同步至内核，实现零延迟网络热插拔。
+
+### 12.3 零锁实时遥测收集
+* 运行期主进程在处理 UDS `Stats` 查询时，会通过 Netlink 向内核发送 Dump 请求。
+* 从内核返回的二进制序列化载荷中读取每个 Peer 的：
+  * `rx_bytes`（累计接收字节数）
+  * `tx_bytes`（累计发送字节数）
+  * `last_handshake_time`（最近握手时间戳）
+* 采集到的数据会被缓存并合并注入到遥测组件的 `l3_stats` 结构中，使 `new-proxy-cli` 能够提供与用户态 QUIC 同样的实时性能指标监控。
 

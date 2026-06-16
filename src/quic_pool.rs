@@ -1090,6 +1090,65 @@ impl QuicPoolClient {
         self.slots.store(Arc::new(slots));
         Ok(())
     }
+
+    pub async fn refresh_control_config_metadata_only(&self) -> Result<(), String> {
+        let Some(refresh) = self.refresh_config.clone() else {
+            return Err("control refresh is not configured for this pool".to_string());
+        };
+
+        log::info!(
+            "Refreshing QUIC control session metadata for peer {}",
+            crate::app_config::encode_base64_32(&refresh.server_public_key)
+        );
+        let control_client = crate::control::ControlClient::new(
+            refresh.private_key,
+            refresh.server_public_key,
+            refresh.control_endpoint,
+        );
+        let (control_response, _control_socket) = control_client.negotiate_config().await?;
+        let quic_endpoint_ip = crate::app_config::select_quic_endpoint_ip(
+            &control_response,
+            refresh.fallback_endpoint,
+        )?;
+        let endpoints = control_response
+            .port_pool
+            .iter()
+            .map(|&port| SocketAddr::new(quic_endpoint_ip, port))
+            .collect::<Vec<_>>();
+        if endpoints.len() != self.data_port_count {
+            return Err(format!(
+                "refreshed QUIC data port count mismatch: existing pool uses {}, control plane returned {}; restart the client to change worker topology",
+                self.data_port_count,
+                endpoints.len()
+            ));
+        }
+        let runtime_config = PoolRuntimeConfig {
+            session_psk: control_response.session_psk,
+            server_cert_sha256: control_response.quic_cert_sha256,
+            endpoints,
+        };
+
+        *self.runtime_config.write() = runtime_config;
+        Ok(())
+    }
+
+    pub fn trigger_refresh(self: Arc<Self>) {
+        tokio::spawn(async move {
+            if self.control_refresh_allowed_now() {
+                match self.refresh_control_config_metadata_only().await {
+                    Ok(()) => self.record_control_refresh_success(),
+                    Err(e) => {
+                        let delay = self.record_control_refresh_failure();
+                        log::warn!(
+                            "Failed to refresh QUIC session metadata after failure: {}; backing off for {:?}",
+                            e,
+                            delay
+                        );
+                    }
+                }
+            }
+        });
+    }
 }
 
 // 3. 服务端 QUIC 接收端与验证服务

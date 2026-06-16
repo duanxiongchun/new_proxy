@@ -34,7 +34,7 @@ cleanup() {
   ip netns delete topo_server2_ns 2>/dev/null || true
   ip netns delete topo_router_ns 2>/dev/null || true
   ip netns delete topo_client_ns 2>/dev/null || true
-  rm -f /run/new_proxy/server1_topo.sock /run/new_proxy/server2_topo.sock /run/new_proxy/client_topo.sock
+  rm -f /run/new_proxy/srv1_topo.sock /run/new_proxy/srv2_topo.sock /run/new_proxy/client_topo.sock
 }
 trap cleanup EXIT
 
@@ -58,8 +58,8 @@ if [ ! -e /dev/net/tun ]; then
 fi
 chmod 666 /dev/net/tun
 
-SERVER1_CONF="$ARTIFACT_DIR/server1_topo.conf"
-SERVER2_CONF="$ARTIFACT_DIR/server2_topo.conf"
+SERVER1_CONF="$ARTIFACT_DIR/srv1_topo.conf"
+SERVER2_CONF="$ARTIFACT_DIR/srv2_topo.conf"
 CLIENT_CONF="$ARTIFACT_DIR/client_topo.conf"
 
 cat > "$SERVER1_CONF" <<EOF_CONF
@@ -170,9 +170,9 @@ SERVER1_PID=$!
 ip netns exec topo_server2_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER2_CONF" > "$ARTIFACT_DIR/server2.log" 2>&1 &
 SERVER2_PID=$!
 sleep 2
-ip netns exec topo_server1_ns ip addr add 10.70.0.1/24 dev server1_topo || true
-ip netns exec topo_server1_ns ip link set server1_topo up
-ip netns exec topo_server1_ns ip route replace 10.70.0.2/32 dev server1_topo
+ip netns exec topo_server1_ns ip addr add 10.70.0.1/24 dev srv1_topo-tun || true
+ip netns exec topo_server1_ns ip link set srv1_topo-tun up
+ip netns exec topo_server1_ns ip route replace 10.70.0.2/32 dev srv1_topo-tun
 for pid in "$SERVER1_PID" "$SERVER2_PID"; do
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "A server daemon exited early"

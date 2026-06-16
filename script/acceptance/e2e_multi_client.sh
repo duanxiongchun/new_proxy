@@ -42,8 +42,8 @@ cleanup() {
   ip netns delete router_ns 2>/dev/null || true
   ip netns delete client1_ns 2>/dev/null || true
   ip netns delete client2_ns 2>/dev/null || true
-  rm -f /run/new_proxy/server_multi.sock /run/new_proxy/client1.sock
-  rm -f /tmp/server_multi.conf /tmp/client1.conf
+  rm -f /run/new_proxy/srv_multi.sock /run/new_proxy/client1.sock
+  rm -f /tmp/srv_multi.conf /tmp/client1.conf
 }
 trap cleanup EXIT
 
@@ -54,7 +54,7 @@ ip netns delete server_ns 2>/dev/null || true
 ip netns delete router_ns 2>/dev/null || true
 ip netns delete client1_ns 2>/dev/null || true
 ip netns delete client2_ns 2>/dev/null || true
-rm -f /run/new_proxy/server_multi.sock
+rm -f /run/new_proxy/srv_multi.sock
 rm -f /run/new_proxy/client1.sock
 
 echo "=== [2/8] Creating Namespaces (Server, Router, Client1, Client2) ==="
@@ -136,7 +136,7 @@ echo "=== [6/8] Writing Multi-Client Configuration Files ==="
 # Client 1: ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 # Client 2: direct physical L3 baseline namespace
 
-cat > /tmp/server_multi.conf <<EOF_CONF
+cat > /tmp/srv_multi.conf <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24, fd00::1/64
@@ -175,9 +175,13 @@ ip netns exec server_ns python3 -m http.server 8080 >/dev/null 2>&1 &
 HTTP_PID=$!
 
 # C. Start Server Proxy Daemon
-ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config /tmp/server_multi.conf > /tmp/new_proxy_server_multi.log 2>&1 &
+ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config /tmp/srv_multi.conf > /tmp/new_proxy_srv_multi.log 2>&1 &
 SERVER_PID=$!
 sleep 2
+
+# Manually configure the server TUN interface (since Table = off avoids automatic setup)
+ip netns exec server_ns ip addr replace 10.0.0.1/24 dev srv_multi-tun
+ip netns exec server_ns ip link set srv_multi-tun up
 
 # D. Start Client 1 (Custom Proxy) Daemon
 ip netns exec client1_ns "$ROOT_DIR/target/debug/new_proxy" -config /tmp/client1.conf > /tmp/new_proxy_client1.log 2>&1 &
@@ -211,7 +215,7 @@ fi
 
 echo ""
 echo ">> Fetching Server Telemetry for all concurrent Clients..."
-ip netns exec server_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface server_multi show
+ip netns exec server_ns "$ROOT_DIR/target/debug/new-proxy-cli" --interface srv_multi show
 
 # Cleanup will be automatically executed by trap EXIT
 

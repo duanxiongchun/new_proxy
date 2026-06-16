@@ -116,17 +116,17 @@ echo "=== [7/9] Starting Gateway Daemons ==="
 ip netns exec server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$SERVER_CONF" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
-# Wait for e2e_server interface to appear
+# Wait for e2e_server-tun interface to appear
 for _ in $(seq 1 40); do
-  if ip netns exec server_ns ip link show dev e2e_server >/dev/null 2>&1; then
+  if ip netns exec server_ns ip link show dev e2e_server-tun >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
 done
 
-ip netns exec server_ns ip addr add 10.0.0.1/24 dev e2e_server || true
-ip netns exec server_ns ip link set e2e_server up mtu 1280
-ip netns exec server_ns ip route replace 10.0.0.2/32 dev e2e_server
+ip netns exec server_ns ip addr add 10.0.0.1/24 dev e2e_server-tun || true
+ip netns exec server_ns ip link set e2e_server-tun up mtu 1280
+ip netns exec server_ns ip route replace 10.0.0.2/32 dev e2e_server-tun
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "✗ [FAIL] Server daemon exited early"
   cat "$SERVER_LOG"
@@ -136,9 +136,9 @@ fi
 ip netns exec client_ns "$ROOT_DIR/target/debug/new_proxy" -config "$CLIENT_CONF" > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 
-# Wait for e2e_client interface to appear
+# Wait for e2e_client-tun interface to appear
 for _ in $(seq 1 40); do
-  if ip netns exec client_ns ip link show dev e2e_client >/dev/null 2>&1; then
+  if ip netns exec client_ns ip link show dev e2e_client-tun >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
@@ -175,8 +175,8 @@ done
 ip netns exec router_ns tcpdump -i veth-router-c -w "$ARTIFACT_DIR/capture_router.pcap" >/dev/null 2>&1 &
 TCPDUMP_R_PID=$!
 
-# Start tcpdump on server TUN interface (e2e_server) to check decapsulated SYN MSS value
-ip netns exec server_ns tcpdump -i e2e_server -w "$ARTIFACT_DIR/capture_tun_server.pcap" >/dev/null 2>&1 &
+# Start tcpdump on server TUN interface (e2e_server-tun) to check decapsulated SYN MSS value
+ip netns exec server_ns tcpdump -i e2e_server-tun -w "$ARTIFACT_DIR/capture_tun_server.pcap" >/dev/null 2>&1 &
 TCPDUMP_T_PID=$!
 
 sleep 2

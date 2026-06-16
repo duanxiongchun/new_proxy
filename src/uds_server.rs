@@ -197,7 +197,7 @@ async fn handle_stats(
     stream: &mut tokio::net::UnixStream,
     framed_response: bool,
 ) {
-    let l3_stats = context.l3_registry.snapshot();
+    let mut l3_stats = context.l3_registry.snapshot();
     let aggregated = {
         let mut aggregated = Vec::new();
         let mut seen = HashSet::new();
@@ -205,6 +205,46 @@ async fn handle_stats(
             let st = context.state.read();
             st.config.peers.clone()
         };
+
+        let has_wg_peers = peers
+            .iter()
+            .any(|peer| peer.r#type == config::PeerType::Wireguard);
+
+        #[cfg(target_os = "linux")]
+        if has_wg_peers {
+            use defguard_wireguard_rs::{Kernel, Userspace, WGApi, WireguardInterfaceApi};
+            let wg_name = crate::app_config::wg_interface_name(&context.interface_name);
+            let socket_path = format!("/var/run/wireguard/{}.sock", wg_name);
+            let alternative_socket_path = format!("/run/wireguard/{}.sock", wg_name);
+            let is_userspace = std::path::Path::new(&socket_path).exists()
+                || std::path::Path::new(&alternative_socket_path).exists();
+
+            let host_result = if is_userspace {
+                WGApi::<Userspace>::new(wg_name)
+                    .ok()
+                    .and_then(|api| api.read_interface_data().ok())
+            } else {
+                WGApi::<Kernel>::new(wg_name)
+                    .ok()
+                    .and_then(|api| api.read_interface_data().ok())
+            };
+
+            if let Some(host) = host_result {
+                for (key, peer_data) in &host.peers {
+                    let pub_key_bytes = key.as_array();
+                    if let Some(stats) = l3_stats.get_mut(&pub_key_bytes) {
+                        stats.rx_bytes = peer_data.rx_bytes;
+                        stats.tx_bytes = peer_data.tx_bytes;
+                        stats.last_handshake = peer_data
+                            .last_handshake
+                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                    }
+                }
+            }
+        }
+
         let sources = telemetry_sources(&peers, &l3_stats);
         let registry_map = combine_peer_telemetries(&context.peer_telemetries);
         let quic_registry = context.shared_quic_registry.read();
@@ -238,7 +278,10 @@ async fn handle_stats(
             let source = sources
                 .get(&pub_key)
                 .cloned()
-                .unwrap_or_else(|| "both".to_string());
+                .unwrap_or_else(|| match peer.r#type {
+                    config::PeerType::Wireguard => "wireguard".to_string(),
+                    config::PeerType::Quic => "proxy".to_string(),
+                });
 
             aggregated.push(UnifiedTelemetry {
                 public_key: encode_base64_32(&pub_key),
@@ -497,6 +540,7 @@ async fn handle_add_peer(
         allowed_ips: parsed_allowed_ips,
         endpoint: parsed_endpoint,
         proxy_port,
+        r#type: config::PeerType::Quic,
     };
 
     if context.runtime_mode == RuntimeMode::Client
@@ -868,7 +912,8 @@ async fn setup_peer_routes_for_context(
     peer: config::PeerConfig,
 ) -> Result<(), String> {
     let interface_name = context.interface_name.clone();
-    run_blocking_command(move || setup_peer_routes(&peer, &interface_name)).await
+    let mode = context.state.read().config.interface.mode.clone();
+    run_blocking_command(move || setup_peer_routes(&peer, &interface_name, &mode)).await
 }
 
 async fn cleanup_peer_routes_for_context(
@@ -876,7 +921,8 @@ async fn cleanup_peer_routes_for_context(
     peer: config::PeerConfig,
 ) -> Result<(), String> {
     let interface_name = context.interface_name.clone();
-    run_blocking_command(move || cleanup_peer_routes(&peer, &interface_name)).await
+    let mode = context.state.read().config.interface.mode.clone();
+    run_blocking_command(move || cleanup_peer_routes(&peer, &interface_name, &mode)).await
 }
 
 async fn rollback_peer_routes(
@@ -925,7 +971,9 @@ async fn write_error(stream: &mut tokio::net::UnixStream, framed_response: bool,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GatewayConfig, InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
+    use crate::config::{
+        GatewayConfig, InterfaceConfig, PeerConfig, PeerType, QUICPoolConfig, XdpConfig,
+    };
     use crate::routing::AllowedIPsRouter;
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -936,6 +984,7 @@ mod tests {
                 private_key: [1u8; 32],
                 addresses: vec![],
                 listen_port: Some(0),
+                wg_listen_port: None,
                 listen_control_port: Some(51820),
                 mtu: 1420,
                 table: None,
@@ -948,6 +997,7 @@ mod tests {
                 allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
                 endpoint: Some("1.2.3.4:51820".parse().unwrap()),
                 proxy_port: Some(40001),
+                r#type: PeerType::Quic,
             }],
             quic_pool: QUICPoolConfig {
                 public_ipv4: None,
@@ -1040,7 +1090,7 @@ mod tests {
         assert_eq!(stats[0].l4_rx_bytes, 70);
         assert_eq!(stats[0].l4_tx_bytes, 80);
         assert_eq!(stats[0].l3_unknown_handshake_drops, 0);
-        assert_eq!(stats[0].source, "both");
+        assert_eq!(stats[0].source, "proxy");
 
         let _ = fs::remove_file(path);
     }
@@ -1065,6 +1115,7 @@ mod tests {
                 allowed_ips: vec!["10.0.9.0/24".parse().unwrap()],
                 endpoint: None,
                 proxy_port: None,
+                r#type: PeerType::Quic,
             });
         }
         start(listener, context);
@@ -1400,12 +1451,14 @@ mod tests {
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         };
         let mut new_peer = PeerConfig {
             public_key: [3u8; 32],
             allowed_ips: vec!["10.0.0.128/25".parse().unwrap()],
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         };
 
         assert!(

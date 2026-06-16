@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Arc;
 
-use crate::app_config::RuntimeMode;
+use crate::app_config::{quic_interface_name, RuntimeMode};
 #[cfg(target_os = "linux")]
 use crate::client::build_peer_quic_pool;
 use crate::config::GatewayConfig;
@@ -2375,7 +2375,7 @@ impl XdpDatapath {
         };
 
         let intercept_names = if config.xdp.intercept_interfaces.is_empty() {
-            vec![interface_name.clone()]
+            vec![quic_interface_name(&interface_name, &config.interface.mode)]
         } else {
             config.xdp.intercept_interfaces.clone()
         };
@@ -2489,7 +2489,8 @@ impl Datapath for XdpDatapath {
             let queue_count = if queue_count == 0 { 1 } else { queue_count };
 
             // Open TUN device for the server plaintext L3 datapath
-            let tun_fds = match crate::tun_device::open_tun(&self.interface_name, queue_count) {
+            let quic_name = quic_interface_name(&self.interface_name, &self.config.interface.mode);
+            let tun_fds = match crate::tun_device::open_tun(&quic_name, queue_count) {
                 Ok(fds) => fds,
                 Err(e) => {
                     log::error!("Failed to open server TUN device: {}", e);
@@ -2772,7 +2773,8 @@ impl Datapath for XdpDatapath {
             let queue_count = if queue_count == 0 { 1 } else { queue_count };
 
             // Open TUN device for the client L3 datapath
-            let tun_fds = match crate::tun_device::open_tun(&self.interface_name, queue_count) {
+            let quic_name = quic_interface_name(&self.interface_name, &self.config.interface.mode);
+            let tun_fds = match crate::tun_device::open_tun(&quic_name, queue_count) {
                 Ok(fds) => fds,
                 Err(e) => {
                     log::error!("Failed to open TUN device: {}", e);
@@ -2988,6 +2990,7 @@ mod tests {
                 private_key: [1u8; 32],
                 addresses: vec!["10.0.0.1/24".parse().unwrap()],
                 listen_port: Some(40000),
+                wg_listen_port: None,
                 listen_control_port: Some(40001),
                 mtu: 1400,
                 table: None,

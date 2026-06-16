@@ -68,6 +68,18 @@ pub fn api_socket_path(interface_name: &str) -> String {
     format!("/run/new_proxy/{}.sock", interface_name)
 }
 
+pub fn quic_interface_name(name: &str, mode: &str) -> String {
+    if mode.eq_ignore_ascii_case("af_xdp") {
+        format!("{}-veth", name)
+    } else {
+        format!("{}-tun", name)
+    }
+}
+
+pub fn wg_interface_name(name: &str) -> String {
+    format!("{}-wg", name)
+}
+
 pub fn validate_gateway_config(config: &GatewayConfig) -> Result<RuntimeMode, String> {
     if let Some(table) = config.interface.table.as_deref() {
         if !table.eq_ignore_ascii_case("auto") && !table.eq_ignore_ascii_case("off") {
@@ -190,11 +202,11 @@ pub fn telemetry_sources(
 ) -> HashMap<[u8; 32], String> {
     let mut sources = HashMap::new();
     for peer in peers {
-        if l3_stats.contains_key(&peer.public_key) {
-            sources.insert(peer.public_key, "both".to_string());
-        } else {
-            sources.insert(peer.public_key, "proxy".to_string());
-        }
+        let source = match peer.r#type {
+            config::PeerType::Wireguard => "wireguard".to_string(),
+            config::PeerType::Quic => "proxy".to_string(),
+        };
+        sources.insert(peer.public_key, source);
     }
     for pub_key in l3_stats.keys() {
         sources
@@ -227,7 +239,7 @@ pub fn select_quic_endpoint_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InterfaceConfig, PeerConfig, QUICPoolConfig, XdpConfig};
+    use crate::config::{InterfaceConfig, PeerConfig, PeerType, QUICPoolConfig, XdpConfig};
 
     fn client_config(peers: Vec<PeerConfig>) -> GatewayConfig {
         GatewayConfig {
@@ -235,6 +247,7 @@ mod tests {
                 private_key: [1u8; 32],
                 addresses: vec!["10.0.0.2/24".parse().unwrap()],
                 listen_port: None,
+                wg_listen_port: None,
                 listen_control_port: None,
                 mtu: 1400,
                 table: None,
@@ -271,12 +284,14 @@ mod tests {
             allowed_ips: vec!["10.10.0.0/16".parse().unwrap()],
             endpoint: Some("127.0.0.1:51820".parse().unwrap()),
             proxy_port: Some(51821),
+            r#type: PeerType::Quic,
         };
         let wg_only_peer = PeerConfig {
             public_key: [2u8; 32],
             allowed_ips: vec!["10.20.0.0/16".parse().unwrap()],
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         };
 
         let router = rebuild_l4_router(&[proxy_peer, wg_only_peer]);
@@ -298,6 +313,7 @@ mod tests {
             allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
             endpoint: Some("127.0.0.1:51820".parse().unwrap()),
             proxy_port: Some(51821),
+            r#type: PeerType::Quic,
         }]);
 
         assert_eq!(determine_runtime_mode(&config), Ok(RuntimeMode::Client));
@@ -339,6 +355,7 @@ mod tests {
             allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         };
         let mut config = client_config(vec![peer]);
         config.interface.table = Some("manual".to_string());
@@ -367,6 +384,7 @@ mod tests {
                 private_key: [1u8; 32],
                 addresses: vec!["10.0.0.1/24".parse().unwrap()],
                 listen_port: None,
+                wg_listen_port: None,
                 listen_control_port: Some(51820),
                 mtu: 1400,
                 table: None,
@@ -379,6 +397,7 @@ mod tests {
                 allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
                 endpoint: None,
                 proxy_port: None,
+                r#type: PeerType::Quic,
             }],
             quic_pool: QUICPoolConfig {
                 public_ipv4: None,
@@ -406,12 +425,14 @@ mod tests {
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             endpoint: Some("127.0.0.1:51820".parse().unwrap()),
             proxy_port: Some(51821),
+            r#type: PeerType::Quic,
         };
         let mut peer2 = PeerConfig {
             public_key: [3u8; 32],
             allowed_ips: vec!["10.0.0.128/25".parse().unwrap()],
             endpoint: Some("127.0.0.1:51820".parse().unwrap()),
             proxy_port: Some(51821),
+            r#type: PeerType::Quic,
         };
         let mut config = client_config(vec![peer1.clone(), peer2.clone()]);
 
@@ -494,6 +515,7 @@ mod tests {
             allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
             endpoint: None,
             proxy_port: None,
+            r#type: PeerType::Quic,
         }];
         let mut l3_stats = HashMap::new();
         l3_stats.insert(
@@ -520,10 +542,21 @@ mod tests {
         );
 
         let sources = telemetry_sources(&peers, &l3_stats);
-        assert_eq!(sources.get(&[1u8; 32]).map(String::as_str), Some("both"));
+        assert_eq!(sources.get(&[1u8; 32]).map(String::as_str), Some("proxy"));
         assert_eq!(
             sources.get(&[2u8; 32]).map(String::as_str),
             Some("wireguard")
         );
+    }
+
+    #[test]
+    fn test_automatic_interface_naming_helpers() {
+        assert_eq!(quic_interface_name("client", "tun"), "client-tun");
+        assert_eq!(quic_interface_name("client", "TUN"), "client-tun");
+        assert_eq!(quic_interface_name("client", "af_xdp"), "client-veth");
+        assert_eq!(quic_interface_name("client", "AF_XDP"), "client-veth");
+        assert_eq!(quic_interface_name("client", "other"), "client-tun");
+
+        assert_eq!(wg_interface_name("client"), "client-wg");
     }
 }
