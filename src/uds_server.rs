@@ -212,23 +212,34 @@ async fn handle_stats(
 
         #[cfg(target_os = "linux")]
         if has_wg_peers {
-            use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+            use defguard_wireguard_rs::{Kernel, Userspace, WGApi, WireguardInterfaceApi};
             let wg_name = crate::app_config::wg_interface_name(&context.interface_name);
-            if let Ok(api) = WGApi::<Kernel>::new(wg_name) {
-                if let Ok(host) = api.read_interface_data() {
-                    for (key, peer_data) in &host.peers {
-                        let pub_key_bytes = key.as_array();
-                        if let Some(stats) = l3_stats.get_mut(&pub_key_bytes) {
-                            stats.rx_bytes = peer_data.rx_bytes;
-                            stats.tx_bytes = peer_data.tx_bytes;
-                            stats.last_handshake = peer_data
-                                .last_handshake
-                                .and_then(|t| {
-                                    t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
-                                })
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                        }
+            let socket_path = format!("/var/run/wireguard/{}.sock", wg_name);
+            let alternative_socket_path = format!("/run/wireguard/{}.sock", wg_name);
+            let is_userspace = std::path::Path::new(&socket_path).exists()
+                || std::path::Path::new(&alternative_socket_path).exists();
+
+            let host_result = if is_userspace {
+                WGApi::<Userspace>::new(wg_name)
+                    .ok()
+                    .and_then(|api| api.read_interface_data().ok())
+            } else {
+                WGApi::<Kernel>::new(wg_name)
+                    .ok()
+                    .and_then(|api| api.read_interface_data().ok())
+            };
+
+            if let Some(host) = host_result {
+                for (key, peer_data) in &host.peers {
+                    let pub_key_bytes = key.as_array();
+                    if let Some(stats) = l3_stats.get_mut(&pub_key_bytes) {
+                        stats.rx_bytes = peer_data.rx_bytes;
+                        stats.tx_bytes = peer_data.tx_bytes;
+                        stats.last_handshake = peer_data
+                            .last_handshake
+                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
                     }
                 }
             }

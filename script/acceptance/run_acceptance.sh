@@ -68,6 +68,8 @@ bash_scripts=(
   "script/acceptance/e2e_mss_clamping.sh"
   "script/acceptance/e2e_udp_icmp_tunnel.sh"
   "script/acceptance/e2e_udp_over_quic.sh"
+  "script/acceptance/e2e_hybrid_wireguard.sh"
+  "script/acceptance/e2e_hybrid_ha_reconnect.sh"
   "script/acceptance/stability_stress_test.sh"
   "script/perf/perf_smoke.sh"
   "script/perf/perf_cores_scalability.sh"
@@ -101,6 +103,8 @@ TESTS=(
   "e2e_mss_clamping"
   "e2e_udp_icmp_tunnel"
   "e2e_udp_over_quic"
+  "e2e_hybrid_wireguard"
+  "e2e_hybrid_ha_reconnect"
 )
 
 if [ "${RUN_STABILITY:-0}" = "1" ]; then

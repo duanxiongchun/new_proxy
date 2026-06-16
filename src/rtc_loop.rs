@@ -214,6 +214,13 @@ impl RtcWorker {
                 quinn_proto::Event::ConnectionLost { reason } => {
                     log::warn!("Connection {:?} lost: {:?}", handle, reason);
                     connection_lost = true;
+                    if let Some(conn) = self.connections.get(&handle) {
+                        if let Some(pub_key) = conn.peer_public_key {
+                            if let Some(pool) = dp_snapshot.client_quic_pools.get(&pub_key) {
+                                pool.clone().trigger_refresh();
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }

@@ -82,23 +82,42 @@ pub fn setup_kernel_wireguard(
     use defguard_wireguard_rs::key::Key;
     use defguard_wireguard_rs::net::IpAddrMask;
     use defguard_wireguard_rs::peer::Peer;
-    use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
+    use defguard_wireguard_rs::{
+        InterfaceConfiguration, Kernel, Userspace, WGApi, WireguardInterfaceApi,
+    };
 
     let wg_name = crate::app_config::wg_interface_name(interface_name);
-    let mut api = WGApi::<Kernel>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+    log::info!("setup_kernel_wireguard: wg_name={}", wg_name);
 
-    // Try creating native wireguard interface, if fails (missing module), fall back to wireguard-go
-    if !std::path::Path::new("/sys/class/net")
+    let exists = std::path::Path::new("/sys/class/net")
         .join(&wg_name)
-        .exists()
-    {
-        if let Err(e) = api.create_interface() {
+        .exists();
+    log::info!("setup_kernel_wireguard: interface exists={}", exists);
+
+    let mut is_userspace = false;
+
+    if !exists {
+        // Clean up any leftover unix socket files to prevent UAPI socket in use errors
+        let socket_path = format!("/var/run/wireguard/{}.sock", wg_name);
+        let alternative_socket_path = format!("/run/wireguard/{}.sock", wg_name);
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&alternative_socket_path);
+
+        let mut kernel_api =
+            WGApi::<Kernel>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+        log::info!("Creating native wireguard interface: {}", wg_name);
+        if let Err(e) = kernel_api.create_interface() {
             log::warn!("Failed to create native kernel wireguard interface: {:?}. Falling back to wireguard-go.", e);
             // Run: wireguard-go <wg_name>
+            log::info!("Running wireguard-go {}", wg_name);
             let status = std::process::Command::new("wireguard-go")
                 .arg(&wg_name)
                 .status()
-                .map_err(|err| format!("failed to start wireguard-go: {}", err))?;
+                .map_err(|err| {
+                    log::error!("Failed to spawn wireguard-go: {}", err);
+                    format!("failed to start wireguard-go: {}", err)
+                })?;
+            log::info!("wireguard-go exit status: {:?}", status);
             if !status.success() {
                 return Err("wireguard-go exited with error".to_string());
             }
@@ -115,9 +134,22 @@ pub fn setup_kernel_wireguard(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            log::info!("wireguard-go device found={}", found);
             if !found {
                 return Err("wireguard-go TUN interface did not appear within timeout".to_string());
             }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            is_userspace = true;
+        } else {
+            log::info!("Successfully created native WireGuard interface.");
+        }
+    } else {
+        let socket_path = format!("/var/run/wireguard/{}.sock", wg_name);
+        let alternative_socket_path = format!("/run/wireguard/{}.sock", wg_name);
+        if std::path::Path::new(&socket_path).exists()
+            || std::path::Path::new(&alternative_socket_path).exists()
+        {
+            is_userspace = true;
         }
     }
 
@@ -155,8 +187,52 @@ pub fn setup_kernel_wireguard(
         mtu: None,
         fwmark: None,
     };
-    api.configure_interface(&interface_config)
-        .map_err(|e| format!("{:?}", e))?;
+
+    if is_userspace {
+        log::info!(
+            "Configuring userspace WireGuard interface via UAPI: {}",
+            wg_name
+        );
+
+        // Assign IP addresses manually using standard `ip` command
+        for addr in &config.interface.addresses {
+            let status = std::process::Command::new("ip")
+                .args(["addr", "replace", &addr.to_string(), "dev", &wg_name])
+                .status()
+                .map_err(|e| format!("failed to run ip addr: {}", e))?;
+            if !status.success() {
+                return Err(format!("failed to assign address {} to {}", addr, wg_name));
+            }
+        }
+
+        // Set MTU manually
+        let status = std::process::Command::new("ip")
+            .args([
+                "link",
+                "set",
+                "dev",
+                &wg_name,
+                "mtu",
+                &config.interface.mtu.to_string(),
+            ])
+            .status()
+            .map_err(|e| format!("failed to set MTU: {}", e))?;
+        if !status.success() {
+            return Err(format!("failed to set MTU on {}", wg_name));
+        }
+
+        // Write host configuration directly to UAPI socket
+        let api = WGApi::<Userspace>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+        let host = defguard_wireguard_rs::host::Host::try_from(&interface_config)
+            .map_err(|e| format!("{:?}", e))?;
+        api.write_host(&host)
+            .map_err(|e| format!("UAPI write failed: {:?}", e))?;
+    } else {
+        log::info!("Configuring WireGuard interface via WGApi::<Kernel>");
+        let api = WGApi::<Kernel>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+        api.configure_interface(&interface_config)
+            .map_err(|e| format!("{:?}", e))?;
+    }
 
     // Bring interface up
     let status = std::process::Command::new("ip")
@@ -172,23 +248,50 @@ pub fn setup_kernel_wireguard(
 
 #[cfg(target_os = "linux")]
 pub fn cleanup_kernel_wireguard(interface_name: &str) -> Result<(), String> {
-    use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+    use defguard_wireguard_rs::{Kernel, Userspace, WGApi, WireguardInterfaceApi};
     let wg_name = crate::app_config::wg_interface_name(interface_name);
-    let api = WGApi::<Kernel>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
-    if std::path::Path::new("/sys/class/net")
-        .join(&wg_name)
-        .exists()
-    {
-        api.remove_interface().map_err(|e| format!("{:?}", e))?;
+
+    let socket_path = format!("/var/run/wireguard/{}.sock", wg_name);
+    let alternative_socket_path = format!("/run/wireguard/{}.sock", wg_name);
+    let is_userspace = std::path::Path::new(&socket_path).exists()
+        || std::path::Path::new(&alternative_socket_path).exists();
+
+    if is_userspace {
+        log::info!("Cleaning up userspace WireGuard interface: {}", wg_name);
+        let api = WGApi::<Userspace>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+        if std::path::Path::new("/sys/class/net")
+            .join(&wg_name)
+            .exists()
+        {
+            api.remove_interface().map_err(|e| format!("{:?}", e))?;
+        }
+    } else {
+        log::info!("Cleaning up kernel WireGuard interface: {}", wg_name);
+        let api = WGApi::<Kernel>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+        if std::path::Path::new("/sys/class/net")
+            .join(&wg_name)
+            .exists()
+        {
+            api.remove_interface().map_err(|e| format!("{:?}", e))?;
+        }
     }
     Ok(())
 }
 
 #[cfg(not(tarpaulin))]
 pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), String> {
+    log::info!(
+        "setup_routes: interface_name={}, table_is_off={}",
+        interface_name,
+        table_is_off(config)
+    );
     if table_is_off(config) {
         log::info!("Table is off. Skipping automatic userspace routing setup.");
         return Ok(());
+    }
+
+    for (i, peer) in config.peers.iter().enumerate() {
+        log::info!("Peer {} type: {:?}", i, peer.r#type);
     }
 
     #[cfg(target_os = "linux")]
@@ -197,6 +300,7 @@ pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), 
         .iter()
         .any(|peer| peer.r#type == crate::config::PeerType::Wireguard)
     {
+        log::info!("Found WireGuard peer. Calling setup_kernel_wireguard.");
         setup_kernel_wireguard(config, interface_name)?;
     }
 

@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 pub const OUTER_SOCKET_MARK: u32 = 0x6e70;
 pub const ROUTING_TABLE: u32 = 0x6e70;
 pub const MAIN_SUPPRESS_RULE_PRIORITY: u32 = 9999;
-pub const ROUTING_RULE_PRIORITY: u32 = 10000;
+pub const ROUTING_RULE_PRIORITY: u32 = 9998;
 
 #[cfg(all(target_os = "linux", not(test), not(tarpaulin)))]
 pub fn set_outer_mark(socket: &std::net::UdpSocket) -> Result<(), String> {
