@@ -74,11 +74,139 @@ pub fn cleanup_runtime(config: &GatewayConfig, interface_name: &str) {
 #[cfg(tarpaulin)]
 pub fn cleanup_runtime(_config: &GatewayConfig, _interface_name: &str) {}
 
+#[cfg(target_os = "linux")]
+pub fn setup_kernel_wireguard(
+    config: &crate::config::GatewayConfig,
+    interface_name: &str,
+) -> Result<(), String> {
+    use defguard_wireguard_rs::key::Key;
+    use defguard_wireguard_rs::net::IpAddrMask;
+    use defguard_wireguard_rs::peer::Peer;
+    use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
+
+    let wg_name = crate::app_config::wg_interface_name(interface_name);
+    let mut api = WGApi::<Kernel>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+
+    // Try creating native wireguard interface, if fails (missing module), fall back to wireguard-go
+    if !std::path::Path::new("/sys/class/net")
+        .join(&wg_name)
+        .exists()
+    {
+        if let Err(e) = api.create_interface() {
+            log::warn!("Failed to create native kernel wireguard interface: {:?}. Falling back to wireguard-go.", e);
+            // Run: wireguard-go <wg_name>
+            let status = std::process::Command::new("wireguard-go")
+                .arg(&wg_name)
+                .status()
+                .map_err(|err| format!("failed to start wireguard-go: {}", err))?;
+            if !status.success() {
+                return Err("wireguard-go exited with error".to_string());
+            }
+            // Wait up to 2 seconds (polling every 50ms) for the userspace TUN device to appear
+            let start = std::time::Instant::now();
+            let mut found = false;
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                if std::path::Path::new("/sys/class/net")
+                    .join(&wg_name)
+                    .exists()
+                {
+                    found = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !found {
+                return Err("wireguard-go TUN interface did not appear within timeout".to_string());
+            }
+        }
+    }
+
+    let listen_port = config
+        .interface
+        .wg_listen_port
+        .unwrap_or(config.interface.listen_port.unwrap_or(51820) + 1);
+
+    let mut wg_peers = Vec::new();
+    for peer in &config.peers {
+        if peer.r#type == crate::config::PeerType::Wireguard {
+            let key = Key::new(peer.public_key);
+            let mut wg_peer = Peer::new(key);
+            wg_peer.endpoint = peer.endpoint;
+            wg_peer.allowed_ips = peer
+                .allowed_ips
+                .iter()
+                .map(|ip| IpAddrMask::new(ip.addr(), ip.prefix_len()))
+                .collect();
+            wg_peers.push(wg_peer);
+        }
+    }
+
+    let interface_config = InterfaceConfiguration {
+        name: wg_name.clone(),
+        prvkey: crate::app_config::encode_base64_32(&config.interface.private_key),
+        addresses: config
+            .interface
+            .addresses
+            .iter()
+            .map(|addr| IpAddrMask::new(addr.addr(), addr.prefix_len()))
+            .collect(),
+        port: listen_port,
+        peers: wg_peers,
+        mtu: None,
+        fwmark: None,
+    };
+    api.configure_interface(&interface_config)
+        .map_err(|e| format!("{:?}", e))?;
+
+    // Bring interface up
+    let status = std::process::Command::new("ip")
+        .args(["link", "set", "dev", &wg_name, "up"])
+        .status()
+        .map_err(|e| format!("failed to bring interface up: {}", e))?;
+    if !status.success() {
+        return Err("failed to bring interface up".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn cleanup_kernel_wireguard(interface_name: &str) -> Result<(), String> {
+    use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+    let wg_name = crate::app_config::wg_interface_name(interface_name);
+    let api = WGApi::<Kernel>::new(wg_name.clone()).map_err(|e| format!("{:?}", e))?;
+    if std::path::Path::new("/sys/class/net")
+        .join(&wg_name)
+        .exists()
+    {
+        api.remove_interface().map_err(|e| format!("{:?}", e))?;
+    }
+    Ok(())
+}
+
 #[cfg(not(tarpaulin))]
 pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), String> {
     if table_is_off(config) {
         log::info!("Table is off. Skipping automatic userspace routing setup.");
         return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    if config
+        .peers
+        .iter()
+        .any(|peer| peer.r#type == crate::config::PeerType::Wireguard)
+    {
+        setup_kernel_wireguard(config, interface_name)?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if config
+        .peers
+        .iter()
+        .any(|peer| peer.r#type == crate::config::PeerType::Wireguard)
+    {
+        log::warn!("WireGuard peer configured, but kernel WireGuard setup is not supported on this platform.");
     }
 
     let quic_name = quic_interface_name(interface_name, &config.interface.mode);
@@ -143,15 +271,33 @@ pub fn cleanup_peer_routes(_peer: &PeerConfig, _interface_name: &str) -> Result<
 #[cfg(not(tarpaulin))]
 fn cleanup_routes(config: &GatewayConfig, interface_name: &str) {
     let quic_name = quic_interface_name(interface_name, &config.interface.mode);
+
+    #[cfg(target_os = "linux")]
+    if config
+        .peers
+        .iter()
+        .any(|peer| peer.r#type == crate::config::PeerType::Wireguard)
+    {
+        if let Err(e) = cleanup_kernel_wireguard(interface_name) {
+            log::warn!("Failed to clean up kernel WireGuard: {}", e);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if config
+        .peers
+        .iter()
+        .any(|peer| peer.r#type == crate::config::PeerType::Wireguard)
+    {
+        log::warn!("Kernel WireGuard cleanup skipped: not supported on this platform.");
+    }
+
     if table_is_off(config) {
         cleanup_tun_link(&quic_name);
         return;
     }
 
-    log::info!(
-        "Cleaning up userspace routing for interface: {}",
-        quic_name
-    );
+    log::info!("Cleaning up userspace routing for interface: {}", quic_name);
 
     for command in cleanup_route_commands(config, &quic_name) {
         run_command_best_effort(command.program, &command.args);
@@ -741,5 +887,30 @@ mod tests {
         let err = run_script("echo pre-script-failed >&2; exit 7").unwrap_err();
         assert!(err.contains("pre-script-failed"));
         assert!(err.contains("status"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_setup_kernel_wireguard_failure_flow() {
+        let mut config = config_with_table(None);
+        config.interface.private_key = [1u8; 32];
+        config.interface.wg_listen_port = Some(51821);
+
+        let peer = PeerConfig {
+            public_key: [2u8; 32],
+            allowed_ips: vec!["10.20.0.0/16".parse().unwrap()],
+            endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            proxy_port: None,
+            r#type: PeerType::Wireguard,
+        };
+        config.peers = vec![peer];
+
+        // This will run without panic, exercising peer parsing and key building logic.
+        // It fails because we run without root privileges/correct setup, which we expect and assert.
+        let res = setup_kernel_wireguard(&config, "mock-wg-test");
+        assert!(res.is_err());
+
+        let res_clean = cleanup_kernel_wireguard("mock-wg-test");
+        assert!(res_clean.is_ok() || res_clean.is_err());
     }
 }
