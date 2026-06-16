@@ -197,7 +197,7 @@ async fn handle_stats(
     stream: &mut tokio::net::UnixStream,
     framed_response: bool,
 ) {
-    let l3_stats = context.l3_registry.snapshot();
+    let mut l3_stats = context.l3_registry.snapshot();
     let aggregated = {
         let mut aggregated = Vec::new();
         let mut seen = HashSet::new();
@@ -205,6 +205,35 @@ async fn handle_stats(
             let st = context.state.read();
             st.config.peers.clone()
         };
+
+        let has_wg_peers = peers
+            .iter()
+            .any(|peer| peer.r#type == config::PeerType::Wireguard);
+
+        #[cfg(target_os = "linux")]
+        if has_wg_peers {
+            use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+            let wg_name = crate::app_config::wg_interface_name(&context.interface_name);
+            if let Ok(api) = WGApi::<Kernel>::new(wg_name) {
+                if let Ok(host) = api.read_interface_data() {
+                    for (key, peer_data) in &host.peers {
+                        let pub_key_bytes = key.as_array();
+                        if let Some(stats) = l3_stats.get_mut(&pub_key_bytes) {
+                            stats.rx_bytes = peer_data.rx_bytes;
+                            stats.tx_bytes = peer_data.tx_bytes;
+                            stats.last_handshake = peer_data
+                                .last_handshake
+                                .and_then(|t| {
+                                    t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+                                })
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+
         let sources = telemetry_sources(&peers, &l3_stats);
         let registry_map = combine_peer_telemetries(&context.peer_telemetries);
         let quic_registry = context.shared_quic_registry.read();
@@ -238,7 +267,10 @@ async fn handle_stats(
             let source = sources
                 .get(&pub_key)
                 .cloned()
-                .unwrap_or_else(|| "both".to_string());
+                .unwrap_or_else(|| match peer.r#type {
+                    config::PeerType::Wireguard => "wireguard".to_string(),
+                    config::PeerType::Quic => "proxy".to_string(),
+                });
 
             aggregated.push(UnifiedTelemetry {
                 public_key: encode_base64_32(&pub_key),
@@ -1047,7 +1079,7 @@ mod tests {
         assert_eq!(stats[0].l4_rx_bytes, 70);
         assert_eq!(stats[0].l4_tx_bytes, 80);
         assert_eq!(stats[0].l3_unknown_handshake_drops, 0);
-        assert_eq!(stats[0].source, "both");
+        assert_eq!(stats[0].source, "proxy");
 
         let _ = fs::remove_file(path);
     }

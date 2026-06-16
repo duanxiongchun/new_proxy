@@ -202,11 +202,11 @@ pub fn telemetry_sources(
 ) -> HashMap<[u8; 32], String> {
     let mut sources = HashMap::new();
     for peer in peers {
-        if l3_stats.contains_key(&peer.public_key) {
-            sources.insert(peer.public_key, "both".to_string());
-        } else {
-            sources.insert(peer.public_key, "proxy".to_string());
-        }
+        let source = match peer.r#type {
+            config::PeerType::Wireguard => "wireguard".to_string(),
+            config::PeerType::Quic => "proxy".to_string(),
+        };
+        sources.insert(peer.public_key, source);
     }
     for pub_key in l3_stats.keys() {
         sources
@@ -542,7 +542,7 @@ mod tests {
         );
 
         let sources = telemetry_sources(&peers, &l3_stats);
-        assert_eq!(sources.get(&[1u8; 32]).map(String::as_str), Some("both"));
+        assert_eq!(sources.get(&[1u8; 32]).map(String::as_str), Some("proxy"));
         assert_eq!(
             sources.get(&[2u8; 32]).map(String::as_str),
             Some("wireguard")
