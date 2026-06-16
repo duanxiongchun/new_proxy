@@ -5,6 +5,8 @@
 ## 主要功能
 
 - **物理双数据面后端**：同时支持标准 Linux 多队列 TUN 设备以及先进的 eBPF 驱动级 **AF_XDP 零拷贝内核旁路数据面**，实现高效率的数据转发。
+- **混合隧道共存 (Hybrid Tunneling)**：同时支持内核态/用户态 WireGuard 隧道和 IP-over-QUIC 隧道，通过长匹配前缀（LPM）路由表自动对流量分流，实现多协议无缝并存。
+- **自动化网卡接口命名规范**：自动将物理隧道和虚拟接口进行隔离命名（QUIC 对应 `<name>-tun` 或 `<name>-veth`，WireGuard 对应 `<name>-wg`），避免不同数据面设备发生命名冲突。
 - **纯 L3 隧道数据面**：摒弃用户态 SOCKS/TCP 流代理，采用 IP-over-QUIC Datagram 方式，无需任何用户态 SOCKS、WireGuard (boringtun) 或 TCP/IP 协议栈 (smoltcp)，纯粹在 IP 层高速透传。
 - **AF_XDP 零拷贝内核旁路**：依托 eBPF 过滤程序，自动将目标流量在内核驱动层重定向至用户态共享内存环（UMEM Rings），并辅以共享二层 MAC 地址缓存、填充环批处理生产（Fill Ring Batching）以及空闲时立即 Flush 机制，突破 CPU 锁与总线屏障限制，榨干硬件转发性能。
 - **对称多队列多核心映射**：支持多物理 QUIC 数据面连接池，与多队列网卡通道（TUN/XSK）一一对称绑定物理 OS 线程，实现无共享状态、高并发的 RTC 转发流。
@@ -12,7 +14,7 @@
 - **集约化管控面单线程**：主运行时使用 `new_current_thread` 单线程调度，将 UDS CLI 服务、控制协商及 Failover 检测与高频数据工作线程进行物理隔离，避免调度开销与干扰。
 - **对等密钥认证与防重放**：复用 WireGuard 格式的密钥材料，通过 X25519 ECDH 派生共享密钥，并利用 HMAC-SHA256 签名校验和 Nonce 缓存防范控制面重放攻击。
 - **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端强校验建立可信 QUIC 数据物理连接。
-- **聚合遥测与诊断**：通过 `new-proxy-cli` 实时查询每个网卡队列、物理 Slot 连接状态、收发字节数及物理连接数指标。
+- **整合遥测与诊断**：通过 `new-proxy-cli` 实时查询每个网卡队列、物理 Slot 连接状态、收发字节数及物理连接数指标，并全面支持 WireGuard 流量来源与内核状态遥测。
 - **动态 Peer 管理**：运行期支持通过 CLI / UDS API 动态添加和删除对等体，自动安全地重新热插拔网络拓扑。
 
 ## 目录结构
@@ -84,6 +86,7 @@ target/release/new-proxy-cli
 * **`Table`**（`auto` / `off`，默认 `auto`）：设置为 `auto` 时，网关启动会自动配置 TUN 地址和 peer 路由，退出时自动回滚。若为 `off` 则跳过该行为，交由外部配置。
 * **`PreScript` / `pre_script`**：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
 * **`PostScript` / `post_script`**：在网关优雅退出并清理完所有路由和防火墙之后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
+* **`WgListenPort`**（仅用于 `[Interface]` 部分）：指定 WireGuard 隧道的本地监听端口。若未配置，默认使用 `ListenPort + 1` 或 `51821`。
 
 ### 数据面后端模式 (TUN / AF_XDP)
 
@@ -162,6 +165,61 @@ sudo target/release/new_proxy -config conf/client.conf
 ```
 
 同样，`conf/client.conf` 会使用接口名 `client`；需要兼容现有 `tun0` 路由/脚本时，请使用 `tun0.conf`。
+
+### 混合隧道与对等体类型配置
+
+在混合模式下，您可以在同一个配置文件中同时定义 IP-over-QUIC Peer 和 WireGuard Peer。通过 `Type` 字段指定对等体类型：
+
+* **`Type = quic`**（默认值）：表示该 peer 通过 IP-over-QUIC Datagram 隧道进行转发。数据包将被定向到 `<interface_name>-tun` 或 `<interface_name>-veth`。
+* **`Type = wireguard`**：表示该 peer 通过 Linux 内核态 WireGuard 设备（如果内核不支持，自动平滑退化到用户态 `wireguard-go`）进行转发。数据包将被定向到 `<interface_name>-wg`。
+
+#### 服务端混合配置示例 (`conf/server_hybrid.conf`)
+```ini
+[Interface]
+PrivateKey = <server_private_key_base64>
+Address = 10.0.0.1/24, fd00::1/64
+ListenPort = 51820
+WgListenPort = 51822
+Table = auto
+
+[QUICPool]
+PublicIPv4 = <server_public_ipv4>
+ListenPorts = 40001, 40002
+
+# QUIC Peer
+[Peer]
+PublicKey = <client1_public_key_base64>
+AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
+Type = quic
+
+# WireGuard Peer
+[Peer]
+PublicKey = <client2_public_key_base64>
+AllowedIPs = 10.0.0.3/32, 10.0.5.0/24
+Type = wireguard
+```
+
+#### 客户端混合配置示例 (`conf/client_hybrid.conf`)
+```ini
+[Interface]
+PrivateKey = <client_private_key_base64>
+Address = 10.0.0.2/24, fd00::2/64
+Table = auto
+
+# 服务端 QUIC Peer
+[Peer]
+PublicKey = <server_public_key_base64>
+Endpoint = <server_public_ip>:51820
+AllowedIPs = 10.0.0.1/32
+Type = quic
+
+# 服务端 WireGuard Peer
+[Peer]
+PublicKey = <server_public_key_base64>
+Endpoint = <server_public_ip>:51822
+AllowedIPs = 10.0.0.3/32
+Type = wireguard
+```
 
 客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，必须配置 `Endpoint`；控制面端口 `ProxyPort` 是可选配置，默认使用 `Endpoint` 的端口。
 
@@ -279,7 +337,27 @@ sudo RUN_STABILITY=1 ./script/acceptance/run_acceptance.sh
 *   **AF_XDP 模式**：1 Core = **39.29 MiB/s**，2 Cores = **86.11 MiB/s**，3 Cores = **131.91 MiB/s**，4 Cores = **177.00 MiB/s**。
 *   **TUN 模式**：1 Core = **39.23 MiB/s**，2 Cores = **85.67 MiB/s**，3 Cores = **131.71 MiB/s**，4 Cores = **174.33 MiB/s**。
 
-### 3. 数据面核心优化设计
+### 3. 混合网关对比测试性能 (WireGuard vs. QUIC TUN vs. QUIC XDP)
+
+在三命名空间拓扑中，通过单 TCP 流量（单 stream 下载 50 MiB 的 `blob.bin`）对三种隧道协议进行端到端对比，结果如下：
+
+| 隧道模式 | 吞吐量 (MiB/s) | 吞吐量 (Mbps) | TTFB P50 (ms) | TTFB P95 (ms) | TTFB Max (ms) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **WIREGUARD** | 136.37 | 1143.94 | 4.65 | 5.09 | 5.13 |
+| **QUIC_TUN** | 185.10 | 1552.73 | 4.06 | 4.72 | 4.87 |
+| **QUIC_XDP** | 209.33 | 1756.03 | 3.85 | 4.53 | 4.89 |
+
+#### 关于单线程/单流吞吐对比的性能分析与说明：
+1. **多并发流 vs 单并发流瓶颈**：
+   * 在 Dedicated 单核可扩展性测试中，我们使用 `PARALLEL=16` 个并发 TCP 下载流，完全填满了 QUIC 拥塞窗口（CWND）和数据通道缓冲区，充分释放了网关在单核心下的物理转发上限，从而使得 AF_XDP 单核可以达到 **322.06 MiB/s**。
+   * 而在对比测试 (`perf_compare_hybrid.sh`) 中，采用的是**单流顺序下载（Single TCP stream via `curl`）**。单流 TCP 受限于 TCP 拥塞控制（如 CUBIC/BBR 算法的 CWND 爬升速度）、套接字窗口大小和网络往返延迟（RTT），且无法有效并发分流以维持数据吞吐的高速填充，导致吞吐率降为 **209.33 MiB/s**。
+2. **CPU 亲和度绑定 (CPU Affinity & Pinning)**：
+   * 可扩展性测试中，客户端代理、服务端代理、HTTP 服务端及压测发生器均被指定到独立的 CPU 核心（`taskset`），消除了 CPU 线程调度争抢和 L1/L2/L3 缓存丢失（Cache Miss & Thrashing）。
+   * 对比测试脚本在默认环境下运行，没有显式绑定 CPU 核心，导致用户态网关线程与内核 SoftIRQ 调度相互争抢、缓存被频繁无效化。
+3. **veth 驱动的 Generic XDP 与分段分发机制 (TSO/GRO)**：
+   * 测试运行于虚拟 `veth` 接口上。为启用 XDP 必须在驱动中关闭一部分 TCP 校验和与分片重组分发（GRO/TSO）硬卸载。对于单流 TCP，在缺少 GRO 的情况下对内核软中断（SoftIRQ）包解析的压力呈指数级上升，进一步压低了单流的传输性能。
+
+### 4. 数据面核心优化设计
 
 除了底层的全链路批处理、动态 Flush 机制之外，最近的物理 datapath 优化进一步挖掘了编译期和运行期的极限性能：
 1.  **用户态 Ring 描述符 Non-Volatile 读写优化**：在 [worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs) 中，移除了数据描述符槽位读写（如 [read_rx_desc](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L319)、[write_tx_desc](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L329) 等）的 `read_volatile`/`write_volatile`，改用标准的 Rust 指针读写。由于 AF_XDP 环的锁同步完全由控制索引更新及内存 Fence 保证，移除冗余的数据 volatile 读写释放了 LLVM 编译器的寄存器分配与自动向量化优化。
