@@ -178,11 +178,15 @@ impl GatewayConfig {
             })
             .transpose()?;
 
-        let mtu = interface_section
+        let mut mtu = interface_section
             .get("MTU")
             .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid MTU: {}", e)))
             .transpose()?
             .unwrap_or(1280);
+
+        if mtu > 1280 {
+            mtu = 1280;
+        }
 
         let table = interface_section
             .get("Table")
@@ -536,7 +540,19 @@ MTU = 1500
         );
         fs::write(path, content).unwrap();
         let config = GatewayConfig::load_from_file(path).unwrap();
-        assert_eq!(config.interface.mtu, 1500); // Manually set remains 1500
+        assert_eq!(config.interface.mtu, 1280); // Clamped to 1280
+
+        let content_valid_mtu = format!(
+            r#"
+[Interface]
+PrivateKey = {key}
+Address = 10.0.0.1/24
+MTU = 1200
+"#
+        );
+        fs::write(path, content_valid_mtu).unwrap();
+        let config_valid = GatewayConfig::load_from_file(path).unwrap();
+        assert_eq!(config_valid.interface.mtu, 1200); // MTU <= 1280 remains 1200
 
         let content_no_mtu = format!(
             r#"
