@@ -248,7 +248,7 @@ if ip netns exec mobile_ns ping -c 2 -W 2 10.0.0.1 >/dev/null; then
   echo "✅ Ping successful!"
 else
   echo "❌ Ping failed!" >&2
-  cleanup
+  # cleanup
   exit 1
 fi
 

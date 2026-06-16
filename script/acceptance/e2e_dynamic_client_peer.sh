@@ -132,9 +132,9 @@ WORK_HTTP_PID=$!
 ip netns exec dyn_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
-ip netns exec dyn_server_ns ip addr add 10.0.0.1/24 dev server || true
-ip netns exec dyn_server_ns ip link set server up
-ip netns exec dyn_server_ns ip route replace 10.0.4.0/24 dev server
+ip netns exec dyn_server_ns ip addr add 10.0.0.1/24 dev server-tun || true
+ip netns exec dyn_server_ns ip link set server-tun up
+ip netns exec dyn_server_ns ip route replace 10.0.4.0/24 dev server-tun
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "Server daemon exited early"
   cat "$ARTIFACT_DIR/server.log"

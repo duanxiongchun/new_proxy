@@ -128,9 +128,9 @@ HTTP_PID=$!
 ip netns exec ft_server_ns "$ROOT_DIR/target/debug/new_proxy" -config "$ARTIFACT_DIR/ft_server.conf" > "$ARTIFACT_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
-ip netns exec ft_server_ns ip addr add 10.30.0.1/24 dev ft_server
-ip netns exec ft_server_ns ip link set ft_server up
-ip netns exec ft_server_ns ip route add 10.20.4.0/24 dev ft_server
+ip netns exec ft_server_ns ip addr add 10.30.0.1/24 dev ft_server-tun
+ip netns exec ft_server_ns ip link set ft_server-tun up
+ip netns exec ft_server_ns ip route add 10.20.4.0/24 dev ft_server-tun
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   echo "Server daemon exited early"
   cat "$ARTIFACT_DIR/server.log"
@@ -149,7 +149,7 @@ echo "=== [4/6] Verifying SO_MARK endpoint bypass survives full-tunnel default =
 full_tunnel_route="$(ip netns exec ft_client_ns ip route get 198.51.100.10)"
 echo "$full_tunnel_route" > "$ARTIFACT_DIR/full_tunnel_route.txt"
 echo "$full_tunnel_route"
-if ! grep -q "dev ft_client" <<<"$full_tunnel_route"; then
+if ! grep -q "dev ft_client-tun" <<<"$full_tunnel_route"; then
   echo "Expected generic unmarked traffic to follow full-tunnel policy table: $full_tunnel_route"
   exit 1
 fi
@@ -157,7 +157,7 @@ fi
 marked_endpoint_route="$(ip netns exec ft_client_ns ip route get 10.20.2.2 mark 0x6e70)"
 echo "$marked_endpoint_route" > "$ARTIFACT_DIR/marked_endpoint_route.txt"
 echo "$marked_endpoint_route"
-if grep -q "dev ft_client" <<<"$marked_endpoint_route"; then
+if grep -q "dev ft_client-tun" <<<"$marked_endpoint_route"; then
   echo "Marked endpoint route loops through TUN: $marked_endpoint_route"
   exit 1
 fi
@@ -168,8 +168,8 @@ fi
 
 default_route="$(ip netns exec ft_client_ns ip route show table 28272 default)"
 echo "$default_route" > "$ARTIFACT_DIR/default_route.txt"
-if ! grep -q "dev ft_client" <<<"$default_route"; then
-  echo "Expected full-tunnel policy-table default route via ft_client TUN, got: $default_route"
+if ! grep -q "dev ft_client-tun" <<<"$default_route"; then
+  echo "Expected full-tunnel policy-table default route via ft_client-tun TUN, got: $default_route"
   exit 1
 fi
 policy_rule="$(ip netns exec ft_client_ns ip rule show | grep 'not from all fwmark 0x6e70 lookup 28272' || true)"
@@ -206,7 +206,7 @@ sleep 2
 full_tunnel_route_after_replace="$(ip netns exec ft_client_ns ip route get 198.51.100.10)"
 echo "$full_tunnel_route_after_replace" > "$ARTIFACT_DIR/full_tunnel_route_after_replace.txt"
 echo "$full_tunnel_route_after_replace"
-if ! grep -q "dev ft_client" <<<"$full_tunnel_route_after_replace"; then
+if ! grep -q "dev ft_client-tun" <<<"$full_tunnel_route_after_replace"; then
   echo "Expected generic unmarked traffic to follow full-tunnel policy table after dynamic peer replacement: $full_tunnel_route_after_replace"
   cat "$ARTIFACT_DIR/client.log"
   exit 1
@@ -214,7 +214,7 @@ fi
 marked_endpoint_route_after_replace="$(ip netns exec ft_client_ns ip route get 10.20.2.2 mark 0x6e70)"
 echo "$marked_endpoint_route_after_replace" > "$ARTIFACT_DIR/marked_endpoint_route_after_replace.txt"
 echo "$marked_endpoint_route_after_replace"
-if grep -q "dev ft_client" <<<"$marked_endpoint_route_after_replace"; then
+if grep -q "dev ft_client-tun" <<<"$marked_endpoint_route_after_replace"; then
   echo "Marked endpoint route loops through TUN after dynamic peer replacement: $marked_endpoint_route_after_replace"
   cat "$ARTIFACT_DIR/client.log"
   exit 1
