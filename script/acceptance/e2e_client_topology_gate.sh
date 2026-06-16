@@ -67,7 +67,6 @@ cat > "$SERVER1_CONF" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.70.0.1/24
 ListenPort = 51920
-ListenControlPort = 51921
 Table = off
 
 [QUICPool]
@@ -84,7 +83,6 @@ cat > "$SERVER2_CONF" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_CLIENT2_PRIVATE_KEY}
 Address = 10.70.0.3/24
 ListenPort = 52920
-ListenControlPort = 52921
 Table = off
 
 [QUICPool]
@@ -106,7 +104,6 @@ Table = auto
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.60.2.2:51920
-ProxyPort = 51921
 AllowedIPs = 10.70.0.1/32
 EOF_CONF
 
@@ -226,7 +223,7 @@ add_output="$(ip netns exec topo_client_ns "$ROOT_DIR/target/debug/new-proxy-cli
   "${NEW_PROXY_TEST_CLIENT2_PUBLIC_KEY}" \
   "10.70.0.3/32" \
   "10.60.3.2:52920" \
-  "52921" 2>&1)"
+  "52920" 2>&1)"
 add_status=$?
 set -e
 echo "$add_output"
@@ -252,7 +249,7 @@ readd_output="$(ip netns exec topo_client_ns "$ROOT_DIR/target/debug/new-proxy-c
   "${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}" \
   "10.70.0.1/32" \
   "10.60.2.2:51920" \
-  "51921")"
+  "51920")"
 echo "$readd_output"
 if ! grep -q "Peer added successfully" <<<"$readd_output"; then
   echo "Expected original 4-port peer to be accepted after rejected mismatch"

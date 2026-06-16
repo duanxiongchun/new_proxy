@@ -55,7 +55,6 @@ cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 MTU = 1280
 Table = off
 Mode = af_xdp
@@ -70,11 +69,10 @@ AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 
 [XDP]
 QuicInterface = vp-s
-InterceptInterfaces = vp-s-w2
 XdpMode = native
 EOF_CONF
 
-cat > "$ARTIFACT_DIR/client_perf.conf" <<EOF_CONF
+cat > "$ARTIFACT_DIR/client.conf" <<EOF_CONF
 [Interface]
 PrivateKey = ${NEW_PROXY_TEST_CLIENT1_PRIVATE_KEY}
 Address = 10.0.0.2/24
@@ -85,12 +83,10 @@ Mode = af_xdp
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 
 [XDP]
 QuicInterface = vp-c
-InterceptInterfaces = vp-c-w, lo
 XdpMode = native
 EOF_CONF
 
@@ -106,31 +102,31 @@ ip link set vp-rs netns perf_router_ns
 ip link add vp-c type veth peer name vp-rc
 ip link set vp-c netns perf_client_ns
 ip link set vp-rc netns perf_router_ns
-ip link add vp-w type veth peer name vp-c-w
+ip link add vp-w type veth peer name client-veth
 ip link set vp-w netns perf_work_ns
-ip link set vp-c-w netns perf_client_ns
+ip link set client-veth netns perf_client_ns
 
 ip netns exec perf_server_ns ip addr add 10.0.2.2/24 dev vp-s
 ip netns exec perf_server_ns ip link set vp-s up
 ip netns exec perf_server_ns ip link set lo up
 ip netns exec perf_server_ns ip route add default via 10.0.2.1
 
-ip link add vp-s-w1 type veth peer name vp-s-w2
+ip link add vp-s-w1 type veth peer name server-veth
 ip link set vp-s-w1 address 00:00:00:00:00:11
-ip link set vp-s-w2 address 00:00:00:00:00:22
+ip link set server-veth address 00:00:00:00:00:22
 ip link set vp-s-w1 netns perf_server_ns
-ip link set vp-s-w2 netns perf_server_ns
+ip link set server-veth netns perf_server_ns
 ip netns exec perf_server_ns ip addr add 10.0.0.1/24 dev vp-s-w1
 ip netns exec perf_server_ns ip link set vp-s-w1 mtu 1280 up
-ip netns exec perf_server_ns ip link set vp-s-w2 mtu 1280 up
+ip netns exec perf_server_ns ip link set server-veth mtu 1280 up
 ip netns exec perf_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vp-s-w1
 ip netns exec perf_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vp-s-w1
 
 ip netns exec perf_client_ns ip addr add 10.0.1.2/24 dev vp-c
-ip netns exec perf_client_ns ip addr add 10.0.4.1/24 dev vp-c-w
+ip netns exec perf_client_ns ip addr add 10.0.4.1/24 dev client-veth
 ip netns exec perf_client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec perf_client_ns ip link set vp-c up
-ip netns exec perf_client_ns ip link set vp-c-w mtu 1280 up
+ip netns exec perf_client_ns ip link set client-veth mtu 1280 up
 ip netns exec perf_client_ns ip link set lo up
 ip netns exec perf_client_ns ip route add default via 10.0.1.1
 ip netns exec perf_client_ns ip route add 10.0.0.1/32 dev lo
@@ -163,9 +159,9 @@ ip netns exec perf_router_ns sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/n
 
 ip netns exec perf_server_ns ethtool -K vp-s tx off rx off 2>/dev/null || true
 ip netns exec perf_server_ns ethtool -K vp-s-w1 tx off rx off 2>/dev/null || true
-ip netns exec perf_server_ns ethtool -K vp-s-w2 tx off rx off 2>/dev/null || true
+ip netns exec perf_server_ns ethtool -K server-veth tx off rx off 2>/dev/null || true
 ip netns exec perf_client_ns ethtool -K vp-c tx off rx off 2>/dev/null || true
-ip netns exec perf_client_ns ethtool -K vp-c-w tx off rx off 2>/dev/null || true
+ip netns exec perf_client_ns ethtool -K client-veth tx off rx off 2>/dev/null || true
 ip netns exec perf_work_ns ethtool -K vp-w tx off rx off 2>/dev/null || true
 ip netns exec perf_router_ns ethtool -K vp-rs tx off rx off 2>/dev/null || true
 ip netns exec perf_router_ns ethtool -K vp-rc tx off rx off 2>/dev/null || true
@@ -181,7 +177,7 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 ip netns exec perf_server_ns python3 -m http.server 8080 --bind 10.0.0.1 --directory "$ARTIFACT_DIR" > "$ARTIFACT_DIR/http.log" 2>&1 &
 HTTP_PID=$!
-ip netns exec perf_client_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/client_perf.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
+ip netns exec perf_client_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/client.conf" > "$ARTIFACT_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 sleep 3
 if ! kill -0 "$CLIENT_PID" 2>/dev/null; then

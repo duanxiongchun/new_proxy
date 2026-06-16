@@ -262,16 +262,15 @@ impl Datapath for TunDatapath {
                 }
             };
 
-            let listen_control_port = self
+            let listen_port = self
                 .config
                 .interface
-                .listen_control_port
-                .or(self.config.interface.listen_port)
-                .expect("Server config validation failed to enforce control port");
+                .listen_port
+                .expect("Server config validation failed to enforce listen port");
 
             // 启动用户态独立公网控制通道协商服务器 (传递动态 peer_secrets 哈希表)
             let control_server = ControlServer::new(
-                listen_control_port,
+                listen_port,
                 self.peer_secrets.clone(),
                 self.config.quic_pool.listen_ports.clone(),
                 self.config.quic_pool.public_ipv4.clone(),
@@ -612,7 +611,6 @@ mod tests {
                 addresses: vec!["10.0.0.2/24".parse().unwrap()],
                 listen_port: None,
                 wg_listen_port: None,
-                listen_control_port: None,
                 mtu: 1400,
                 table: None,
                 pre_script: None,

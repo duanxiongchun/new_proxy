@@ -50,7 +50,6 @@ cat > "$ARTIFACT_DIR/ft_server.conf" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.30.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 Table = off
 
 [QUICPool]
@@ -72,7 +71,6 @@ Table = auto
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.20.2.2:51820
-ProxyPort = 51821
 AllowedIPs = 0.0.0.0/0
 EOF_CONF
 
@@ -195,7 +193,7 @@ replace_output="$(ip netns exec ft_client_ns "$ROOT_DIR/target/debug/new-proxy-c
   "${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}" \
   "0.0.0.0/0" \
   "10.20.2.2:51820" \
-  "51821")"
+  "51820")"
 echo "$replace_output"
 if ! grep -q "Peer added successfully" <<<"$replace_output"; then
   echo "Expected dynamic full-tunnel peer replacement to succeed"

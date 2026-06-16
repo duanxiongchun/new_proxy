@@ -52,9 +52,9 @@ ip link set vp-rs netns profile_router_ns
 ip link add vp-c type veth peer name vp-rc
 ip link set vp-c netns profile_client_ns
 ip link set vp-rc netns profile_router_ns
-ip link add vp-w type veth peer name vp-cw
+ip link add vp-w type veth peer name client-veth
 ip link set vp-w netns profile_work_ns
-ip link set vp-cw netns profile_client_ns
+ip link set client-veth netns profile_client_ns
 
 # Configure Server NS
 ip netns exec profile_server_ns ip addr add 10.0.2.2/24 dev vp-s
@@ -63,23 +63,23 @@ ip netns exec profile_server_ns ip link set lo up
 ip netns exec profile_server_ns ip route add default via 10.0.2.1
 
 # Configure Server Inner Virtual Interface
-ip link add vp-s-w1 type veth peer name vp-s-w2
+ip link add vp-s-w1 type veth peer name server-veth
 ip link set vp-s-w1 address 00:00:00:00:00:11
-ip link set vp-s-w2 address 00:00:00:00:00:22
+ip link set server-veth address 00:00:00:00:00:22
 ip link set vp-s-w1 netns profile_server_ns
-ip link set vp-s-w2 netns profile_server_ns
+ip link set server-veth netns profile_server_ns
 ip netns exec profile_server_ns ip addr add 10.0.0.1/24 dev vp-s-w1
 ip netns exec profile_server_ns ip link set vp-s-w1 mtu 1420 up
-ip netns exec profile_server_ns ip link set vp-s-w2 mtu 1420 up
+ip netns exec profile_server_ns ip link set server-veth mtu 1420 up
 ip netns exec profile_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vp-s-w1
 ip netns exec profile_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vp-s-w1
 
 # Configure Client NS
 ip netns exec profile_client_ns ip addr add 10.0.1.2/24 dev vp-c
-ip netns exec profile_client_ns ip addr add 10.0.4.1/24 dev vp-cw
+ip netns exec profile_client_ns ip addr add 10.0.4.1/24 dev client-veth
 ip netns exec profile_client_ns ip addr add 10.0.0.2/32 dev lo
 ip netns exec profile_client_ns ip link set vp-c up
-ip netns exec profile_client_ns ip link set vp-cw mtu 1420 up
+ip netns exec profile_client_ns ip link set client-veth mtu 1420 up
 ip netns exec profile_client_ns ip link set lo up
 ip netns exec profile_client_ns ip route add default via 10.0.1.1
 ip netns exec profile_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -109,9 +109,9 @@ done
 # Disable checksum/GRO offloads on veth interfaces
 ip netns exec profile_server_ns ethtool -K vp-s tx off rx off 2>/dev/null || true
 ip netns exec profile_server_ns ethtool -K vp-s-w1 tx off rx off 2>/dev/null || true
-ip netns exec profile_server_ns ethtool -K vp-s-w2 tx off rx off 2>/dev/null || true
+ip netns exec profile_server_ns ethtool -K server-veth tx off rx off 2>/dev/null || true
 ip netns exec profile_client_ns ethtool -K vp-c tx off rx off 2>/dev/null || true
-ip netns exec profile_client_ns ethtool -K vp-cw tx off rx off 2>/dev/null || true
+ip netns exec profile_client_ns ethtool -K client-veth tx off rx off 2>/dev/null || true
 ip netns exec profile_work_ns ethtool -K vp-w tx off rx off 2>/dev/null || true
 ip netns exec profile_router_ns ethtool -K vp-rs tx off rx off 2>/dev/null || true
 ip netns exec profile_router_ns ethtool -K vp-rc tx off rx off 2>/dev/null || true
@@ -122,7 +122,6 @@ cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 MTU = 1420
 Table = off
 Mode = af_xdp
@@ -137,7 +136,6 @@ AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 
 [XDP]
 QuicInterface = vp-s
-InterceptInterfaces = vp-s-w2
 XdpMode = native
 EOF_CONF
 
@@ -152,12 +150,10 @@ Mode = af_xdp
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 
 [XDP]
 QuicInterface = vp-c
-InterceptInterfaces = vp-cw, lo
 XdpMode = native
 EOF_CONF
 
