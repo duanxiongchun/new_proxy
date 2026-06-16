@@ -129,7 +129,7 @@ for test_name in "${TESTS[@]}"; do
   if timeout --kill-after=10s 300s sudo -E bash "script/acceptance/${test_name}.sh"; then
     RESULTS["$test_name"]="PASS"
   else
-    local exit_status=$?
+    exit_status=$?
     if [ $exit_status -eq 124 ]; then
       echo "❌ [TIMEOUT] E2E Test $test_name timed out after 300 seconds (5 minutes)!" >&2
       RESULTS["$test_name"]="TIMEOUT"
