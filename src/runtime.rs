@@ -1,5 +1,5 @@
-use crate::app_config::quic_interface_name;
-use crate::config::{GatewayConfig, PeerConfig};
+use crate::app_config::{quic_interface_name, wg_interface_name};
+use crate::config::{GatewayConfig, PeerConfig, PeerType};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct CommandSpec {
@@ -223,7 +223,7 @@ pub fn setup_routes(config: &GatewayConfig, interface_name: &str) -> Result<(), 
         run_command_best_effort(command.program, &command.args);
     }
 
-    for command in setup_route_commands(config, &quic_name) {
+    for command in setup_route_commands(config, interface_name) {
         run_command_checked(command.program, &command.args)?;
     }
 
@@ -236,22 +236,34 @@ pub fn setup_routes(_config: &GatewayConfig, _interface_name: &str) -> Result<()
 }
 
 #[cfg(not(tarpaulin))]
-pub fn setup_peer_routes(peer: &PeerConfig, interface_name: &str) -> Result<(), String> {
-    for command in setup_peer_route_commands(peer, interface_name) {
+pub fn setup_peer_routes(
+    peer: &PeerConfig,
+    interface_name: &str,
+    mode: &str,
+) -> Result<(), String> {
+    for command in setup_peer_route_commands(peer, interface_name, mode) {
         run_command_checked(command.program, &command.args)?;
     }
     Ok(())
 }
 
 #[cfg(tarpaulin)]
-pub fn setup_peer_routes(_peer: &PeerConfig, _interface_name: &str) -> Result<(), String> {
+pub fn setup_peer_routes(
+    _peer: &PeerConfig,
+    _interface_name: &str,
+    _mode: &str,
+) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(not(tarpaulin))]
-pub fn cleanup_peer_routes(peer: &PeerConfig, interface_name: &str) -> Result<(), String> {
+pub fn cleanup_peer_routes(
+    peer: &PeerConfig,
+    interface_name: &str,
+    mode: &str,
+) -> Result<(), String> {
     let mut errors = Vec::new();
-    for command in cleanup_peer_route_commands(peer, interface_name) {
+    for command in cleanup_peer_route_commands(peer, interface_name, mode) {
         if let Err(e) = run_command_checked(command.program, &command.args) {
             errors.push(e);
         }
@@ -264,7 +276,11 @@ pub fn cleanup_peer_routes(peer: &PeerConfig, interface_name: &str) -> Result<()
 }
 
 #[cfg(tarpaulin)]
-pub fn cleanup_peer_routes(_peer: &PeerConfig, _interface_name: &str) -> Result<(), String> {
+pub fn cleanup_peer_routes(
+    _peer: &PeerConfig,
+    _interface_name: &str,
+    _mode: &str,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -299,7 +315,7 @@ fn cleanup_routes(config: &GatewayConfig, interface_name: &str) {
 
     log::info!("Cleaning up userspace routing for interface: {}", quic_name);
 
-    for command in cleanup_route_commands(config, &quic_name) {
+    for command in cleanup_route_commands(config, interface_name) {
         run_command_best_effort(command.program, &command.args);
     }
 }
@@ -319,6 +335,8 @@ fn setup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<Com
         return commands;
     }
 
+    let quic_name = quic_interface_name(interface_name, &config.interface.mode);
+
     for addr in &config.interface.addresses {
         commands.push(CommandSpec::new(
             "ip",
@@ -327,7 +345,7 @@ fn setup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<Com
                 "replace".to_string(),
                 addr.to_string(),
                 "dev".to_string(),
-                interface_name.to_string(),
+                quic_name.clone(),
             ],
         ));
     }
@@ -337,7 +355,7 @@ fn setup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<Com
         vec![
             "link".to_string(),
             "set".to_string(),
-            interface_name.to_string(),
+            quic_name.clone(),
             "up".to_string(),
             "mtu".to_string(),
             config.interface.mtu.to_string(),
@@ -347,14 +365,28 @@ fn setup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<Com
     ));
 
     for peer in &config.peers {
-        commands.extend(setup_peer_route_commands(peer, interface_name));
+        commands.extend(setup_peer_route_commands(
+            peer,
+            interface_name,
+            &config.interface.mode,
+        ));
     }
     commands.extend(setup_policy_rule_commands(config));
 
     commands
 }
 
-fn setup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<CommandSpec> {
+fn setup_peer_route_commands(
+    peer: &PeerConfig,
+    interface_name: &str,
+    mode: &str,
+) -> Vec<CommandSpec> {
+    let quic_name = quic_interface_name(interface_name, mode);
+    let wg_name = wg_interface_name(interface_name);
+    let dev_name = match peer.r#type {
+        PeerType::Quic => quic_name,
+        PeerType::Wireguard => wg_name,
+    };
     peer.allowed_ips
         .iter()
         .map(|allowed_ip| {
@@ -366,7 +398,7 @@ fn setup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<Com
                         "replace".to_string(),
                         allowed_ip.to_string(),
                         "dev".to_string(),
-                        interface_name.to_string(),
+                        dev_name.clone(),
                         "table".to_string(),
                         crate::socket_mark::ROUTING_TABLE.to_string(),
                     ],
@@ -380,7 +412,7 @@ fn setup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<Com
                         "replace".to_string(),
                         allowed_ip.to_string(),
                         "dev".to_string(),
-                        interface_name.to_string(),
+                        dev_name.clone(),
                         "table".to_string(),
                         crate::socket_mark::ROUTING_TABLE.to_string(),
                     ],
@@ -489,9 +521,14 @@ fn policy_rule_command(ipv6: bool, op: &str) -> CommandSpec {
 
 fn cleanup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<CommandSpec> {
     let mut commands = Vec::new();
+    let quic_name = quic_interface_name(interface_name, &config.interface.mode);
     if !table_is_off(config) {
         for peer in &config.peers {
-            commands.extend(cleanup_peer_route_commands(peer, interface_name));
+            commands.extend(cleanup_peer_route_commands(
+                peer,
+                interface_name,
+                &config.interface.mode,
+            ));
         }
         commands.extend(flush_policy_table_commands(config));
         commands.extend(cleanup_policy_rule_commands(config));
@@ -504,17 +541,27 @@ fn cleanup_route_commands(config: &GatewayConfig, interface_name: &str) -> Vec<C
                     "del".to_string(),
                     addr.to_string(),
                     "dev".to_string(),
-                    interface_name.to_string(),
+                    quic_name.clone(),
                 ],
             ));
         }
     }
 
-    commands.push(tun_link_delete_command(interface_name));
+    commands.push(tun_link_delete_command(&quic_name));
     commands
 }
 
-fn cleanup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<CommandSpec> {
+fn cleanup_peer_route_commands(
+    peer: &PeerConfig,
+    interface_name: &str,
+    mode: &str,
+) -> Vec<CommandSpec> {
+    let quic_name = quic_interface_name(interface_name, mode);
+    let wg_name = wg_interface_name(interface_name);
+    let dev_name = match peer.r#type {
+        PeerType::Quic => quic_name,
+        PeerType::Wireguard => wg_name,
+    };
     peer.allowed_ips
         .iter()
         .map(|allowed_ip| {
@@ -526,7 +573,7 @@ fn cleanup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<C
                         "del".to_string(),
                         allowed_ip.to_string(),
                         "dev".to_string(),
-                        interface_name.to_string(),
+                        dev_name.clone(),
                         "table".to_string(),
                         crate::socket_mark::ROUTING_TABLE.to_string(),
                     ],
@@ -540,7 +587,7 @@ fn cleanup_peer_route_commands(peer: &PeerConfig, interface_name: &str) -> Vec<C
                         "del".to_string(),
                         allowed_ip.to_string(),
                         "dev".to_string(),
-                        interface_name.to_string(),
+                        dev_name.clone(),
                         "table".to_string(),
                         crate::socket_mark::ROUTING_TABLE.to_string(),
                     ],
@@ -672,6 +719,9 @@ mod tests {
         ];
         config.interface.mtu = 1280;
         config.peers = vec![peer_with_allowed_ips(&["10.10.0.0/16", "fd10::/64"])];
+        let mut wg_peer = peer_with_allowed_ips(&["10.20.0.0/16", "fd20::/64"]);
+        wg_peer.r#type = PeerType::Wireguard;
+        config.peers.push(wg_peer);
 
         let commands = setup_route_commands(&config, "np0");
 
@@ -680,14 +730,14 @@ mod tests {
             vec![
                 CommandSpec::new(
                     "ip",
-                    vec!["addr", "replace", "10.0.0.2/24", "dev", "np0"]
+                    vec!["addr", "replace", "10.0.0.2/24", "dev", "np0-tun"]
                         .into_iter()
                         .map(str::to_string)
                         .collect()
                 ),
                 CommandSpec::new(
                     "ip",
-                    vec!["addr", "replace", "fd00::2/64", "dev", "np0"]
+                    vec!["addr", "replace", "fd00::2/64", "dev", "np0-tun"]
                         .into_iter()
                         .map(str::to_string)
                         .collect()
@@ -697,7 +747,7 @@ mod tests {
                     vec![
                         "link",
                         "set",
-                        "np0",
+                        "np0-tun",
                         "up",
                         "mtu",
                         "1280",
@@ -715,7 +765,7 @@ mod tests {
                         "replace",
                         "10.10.0.0/16",
                         "dev",
-                        "np0",
+                        "np0-tun",
                         "table",
                         &crate::socket_mark::ROUTING_TABLE.to_string(),
                     ]
@@ -731,7 +781,38 @@ mod tests {
                         "replace",
                         "fd10::/64",
                         "dev",
-                        "np0",
+                        "np0-tun",
+                        "table",
+                        &crate::socket_mark::ROUTING_TABLE.to_string(),
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec![
+                        "route",
+                        "replace",
+                        "10.20.0.0/16",
+                        "dev",
+                        "np0-wg",
+                        "table",
+                        &crate::socket_mark::ROUTING_TABLE.to_string(),
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec![
+                        "-6",
+                        "route",
+                        "replace",
+                        "fd20::/64",
+                        "dev",
+                        "np0-wg",
                         "table",
                         &crate::socket_mark::ROUTING_TABLE.to_string(),
                     ]
@@ -764,7 +845,7 @@ mod tests {
             cleanup_route_commands(&config, "np0"),
             vec![CommandSpec::new(
                 "ip",
-                vec!["link", "delete", "np0"]
+                vec!["link", "delete", "np0-tun"]
                     .into_iter()
                     .map(str::to_string)
                     .collect()
@@ -776,6 +857,9 @@ mod tests {
     fn cleanup_route_commands_delete_peer_routes_addresses_and_link() {
         let mut config = config_with_table(None);
         config.peers = vec![peer_with_allowed_ips(&["10.10.0.0/16", "fd10::/64"])];
+        let mut wg_peer = peer_with_allowed_ips(&["10.20.0.0/16", "fd20::/64"]);
+        wg_peer.r#type = PeerType::Wireguard;
+        config.peers.push(wg_peer);
 
         let commands = cleanup_route_commands(&config, "np0");
 
@@ -789,7 +873,7 @@ mod tests {
                         "del",
                         "10.10.0.0/16",
                         "dev",
-                        "np0",
+                        "np0-tun",
                         "table",
                         &crate::socket_mark::ROUTING_TABLE.to_string(),
                     ]
@@ -805,7 +889,38 @@ mod tests {
                         "del",
                         "fd10::/64",
                         "dev",
-                        "np0",
+                        "np0-tun",
+                        "table",
+                        &crate::socket_mark::ROUTING_TABLE.to_string(),
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec![
+                        "route",
+                        "del",
+                        "10.20.0.0/16",
+                        "dev",
+                        "np0-wg",
+                        "table",
+                        &crate::socket_mark::ROUTING_TABLE.to_string(),
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+                ),
+                CommandSpec::new(
+                    "ip",
+                    vec![
+                        "-6",
+                        "route",
+                        "del",
+                        "fd20::/64",
+                        "dev",
+                        "np0-wg",
                         "table",
                         &crate::socket_mark::ROUTING_TABLE.to_string(),
                     ]
@@ -821,14 +936,14 @@ mod tests {
                 main_suppress_rule_command(true, "del"),
                 CommandSpec::new(
                     "ip",
-                    vec!["addr", "del", "10.0.0.2/24", "dev", "np0"]
+                    vec!["addr", "del", "10.0.0.2/24", "dev", "np0-tun"]
                         .into_iter()
                         .map(str::to_string)
                         .collect()
                 ),
                 CommandSpec::new(
                     "ip",
-                    vec!["link", "delete", "np0"]
+                    vec!["link", "delete", "np0-tun"]
                         .into_iter()
                         .map(str::to_string)
                         .collect()

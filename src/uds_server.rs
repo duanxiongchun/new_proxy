@@ -869,7 +869,8 @@ async fn setup_peer_routes_for_context(
     peer: config::PeerConfig,
 ) -> Result<(), String> {
     let interface_name = context.interface_name.clone();
-    run_blocking_command(move || setup_peer_routes(&peer, &interface_name)).await
+    let mode = context.state.read().config.interface.mode.clone();
+    run_blocking_command(move || setup_peer_routes(&peer, &interface_name, &mode)).await
 }
 
 async fn cleanup_peer_routes_for_context(
@@ -877,7 +878,8 @@ async fn cleanup_peer_routes_for_context(
     peer: config::PeerConfig,
 ) -> Result<(), String> {
     let interface_name = context.interface_name.clone();
-    run_blocking_command(move || cleanup_peer_routes(&peer, &interface_name)).await
+    let mode = context.state.read().config.interface.mode.clone();
+    run_blocking_command(move || cleanup_peer_routes(&peer, &interface_name, &mode)).await
 }
 
 async fn rollback_peer_routes(
