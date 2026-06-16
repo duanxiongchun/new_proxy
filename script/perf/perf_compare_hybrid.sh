@@ -106,9 +106,9 @@ setup_common_namespaces() {
   ip link set vp-c netns perf_client_ns
   ip link set vp-rc netns perf_router_ns
 
-  ip link add vp-w type veth peer name vp-c-w
+  ip link add vp-w type veth peer name client_xdp-veth
   ip link set vp-w netns perf_work_ns
-  ip link set vp-c-w netns perf_client_ns
+  ip link set client_xdp-veth netns perf_client_ns
 
   # Server NS Physical Link
   ip netns exec perf_server_ns ip addr add 10.0.2.2/24 dev vp-s
@@ -118,9 +118,9 @@ setup_common_namespaces() {
 
   # Client NS Physical Links
   ip netns exec perf_client_ns ip addr add 10.0.1.2/24 dev vp-c
-  ip netns exec perf_client_ns ip addr add 10.0.4.1/24 dev vp-c-w
+  ip netns exec perf_client_ns ip addr add 10.0.4.1/24 dev client_xdp-veth
   ip netns exec perf_client_ns ip link set vp-c up
-  ip netns exec perf_client_ns ip link set vp-c-w up
+  ip netns exec perf_client_ns ip link set client_xdp-veth up
   ip netns exec perf_client_ns ip link set lo up
   ip netns exec perf_client_ns ip route add default via 10.0.1.1
   ip netns exec perf_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -296,7 +296,6 @@ cat > "$ARTIFACT_DIR/server_tun.conf" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 MTU = 1420
 Table = auto
 
@@ -319,7 +318,6 @@ Table = auto
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 EOF_CONF
 
@@ -342,14 +340,14 @@ echo "=== [3/3] Benchmarking QUIC XDP Mode ==="
 setup_common_namespaces
 
 # Build veth links for server-side XDP intercept (like perf_smoke_xdp.sh)
-ip link add vp-s-w1 type veth peer name vp-s-w2
+ip link add vp-s-w1 type veth peer name server_xdp-veth
 ip link set vp-s-w1 address 00:00:00:00:00:11
-ip link set vp-s-w2 address 00:00:00:00:00:22
+ip link set server_xdp-veth address 00:00:00:00:00:22
 ip link set vp-s-w1 netns perf_server_ns
-ip link set vp-s-w2 netns perf_server_ns
+ip link set server_xdp-veth netns perf_server_ns
 ip netns exec perf_server_ns ip addr add 10.0.0.1/24 dev vp-s-w1
 ip netns exec perf_server_ns ip link set vp-s-w1 mtu 1420 up
-ip netns exec perf_server_ns ip link set vp-s-w2 mtu 1420 up
+ip netns exec perf_server_ns ip link set server_xdp-veth mtu 1420 up
 ip netns exec perf_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vp-s-w1
 ip netns exec perf_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vp-s-w1
 
@@ -364,9 +362,9 @@ done
 
 ip netns exec perf_server_ns ethtool -K vp-s tx off rx off 2>/dev/null || true
 ip netns exec perf_server_ns ethtool -K vp-s-w1 tx off rx off 2>/dev/null || true
-ip netns exec perf_server_ns ethtool -K vp-s-w2 tx off rx off 2>/dev/null || true
+ip netns exec perf_server_ns ethtool -K server_xdp-veth tx off rx off 2>/dev/null || true
 ip netns exec perf_client_ns ethtool -K vp-c tx off rx off 2>/dev/null || true
-ip netns exec perf_client_ns ethtool -K vp-c-w tx off rx off 2>/dev/null || true
+ip netns exec perf_client_ns ethtool -K client_xdp-veth tx off rx off 2>/dev/null || true
 ip netns exec perf_work_ns ethtool -K vp-w tx off rx off 2>/dev/null || true
 ip netns exec perf_router_ns ethtool -K vp-rs tx off rx off 2>/dev/null || true
 ip netns exec perf_router_ns ethtool -K vp-rc tx off rx off 2>/dev/null || true
@@ -376,7 +374,6 @@ cat > "$ARTIFACT_DIR/server_xdp.conf" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 MTU = 1420
 Table = off
 Mode = af_xdp
@@ -391,7 +388,6 @@ AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 
 [XDP]
 QuicInterface = vp-s
-InterceptInterfaces = vp-s-w2
 XdpMode = native
 EOF_CONF
 
@@ -406,12 +402,10 @@ Mode = af_xdp
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 
 [XDP]
 QuicInterface = vp-c
-InterceptInterfaces = vp-c-w, lo
 XdpMode = native
 EOF_CONF
 

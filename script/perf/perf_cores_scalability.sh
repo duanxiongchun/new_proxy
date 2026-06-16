@@ -156,7 +156,6 @@ Table = auto
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 EOF_CONF
 
@@ -170,7 +169,6 @@ write_server_conf() {
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 MTU = 1420
 Table = auto
 

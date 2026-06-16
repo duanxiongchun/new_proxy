@@ -2374,11 +2374,7 @@ impl XdpDatapath {
             index
         };
 
-        let intercept_names = if config.xdp.intercept_interfaces.is_empty() {
-            vec![quic_interface_name(&interface_name, &config.interface.mode)]
-        } else {
-            config.xdp.intercept_interfaces.clone()
-        };
+        let intercept_names = vec![quic_interface_name(&interface_name, &config.interface.mode)];
 
         let mut intercept_ifindexes = Vec::new();
         for ifname in &intercept_names {
@@ -2530,15 +2526,14 @@ impl Datapath for XdpDatapath {
                 }
             };
 
-            let listen_control_port = self
+            let listen_port = self
                 .config
                 .interface
-                .listen_control_port
-                .or(self.config.interface.listen_port)
-                .expect("Server config validation failed to enforce control port");
+                .listen_port
+                .expect("Server config validation failed to enforce listen port");
 
             let control_server = ControlServer::new(
-                listen_control_port,
+                listen_port,
                 self.peer_secrets.clone(),
                 self.config.quic_pool.listen_ports.clone(),
                 self.config.quic_pool.public_ipv4.clone(),
@@ -2991,7 +2986,6 @@ mod tests {
                 addresses: vec!["10.0.0.1/24".parse().unwrap()],
                 listen_port: Some(40000),
                 wg_listen_port: None,
-                listen_control_port: Some(40001),
                 mtu: 1400,
                 table: None,
                 pre_script: None,
@@ -3006,7 +3000,6 @@ mod tests {
             },
             xdp: XdpConfig {
                 quic_interface: Some("non_existent_dev_abc".to_string()),
-                intercept_interfaces: vec!["lo".to_string()],
                 xdp_mode: "native".to_string(),
             },
         }

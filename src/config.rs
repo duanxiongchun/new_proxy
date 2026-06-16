@@ -14,7 +14,6 @@ pub struct InterfaceConfig {
     pub addresses: Vec<IpNet>,
     pub listen_port: Option<u16>,
     pub wg_listen_port: Option<u16>,
-    pub listen_control_port: Option<u16>,
     pub mtu: u16,
     pub table: Option<String>,
     pub pre_script: Option<String>,
@@ -25,7 +24,6 @@ pub struct InterfaceConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct XdpConfig {
     pub quic_interface: Option<String>,
-    pub intercept_interfaces: Vec<String>,
     pub xdp_mode: String,
 }
 
@@ -33,7 +31,6 @@ impl Default for XdpConfig {
     fn default() -> Self {
         Self {
             quic_interface: None,
-            intercept_interfaces: Vec::new(),
             xdp_mode: "native".to_string(),
         }
     }
@@ -171,14 +168,6 @@ impl GatewayConfig {
             })
             .transpose()?;
 
-        let listen_control_port = interface_section
-            .get("ListenControlPort")
-            .map(|s| {
-                s.parse::<u16>()
-                    .map_err(|e| format!("Invalid ListenControlPort: {}", e))
-            })
-            .transpose()?;
-
         let wg_listen_port = interface_section
             .get("WgListenPort")
             .or_else(|| interface_section.get("wg_listen_port"))
@@ -221,7 +210,6 @@ impl GatewayConfig {
             addresses,
             listen_port,
             wg_listen_port,
-            listen_control_port,
             mtu,
             table,
             pre_script,
@@ -317,20 +305,6 @@ impl GatewayConfig {
             .and_then(|s| s.get("QuicInterface").or_else(|| s.get("quic_interface")))
             .map(|v| v.trim().to_string());
 
-        let intercept_interfaces = xdp_section
-            .and_then(|s| {
-                s.get("InterceptInterfaces")
-                    .or_else(|| s.get("intercept_interfaces"))
-            })
-            .map(|interfaces_str| {
-                interfaces_str
-                    .split(',')
-                    .map(|p| p.trim().to_string())
-                    .filter(|p| !p.is_empty())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
-
         let xdp_mode = xdp_section
             .and_then(|s| s.get("XdpMode").or_else(|| s.get("xdp_mode")))
             .map(|v| v.trim().to_string())
@@ -338,7 +312,6 @@ impl GatewayConfig {
 
         let xdp = XdpConfig {
             quic_interface,
-            intercept_interfaces,
             xdp_mode,
         };
 
@@ -416,7 +389,6 @@ mod tests {
 PrivateKey = {key}
 Address = 10.0.0.1/24, fd00::1/64
 ListenPort = 51820
-ListenControlPort = 51821
 MTU = 1280
 
 [Peer]
@@ -436,7 +408,6 @@ ListenPorts = 40001, 40002
         let config = GatewayConfig::load_from_file(path).unwrap();
         assert_eq!(config.interface.listen_port, Some(51820));
         assert_eq!(config.interface.wg_listen_port, None);
-        assert_eq!(config.interface.listen_control_port, Some(51821));
         assert_eq!(config.interface.mtu, 1280);
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].proxy_port, Some(40001));
@@ -593,7 +564,6 @@ Mode = af_xdp
 
 [XDP]
 QuicInterface = eth0
-InterceptInterfaces = eth0, lo
 XdpMode = native
 "#,
             key
@@ -601,10 +571,6 @@ XdpMode = native
         let gateway_conf = GatewayConfig::load_from_str(&conf).unwrap();
         assert_eq!(gateway_conf.interface.mode, "af_xdp");
         assert_eq!(gateway_conf.xdp.quic_interface, Some("eth0".to_string()));
-        assert_eq!(
-            gateway_conf.xdp.intercept_interfaces,
-            vec!["eth0".to_string(), "lo".to_string()]
-        );
         assert_eq!(gateway_conf.xdp.xdp_mode, "native");
     }
 }

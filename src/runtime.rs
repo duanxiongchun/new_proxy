@@ -826,7 +826,6 @@ mod tests {
                 addresses: vec!["10.0.0.2/24".parse().unwrap()],
                 listen_port: None,
                 wg_listen_port: None,
-                listen_control_port: None,
                 mtu: 1400,
                 table: table.map(str::to_string),
                 pre_script: None,

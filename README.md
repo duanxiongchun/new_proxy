@@ -1,4 +1,4 @@
-﻿# new_proxy
+# new_proxy
 
 `new_proxy` 是一个高性能纯 L3 IP-over-QUIC Datagram 异步隧道安全网关。所有数据流量（TCP, UDP, ICMP）均被无状态、零额外分流处理地封装进 QUIC Datagram 报文进行公网加密传输。依托 Linux 多队列 TUN 网卡与对称多核绑定哈希设计，实现无全局锁竞争的高并发 RTC 转发流，彻底消除 TCP-over-TCP 的队头阻塞及拥塞崩溃瓶颈。
 
@@ -102,7 +102,6 @@ target/release/new-proxy-cli
 #### AF_XDP 相关配置
 当 `Mode = af_xdp` 时，必须在配置文件中指定 `[XDP]` 选项段：
 * **`QuicInterface`**：指定运行外层 QUIC 加密隧道的物理/虚拟网卡接口名（如 `eth0`）。
-* **`InterceptInterfaces`**：逗号分隔的接口列表，指定需要挂载 eBPF 程序以截获本地业务流量的接口名（如 `eth0, lo`）。
 * **`XdpMode`**（`native` / `skb` / `driver`，默认 `native`）：eBPF 程序的加载模式。在虚拟测试环境（如 `veth`）或网卡不支持 native 模式时，可使用 `skb` 模式（Generic XDP）。
 
 

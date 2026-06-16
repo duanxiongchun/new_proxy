@@ -149,19 +149,11 @@ fn ipnets_overlap(a: ipnet::IpNet, b: ipnet::IpNet) -> bool {
 }
 
 pub fn determine_runtime_mode(config: &GatewayConfig) -> Result<RuntimeMode, String> {
-    let server_mode =
-        config.interface.listen_control_port.is_some() || !config.quic_pool.listen_ports.is_empty();
+    let server_mode = !config.quic_pool.listen_ports.is_empty();
     if server_mode {
-        if config.interface.listen_control_port.is_none() && config.interface.listen_port.is_none()
-        {
+        if config.interface.listen_port.is_none() {
             return Err(
-                "Invalid server config: Either ListenControlPort or ListenPort must be set when QUICPool.ListenPorts is set"
-                    .to_string(),
-            );
-        }
-        if config.quic_pool.listen_ports.is_empty() {
-            return Err(
-                "Invalid server config: QUICPool.ListenPorts must contain at least one port"
+                "Invalid server config: ListenPort must be set when QUICPool.ListenPorts is set"
                     .to_string(),
             );
         }
@@ -248,7 +240,6 @@ mod tests {
                 addresses: vec!["10.0.0.2/24".parse().unwrap()],
                 listen_port: None,
                 wg_listen_port: None,
-                listen_control_port: None,
                 mtu: 1400,
                 table: None,
                 pre_script: None,
@@ -364,17 +355,15 @@ mod tests {
             .contains("Invalid Table value"));
 
         config.interface.table = None;
-        config.interface.listen_control_port = Some(51820);
-        assert!(determine_runtime_mode(&config)
-            .unwrap_err()
-            .contains("QUICPool.ListenPorts must contain at least one port"));
+        config.interface.listen_port = Some(51820);
+        config.quic_pool.listen_ports = vec![];
+        assert!(determine_runtime_mode(&config).is_ok()); // client mode with peer
 
-        config.interface.listen_control_port = None;
         config.interface.listen_port = None;
         config.quic_pool.listen_ports = vec![40001];
         assert!(determine_runtime_mode(&config)
             .unwrap_err()
-            .contains("Either ListenControlPort or ListenPort must be set"));
+            .contains("ListenPort must be set when QUICPool.ListenPorts is set"));
     }
 
     #[test]
@@ -383,9 +372,8 @@ mod tests {
             interface: InterfaceConfig {
                 private_key: [1u8; 32],
                 addresses: vec!["10.0.0.1/24".parse().unwrap()],
-                listen_port: None,
+                listen_port: Some(51820),
                 wg_listen_port: None,
-                listen_control_port: Some(51820),
                 mtu: 1400,
                 table: None,
                 pre_script: None,

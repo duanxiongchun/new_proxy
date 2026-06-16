@@ -49,7 +49,6 @@ cat > "$ARTIFACT_DIR/server.conf" <<EOF_CONF
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 Table = off
 
 [QUICPool]
@@ -160,7 +159,7 @@ add_output="$(ip netns exec dyn_client_ns "$ROOT_DIR/target/debug/new-proxy-cli"
   "${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}" \
   "10.0.0.1/32" \
   "10.0.2.2:51820" \
-  "51821")"
+  "51820")"
 echo "$add_output"
 if ! grep -q "Peer added successfully" <<<"$add_output"; then
   echo "Dynamic add-peer failed"

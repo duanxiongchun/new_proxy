@@ -163,12 +163,10 @@ Mode = af_xdp
 [Peer]
 PublicKey = ${NEW_PROXY_TEST_SERVER_PUBLIC_KEY}
 Endpoint = 10.0.2.2:51820
-ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 
 [XDP]
 QuicInterface = vs-c
-InterceptInterfaces = vs-cw, lo
 XdpMode = native
 EOF_CONF
 
@@ -182,7 +180,6 @@ write_server_conf() {
 PrivateKey = ${NEW_PROXY_TEST_SERVER_PRIVATE_KEY}
 Address = 10.0.0.1/24
 ListenPort = 51820
-ListenControlPort = 51821
 MTU = 1420
 Table = off
 Mode = af_xdp
@@ -197,7 +194,6 @@ AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
 
 [XDP]
 QuicInterface = vs-s
-InterceptInterfaces = vs-s-w2
 XdpMode = native
 EOF_CONF
 }
@@ -222,30 +218,30 @@ setup_topology() {
   ip link set vs-rc address 00:00:00:00:01:01
   ip link set vs-c netns scale_client_ns
   ip link set vs-rc netns scale_router_ns
-  ip link add vs-w numtxqueues "$nq" numrxqueues "$nq" type veth peer name vs-cw numtxqueues "$nq" numrxqueues "$nq"
+  ip link add vs-w numtxqueues "$nq" numrxqueues "$nq" type veth peer name client-veth numtxqueues "$nq" numrxqueues "$nq"
   ip link set vs-w netns scale_work_ns
-  ip link set vs-cw netns scale_client_ns
+  ip link set client-veth netns scale_client_ns
 
   ip netns exec scale_server_ns ip addr add 10.0.2.2/24 dev vs-s
   ip netns exec scale_server_ns ip link set vs-s up txqueuelen 10000
   ip netns exec scale_server_ns ip link set lo up
   ip netns exec scale_server_ns ip route add default via 10.0.2.1
 
-  ip link add vs-s-w1 numtxqueues "$nq" numrxqueues "$nq" type veth peer name vs-s-w2 numtxqueues "$nq" numrxqueues "$nq"
+  ip link add vs-s-w1 numtxqueues "$nq" numrxqueues "$nq" type veth peer name server-veth numtxqueues "$nq" numrxqueues "$nq"
   ip link set vs-s-w1 address 00:00:00:00:00:11
-  ip link set vs-s-w2 address 00:00:00:00:00:22
+  ip link set server-veth address 00:00:00:00:00:22
   ip link set vs-s-w1 netns scale_server_ns
-  ip link set vs-s-w2 netns scale_server_ns
+  ip link set server-veth netns scale_server_ns
   ip netns exec scale_server_ns ip addr add 10.0.0.1/24 dev vs-s-w1
   ip netns exec scale_server_ns ip link set vs-s-w1 mtu 1420 up txqueuelen 10000
-  ip netns exec scale_server_ns ip link set vs-s-w2 mtu 1420 up txqueuelen 10000
+  ip netns exec scale_server_ns ip link set server-veth mtu 1420 up txqueuelen 10000
   ip netns exec scale_server_ns ip neighbor add 10.0.0.2 lladdr 00:00:00:00:00:22 dev vs-s-w1
   ip netns exec scale_server_ns ip route add 10.0.4.0/24 via 10.0.0.2 dev vs-s-w1
 
   ip netns exec scale_client_ns ip addr add 10.0.1.2/24 dev vs-c
-  ip netns exec scale_client_ns ip addr add 10.0.4.1/24 dev vs-cw
+  ip netns exec scale_client_ns ip addr add 10.0.4.1/24 dev client-veth
   ip netns exec scale_client_ns ip link set vs-c up txqueuelen 10000
-  ip netns exec scale_client_ns ip link set vs-cw mtu 1420 up txqueuelen 10000
+  ip netns exec scale_client_ns ip link set client-veth mtu 1420 up txqueuelen 10000
   ip netns exec scale_client_ns ip link set lo up
   ip netns exec scale_client_ns ip route add default via 10.0.1.1
   ip netns exec scale_client_ns sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
@@ -285,9 +281,9 @@ setup_topology() {
   # Disable TX/RX checksum offloading (required for AF_XDP on veth interfaces)
   ip netns exec scale_server_ns ethtool -K vs-s tx off rx off >/dev/null 2>&1 || true
   ip netns exec scale_server_ns ethtool -K vs-s-w1 tx off rx off >/dev/null 2>&1 || true
-  ip netns exec scale_server_ns ethtool -K vs-s-w2 tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_server_ns ethtool -K server-veth tx off rx off >/dev/null 2>&1 || true
   ip netns exec scale_client_ns ethtool -K vs-c tx off rx off >/dev/null 2>&1 || true
-  ip netns exec scale_client_ns ethtool -K vs-cw tx off rx off >/dev/null 2>&1 || true
+  ip netns exec scale_client_ns ethtool -K client-veth tx off rx off >/dev/null 2>&1 || true
   ip netns exec scale_work_ns ethtool -K vs-w tx off rx off >/dev/null 2>&1 || true
   ip netns exec scale_router_ns ethtool -K vs-rs tx off rx off >/dev/null 2>&1 || true
   ip netns exec scale_router_ns ethtool -K vs-rc tx off rx off >/dev/null 2>&1 || true
@@ -311,7 +307,7 @@ run_group() {
   local server_cpus
   local loader_cpus="10-13"
   local target_cpus="14-15"
-  local server_conf="$ARTIFACT_DIR/server_${data_ports}.conf"
+  local server_conf="$ARTIFACT_DIR/server.conf"
   local server_log="$ARTIFACT_DIR/server_${data_ports}.log"
   local client_log="$ARTIFACT_DIR/client_${data_ports}.log"
   local worker_dump="$ARTIFACT_DIR/client_${data_ports}_dump.txt"

@@ -717,7 +717,6 @@ mod tests {
                 ],
                 listen_port: None,
                 wg_listen_port: None,
-                listen_control_port: None,
                 mtu: 1400,
                 table: None,
                 pre_script: None,

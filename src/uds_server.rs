@@ -985,7 +985,6 @@ mod tests {
                 addresses: vec![],
                 listen_port: Some(0),
                 wg_listen_port: None,
-                listen_control_port: Some(51820),
                 mtu: 1420,
                 table: None,
                 pre_script: None,
