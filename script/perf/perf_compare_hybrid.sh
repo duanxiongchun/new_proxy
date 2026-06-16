@@ -4,6 +4,29 @@
 # ==============================================================================
 set -euo pipefail
 
+PARALLEL="${PERF_PARALLEL:-1}"
+PIN_CPUS="${PERF_PIN_CPUS:-0}"
+
+SERVER_AFFINITY=""
+CLIENT_AFFINITY=""
+HTTP_AFFINITY=""
+LOADER_AFFINITY=""
+
+if [ "$PIN_CPUS" -ne 0 ]; then
+  CPU_COUNT=$(nproc)
+  if [ "$CPU_COUNT" -ge 4 ]; then
+    SERVER_AFFINITY="taskset -c 0"
+    CLIENT_AFFINITY="taskset -c 1"
+    HTTP_AFFINITY="taskset -c 2"
+    LOADER_AFFINITY="taskset -c 3"
+  else
+    SERVER_AFFINITY="taskset -c 0"
+    CLIENT_AFFINITY="taskset -c 0"
+    HTTP_AFFINITY="taskset -c $((CPU_COUNT - 1))"
+    LOADER_AFFINITY="taskset -c $((CPU_COUNT - 1))"
+  fi
+fi
+
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root / using sudo."
   exit 1
@@ -120,7 +143,7 @@ setup_common_namespaces() {
 }
 
 start_in_memory_http_server() {
-  ip netns exec perf_server_ns python3 - "$BLOB_MIB" <<'PY' > "$ARTIFACT_DIR/http.log" 2>&1 &
+  ip netns exec perf_server_ns $HTTP_AFFINITY python3 - "$BLOB_MIB" <<'PY' > "$ARTIFACT_DIR/http.log" 2>&1 &
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import socketserver
 import sys
@@ -179,7 +202,7 @@ json.dump({"mode": os.sys.argv[1]}, open(os.sys.argv[1], "w"))
 PY
 
   # TTFB benchmark
-  ip netns exec perf_work_ns python3 - "$output_file" <<'PY'
+  ip netns exec perf_work_ns $LOADER_AFFINITY python3 - "$output_file" <<'PY'
 import json, subprocess, sys, time
 out = sys.argv[1]
 samples = []
@@ -200,18 +223,28 @@ json.dump(data, open(out, "w", encoding="utf-8"), indent=2)
 PY
 
   # Throughput benchmark
-  ip netns exec perf_work_ns python3 - "$output_file" "$BLOB_MIB" <<'PY'
-import json, subprocess, sys, time
+  ip netns exec perf_work_ns $LOADER_AFFINITY python3 - "$output_file" "$BLOB_MIB" "$PARALLEL" <<'PY'
+import json, subprocess, sys, time, concurrent.futures
 out = sys.argv[1]
 blob_mib = int(sys.argv[2])
+parallel = int(sys.argv[3])
+
+def one():
+    subprocess.check_call([
+        "curl", "-fsS", "-o", "/dev/null", "--connect-timeout", "5", "--max-time", "20",
+        "http://10.0.0.1:8080/blob.bin"
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 start = time.monotonic()
-subprocess.check_call([
-    "curl", "-fsS", "-o", "/dev/null", "--connect-timeout", "5", "--max-time", "20",
-    "http://10.0.0.1:8080/blob.bin"
-])
+if parallel <= 1:
+    one()
+else:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+        list(ex.map(lambda _: one(), range(parallel)))
 elapsed = time.monotonic() - start
+total_mib = blob_mib * parallel
 data = json.load(open(out, encoding="utf-8"))
-data["throughput_mib_s"] = blob_mib / elapsed
+data["throughput_mib_s"] = total_mib / elapsed
 json.dump(data, open(out, "w", encoding="utf-8"), indent=2)
 PY
 }
@@ -223,7 +256,7 @@ echo "=== [1/3] Benchmarking WireGuard (wireguard-go Userspace) ==="
 setup_common_namespaces
 
 # Configure Server WireGuard
-ip netns exec perf_server_ns wireguard-go wg-server
+ip netns exec perf_server_ns $SERVER_AFFINITY wireguard-go wg-server
 sleep 0.5
 ip netns exec perf_server_ns ip addr add 10.0.0.1/24 dev wg-server
 ip netns exec perf_server_ns ip link set wg-server up
@@ -235,7 +268,7 @@ ip netns exec perf_server_ns wg set wg-server \
 ip netns exec perf_server_ns ip route replace 10.0.4.0/24 dev wg-server
 
 # Configure Client WireGuard
-ip netns exec perf_client_ns wireguard-go wg-client
+ip netns exec perf_client_ns $CLIENT_AFFINITY wireguard-go wg-client
 sleep 0.5
 ip netns exec perf_client_ns ip addr add 10.0.0.2/24 dev wg-client
 ip netns exec perf_client_ns ip link set wg-client up
@@ -290,11 +323,11 @@ ProxyPort = 51821
 AllowedIPs = 10.0.0.1/32
 EOF_CONF
 
-ip netns exec perf_server_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server_tun.conf" > "$ARTIFACT_DIR/server_tun.log" 2>&1 &
+ip netns exec perf_server_ns $SERVER_AFFINITY "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/server_tun.conf" > "$ARTIFACT_DIR/server_tun.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 
-ip netns exec perf_client_ns "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_tun.conf" > "$ARTIFACT_DIR/client_tun.log" 2>&1 &
+ip netns exec perf_client_ns $CLIENT_AFFINITY "$ROOT_DIR/target/release/new_proxy" -config "$ARTIFACT_DIR/client_tun.conf" > "$ARTIFACT_DIR/client_tun.log" 2>&1 &
 CLIENT_PID=$!
 sleep 2
 
@@ -382,11 +415,11 @@ InterceptInterfaces = vp-c-w, lo
 XdpMode = native
 EOF_CONF
 
-ip netns exec perf_server_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/server_xdp.conf" > "$ARTIFACT_DIR/server_xdp.log" 2>&1 &
+ip netns exec perf_server_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $SERVER_AFFINITY $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/server_xdp.conf" > "$ARTIFACT_DIR/server_xdp.log" 2>&1 &
 SERVER_PID=$!
 sleep 2
 
-ip netns exec perf_client_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/client_xdp.conf" > "$ARTIFACT_DIR/client_xdp.log" 2>&1 &
+ip netns exec perf_client_ns bash -c "mount -t bpf bpf /sys/fs/bpf && exec $CLIENT_AFFINITY $ROOT_DIR/target/release/new_proxy -config $ARTIFACT_DIR/client_xdp.conf" > "$ARTIFACT_DIR/client_xdp.log" 2>&1 &
 CLIENT_PID=$!
 sleep 2
 
