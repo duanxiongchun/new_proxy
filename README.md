@@ -21,7 +21,7 @@
 
 ```text
 conf/                  示例配置文件
-doc/                   架构、测试规格和测试报告
+doc/                   架构与测试规格文档
 script/acceptance/     端到端与稳定性测试脚本
 src/                   Rust 源码
 ```
@@ -313,7 +313,7 @@ sudo ./script/acceptance/run_acceptance.sh
 sudo RUN_STABILITY=1 ./script/acceptance/run_acceptance.sh
 ```
 
-最新测试结果见 [doc/TEST_REPORT.md](file:///home/duanxiongchun/new_proxy/doc/TEST_REPORT.md)。
+当前测试范围与目标覆盖矩阵见 [doc/TESTING.md](/data00/home/duanxiongchun/new_proxy/doc/TESTING.md)。
 
 ## 性能与多核可扩展性指标
 
