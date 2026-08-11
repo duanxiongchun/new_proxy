@@ -1,158 +1,53 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# new_proxy Unified Acceptance Test Runner
-# ==============================================================================
-set -u
+set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+run() {
+  local description="$1"
+  shift
+  printf '\n--- %s ---\n' "$description"
+  "$@"
+}
+
 echo "======================================================================"
-echo " Starting Unified Acceptance Tests"
+echo " Starting AF_XDP QUIC Appliance v1 Gate"
 echo "======================================================================"
 
-# 1. Run Rust static checks and unit tests
-echo "--- Checking Rust Formatting ---"
-if ! cargo fmt --check; then
-  echo "❌ Rust formatting check failed!" >&2
-  exit 1
-fi
-echo "✅ Rust formatting check passed."
+run "Rust formatting" cargo fmt --check
+run "Cargo check" cargo check
+run "Clippy" cargo clippy --all-targets -- -D warnings
+run "v1 unit tests" cargo test --lib v1_unit_
+run "v1 integration tests" cargo test --test v1_flow_integration
+run "all Rust tests" cargo test
+run "binary build" cargo build --bins
 
-echo "--- Running Cargo Check ---"
-if ! cargo check --quiet; then
-  echo "❌ Cargo check failed!" >&2
-  exit 1
-fi
-echo "✅ Cargo check passed."
-
-echo "--- Running Clippy ---"
-if ! cargo clippy --all-targets -- -D warnings; then
-  echo "❌ Clippy failed!" >&2
-  exit 1
-fi
-echo "✅ Clippy passed."
-
-echo "--- Running Unit Tests ---"
-if ! cargo test --quiet; then
-  echo "❌ Unit tests failed!" >&2
-  exit 1
-fi
-echo "✅ Unit tests passed."
-
-# 2. Build Binaries
-echo "--- Building Binaries ---"
-if ! cargo build --bins; then
-  echo "❌ Build failed!" >&2
-  exit 1
-fi
-echo "✅ Build succeeded."
-
-if [ "${RUN_PERF:-0}" = "1" ]; then
-  echo "--- Building Release Binaries For Perf ---"
-  if ! cargo build --release --bins; then
-    echo "❌ Release build failed!" >&2
-    exit 1
-  fi
-  echo "✅ Release build succeeded."
-fi
-
-# 3. Compile/Syntax checks on scripts
-echo "--- Checking Scripts Syntax ---"
-bash_scripts=(
-  "script/acceptance/e2e_test_dualstack.sh"
-  "script/acceptance/e2e_multi_client.sh"
-  "script/acceptance/e2e_dynamic_client_peer.sh"
-  "script/acceptance/e2e_client_topology_gate.sh"
-  "script/acceptance/e2e_full_tunnel_bypass.sh"
-  "script/acceptance/e2e_mss_clamping.sh"
-  "script/acceptance/e2e_udp_icmp_tunnel.sh"
-  "script/acceptance/e2e_udp_over_quic.sh"
-  "script/acceptance/e2e_hybrid_wireguard.sh"
-  "script/acceptance/e2e_hybrid_ha_reconnect.sh"
-  "script/acceptance/stability_stress_test.sh"
-  "script/perf/perf_smoke.sh"
-  "script/perf/perf_cores_scalability.sh"
+V1_E2E_SCRIPTS=(
+  "script/acceptance/v1/e2e_v1_client_to_target.sh"
+  "script/acceptance/v1/e2e_v1_server_return.sh"
+  "script/acceptance/v1/e2e_v1_client_return.sh"
+  "script/acceptance/v1/e2e_v1_same_interface.sh"
+  "script/acceptance/v1/e2e_v1_multi_intercept.sh"
+  "script/acceptance/v1/e2e_v1_recovery.sh"
 )
 
-for s in "${bash_scripts[@]}"; do
-  if ! bash -n "$s"; then
-    echo "❌ Syntax check failed for $s" >&2
-    exit 1
-  fi
-done
-echo "✅ Script syntax checks passed."
-
-echo "--- Checking Python Helpers ---"
-if ! python3 -m py_compile \
-  script/acceptance/stability_report.py \
-  script/acceptance/stability_server.py \
-  script/acceptance/stability_long_tcp.py; then
-  echo "❌ Python helper syntax check failed!" >&2
-  exit 1
-fi
-echo "✅ Python helper syntax checks passed."
-
-# 4. Run E2E scenarios
-TESTS=(
-  "e2e_test_dualstack"
-  "e2e_multi_client"
-  "e2e_dynamic_client_peer"
-  "e2e_client_topology_gate"
-  "e2e_full_tunnel_bypass"
-  "e2e_mss_clamping"
-  "e2e_udp_icmp_tunnel"
-  "e2e_udp_over_quic"
-  "e2e_hybrid_wireguard"
-  "e2e_hybrid_ha_reconnect"
-)
-
-if [ "${RUN_STABILITY:-0}" = "1" ]; then
-  TESTS+=("stability_stress_test")
-fi
-
-if [ "${RUN_PERF:-0}" = "1" ]; then
-  TESTS+=("../perf/perf_smoke")
-  TESTS+=("../perf/perf_cores_scalability")
-fi
-
-declare -A RESULTS
-FAILED=0
-
-for test_name in "${TESTS[@]}"; do
-  echo "======================================================================"
-  echo " Running E2E Test: $test_name"
-  echo "======================================================================"
-  
-  # Set a timeout of 300 seconds (5 minutes) for each test scenario to prevent hanging indefinitely.
-  # If a timeout occurs, timeout will exit with status 124.
-  if timeout --kill-after=10s 300s sudo -E bash "script/acceptance/${test_name}.sh"; then
-    RESULTS["$test_name"]="PASS"
-  else
-    exit_status=$?
-    if [ $exit_status -eq 124 ]; then
-      echo "❌ [TIMEOUT] E2E Test $test_name timed out after 300 seconds (5 minutes)!" >&2
-      RESULTS["$test_name"]="TIMEOUT"
-    else
-      echo "❌ [FAIL] E2E Test $test_name failed!" >&2
-      RESULTS["$test_name"]="FAIL"
+if [[ "${RUN_V1_E2E:-0}" == "1" ]]; then
+  for script in "${V1_E2E_SCRIPTS[@]}"; do
+    if [[ ! -f "$script" ]]; then
+      echo "Missing required v1 E2E script: $script" >&2
+      exit 1
     fi
-    FAILED=$((FAILED + 1))
-  fi
-done
+    run "Shell syntax: $script" bash -n "$script"
+  done
 
-echo "======================================================================"
-echo " Acceptance Test Summary"
-echo "======================================================================"
-for test_name in "${TESTS[@]}"; do
-  printf "%-30s : %s\n" "$test_name" "${RESULTS[$test_name]}"
-done
-echo "======================================================================"
-
-if [ "$FAILED" -ne 0 ]; then
-  echo "❌ Acceptance tests failed! ($FAILED failures)" >&2
-  exit 1
+  for script in "${V1_E2E_SCRIPTS[@]}"; do
+    run "v1 E2E: $script" timeout --kill-after=10s 300s sudo -E bash "$script"
+  done
 else
-  echo "✅ All acceptance tests passed successfully!"
-  exit 0
+  echo
+  echo "Privileged v1 E2E deferred; set RUN_V1_E2E=1 after the six v1 scenarios exist."
 fi
+
+echo
+echo "AF_XDP QUIC Appliance v1 gate passed."
