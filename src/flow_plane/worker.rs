@@ -1,6 +1,6 @@
 use crate::flow_plane::{
-    parse_flow_key, rewrite_packet, FlowKey, InterceptIoUpdate, IoOwnerKey, QuicFlowId, Session,
-    SessionError, SessionId, SessionTable, TransportProtocol,
+    parse_flow_key, rewrite_packet, FlowKey, InterceptIoUpdate, IoOwnerKey, QuicFlow, QuicFlowId,
+    Session, SessionError, SessionId, SessionTable, TransportProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -163,6 +163,8 @@ pub enum FlowWorkerError {
     Packet(#[from] crate::flow_plane::PacketError),
     #[error(transparent)]
     Session(#[from] SessionError),
+    #[error("QUIC flow belongs to worker {expected}, not worker {actual}")]
+    WrongQuicFlowOwner { expected: usize, actual: usize },
 }
 
 #[derive(Debug)]
@@ -202,13 +204,19 @@ impl FlowWorkerState {
         &mut self,
         io_owner: IoOwnerKey,
         packet: Bytes,
-        quic_flow_id: QuicFlowId,
+        quic_flow: &QuicFlow,
         tunnel_target: IoOwnerKey,
     ) -> Result<HandledIntercept, FlowWorkerError> {
+        if quic_flow.flow_worker_id() != self.worker_id {
+            return Err(FlowWorkerError::WrongQuicFlowOwner {
+                expected: self.worker_id,
+                actual: quic_flow.flow_worker_id(),
+            });
+        }
         let flow = parse_flow_key(&packet)?;
         let session_id =
             self.sessions
-                .get_or_create(self.worker_id, flow, io_owner, quic_flow_id)?;
+                .get_or_create(self.worker_id, flow, io_owner, quic_flow.id())?;
         let translated = self
             .sessions
             .get(session_id)

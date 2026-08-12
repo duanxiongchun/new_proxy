@@ -36,6 +36,7 @@
 - `xsks_map`：queue 到 XSK。
 - `role_flags`：接口是 tunnel、intercept 或双角色。
 - `tunnel_port`：外层 QUIC UDP 目的端口。
+- `tunnel_v4` / `tunnel_v6`：本接口可作为 tunnel 目的地址的本地 IP。
 - `allowed_v4` / `allowed_v6`：intercept 目标前缀。
 
 目的地址为本接口 tunnel 地址且目的端口匹配的 UDP 优先进入 tunnel 分类；

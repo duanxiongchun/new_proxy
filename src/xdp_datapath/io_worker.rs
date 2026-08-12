@@ -333,7 +333,7 @@ fn stable_flow_owner(flow: &crate::flow_plane::FlowKey, worker_count: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow_plane::{bounded_flow_channels, DcidOwner, QuicFlowId};
+    use crate::flow_plane::{bounded_flow_channels, QuicFlow, QuicFlowId};
 
     fn config(tunnel: bool, intercept: bool) -> IoClassifierConfig {
         IoClassifierConfig {
@@ -346,6 +346,10 @@ mod tests {
             flow_worker_count: 2,
             intercept_policy: InterceptPolicy::AllowedIps(vec!["203.0.113.0/24".parse().unwrap()]),
         }
+    }
+
+    fn indexed_flow() -> QuicFlow {
+        QuicFlow::new(QuicFlowId(7), 1, b"io-worker-flow", 4).unwrap()
     }
 
     fn ipv4_udp_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
@@ -379,6 +383,7 @@ mod tests {
         ip[16..20].copy_from_slice(&destination);
         ip[20..22].copy_from_slice(&10000u16.to_be_bytes());
         ip[22..24].copy_from_slice(&443u16.to_be_bytes());
+        ip[32] = 0x50;
         frame
     }
 
@@ -424,15 +429,7 @@ mod tests {
         let worker = IoWorker::new(config(true, true), dispatcher);
         let dcid = b"12345678";
         let mut index = ActiveDcidIndex::default();
-        index
-            .publish(
-                dcid,
-                DcidOwner {
-                    flow_worker_id: 1,
-                    quic_flow_id: QuicFlowId(7),
-                },
-            )
-            .unwrap();
+        index.publish_for_flow(dcid, &indexed_flow()).unwrap();
         let mut short = vec![0x40];
         short.extend_from_slice(dcid);
         short.extend_from_slice(b"ciphertext");
@@ -485,15 +482,7 @@ mod tests {
         let worker = IoWorker::new(config(true, false), dispatcher);
         let dcid = b"12345678";
         let mut index = ActiveDcidIndex::default();
-        index
-            .publish(
-                dcid,
-                DcidOwner {
-                    flow_worker_id: 1,
-                    quic_flow_id: QuicFlowId(7),
-                },
-            )
-            .unwrap();
+        index.publish_for_flow(dcid, &indexed_flow()).unwrap();
         let mut short = vec![0x00];
         short.extend_from_slice(dcid);
         short.extend_from_slice(b"ciphertext");
@@ -518,15 +507,7 @@ mod tests {
         let worker = IoWorker::new(config(true, false), dispatcher);
         let dcid = b"12345678";
         let mut index = ActiveDcidIndex::default();
-        index
-            .publish(
-                dcid,
-                DcidOwner {
-                    flow_worker_id: 1,
-                    quic_flow_id: QuicFlowId(7),
-                },
-            )
-            .unwrap();
+        index.publish_for_flow(dcid, &indexed_flow()).unwrap();
         let mut long = vec![0xa0, 0, 0, 0, 1, 8];
         long.extend_from_slice(dcid);
         long.push(0);

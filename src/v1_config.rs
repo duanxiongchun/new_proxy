@@ -137,10 +137,14 @@ pub enum ConfigError {
     ZeroChannelCapacity,
     #[error("dcid_len must be greater than zero")]
     ZeroDcidLength,
-    #[error("dcid_len must be in 1..=20")]
+    #[error("dcid_len must be at most 20 bytes")]
     InvalidDcidLength,
+    #[error("dcid_len must be at least 8 bytes")]
+    InsecureDcidLength,
     #[error("NAT port range is invalid")]
     InvalidNatPortRange,
+    #[error("NAT port range must provide at least one port per Flow worker")]
+    NatRangeTooSmall,
     #[error("AllowedIPs must not be empty")]
     EmptyAllowedIps,
 }
@@ -229,6 +233,9 @@ impl ApplianceConfig {
         if dcid_len > 20 {
             return Err(ConfigError::InvalidDcidLength);
         }
+        if dcid_len < 8 {
+            return Err(ConfigError::InsecureDcidLength);
+        }
         let tunnel_interface = InterfaceName::parse(required(tunnel, "Interface")?)?;
         let tunnel_next_hop_mac = MacAddress::parse(required(tunnel, "NextHopMac")?)?;
         let endpoint = optional(tunnel, "Endpoint")
@@ -249,7 +256,9 @@ impl ApplianceConfig {
             Role::Client
                 if endpoint.is_none()
                     || listen.is_some()
-                    || optional(tunnel, "ServerCertificateSha256").is_none() =>
+                    || optional(tunnel, "ServerCertificateSha256").is_none()
+                    || optional(tunnel, "ServerCertificate").is_some()
+                    || optional(tunnel, "ServerPrivateKey").is_some() =>
             {
                 return Err(ConfigError::InvalidClientAddressing)
             }
@@ -257,7 +266,8 @@ impl ApplianceConfig {
                 if listen.is_none()
                     || endpoint.is_some()
                     || optional(tunnel, "ServerCertificate").is_none()
-                    || optional(tunnel, "ServerPrivateKey").is_none() =>
+                    || optional(tunnel, "ServerPrivateKey").is_none()
+                    || optional(tunnel, "ServerCertificateSha256").is_some() =>
             {
                 return Err(ConfigError::InvalidServerAddressing)
             }
@@ -295,6 +305,9 @@ impl ApplianceConfig {
         let port_end = parse_u16(nat, "PortEnd")?;
         if port_start == 0 || port_start > port_end {
             return Err(ConfigError::InvalidNatPortRange);
+        }
+        if usize::from(port_end - port_start) + 1 < flow_worker_count {
+            return Err(ConfigError::NatRangeTooSmall);
         }
         let allowed_ips = required(allowed, "Prefixes")?
             .split(',')
@@ -599,6 +612,59 @@ mod tests {
         assert_eq!(
             ApplianceConfig::parse(&config),
             Err(ConfigError::InvalidDcidLength)
+        );
+    }
+
+    #[test]
+    fn v1_unit_config_rejects_insecure_dcid_length() {
+        let config = valid(
+            "client",
+            "Endpoint=127.0.0.1:4433\nServerCertificateSha256=0202020202020202020202020202020202020202020202020202020202020202",
+            "[Intercept]\nInterface=eth1\nNextHopMac=02:00:00:00:00:02\n",
+        )
+        .replace("DcidLength=8", "DcidLength=1");
+
+        assert_eq!(
+            ApplianceConfig::parse(&config),
+            Err(ConfigError::InsecureDcidLength)
+        );
+    }
+
+    #[test]
+    fn v1_unit_config_rejects_nat_range_smaller_than_flow_worker_count() {
+        let config = valid(
+            "client",
+            "Endpoint=127.0.0.1:4433\nServerCertificateSha256=0202020202020202020202020202020202020202020202020202020202020202",
+            "[Intercept]\nInterface=eth1\nNextHopMac=02:00:00:00:00:02\n",
+        )
+        .replace("PortEnd=41000", "PortEnd=40000");
+
+        assert_eq!(
+            ApplianceConfig::parse(&config),
+            Err(ConfigError::NatRangeTooSmall)
+        );
+    }
+
+    #[test]
+    fn v1_unit_config_rejects_role_irrelevant_tunnel_tls_fields() {
+        let client_with_server_key = valid(
+            "client",
+            "Endpoint=127.0.0.1:4433\nServerCertificateSha256=0202020202020202020202020202020202020202020202020202020202020202\nServerCertificate=server-cert.der",
+            "[Intercept]\nInterface=eth1\nNextHopMac=02:00:00:00:00:02\n",
+        );
+        assert_eq!(
+            ApplianceConfig::parse(&client_with_server_key),
+            Err(ConfigError::InvalidClientAddressing)
+        );
+
+        let server_with_client_pin = valid(
+            "server",
+            "Listen=0.0.0.0:4433\nServerCertificate=server-cert.der\nServerPrivateKey=server-key.der\nServerCertificateSha256=0202020202020202020202020202020202020202020202020202020202020202",
+            "[Intercept]\nInterface=eth1\nNextHopMac=02:00:00:00:00:02\n",
+        );
+        assert_eq!(
+            ApplianceConfig::parse(&server_with_client_pin),
+            Err(ConfigError::InvalidServerAddressing)
         );
     }
 

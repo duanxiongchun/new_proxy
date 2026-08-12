@@ -360,12 +360,16 @@ fn build_flow_key(
 ) -> Result<FlowKey, PacketError> {
     let (source_port, destination_port, protocol) = match protocol {
         IP_PROTOCOL_TCP => {
-            let ports = transport
-                .get(..4)
+            let header = transport
+                .get(..20)
                 .ok_or(PacketError::TruncatedTransportHeader)?;
+            let header_len = usize::from(header[12] >> 4) * 4;
+            if header_len < 20 || header_len > transport.len() {
+                return Err(PacketError::TruncatedTransportHeader);
+            }
             (
-                u16::from_be_bytes([ports[0], ports[1]]),
-                u16::from_be_bytes([ports[2], ports[3]]),
+                u16::from_be_bytes([header[0], header[1]]),
+                u16::from_be_bytes([header[2], header[3]]),
                 TransportProtocol::Tcp,
             )
         }
@@ -464,6 +468,7 @@ mod tests {
         let mut tcp = [0u8; 20];
         tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
         tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[12] = 0x50;
 
         let key = parse_flow_key(&ipv4_packet(6, &tcp)).unwrap();
 
@@ -511,6 +516,7 @@ mod tests {
         let mut tcp = [0u8; 20];
         tcp[0..2].copy_from_slice(&23456u16.to_be_bytes());
         tcp[2..4].copy_from_slice(&8443u16.to_be_bytes());
+        tcp[12] = 0x50;
 
         let key = parse_flow_key(&ipv6_packet(6, &tcp)).unwrap();
 
@@ -556,6 +562,22 @@ mod tests {
         );
         assert_eq!(
             parse_flow_key(&ipv4_packet(17, &[0, 1, 2])),
+            Err(PacketError::TruncatedTransportHeader)
+        );
+    }
+
+    #[test]
+    fn v1_unit_parse_flow_key_rejects_tcp_shorter_than_minimum_header() {
+        let mut truncated_tcp = [0u8; 17];
+        truncated_tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
+        truncated_tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+
+        assert_eq!(
+            parse_flow_key(&ipv4_packet(IP_PROTOCOL_TCP, &truncated_tcp)),
+            Err(PacketError::TruncatedTransportHeader)
+        );
+        assert_eq!(
+            parse_flow_key(&ipv6_packet(IP_PROTOCOL_TCP, &truncated_tcp)),
             Err(PacketError::TruncatedTransportHeader)
         );
     }

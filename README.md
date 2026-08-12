@@ -104,7 +104,7 @@ make package
 | `Appliance` | `Role` | `client` 或 `server` |
 | `Appliance` | `FlowWorkerCount` | Flow worker 数量，必须大于 0 |
 | `Appliance` | `ChannelCapacity` | IO/Flow bounded channel 容量 |
-| `Appliance` | `DcidLength` | 固定 DCID 长度，范围 `1..=20` |
+| `Appliance` | `DcidLength` | 固定 DCID 长度，范围 `8..=20` |
 | `Appliance` | `StatsPath` | 原子更新的只读 JSON stats 路径 |
 | `Appliance` | `SharedKey` | 32 字节 HMAC key 的 64 位十六进制文本 |
 | `Tunnel` | `Interface` | 外层 QUIC 接口 |
@@ -188,13 +188,8 @@ RUN_V1_E2E=1 ./script/acceptance/run_acceptance.sh
 可选的有界长稳和性能基线：
 
 ```bash
-RUN_V1_SOAK=1 sudo -E env \
-  V1_BIN="$PWD/target/release/new_proxy" \
-  bash script/acceptance/v1/soak_v1.sh
-
-RUN_V1_PERF=1 sudo -E env \
-  V1_BIN="$PWD/target/release/new_proxy" \
-  bash script/perf/perf_v1.sh
+RUN_V1_SOAK=1 V1_SOAK_CYCLES=10 ./script/acceptance/run_acceptance.sh
+RUN_V1_PERF=1 V1_PERF_ITERATIONS=100 ./script/acceptance/run_acceptance.sh
 ```
 
 性能结果依赖 NIC、XDP mode、queue 数和 CPU 拓扑；仓库不内置不可复现的历史数字。

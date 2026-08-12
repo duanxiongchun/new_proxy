@@ -14,12 +14,14 @@ use std::time::Instant;
 
 const AUTH_REQUEST: u8 = 1;
 const AUTH_RESPONSE: u8 = 2;
+const AUTH_CONFIRM: u8 = 3;
 const INNER_PACKET: u8 = 16;
 const INNER_FRAGMENT: u8 = 17;
 const ALPN: &[u8] = b"new-proxy-v1";
 const INNER_FRAGMENT_HEADER_LEN: usize = 13;
 const MAX_INNER_PACKET_LEN: usize = u16::MAX as usize;
 const MAX_REASSEMBLY_BYTES: usize = 1024 * 1024;
+const MAX_REASSEMBLY_ENTRIES: usize = 4096;
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -88,6 +90,7 @@ pub struct QuicEngine {
     client_reconnect: Option<ClientReconnect>,
     shared_key: [u8; 32],
     client_nonce: Option<[u8; 16]>,
+    server_pending_nonce: Option<[u8; 16]>,
     authenticated: bool,
     dcid_len: usize,
     generated_dcids: Arc<Mutex<VecDeque<Bytes>>>,
@@ -171,6 +174,7 @@ impl QuicEngine {
                 }),
                 shared_key,
                 client_nonce: None,
+                server_pending_nonce: None,
                 authenticated: false,
                 dcid_len,
                 generated_dcids,
@@ -225,6 +229,7 @@ impl QuicEngine {
             client_reconnect: None,
             shared_key,
             client_nonce: None,
+            server_pending_nonce: None,
             authenticated: false,
             dcid_len,
             generated_dcids,
@@ -308,6 +313,7 @@ impl QuicEngine {
             connection.close(now, VarInt::from(0u32), Bytes::from_static(b"closed"));
         }
         self.authenticated = false;
+        self.server_pending_nonce = None;
         self.clear_reassembly();
         self.retire_all_dcids();
         self.events.push_back(QuicEngineEvent::Closed);
@@ -407,6 +413,7 @@ impl QuicEngine {
                 Event::ConnectionLost { reason } => {
                     log::warn!("QUIC connection lost: {reason}");
                     self.authenticated = false;
+                    self.server_pending_nonce = None;
                     self.clear_reassembly();
                     self.retire_all_dcids();
                     self.events.push_back(QuicEngineEvent::Closed);
@@ -475,7 +482,7 @@ impl QuicEngine {
                     &auth_mac(&self.shared_key, b"client", &nonce),
                 ) {
                     log::debug!("server accepted v1 HMAC authentication");
-                    self.authenticated = true;
+                    self.server_pending_nonce = Some(nonce);
                     let mut response = Vec::with_capacity(49);
                     response.push(AUTH_RESPONSE);
                     response.extend_from_slice(&nonce);
@@ -485,7 +492,6 @@ impl QuicEngine {
                     } else {
                         log::debug!("queued v1 HMAC authentication response");
                     }
-                    self.events.push_back(QuicEngineEvent::Authenticated);
                 }
             }
             (QuicRole::Client, AUTH_RESPONSE) if payload.len() == 48 => {
@@ -498,6 +504,30 @@ impl QuicEngine {
                     )
                 {
                     log::debug!("client accepted v1 HMAC authentication");
+                    self.authenticated = true;
+                    let mut confirm = Vec::with_capacity(49);
+                    confirm.push(AUTH_CONFIRM);
+                    confirm.extend_from_slice(&nonce);
+                    confirm.extend_from_slice(&auth_mac(&self.shared_key, b"confirm", &nonce));
+                    if self.send_datagram(Bytes::from(confirm)).is_err() {
+                        log::warn!("failed to queue v1 HMAC authentication confirmation");
+                    } else {
+                        log::debug!("queued v1 HMAC authentication confirmation");
+                    }
+                    self.events.push_back(QuicEngineEvent::Authenticated);
+                }
+            }
+            (QuicRole::Server, AUTH_CONFIRM) if payload.len() == 48 => {
+                let nonce: [u8; 16] = payload[..16].try_into().expect("checked auth nonce");
+                let received_mac: [u8; 32] = payload[16..].try_into().expect("checked auth MAC");
+                if self.server_pending_nonce == Some(nonce)
+                    && constant_time_eq(
+                        &received_mac,
+                        &auth_mac(&self.shared_key, b"confirm", &nonce),
+                    )
+                {
+                    log::debug!("server accepted v1 HMAC authentication confirmation");
+                    self.server_pending_nonce = None;
                     self.authenticated = true;
                     self.events.push_back(QuicEngineEvent::Authenticated);
                 }
@@ -567,7 +597,9 @@ impl QuicEngine {
         }
 
         if !self.reassembly.contains_key(&packet_id) {
-            if self.reassembly_bytes.saturating_add(total_len) > MAX_REASSEMBLY_BYTES {
+            if self.reassembly.len() >= MAX_REASSEMBLY_ENTRIES
+                || self.reassembly_bytes.saturating_add(total_len) > MAX_REASSEMBLY_BYTES
+            {
                 return;
             }
             self.reassembly.insert(
@@ -631,6 +663,7 @@ impl QuicEngine {
             let _ = self.endpoint.handle_event(handle, event);
         }
         self.authenticated = false;
+        self.server_pending_nonce = None;
         self.clear_reassembly();
         self.retire_all_dcids();
         self.events.push_back(QuicEngineEvent::Closed);
@@ -1033,6 +1066,47 @@ mod tests {
             .iter()
             .any(|event| matches!(event, QuicEngineEvent::DcidRetired(_))));
         assert!(events.contains(&QuicEngineEvent::Closed));
+    }
+
+    #[test]
+    fn v1_unit_quic_engine_server_requires_auth_confirmation_before_inner_data() {
+        let (_, mut server, _, _) = engine_pair();
+        let now = Instant::now();
+        server.server_pending_nonce = Some([9u8; 16]);
+
+        server.handle_application_datagram(now, Bytes::from_static(&[INNER_PACKET, b'i', b'p']));
+
+        assert!(!server.is_authenticated());
+        assert!(std::iter::from_fn(|| server.poll(now))
+            .all(|event| !matches!(event, QuicEngineEvent::InnerPacket(_))));
+    }
+
+    #[test]
+    fn v1_unit_quic_engine_reassembly_limits_fragment_entry_count() {
+        let (_, mut server, _, _) = engine_pair();
+        let now = Instant::now();
+        server.authenticated = true;
+
+        for packet_id in 0..MAX_REASSEMBLY_ENTRIES as u64 {
+            let mut fragment = vec![INNER_FRAGMENT];
+            fragment.extend_from_slice(&packet_id.to_be_bytes());
+            fragment.extend_from_slice(&2u16.to_be_bytes());
+            fragment.extend_from_slice(&0u16.to_be_bytes());
+            fragment.push(1);
+            server.handle_application_datagram(now, Bytes::from(fragment));
+        }
+
+        let mut extra = vec![INNER_FRAGMENT];
+        extra.extend_from_slice(&(MAX_REASSEMBLY_ENTRIES as u64).to_be_bytes());
+        extra.extend_from_slice(&2u16.to_be_bytes());
+        extra.extend_from_slice(&0u16.to_be_bytes());
+        extra.push(1);
+        server.handle_application_datagram(now, Bytes::from(extra));
+
+        assert_eq!(server.reassembly.len(), MAX_REASSEMBLY_ENTRIES);
+        assert!(!server
+            .reassembly
+            .contains_key(&(MAX_REASSEMBLY_ENTRIES as u64)));
     }
 
     #[test]

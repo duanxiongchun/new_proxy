@@ -84,7 +84,17 @@ pub struct ActiveDcidIndex {
 }
 
 impl ActiveDcidIndex {
-    pub fn publish(&mut self, dcid: &[u8], owner: DcidOwner) -> Result<(), QuicFlowError> {
+    pub fn publish_for_flow(&mut self, dcid: &[u8], flow: &QuicFlow) -> Result<(), QuicFlowError> {
+        self.publish(
+            dcid,
+            DcidOwner {
+                flow_worker_id: flow.flow_worker_id(),
+                quic_flow_id: flow.id(),
+            },
+        )
+    }
+
+    fn publish(&mut self, dcid: &[u8], owner: DcidOwner) -> Result<(), QuicFlowError> {
         if dcid.is_empty() {
             return Err(QuicFlowError::EmptyDcid);
         }

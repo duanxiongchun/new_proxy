@@ -210,17 +210,12 @@ impl BpfLinkManager {
         let Some(attached_id) = self.attached_program_id()? else {
             return Ok(());
         };
-        let loaded_tag = bpftool_program_tag(
+        let pinned_id = bpftool_program_id(
             Command::new("bpftool")
                 .args(["-j", "prog", "show", "pinned"])
                 .arg(self.pin_dir.join("xdp_filter_prog")),
         )?;
-        let attached_tag = bpftool_program_tag(
-            Command::new("bpftool")
-                .args(["-j", "prog", "show", "id"])
-                .arg(attached_id.to_string()),
-        )?;
-        if attached_tag != loaded_tag {
+        if attached_id != pinned_id {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -312,24 +307,6 @@ fn bpftool_program_id(command: &mut Command) -> io::Result<u64> {
         .get("id")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| io::Error::other("pinned XDP program has no numeric id"))
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-fn bpftool_program_tag(command: &mut Command) -> io::Result<String> {
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "query XDP program tag failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(io::Error::other)?;
-    value
-        .get("tag")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| io::Error::other("XDP program has no tag"))
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
