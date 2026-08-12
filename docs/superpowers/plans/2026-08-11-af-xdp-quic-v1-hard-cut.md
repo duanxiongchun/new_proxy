@@ -75,15 +75,18 @@
 
 ```bash
 run "Rust formatting" cargo fmt --check
-run "Cargo check" cargo check
-run "Clippy" cargo clippy --all-targets -- -D warnings
-run "v1 unit tests" cargo test --lib v1_unit_
+run "v1 Cargo check" cargo check --offline --all-targets
+run "v1 Clippy" cargo clippy --offline --all-targets -- -D warnings
+run "v1 unit tests" cargo test --offline --lib
 run "v1 integration tests" cargo test --test v1_flow_integration
-run "all Rust tests" cargo test
-run "binary build" cargo build --bins
 ```
 
 When `RUN_V1_E2E=1`, require exactly the six named `script/acceptance/v1/e2e_v1_*.sh` scripts, pass each through `bash -n`, and execute each under `timeout --kill-after=10s 300s sudo -E`. Reject a missing script instead of treating an empty glob as success.
+
+After the legacy targets are deleted, the hard-cut gate runs all remaining
+Cargo targets. The repository contains only the v1 library, one v1 binary, and
+the v1 integration target, so `--all-targets` can no longer reactivate an old
+runtime.
 
 - [ ] **Step 2: Delete legacy acceptance, stability, and TUN/hybrid performance scripts**
 
@@ -99,7 +102,7 @@ Expected: no matches.
 
 Run: `bash script/acceptance/run_acceptance.sh`
 
-Expected: static checks, focused tests, full tests, and binary build pass; the runner explicitly reports privileged v1 E2E deferred until `RUN_V1_E2E=1`.
+Expected: v1-scoped static checks and focused tests pass; the runner explicitly reports privileged v1 E2E deferred until `RUN_V1_E2E=1`.
 
 - [ ] **Step 5: Commit the gate replacement**
 
@@ -147,7 +150,7 @@ fn v1_unit_io_registry_rejects_duplicate_owner() {
 
 - [ ] **Step 2: Run RED ownership tests**
 
-Run: `cargo test v1_unit_io_registry -- --nocapture`
+Run: `cargo test --lib v1_unit_io_registry -- --nocapture`
 
 Expected: FAIL because `flow_plane::io_registry` does not exist.
 
@@ -161,7 +164,7 @@ Create fixed packet fixtures in the test module for IPv4/IPv6 TCP, UDP, ICMP ech
 
 - [ ] **Step 5: Run RED packet tests**
 
-Run: `cargo test v1_unit_parse_flow_key -- --nocapture`
+Run: `cargo test --lib v1_unit_parse_flow_key -- --nocapture`
 
 Expected: FAIL because `parse_flow_key` is missing.
 
@@ -185,7 +188,7 @@ Use checked slicing and checked IPv6 extension-header offsets. Normalize ICMP ec
 
 - [ ] **Step 7: Verify the slice**
 
-Run: `cargo test v1_unit_io_registry v1_unit_parse_flow_key`
+Run: `cargo test --lib v1_unit_`
 
 Expected: all focused tests pass.
 
@@ -215,7 +218,7 @@ Test sequential allocation over `40000..=40001`, uniqueness for two distinct Flo
 
 - [ ] **Step 2: Run RED NAT tests**
 
-Run: `cargo test v1_unit_nat_ -- --nocapture`
+Run: `cargo test --lib v1_unit_nat_ -- --nocapture`
 
 Expected: FAIL because `NatTable` does not exist.
 
@@ -244,7 +247,7 @@ Assert duplicate and out-of-order packets return the same `SessionId`; an owner 
 
 - [ ] **Step 5: Run RED Session tests**
 
-Run: `cargo test v1_unit_session_ -- --nocapture`
+Run: `cargo test --lib v1_unit_session_ -- --nocapture`
 
 Expected: FAIL because `SessionTable` does not exist.
 
@@ -254,7 +257,7 @@ Expose `get_or_create`, `lookup_reverse`, `remove`, `remove_by_quic_flow`, and i
 
 - [ ] **Step 7: Verify NAT and Session behavior**
 
-Run: `cargo test v1_unit_nat_ v1_unit_session_`
+Run: `cargo test --lib v1_unit_`
 
 Expected: all focused tests pass.
 
@@ -284,7 +287,7 @@ Assert a `QuicFlow` computes its queue once, adding/replacing DCIDs never change
 
 - [ ] **Step 2: Run RED QUIC ownership tests**
 
-Run: `cargo test v1_unit_quic_flow_ -- --nocapture`
+Run: `cargo test --lib v1_unit_quic_flow_ -- --nocapture`
 
 Expected: FAIL because `quic_flow` does not exist.
 
@@ -306,7 +309,7 @@ Create two Sessions bound to an old flow and one to another flow. Call `remove_b
 
 - [ ] **Step 7: Verify**
 
-Run: `cargo test v1_unit_quic_flow_ v1_unit_dcid_ v1_unit_session_reclaims_`
+Run: `cargo test --lib v1_unit_`
 
 Expected: all focused tests pass.
 
@@ -370,7 +373,7 @@ Allow a server Session initialized with `(server_intercept_ifindex, 0)` to accep
 
 - [ ] **Step 6: Verify pure Flow plane**
 
-Run: `cargo test v1_unit_`
+Run: `cargo test --lib v1_unit_`
 
 Run: `cargo test --test v1_flow_integration`
 
@@ -405,7 +408,7 @@ Assert valid single client and server parse; server with two intercept interface
 
 - [ ] **Step 2: Run RED config tests**
 
-Run: `cargo test v1_unit_config_ -- --nocapture`
+Run: `cargo test --lib v1_unit_config_ -- --nocapture`
 
 Expected: FAIL because `ApplianceConfig` is missing.
 
@@ -423,9 +426,9 @@ Provide separate, complete `conf/client.conf` and `conf/server.conf`; remove the
 
 - [ ] **Step 6: Verify**
 
-Run: `cargo test v1_unit_config_`
+Run: `cargo test --lib v1_unit_config_`
 
-Run: `cargo check`
+Run: `bash script/acceptance/run_acceptance.sh`
 
 Expected: focused tests and compilation pass.
 
@@ -457,7 +460,7 @@ Drive client and server engines by exchanging `Transmit` events in memory. Asser
 
 - [ ] **Step 2: Run RED engine tests**
 
-Run: `cargo test v1_unit_quic_engine_ -- --nocapture`
+Run: `cargo test --lib v1_unit_quic_engine_ -- --nocapture`
 
 Expected: FAIL because `QuicEngine` does not exist.
 
@@ -475,9 +478,11 @@ Run the in-memory test and assert the outer packet capture does not contain the 
 
 - [ ] **Step 6: Verify**
 
-Run: `cargo test v1_unit_quic_engine_ v1_integration_`
+Run: `cargo test --lib v1_unit_quic_engine_`
 
-Run: `cargo clippy --all-targets -- -D warnings`
+Run: `cargo test --test v1_flow_integration v1_integration_`
+
+Run: `bash script/acceptance/run_acceptance.sh`
 
 Expected: tests and clippy pass.
 
@@ -511,7 +516,7 @@ Assert unique owners across different interfaces with equal queue IDs, same-inte
 
 - [ ] **Step 2: Run RED assembly tests**
 
-Run: `cargo test v1_unit_xdp_runtime_ -- --nocapture`
+Run: `cargo test --lib v1_unit_xdp_runtime_ -- --nocapture`
 
 Expected: FAIL because the owner-based runtime is missing.
 
@@ -535,11 +540,9 @@ Expected: no runtime-path matches.
 
 - [ ] **Step 7: Verify**
 
-Run: `cargo test v1_unit_xdp_runtime_`
+Run: `cargo test --lib v1_unit_xdp_runtime_`
 
-Run: `cargo test`
-
-Run: `cargo build --bins`
+Run: `bash script/acceptance/run_acceptance.sh`
 
 Expected: all pass.
 
@@ -596,15 +599,7 @@ Expected: no implementation matches; comments that explain forbidden behavior ar
 
 - [ ] **Step 6: Verify**
 
-Run: `cargo fmt --check`
-
-Run: `cargo check`
-
-Run: `cargo clippy --all-targets -- -D warnings`
-
-Run: `cargo test`
-
-Run: `cargo build --bins`
+Run: `bash script/acceptance/run_acceptance.sh`
 
 Expected: all pass.
 
@@ -706,16 +701,6 @@ Measure TCP/UDP throughput, p50/p99 latency, packet sizes, queue distribution, a
 For every hard constraint in `doc/ARCHITECTURE.md` and every target test in `doc/TESTING.md`, record the implementing type/function and test/script. Fix any uncovered item before declaring completion.
 
 - [ ] **Step 5: Run final verification**
-
-Run: `cargo fmt --check`
-
-Run: `cargo check`
-
-Run: `cargo clippy --all-targets -- -D warnings`
-
-Run: `cargo test`
-
-Run: `cargo build --bins`
 
 Run: `bash script/acceptance/run_acceptance.sh`
 

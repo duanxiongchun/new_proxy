@@ -1,373 +1,211 @@
 # new_proxy
 
-`new_proxy` 是一个高性能纯 L3 IP-over-QUIC Datagram 异步隧道安全网关。所有数据流量（TCP, UDP, ICMP）均被无状态、零额外分流处理地封装进 QUIC Datagram 报文进行公网加密传输。依托 Linux 多队列 TUN 网卡与对称多核绑定哈希设计，实现无全局锁竞争的高并发 RTC 转发流，彻底消除 TCP-over-TCP 的队头阻塞及拥塞崩溃瓶颈。
+`new_proxy` v5 是固定拓扑的 AF_XDP QUIC L3 appliance。当前只支持一组
+`client <-> server`，由用户态 Flow worker 完成双层 stateful SNAT，并通过
+QUIC Datagram 加密传输 IPv4/IPv6 TCP、UDP、ICMP 流量。
 
-## 主要功能
+项目已硬切到 v1：不提供旧运行时兼容层、动态 peer 管理或第二种数据面。
 
-- **物理双数据面后端**：同时支持标准 Linux 多队列 TUN 设备以及先进的 eBPF 驱动级 **AF_XDP 零拷贝内核旁路数据面**，实现高效率的数据转发。
-- **混合隧道共存 (Hybrid Tunneling)**：同时支持内核态/用户态 WireGuard 隧道和 IP-over-QUIC 隧道，通过长匹配前缀（LPM）路由表自动对流量分流，实现多协议无缝并存。
-- **自动化网卡接口命名规范**：自动将物理隧道和虚拟接口进行隔离命名（QUIC 对应 `<name>-tun` 或 `<name>-veth`，WireGuard 对应 `<name>-wg`），避免不同数据面设备发生命名冲突。
-- **纯 L3 隧道数据面**：摒弃用户态 SOCKS/TCP 流代理，采用 IP-over-QUIC Datagram 方式，无需任何用户态 SOCKS、WireGuard (boringtun) 或 TCP/IP 协议栈 (smoltcp)，纯粹在 IP 层高速透传。
-- **AF_XDP 零拷贝内核旁路**：依托 eBPF 过滤程序，自动将目标流量在内核驱动层重定向至用户态共享内存环（UMEM Rings），并辅以共享二层 MAC 地址缓存、填充环批处理生产（Fill Ring Batching）以及空闲时立即 Flush 机制，突破 CPU 锁与总线屏障限制，榨干硬件转发性能。
-- **对称多队列多核心映射**：支持多物理 QUIC 数据面连接池，与多队列网卡通道（TUN/XSK）一一对称绑定物理 OS 线程，实现无共享状态、高并发的 RTC 转发流。
-- **操作系统自动 MSS 夹紧 (MSS Clamping)**：利用物理或 TUN 设备 MTU 强制内核在 TCP 握手阶段自动协商更小的 MSS 大小，防范 IP 分片并节省用户态包改写与校验和重算开销。
-- **集约化管控面单线程**：主运行时使用 `new_current_thread` 单线程调度，将 UDS CLI 服务、控制协商及 Failover 检测与高频数据工作线程进行物理隔离，避免调度开销与干扰。
-- **对等密钥认证与防重放**：复用 WireGuard 格式的密钥材料，通过 X25519 ECDH 派生共享密钥，并利用 HMAC-SHA256 签名校验和 Nonce 缓存防范控制面重放攻击。
-- **证书指纹固定**：控制面下发服务端 QUIC 证书 SHA-256 指纹，客户端强校验建立可信 QUIC 数据物理连接。
-- **整合遥测与诊断**：通过 `new-proxy-cli` 实时查询每个网卡队列、物理 Slot 连接状态、收发字节数及物理连接数指标，并全面支持 WireGuard 流量来源与内核状态遥测。
-- **动态 Peer 管理**：运行期支持通过 CLI / UDS API 动态添加和删除对等体，自动安全地重新热插拔网络拓扑。
+## 支持范围
 
-## 目录结构
+- 单 client、单 server、固定 endpoint/listen 地址。
+- AF_XDP/XSK 收发；每个 `(ifindex, queue_id)` 只有一个 IO owner。
+- client 可配置多个本地 intercept interface；server 只能配置一个。
+- tunnel interface 与 intercept interface 可以是同一接口。
+- 每个 Flow worker 独占自己的 Session、NAT、reverse-NAT 和 QUIC 状态。
+- client/server 分别执行本地 stateful SNAT。
+- IPv4/IPv6 TCP、UDP、ICMP/ICMPv6。
+- TLS 服务端证书 SHA-256 pin 和共享密钥 HMAC 双向认证。
+- QUIC Datagram 内有界分片/重组，支持标准 1500-byte inner packet。
+- QUIC keepalive 保持健康空闲长连接；断线后清理旧 Session/NAT/DCID 并重连。
+- 以 `0600` 原子写入的只读 JSON stats 文件。
+
+不支持：
+
+- 多 peer、多租户或运行时动态拓扑。
+- WireGuard、hybrid 或 TUN 数据面。
+- 配置兼容、控制面 socket 或独立管理 CLI。
+- 自动修改主机路由、邻居或防火墙。
+
+## 架构
 
 ```text
-conf/                  示例配置文件
-doc/                   架构与测试规格文档
-script/acceptance/     端到端与稳定性测试脚本
-src/                   Rust 源码
+local network
+    |
+intercept NIC / XSK
+    |
+IO worker -- bounded channel --> Flow worker
+                                  |- Session owner
+                                  |- local SNAT / reverse NAT
+                                  |- QUIC + TLS pin + HMAC
+    |                             |
+tunnel NIC / XSK <----------------+
+    |
+encrypted QUIC/UDP
 ```
 
-## 安装与构建
+- IO worker 独占一个 XSK 的 RX/TX/Fill/Completion rings，只做轻量分类和收发。
+- Flow worker 是唯一可创建、修改和回收 Session/NAT/QUIC 状态的线程。
+- intercept ingress 按内层 flow 稳定选择 Flow worker。
+- tunnel ingress 先按 active DCID 定位 Flow worker；只有合法 Initial 可以走
+  deterministic bootstrap。
+- 每个 QUIC flow 绑定稳定 tunnel queue；本地回投使用 Session 记录的
+  `(intercept_ifindex, intercept_queue_id)`。
 
-### 环境要求
+详细约束见 `doc/ARCHITECTURE.md`，覆盖映射见 `doc/TESTING.md`。
 
-- Linux
-- Rust stable toolchain
-- root 权限或具备等价网络管理能力
-- `iproute2`
-- `python3`
-- `curl`
-- `ping`
+## 环境要求
 
-测试脚本依赖 Linux Network Namespace、TUN 设备和路由配置能力，必须使用 root 权限运行。
+- Linux，内核支持 XDP 和 AF_XDP。
+- root 或等价的 BPF、XDP、AF_XDP 权限。
+- Rust stable、Clang/LLVM。
+- `bpftool`、`iproute2`、`ethtool`、`openssl`、`python3`。
+- 物理部署必须预先配置接口地址、路由和静态/稳定邻居；配置中的
+  `NextHopMac` 由运行时直接用于 L2 发包。
 
-### 构建
+`[XDP] Mode=native` 用于支持 native XDP 的 NIC；veth 测试环境使用
+`Mode=skb`。
+
+## 构建
 
 ```bash
-cargo build --release --bins
+cargo build --release --bin new_proxy
 ```
 
-开发调试也可以构建 debug 版本：
-
-```bash
-cargo build --bins
-```
-
-构建产物：
+唯一运行产物是：
 
 ```text
 target/release/new_proxy
-target/release/new-proxy-cli
 ```
 
-### Debian 打包与安装 (Makefile)
+Cargo build script 会编译并嵌入 XDP ELF；部署时不需要源码目录或独立
+`xdp_filter.o`。
 
-本项目支持通过 `make` 工具快速构建并打包为 Debian 格式的安装包（`.deb`），自动集成二进制文件、systemd 服务模板以及示例配置：
-
-1. **构建并打包**：
-   ```bash
-   make package
-   ```
-   该命令会在 `target/` 目录下生成匹配当前 Debian 架构的安装包，例如 `new-proxy_5.0.0_amd64.deb` 或 `new-proxy_5.0.0_arm64.deb`。也可以显式覆盖架构：`make package ARCH=arm64`。
-
-2. **安装 Debian 包**：
-   ```bash
-   sudo dpkg -i target/new-proxy_5.0.0_$(dpkg --print-architecture).deb
-   ```
-   安装后，程序文件将被放置于 `/usr/bin/`，服务模板将写入 `/lib/systemd/system/`，示例配置复制至 `/etc/new_proxy/`。
-
-3. **清理构建缓存与包**：
-   ```bash
-   make clean
-   ```
-
-## 配置方式
-
-示例配置位于 `conf/`。支持以下高级配置项：
-* **`Table`**（`auto` / `off`，默认 `auto`）：设置为 `auto` 时，网关启动会自动配置 TUN 地址和 peer 路由，退出时自动回滚。若为 `off` 则跳过该行为，交由外部配置。
-* **`PreScript` / `pre_script`**：网关启动前执行的脚本。可以是一个**单行 shell 命令**（如 `sysctl -w ...`），也可以是一个**可执行脚本/bash 文件的路径**（如 `/etc/new_proxy/pre.sh` 或 `bash /path/to/script.sh`）。
-* **`PostScript` / `post_script`**：在网关优雅退出并清理完所有路由和防火墙之后执行的脚本。同样支持**单行 shell 命令**或**脚本/bash 文件的路径**。
-* **`WgListenPort`**（仅用于 `[Interface]` 部分）：指定 WireGuard 隧道的本地监听端口。若未配置，默认使用 `ListenPort + 1` 或 `51821`。
-
-### 数据面后端模式 (TUN / AF_XDP)
-
-`new_proxy` 支持两种物理数据面后端模式，可通过 `[Interface]` 部分中的 `Mode` 字段进行配置：
-
-* **TUN 模式** (`Mode = tun`，默认值)：
-  * 创建并配置 Linux 多队列 TUN 虚拟网卡设备。数据包经内核路由截获，通过异步读写 TUN FD 进行处理。
-  * 具备广泛的兼容性，支持各种通用虚拟/物理网卡和双栈网络。
-* **AF_XDP 模式** (`Mode = af_xdp`)：
-  * 使用 eBPF 驱动过滤程序将目标流量在内核驱动层直接重定向至用户态共享内存套接字（XSK），完全旁路内核 TCP/IP 协议栈。
-  * 提供零拷贝、低 CPU 损耗的极致包转发效率。需要宿主机配置 `[XDP]` 部分。
-
-#### AF_XDP 相关配置
-当 `Mode = af_xdp` 时，必须在配置文件中指定 `[XDP]` 选项段：
-* **`QuicInterface`**：指定运行外层 QUIC 加密隧道的物理/虚拟网卡接口名（如 `eth0`）。
-* **`XdpMode`**（`native` / `skb` / `driver`，默认 `native`）：eBPF 程序的加载模式。在虚拟测试环境（如 `veth`）或网卡不支持 native 模式时，可使用 `skb` 模式（Generic XDP）。
-
-
-### 服务端配置
-
-服务端需要配置监听端口、QUIC 端口池以及允许接入的 Peer：
-
-```ini
-[Interface]
-PrivateKey = <server_private_key_base64>
-Address = 10.0.0.1/24, fd00::1/64
-ListenPort = 51820
-Table = auto
-PreScript = echo "Server starting..."
-PostScript = echo "Server stopped cleanly."
-
-[QUICPool]
-PublicIPv4 = <server_public_ipv4>
-PublicIPv6 = <server_public_ipv6>
-ListenPorts = 40001, 40002, 40003, 40004
-
-[Peer]
-PublicKey = <client_public_key_base64>
-AllowedIPs = 10.0.0.2/32, fd00::2/128
-```
-
-启动服务端：
+构建 Debian 包：
 
 ```bash
-sudo target/release/new_proxy -config conf/server.conf
+make package
 ```
 
-接口名遵循 WireGuard/wg-quick 习惯：由配置文件名去掉 `.conf` 后得到。上面的命令会使用接口名 `server`；如果要使用 `tun0`，请把配置文件命名为 `tun0.conf` 并用 `-config .../tun0.conf` 启动。
+包内包含 binary、`new_proxy@.service` 以及 client/server 示例配置。
+`/etc/new_proxy/client.conf` 和 `server.conf` 作为 conffile 安装，升级不会静默覆盖。
 
-### 客户端配置
+## 配置
 
-客户端的 QUIC proxy peer 需要配置服务端 endpoint 和目标 `AllowedIPs`：
+完整示例：
 
-```ini
-[Interface]
-PrivateKey = <client_private_key_base64>
-Address = 10.0.0.2/24, fd00::2/64
-MTU = 1100
-Table = auto
-PreScript = echo "Client starting..." && sysctl -w net.ipv4.ip_forward=1
-PostScript = echo "Client stopped cleanly."
+- `conf/client.conf`
+- `conf/server.conf`
 
-[Peer]
-PublicKey = <server_public_key_base64>
-Endpoint = <server_public_ip>:51820
-AllowedIPs = 10.0.0.1/32, fd00::1/128
-```
+关键字段：
 
-运行时 packet buffer 默认按 `MTU + 256` 分配，并限制在 `1500..65535` 字节；默认 `MTU = 1100` 时 buffer 为最低值 `1500` 字节，jumbo MTU `9000` 时为 `9256` 字节。需要特殊调参时可用环境变量 `NEW_PROXY_PACKET_BUFFER_BYTES` 覆盖。
+| Section | Field | 含义 |
+|---|---|---|
+| `Appliance` | `Role` | `client` 或 `server` |
+| `Appliance` | `FlowWorkerCount` | Flow worker 数量，必须大于 0 |
+| `Appliance` | `ChannelCapacity` | IO/Flow bounded channel 容量 |
+| `Appliance` | `DcidLength` | 固定 DCID 长度，范围 `1..=20` |
+| `Appliance` | `StatsPath` | 原子更新的只读 JSON stats 路径 |
+| `Appliance` | `SharedKey` | 32 字节 HMAC key 的 64 位十六进制文本 |
+| `Tunnel` | `Interface` | 外层 QUIC 接口 |
+| `Tunnel` | `Endpoint` | client 连接的 server 地址 |
+| `Tunnel` | `Listen` | server 监听地址 |
+| `Tunnel` | `NextHopMac` | 外层报文下一跳 MAC |
+| `Tunnel` | `ServerCertificateSha256` | client 使用的 DER 证书 SHA-256 pin |
+| `Tunnel` | `ServerCertificate` | server DER 证书路径 |
+| `Tunnel` | `ServerPrivateKey` | server PKCS#8 DER 私钥路径 |
+| `Intercept*` | `Interface` | 本地明文接口 |
+| `Intercept*` | `NextHopMac` | 本地网络下一跳 MAC |
+| `NAT` | `AddressV4/AddressV6` | 本节点 SNAT 地址，至少配置一个 |
+| `NAT` | `PortStart/PortEnd` | 本节点 SNAT 端口范围 |
+| `AllowedIPs` | `Prefixes` | client intercept 的目标前缀 |
+| `XDP` | `Mode` | `native` 或 `skb` |
 
-启动客户端：
+配置 parser 是严格的。未知 section/field、旧字段、server 多 intercept、
+重复接口、空 AllowedIPs、无效 NAT 范围和错误 role addressing 都会在启动前失败。
+示例配置中的全零 `SharedKey` 是不可启动的占位符，部署前必须替换为两端一致的
+随机 32-byte key；证书路径、pin、接口、地址和 MAC 也必须按现场修改。
+
+## 运行
+
+先确保 stats 目录存在，并准备接口、地址、邻居与路由：
 
 ```bash
-sudo target/release/new_proxy -config conf/client.conf
+sudo install -d -m 0700 /run/new_proxy
+sudo target/release/new_proxy --config /etc/new_proxy/server.conf
+sudo target/release/new_proxy --config /etc/new_proxy/client.conf
 ```
 
-同样，`conf/client.conf` 会使用接口名 `client`；需要兼容现有 `tun0` 路由/脚本时，请使用 `tun0.conf`。
-
-### 混合隧道与对等体类型配置
-
-在混合模式下，您可以在同一个配置文件中同时定义 IP-over-QUIC Peer 和 WireGuard Peer。通过 `Type` 字段指定对等体类型：
-
-* **`Type = quic`**（默认值）：表示该 peer 通过 IP-over-QUIC Datagram 隧道进行转发。数据包将被定向到 `<interface_name>-tun` 或 `<interface_name>-veth`。
-* **`Type = wireguard`**：表示该 peer 通过 Linux 内核态 WireGuard 设备（如果内核不支持，自动平滑退化到用户态 `wireguard-go`）进行转发。数据包将被定向到 `<interface_name>-wg`。
-
-#### 服务端混合配置示例 (`conf/server_hybrid.conf`)
-```ini
-[Interface]
-PrivateKey = <server_private_key_base64>
-Address = 10.0.0.1/24, fd00::1/64
-ListenPort = 51820
-WgListenPort = 51822
-Table = auto
-
-[QUICPool]
-PublicIPv4 = <server_public_ipv4>
-ListenPorts = 40001, 40002
-
-# QUIC Peer
-[Peer]
-PublicKey = <client1_public_key_base64>
-AllowedIPs = 10.0.0.2/32, 10.0.4.0/24
-Type = quic
-
-# WireGuard Peer
-[Peer]
-PublicKey = <client2_public_key_base64>
-AllowedIPs = 10.0.0.3/32, 10.0.5.0/24
-Type = wireguard
-```
-
-#### 客户端混合配置示例 (`conf/client_hybrid.conf`)
-```ini
-[Interface]
-PrivateKey = <client_private_key_base64>
-Address = 10.0.0.2/24, fd00::2/64
-Table = auto
-
-# 服务端 QUIC Peer
-[Peer]
-PublicKey = <server_public_key_base64>
-Endpoint = <server_public_ip>:51820
-AllowedIPs = 10.0.0.1/32
-Type = quic
-
-# 服务端 WireGuard Peer
-[Peer]
-PublicKey = <server_public_key_base64>
-Endpoint = <server_public_ip>:51822
-AllowedIPs = 10.0.0.3/32
-Type = wireguard
-```
-
-客户端也可以配置 WireGuard-only peer：该 peer 不写 `Endpoint`，不会进入 QUIC pool，也不会被 L4 router 捕获。若配置了 proxy peer，必须配置 `Endpoint`；控制面端口 `ProxyPort` 是可选配置，默认使用 `Endpoint` 的端口。
-
-## 系统服务管理 (Systemd)
-
-安装 Debian 包后，可以使用 systemd 来管理和守护 `new_proxy` 实例。服务采用了模块化/模板化设计（`new_proxy@.service`），支持在一台机器上同时管理多个不同配置的网关实例：
-
-### 1. 配置实例
-准备您的配置文件（实例名即接口名，与 WireGuard/wg-quick 一致），并移动到配置目录下：
-```bash
-sudo cp conf/server.conf /etc/new_proxy/tun0.conf
-```
-*注意：服务加载的配置文件路径为 `/etc/new_proxy/<interface_name>.conf`。*
-
-### 2. 启动与自启服务
-以实例名（接口名，如 `tun0`）启动服务：
-```bash
-# 启动 tun0 实例
-sudo systemctl start new_proxy@tun0
-
-# 设置开机自启
-sudo systemctl enable new_proxy@tun0
-```
-
-### 3. 管理服务状态
-```bash
-# 查看服务运行状态
-sudo systemctl status new_proxy@tun0
-
-# 查看服务实时日志
-sudo journalctl -u new_proxy@tun0 -f
-
-# 停止服务
-sudo systemctl stop new_proxy@tun0
-```
-
-## CLI 使用
-
-查看服务端聚合遥测：
+systemd 示例：
 
 ```bash
-target/release/new-proxy-cli --interface tun0 show
+sudo cp conf/server.conf /etc/new_proxy/server.conf
+sudo systemctl enable --now new_proxy@server
+sudo journalctl -u new_proxy@server -f
 ```
 
-查看客户端聚合遥测：
+`SIGHUP` 请求 QUIC 重连。重连会回收旧连接绑定的 Session、NAT 和 DCID；
+后续业务包重新建 Session。`SIGTERM`/`SIGINT` 执行有界关闭并 detach XDP。
+若进程被 `SIGKILL`，下一实例会在确认 pinned program 属于本项目后清理 stale
+attachment；不会无条件拆除其他 XDP program。
 
-```bash
-target/release/new-proxy-cli --interface client show
-```
+## Stats
 
-输出机器可读 dump：
+读取配置中的 `StatsPath` 即可获得：
 
-```bash
-target/release/new-proxy-cli --interface tun0 dump
-```
+- 每个 IO owner 的 ifindex、queue、role、RX/TX/drop 计数。
+- 每个 Flow worker 的 `quic_flow_id`、tunnel queue、认证状态。
+- Session 原始 tuple、本地 SNAT tuple 和原始 intercept owner。
+- active DCID、reverse NAT、IO/Flow channel、QUIC send、pending queue、NAT/DCID
+  发布和重连失败计数。
 
-动态添加 Peer：
-
-```bash
-target/release/new-proxy-cli --interface tun0 add-peer <public_key> <allowed_ips> [endpoint] [proxy_port]
-```
-
-动态删除 Peer：
-
-```bash
-target/release/new-proxy-cli --interface tun0 remove-peer <public_key>
-```
+该文件是只读观测契约，不提供运行时修改接口。
 
 ## 测试
 
-运行 Rust 编译检查：
+默认非特权门禁：
 
 ```bash
-cargo check
+./script/acceptance/run_acceptance.sh
 ```
 
-运行 Rust 单元测试：
+完整 root E2E（构建包含 XDP ELF 的 release binary 后顺序运行七个隔离场景）：
 
 ```bash
-cargo test
+RUN_V1_E2E=1 ./script/acceptance/run_acceptance.sh
 ```
 
-运行统一的 E2E 验收与集成测试套件（包括格式、Clippy、脚本语法及 8 项端到端场景）：
+七个场景覆盖：
+
+1. client 到 target 的双栈 TCP/UDP/ICMP 闭环。
+2. server reverse NAT 与回隧道。
+3. client reverse NAT 与本地回投。
+4. tunnel/intercept 同接口。
+5. client 多 intercept 回到原接口。
+6. SIGHUP 重连后的状态回收与新 flow identity。
+7. 1500-byte inner packet、12 秒双栈空闲 TCP、2 Flow workers 和 SIGKILL 恢复。
+
+可选的有界长稳和性能基线：
 
 ```bash
-sudo ./script/acceptance/run_acceptance.sh
+RUN_V1_SOAK=1 sudo -E env \
+  V1_BIN="$PWD/target/release/new_proxy" \
+  bash script/acceptance/v1/soak_v1.sh
+
+RUN_V1_PERF=1 sudo -E env \
+  V1_BIN="$PWD/target/release/new_proxy" \
+  bash script/perf/perf_v1.sh
 ```
 
-运行 1 小时稳定性压测（需置环境变量 `RUN_STABILITY=1`）：
+性能结果依赖 NIC、XDP mode、queue 数和 CPU 拓扑；仓库不内置不可复现的历史数字。
+
+## 回滚
+
+部署失败时停止对应实例即可：
 
 ```bash
-sudo RUN_STABILITY=1 ./script/acceptance/run_acceptance.sh
+sudo systemctl stop new_proxy@client new_proxy@server
 ```
 
-当前测试范围与目标覆盖矩阵见 [doc/TESTING.md](/data00/home/duanxiongchun/new_proxy/doc/TESTING.md)。
-
-## 性能与多核可扩展性指标
-
-在标准 MTU 1420（外层虚拟接口 MTU 1500，无 Jumbo 帧）及多物理核心（1..4 Cores）的并发高负载压测下，对 `new_proxy` 在 TUN 模式和 AF_XDP 模式下的吞吐性能进行了对比实测：
-
-### 1. TCP 吞吐性能 (MiB/s)
-
-| CPU 核心数 | AF_XDP 模式 (TCP) | TUN 模式 (TCP) | 相对增长率 (AF_XDP) | 线性扩展效率 (AF_XDP) |
-| :--- | :--- | :--- | :--- | :--- |
-| **1 Core** | **322.06 MiB/s** | 117.05 MiB/s | 1.00x | 100.0% |
-| **2 Cores** | **545.54 MiB/s** | 304.67 MiB/s | 1.69x | 84.7% |
-| **3 Cores** | **697.49 MiB/s** | 403.77 MiB/s | 2.17x | 72.2% |
-| **4 Cores** | **891.69 MiB/s** | 580.86 MiB/s | 2.77x | 69.2% |
-
-*   **单核突破红线**：AF_XDP 单核心 TCP 吞吐量达到 **322.06 MiB/s**（超越 300 MiB/s 的设计红线）。在饱和 UDP 流量测试中，AF_XDP 单核转发能力达到 **366.50 MiB/s**（约合 3.07 Gbps，超越了 350 MiB/s 的设计指标）。
-*   **四核极速吞吐**：AF_XDP 四核心并发 TCP 吞吐量达到 **891.69 MiB/s**（约合 **7.48 Gbps**）。
-
-### 2. UDP 吞吐性能 (MiB/s)
-
-*   **AF_XDP 模式**：1 Core = **39.29 MiB/s**，2 Cores = **86.11 MiB/s**，3 Cores = **131.91 MiB/s**，4 Cores = **177.00 MiB/s**。
-*   **TUN 模式**：1 Core = **39.23 MiB/s**，2 Cores = **85.67 MiB/s**，3 Cores = **131.71 MiB/s**，4 Cores = **174.33 MiB/s**。
-
-### 3. 混合网关对比测试性能 (WireGuard vs. QUIC TUN vs. QUIC XDP)
-
-在三命名空间拓扑中，通过单 TCP 流量（单 stream 下载 50 MiB 的 `blob.bin`）对三种隧道协议进行端到端对比，结果如下：
-
-| 隧道模式 | 吞吐量 (MiB/s) | 吞吐量 (Mbps) | TTFB P50 (ms) | TTFB P95 (ms) | TTFB Max (ms) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **WIREGUARD** | 136.37 | 1143.94 | 4.65 | 5.09 | 5.13 |
-| **QUIC_TUN** | 185.10 | 1552.73 | 4.06 | 4.72 | 4.87 |
-| **QUIC_XDP** | 209.33 | 1756.03 | 3.85 | 4.53 | 4.89 |
-
-#### 关于单线程/单流吞吐对比的性能分析与说明：
-1. **多并发流 vs 单并发流瓶颈**：
-   * 在 Dedicated 单核可扩展性测试中，我们使用 `PARALLEL=16` 个并发 TCP 下载流，完全填满了 QUIC 拥塞窗口（CWND）和数据通道缓冲区，充分释放了网关在单核心下的物理转发上限，从而使得 AF_XDP 单核可以达到 **322.06 MiB/s**。
-   * 而在对比测试 (`perf_compare_hybrid.sh`) 中，采用的是**单流顺序下载（Single TCP stream via `curl`）**。单流 TCP 受限于 TCP 拥塞控制（如 CUBIC/BBR 算法的 CWND 爬升速度）、套接字窗口大小和网络往返延迟（RTT），且无法有效并发分流以维持数据吞吐的高速填充，导致吞吐率降为 **209.33 MiB/s**。
-2. **CPU 亲和度绑定 (CPU Affinity & Pinning)**：
-   * 可扩展性测试中，客户端代理、服务端代理、HTTP 服务端及压测发生器均被指定到独立的 CPU 核心（`taskset`），消除了 CPU 线程调度争抢和 L1/L2/L3 缓存丢失（Cache Miss & Thrashing）。
-   * 对比测试脚本在默认环境下运行，没有显式绑定 CPU 核心，导致用户态网关线程与内核 SoftIRQ 调度相互争抢、缓存被频繁无效化。
-3. **veth 驱动的 Generic XDP 与分段分发机制 (TSO/GRO)**：
-   * 测试运行于虚拟 `veth` 接口上。为启用 XDP 必须在驱动中关闭一部分 TCP 校验和与分片重组分发（GRO/TSO）硬卸载。对于单流 TCP，在缺少 GRO 的情况下对内核软中断（SoftIRQ）包解析的压力呈指数级上升，进一步压低了单流的传输性能。
-
-### 4. 数据面核心优化设计
-
-除了底层的全链路批处理、动态 Flush 机制之外，最近的物理 datapath 优化进一步挖掘了编译期和运行期的极限性能：
-1.  **用户态 Ring 描述符 Non-Volatile 读写优化**：在 [worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs) 中，移除了数据描述符槽位读写（如 [read_rx_desc](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L319)、[write_tx_desc](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L329) 等）的 `read_volatile`/`write_volatile`，改用标准的 Rust 指针读写。由于 AF_XDP 环的锁同步完全由控制索引更新及内存 Fence 保证，移除冗余的数据 volatile 读写释放了 LLVM 编译器的寄存器分配与自动向量化优化。
-2.  **32 位字宽 IP 地址解析**：在 [parse_ip_src_dst](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L953) 中，重构为单次 32 位字宽读取 IP 地址，消除了 4 字节数组逐字节寻址的内存总线开销。
-3.  **L2 二层协议类型提前校验**：在 `EthernetHeader::parse`（定义在 [worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L219)）中，在拷贝 MAC 地址之前优先校验 `ether_type`，对于非 IPv4 流量实现提前中断，节省拷贝耗时。
-4.  **向量预分配避免动态扩容**：在 [reclaim_tx_buffers](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L651) 中预分配回收向量的容量，消除大包率下动态增长的重新分配开销。
-5.  **退出标志原子检测分摊**：在主轮询循环（定义在 [worker.rs](file:///home/duanxiongchun/new_proxy/src/xdp_datapath/worker.rs#L1966)）中，通过循环计数器将 `exit_flag` 原子读取摊销到每 1024 次循环执行一次，有效减小了多核缓存一致性协议（MESI）下的原子总线冲突与 cache 一致性同步。
-6.  **填充环批处理生产 (Fill Ring Batching)**：将归还已处理 RX 缓冲页的操作合并，在每次循环的批次结尾统一调用 `fill.produce()` 并仅执行一次物理内存屏障（Fence），有效消除了 CPU 缓存频繁失效与总线锁竞争开销。
-7.  **空闲时立即 Flush (Immediate Flush on Idle)**：当事件循环变为空闲（没有新包或 500 次空转）时，无条件立即执行 `sendto` 系统调用进行 Flush。这消除了批处理积压引起的 TCP RTT 抖动，使得单核 TCP 吞吐能够轻松跑满带宽上限。
-8.  **用户态 Ring 指针本地缓存与按需回收 (Rings Pointer Caching)**：在 worker 循环中完全缓存了 consumer/producer 指针，消除了空轮询中的 volatile 读；且仅在 `free_tx_chunks` 低于 64 时触发完成队列（Completion Ring）的批量回收，将多余的 volatile 读取减少了 99%。
-9.  **外层 IPv4 校验和常数预累加优化 (Checksum Precomputation)**：优化了 UDP 封装的外层 IP 报头校验和计算方法，从慢速的 20 字节循环累加计算改进为仅依赖 `total_len` 变量的单次常数增量运算，完全清空了包生成热路径中的冗余校验和开销。
-10. **可扩展性与瓶颈解析**：
-    *   **TUN 超线性特征**：多物理队列绑定相互解耦，消除了单核下单个文件描述符（TUN FD）和 L1/L3 缓存抖动（Cache Eviction）的串行开销。
-    *   **AF_XDP 亚线性特征**：在虚拟机（`veth`）测试环境下由于不支持硬件 Zero-Copy，AF_XDP 以 `XDP_COPY` 模式运行，导致 SoftIRQ 软中断上下文切换与内存复制开销高昂（占 CPU 比例约 39.49%）。在近 7.5 Gbps 的极高吞吐下，总线带宽及 L3 缓存读写开始逼近物理硬件瓶颈。
+进程退出会 detach 自己加载的 XDP program 并删除 ifindex-scoped BPF pins。
+接口地址、路由和邻居由部署系统管理，`new_proxy` 不会替用户回滚这些外部配置。

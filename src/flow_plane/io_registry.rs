@@ -65,6 +65,15 @@ impl<T> Default for IoRegistry<T> {
     }
 }
 
+impl<T> IntoIterator for IoRegistry<T> {
+    type Item = (IoOwnerKey, T);
+    type IntoIter = std::collections::hash_map::IntoIter<IoOwnerKey, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.owners.into_iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

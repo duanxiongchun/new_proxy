@@ -1,5 +1,5 @@
 [Unit]
-Description=Hybrid Secure Proxy Gateway - Interface %I
+Description=new_proxy AF_XDP QUIC Appliance - %I
 After=network.target network-online.target
 Wants=network-online.target
 Documentation=https://github.com/duanxiongchun/new_proxy
@@ -8,9 +8,24 @@ Documentation=https://github.com/duanxiongchun/new_proxy
 Type=simple
 WorkingDirectory=/etc/new_proxy
 ExecStart=/usr/bin/new_proxy -config /etc/new_proxy/%i.conf
-Restart=always
+Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+LimitMEMLOCK=infinity
+RuntimeDirectory=new_proxy
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+ReadWritePaths=/sys/fs/bpf /run/new_proxy
 
 [Install]
 WantedBy=multi-user.target

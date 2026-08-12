@@ -234,16 +234,16 @@ pub struct IoTransmit {
 `script/acceptance/run_acceptance.sh` 改为以下顺序：
 
 1. `cargo fmt --check`
-2. `cargo check`
-3. `cargo clippy --all-targets -- -D warnings`
-4. v1 小型单元测试
+2. 全部现存 target 的 offline `cargo check`
+3. 全部现存 target 的 Clippy `-D warnings`
+4. 全部 v1 library 单元测试
 5. v1 集成测试
-6. `cargo test`
-7. 构建 binaries
-8. v1 E2E
-9. 可选 soak/perf
+6. v1 E2E
+7. 可选 soak/perf
 
 runner 不再引用 legacy、TUN、WireGuard、动态 peer 或 multi-client 脚本。
+由于旧 modules、binary 和 test targets 已全部删除，`--all-targets` 只覆盖 v1，
+不会重新启用旧 test harness。
 
 ### 7.3 单元测试
 

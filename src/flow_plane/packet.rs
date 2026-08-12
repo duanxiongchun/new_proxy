@@ -57,6 +57,8 @@ pub enum PacketError {
     NonInitialFragment,
     #[error("IPv6 extension header chain is too long")]
     ExtensionHeaderChainTooLong,
+    #[error("translated flow uses a different IP version or transport protocol")]
+    InvalidTranslation,
 }
 
 pub fn parse_flow_key(packet: &[u8]) -> Result<FlowKey, PacketError> {
@@ -66,6 +68,180 @@ pub fn parse_flow_key(packet: &[u8]) -> Result<FlowKey, PacketError> {
         6 => parse_ipv6_flow_key(packet),
         other => Err(PacketError::UnsupportedIpVersion(other)),
     }
+}
+
+pub fn rewrite_packet(packet: &mut [u8], translated: &FlowKey) -> Result<(), PacketError> {
+    let original = parse_flow_key(packet)?;
+    if original.protocol != translated.protocol
+        || !matches!(
+            (original.source, translated.source),
+            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+        )
+        || !matches!(
+            (original.destination, translated.destination),
+            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+        )
+    {
+        return Err(PacketError::InvalidTranslation);
+    }
+
+    match (original.source, translated.source) {
+        (IpAddr::V4(_), IpAddr::V4(source)) => {
+            let destination = match translated.destination {
+                IpAddr::V4(destination) => destination,
+                IpAddr::V6(_) => return Err(PacketError::InvalidTranslation),
+            };
+            rewrite_ipv4_packet(packet, source, destination, translated)
+        }
+        (IpAddr::V6(_), IpAddr::V6(source)) => {
+            let destination = match translated.destination {
+                IpAddr::V6(destination) => destination,
+                IpAddr::V4(_) => return Err(PacketError::InvalidTranslation),
+            };
+            rewrite_ipv6_packet(packet, source, destination, translated)
+        }
+        _ => Err(PacketError::InvalidTranslation),
+    }
+}
+
+fn rewrite_ipv4_packet(
+    packet: &mut [u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    translated: &FlowKey,
+) -> Result<(), PacketError> {
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    packet[12..16].copy_from_slice(&source.octets());
+    packet[16..20].copy_from_slice(&destination.octets());
+    rewrite_transport_fields(&mut packet[header_len..total_len], translated)?;
+
+    packet[10..12].fill(0);
+    let header_checksum = internet_checksum(&packet[..header_len]);
+    packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    let protocol = packet[9];
+    let preserve_zero_udp = protocol == IP_PROTOCOL_UDP
+        && packet
+            .get(header_len + 6..header_len + 8)
+            .is_some_and(|checksum| checksum == [0, 0]);
+    if !preserve_zero_udp {
+        write_transport_checksum_ipv4(packet, header_len, total_len, protocol)?;
+    }
+    Ok(())
+}
+
+fn rewrite_ipv6_packet(
+    packet: &mut [u8],
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    translated: &FlowKey,
+) -> Result<(), PacketError> {
+    let total_len = 40 + usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+    let (protocol, transport_offset) = ipv6_transport_offset(packet, total_len, packet[6], 40)?;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+    rewrite_transport_fields(&mut packet[transport_offset..total_len], translated)?;
+    write_transport_checksum_ipv6(packet, transport_offset, total_len, protocol)
+}
+
+fn rewrite_transport_fields(transport: &mut [u8], translated: &FlowKey) -> Result<(), PacketError> {
+    match translated.protocol {
+        TransportProtocol::Tcp | TransportProtocol::Udp => {
+            let ports = transport
+                .get_mut(..4)
+                .ok_or(PacketError::TruncatedTransportHeader)?;
+            ports[..2].copy_from_slice(&translated.source_port.to_be_bytes());
+            ports[2..4].copy_from_slice(&translated.destination_port.to_be_bytes());
+        }
+        TransportProtocol::Icmp | TransportProtocol::Icmpv6 => {
+            let icmp = transport
+                .get_mut(..8)
+                .ok_or(PacketError::TruncatedTransportHeader)?;
+            let [message_type, code] = translated.destination_port.to_be_bytes();
+            icmp[0] = message_type;
+            icmp[1] = code;
+            icmp[4..6].copy_from_slice(&translated.source_port.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn write_transport_checksum_ipv4(
+    packet: &mut [u8],
+    transport_offset: usize,
+    total_len: usize,
+    protocol: u8,
+) -> Result<(), PacketError> {
+    let checksum_offset = checksum_offset(protocol)?;
+    let transport_len = total_len - transport_offset;
+    packet[transport_offset + checksum_offset..transport_offset + checksum_offset + 2].fill(0);
+    if protocol == IP_PROTOCOL_ICMP {
+        let checksum = internet_checksum(&packet[transport_offset..total_len]);
+        packet[transport_offset + checksum_offset..transport_offset + checksum_offset + 2]
+            .copy_from_slice(&checksum.to_be_bytes());
+        return Ok(());
+    }
+    let mut sum = 0u32;
+    sum = checksum_add(sum, &packet[12..20]);
+    sum += u32::from(protocol);
+    sum += transport_len as u32;
+    sum = checksum_add(sum, &packet[transport_offset..total_len]);
+    let checksum = checksum_finish(sum);
+    packet[transport_offset + checksum_offset..transport_offset + checksum_offset + 2]
+        .copy_from_slice(&checksum.to_be_bytes());
+    Ok(())
+}
+
+fn write_transport_checksum_ipv6(
+    packet: &mut [u8],
+    transport_offset: usize,
+    total_len: usize,
+    protocol: u8,
+) -> Result<(), PacketError> {
+    let checksum_offset = checksum_offset(protocol)?;
+    let transport_len = total_len - transport_offset;
+    packet[transport_offset + checksum_offset..transport_offset + checksum_offset + 2].fill(0);
+    let mut sum = 0u32;
+    sum = checksum_add(sum, &packet[8..40]);
+    sum = checksum_add(sum, &(transport_len as u32).to_be_bytes());
+    sum = checksum_add(sum, &[0, 0, 0, protocol]);
+    sum = checksum_add(sum, &packet[transport_offset..total_len]);
+    let checksum = checksum_finish(sum);
+    packet[transport_offset + checksum_offset..transport_offset + checksum_offset + 2]
+        .copy_from_slice(&checksum.to_be_bytes());
+    Ok(())
+}
+
+fn checksum_offset(protocol: u8) -> Result<usize, PacketError> {
+    match protocol {
+        IP_PROTOCOL_TCP => Ok(16),
+        IP_PROTOCOL_UDP => Ok(6),
+        IP_PROTOCOL_ICMP | IP_PROTOCOL_ICMPV6 => Ok(2),
+        other => Err(PacketError::UnsupportedProtocol(other)),
+    }
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    checksum_finish(checksum_add(0, bytes))
+}
+
+fn checksum_add(mut sum: u32, bytes: &[u8]) -> u32 {
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    if let Some(byte) = chunks.remainder().first() {
+        sum += u32::from(*byte) << 8;
+    }
+    sum
+}
+
+fn checksum_finish(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 fn parse_ipv4_flow_key(packet: &[u8]) -> Result<FlowKey, PacketError> {
@@ -258,6 +434,31 @@ mod tests {
         packet
     }
 
+    fn assert_ipv4_checksums(packet: &[u8]) {
+        let header_len = usize::from(packet[0] & 0x0f) * 4;
+        let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+        assert_eq!(internet_checksum(&packet[..header_len]), 0);
+        if packet[9] == IP_PROTOCOL_ICMP {
+            assert_eq!(internet_checksum(&packet[header_len..total_len]), 0);
+            return;
+        }
+        let mut sum = checksum_add(0, &packet[12..20]);
+        sum += u32::from(packet[9]);
+        sum += (total_len - header_len) as u32;
+        sum = checksum_add(sum, &packet[header_len..total_len]);
+        assert_eq!(checksum_finish(sum), 0);
+    }
+
+    fn assert_ipv6_transport_checksum(packet: &[u8]) {
+        let total_len = 40 + usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+        let (protocol, offset) = ipv6_transport_offset(packet, total_len, packet[6], 40).unwrap();
+        let mut sum = checksum_add(0, &packet[8..40]);
+        sum = checksum_add(sum, &((total_len - offset) as u32).to_be_bytes());
+        sum = checksum_add(sum, &[0, 0, 0, protocol]);
+        sum = checksum_add(sum, &packet[offset..total_len]);
+        assert_eq!(checksum_finish(sum), 0);
+    }
+
     #[test]
     fn v1_unit_parse_flow_key_ipv4_tcp() {
         let mut tcp = [0u8; 20];
@@ -357,5 +558,109 @@ mod tests {
             parse_flow_key(&ipv4_packet(17, &[0, 1, 2])),
             Err(PacketError::TruncatedTransportHeader)
         );
+    }
+
+    #[test]
+    fn v1_unit_rewrite_packet_ipv4_tcp_forward_and_reverse_are_checksum_safe() {
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[12] = 0x50;
+        let mut packet = ipv4_packet(IP_PROTOCOL_TCP, &tcp);
+        let original = parse_flow_key(&packet).unwrap();
+        let translated = FlowKey {
+            source: "192.0.2.200".parse().unwrap(),
+            source_port: 40000,
+            ..original.clone()
+        };
+
+        rewrite_packet(&mut packet, &translated).unwrap();
+        assert_eq!(parse_flow_key(&packet).unwrap(), translated);
+        assert_ipv4_checksums(&packet);
+
+        let restored = original.reverse();
+        let translated_reply = translated.reverse();
+        let mut reply = packet;
+        rewrite_packet(&mut reply, &translated_reply).unwrap();
+        rewrite_packet(&mut reply, &restored).unwrap();
+        assert_eq!(parse_flow_key(&reply).unwrap(), restored);
+        assert_ipv4_checksums(&reply);
+    }
+
+    #[test]
+    fn v1_unit_rewrite_packet_ipv4_udp_preserves_disabled_checksum() {
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&5353u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+        let mut packet = ipv4_packet(IP_PROTOCOL_UDP, &udp);
+        let original = parse_flow_key(&packet).unwrap();
+        let translated = FlowKey {
+            source: "192.0.2.201".parse().unwrap(),
+            source_port: 40001,
+            ..original
+        };
+
+        rewrite_packet(&mut packet, &translated).unwrap();
+
+        assert_eq!(parse_flow_key(&packet).unwrap(), translated);
+        assert_eq!(&packet[26..28], &[0, 0]);
+        assert_eq!(internet_checksum(&packet[..20]), 0);
+    }
+
+    #[test]
+    fn v1_unit_rewrite_packet_ipv4_icmp_updates_identifier_and_checksum() {
+        let mut icmp = [0u8; 8];
+        icmp[0] = 8;
+        icmp[4..6].copy_from_slice(&77u16.to_be_bytes());
+        let mut packet = ipv4_packet(IP_PROTOCOL_ICMP, &icmp);
+        let original = parse_flow_key(&packet).unwrap();
+        let translated = FlowKey {
+            source: "192.0.2.202".parse().unwrap(),
+            source_port: 40002,
+            ..original
+        };
+
+        rewrite_packet(&mut packet, &translated).unwrap();
+
+        assert_eq!(parse_flow_key(&packet).unwrap(), translated);
+        assert_ipv4_checksums(&packet);
+    }
+
+    #[test]
+    fn v1_unit_rewrite_packet_ipv6_tcp_udp_and_icmpv6_are_checksum_safe() {
+        let cases = [
+            (IP_PROTOCOL_TCP, 20usize, TransportProtocol::Tcp),
+            (IP_PROTOCOL_UDP, 8usize, TransportProtocol::Udp),
+            (IP_PROTOCOL_ICMPV6, 8usize, TransportProtocol::Icmpv6),
+        ];
+        for (protocol, transport_len, expected_protocol) in cases {
+            let mut transport = vec![0u8; transport_len];
+            match expected_protocol {
+                TransportProtocol::Tcp | TransportProtocol::Udp => {
+                    transport[0..2].copy_from_slice(&12345u16.to_be_bytes());
+                    transport[2..4].copy_from_slice(&443u16.to_be_bytes());
+                    if expected_protocol == TransportProtocol::Tcp {
+                        transport[12] = 0x50;
+                    }
+                }
+                TransportProtocol::Icmpv6 => {
+                    transport[0] = 128;
+                    transport[4..6].copy_from_slice(&77u16.to_be_bytes());
+                }
+                TransportProtocol::Icmp => unreachable!(),
+            }
+            let mut packet = ipv6_packet(protocol, &transport);
+            let original = parse_flow_key(&packet).unwrap();
+            let translated = FlowKey {
+                source: "2001:db8:ffff::1".parse().unwrap(),
+                source_port: 40000,
+                ..original
+            };
+
+            rewrite_packet(&mut packet, &translated).unwrap();
+
+            assert_eq!(parse_flow_key(&packet).unwrap(), translated);
+            assert_ipv6_transport_checksum(&packet);
+        }
     }
 }
