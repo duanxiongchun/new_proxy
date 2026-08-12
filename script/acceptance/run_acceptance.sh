@@ -15,6 +15,12 @@ echo "======================================================================"
 echo " Starting AF_XDP QUIC Appliance v1 Gate"
 echo "======================================================================"
 
+if [[ "$(id -u)" == "0" ]]; then
+  V1_PRIVILEGE=(env)
+else
+  V1_PRIVILEGE=(sudo -E env)
+fi
+
 mapfile -t V1_SHELL_SCRIPTS < <(
   find script -type f \( -name '*.sh' -o -path 'script/git-hooks/pre-push' \) -print | sort
 )
@@ -48,7 +54,7 @@ fi
 if [[ "${RUN_V1_E2E:-0}" == "1" ]]; then
   for script in "${V1_E2E_SCRIPTS[@]}"; do
     run "v1 E2E: $script" timeout --kill-after=10s 300s \
-      sudo -E env V1_BIN="$ROOT_DIR/target/release/new_proxy" bash "$script"
+      "${V1_PRIVILEGE[@]}" V1_BIN="$ROOT_DIR/target/release/new_proxy" bash "$script"
   done
 else
   echo
@@ -57,7 +63,7 @@ fi
 
 if [[ "${RUN_V1_SOAK:-0}" == "1" ]]; then
   run "v1 bounded soak" timeout --kill-after=10s "${V1_SOAK_TIMEOUT_SECONDS:-1800}s" \
-    sudo -E env \
+    "${V1_PRIVILEGE[@]}" \
       V1_BIN="$ROOT_DIR/target/release/new_proxy" \
       RUN_V1_SOAK=1 \
       V1_SOAK_CYCLES="${V1_SOAK_CYCLES:-10}" \
@@ -67,7 +73,7 @@ fi
 
 if [[ "${RUN_V1_PERF:-0}" == "1" ]]; then
   run "v1 performance baseline" timeout --kill-after=10s "${V1_PERF_TIMEOUT_SECONDS:-900}s" \
-    sudo -E env \
+    "${V1_PRIVILEGE[@]}" \
       V1_BIN="$ROOT_DIR/target/release/new_proxy" \
       RUN_V1_PERF=1 \
       V1_PERF_ITERATIONS="${V1_PERF_ITERATIONS:-100}" \

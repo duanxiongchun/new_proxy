@@ -28,6 +28,31 @@ struct {
     __type(value, __u8);
 } role_flags SEC(".maps") __attribute__((unused));
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} tunnel_ip_flags SEC(".maps") __attribute__((unused));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} tunnel_v4 SEC(".maps") __attribute__((unused));
+
+struct tunnel_v6_value {
+    __u8 address[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct tunnel_v6_value);
+} tunnel_v6 SEC(".maps") __attribute__((unused));
+
 struct lpm_v4_key {
     __u32 prefix_len;
     __u32 address;
@@ -58,6 +83,28 @@ static __always_inline int redirect_queue(struct xdp_md *ctx) {
     return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
 }
 
+static __always_inline int is_tunnel_v4(struct iphdr *ip, __u32 zero) {
+    __u8 *flags = bpf_map_lookup_elem(&tunnel_ip_flags, &zero);
+    if (!flags || !(*flags & 1))
+        return 0;
+    __u32 *configured = bpf_map_lookup_elem(&tunnel_v4, &zero);
+    return configured && ip->daddr == *configured;
+}
+
+static __always_inline int is_tunnel_v6(struct ipv6hdr *ip6, __u32 zero) {
+    __u8 *flags = bpf_map_lookup_elem(&tunnel_ip_flags, &zero);
+    if (!flags || !(*flags & 2))
+        return 0;
+    struct tunnel_v6_value *configured = bpf_map_lookup_elem(&tunnel_v6, &zero);
+    if (!configured)
+        return 0;
+    for (int i = 0; i < 16; i++) {
+        if (ip6->daddr.s6_addr[i] != configured->address[i])
+            return 0;
+    }
+    return 1;
+}
+
 SEC("xdp")
 int xdp_filter_prog(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -84,7 +131,7 @@ int xdp_filter_prog(struct xdp_md *ctx) {
         if (ip_end > data_end)
             return XDP_PASS;
 
-        if ((*roles & 1) && ip->protocol == IPPROTO_UDP) {
+        if ((*roles & 1) && ip->protocol == IPPROTO_UDP && is_tunnel_v4(ip, zero)) {
             struct udphdr *udp = (void *)ip_end;
             if ((void *)(udp + 1) > data_end)
                 return XDP_PASS;
@@ -105,7 +152,7 @@ int xdp_filter_prog(struct xdp_md *ctx) {
         if ((void *)(ip6 + 1) > data_end)
             return XDP_PASS;
 
-        if ((*roles & 1) && ip6->nexthdr == IPPROTO_UDP) {
+        if ((*roles & 1) && ip6->nexthdr == IPPROTO_UDP && is_tunnel_v6(ip6, zero)) {
             struct udphdr *udp = (void *)(ip6 + 1);
             if ((void *)(udp + 1) > data_end)
                 return XDP_PASS;

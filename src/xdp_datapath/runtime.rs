@@ -1,6 +1,6 @@
 use crate::flow_plane::{
-    bounded_flow_channels, ActiveDcidIndex, DcidOwner, FlowMessage, FlowWorkerState, IoOwnerKey,
-    IoRegistry, IoTransmit, OuterRoute, QuicFlow, QuicFlowId, ReverseNatDirectory, SessionLocator,
+    bounded_flow_channels, ActiveDcidIndex, FlowMessage, FlowWorkerState, IoOwnerKey, IoRegistry,
+    IoTransmit, OuterRoute, QuicFlow, QuicFlowId, ReverseNatDirectory, SessionLocator,
 };
 use crate::quic_engine::{
     pinned_client_config, server_config, QuicEngine, QuicEngineError, QuicEngineEvent,
@@ -364,7 +364,7 @@ impl PreparedRuntime {
                 .get(ifindex)
                 .map(|(_, roles)| *roles)
                 .expect("every interface has classifier roles");
-            configure_bpf_maps(&link, roles, local_tunnel_port, &config)?;
+            configure_bpf_maps(&link, interface, roles, local_tunnel_port, &config)?;
             xsk_maps.insert(*ifindex, link.map_path("xsks_map"));
             bpf_links.push(link);
         }
@@ -732,7 +732,7 @@ fn handle_flow_message(
                 if let Ok(handled) = context.state.handle_intercept(
                     io_owner,
                     packet,
-                    context.quic_flow.id(),
+                    &context.quic_flow,
                     tunnel_target,
                 ) {
                     if publish_session(context, handled.session_id) {
@@ -836,7 +836,7 @@ fn drain_engine(
                     if let Ok(handled) = context.state.handle_intercept(
                         context.default_intercept,
                         packet,
-                        context.quic_flow.id(),
+                        &context.quic_flow,
                         context.default_intercept,
                     ) {
                         if publish_session(context, handled.session_id) {
@@ -863,13 +863,7 @@ fn drain_engine(
                     .active_dcids
                     .write()
                     .expect("active DCID index is not poisoned")
-                    .publish(
-                        &dcid,
-                        DcidOwner {
-                            flow_worker_id: context.worker_id,
-                            quic_flow_id: context.quic_flow.id(),
-                        },
-                    )
+                    .publish_for_flow(&dcid, &context.quic_flow)
                     .is_err()
                 {
                     context.stats.record_dcid_publish_drop();
@@ -1339,6 +1333,7 @@ fn interface_addresses(name: &str) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>
 #[cfg(target_os = "linux")]
 fn configure_bpf_maps(
     link: &BpfLinkManager,
+    interface: &InterfaceInfo,
     roles: IoClassifiers,
     port: u16,
     config: &ApplianceConfig,
@@ -1346,6 +1341,25 @@ fn configure_bpf_maps(
     update_pinned_map(&link.map_path("tunnel_port"), &0u32, &port.to_be())?;
     let flags = u8::from(roles.tunnel) | (u8::from(roles.intercept) << 1);
     update_pinned_map(&link.map_path("role_flags"), &0u32, &flags)?;
+    let tunnel_ip_flags =
+        u8::from(interface.ipv4.is_some()) | (u8::from(interface.ipv6.is_some()) << 1);
+    update_pinned_map(&link.map_path("tunnel_ip_flags"), &0u32, &tunnel_ip_flags)?;
+    if let Some(address) = interface.ipv4 {
+        update_pinned_map(
+            &link.map_path("tunnel_v4"),
+            &0u32,
+            &u32::from_ne_bytes(address.octets()),
+        )?;
+    }
+    if let Some(address) = interface.ipv6 {
+        update_pinned_map(
+            &link.map_path("tunnel_v6"),
+            &0u32,
+            &TunnelV6Value {
+                address: address.octets(),
+            },
+        )?;
+    }
     if roles.intercept {
         let prefixes = match config.role {
             Role::Client => config.allowed_ips.clone(),
@@ -1384,6 +1398,12 @@ struct LpmV4Key {
 #[repr(C)]
 struct LpmV6Key {
     prefix_len: u32,
+    address: [u8; 16],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct TunnelV6Value {
     address: [u8; 16],
 }
 
