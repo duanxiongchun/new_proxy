@@ -6,14 +6,13 @@
 exec < /dev/tty
 
 echo "======================================================================"
-echo " Running Pre-Push Git Hook: Unified Acceptance Tests"
+echo " Running Pre-Push Git Hook: AF_XDP QUIC v1 Gate"
 echo "======================================================================"
 
-# Run the acceptance runner (this runs all code format/clippy/unit/E2E tests)
 if ! ./script/acceptance/run_acceptance.sh; then
-  echo "❌ Push rejected: Acceptance tests failed!" >&2
+  echo "❌ Push rejected: AF_XDP QUIC v1 gate failed!" >&2
   exit 1
 fi
 
-echo "✅ All acceptance tests passed. Pushing to git server..."
+echo "✅ AF_XDP QUIC v1 gate passed. Pushing to git server..."
 exit 0

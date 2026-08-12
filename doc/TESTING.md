@@ -1,213 +1,173 @@
-# new_proxy 测试说明与覆盖矩阵（Pure L3 IP-over-QUIC Datagram 架构）
+# new_proxy v1 测试与覆盖映射
 
-本文档详细描述了 `new_proxy` 纯 L3 IP-over-QUIC Datagram 隧道网关架构下的测试体系。所有单元测试、端到端测试（E2E）、性能测试和稳定性测试均围绕此全新设计展开，废弃原有的 `boringtun` (WireGuard) 和 `smoltcp` (流代理) 相关测试。
+本文档只描述当前 AF_XDP QUIC appliance 的测试资产。旧 TUN、WireGuard、
+hybrid、动态 peer 和 multi-client runtime 测试已从门禁及仓库中删除。
 
----
+## 1. 门禁入口
 
-## 1. 测试体系概览
+唯一入口是：
 
-由于系统采用无状态的 **L3 原始 IP 报文直接封装至 QUIC Datagram 传输**，测试重点从原来的“应用层流协议模拟与状态管理”转移到了**“网卡级报文吞吐、TCP MSS 夹紧（MSS Clamping）、多队列线程亲和度、零分配内存池与极致稳定性”**。
-
-```
-+-------------------------------------------------------+
-|                       测试金字塔                      |
-|                                                       |
-|   [稳定性与压力] --> 长期高吞吐、RSS/FD 增长硬门禁     |
-|   [性能与线性度] --> 1, 2, 3, 4 核心吞吐线性与零分配   |
-|   [E2E 场景测试] --> 双栈透明、对称映射、连接自愈、MSS |
-|   [Rust 单元测试] --> 报文改写、控制面协商、内存回收   |
-+-------------------------------------------------------+
-```
-
----
-
-## 2. Rust 单元与集成测试
-
-运行命令：
 ```bash
-cargo fmt --check
-cargo check
-cargo clippy --all-targets -- -D warnings
-cargo test
+./script/acceptance/run_acceptance.sh
 ```
 
-### 2.1 单元测试分布及核心校验点
+默认门禁不需要 root，执行：
 
-* **`src/app_config.rs` & `src/config.rs`**：
-  * 校验基础配置、Base64 密钥材料解析以及 AllowedIPs 路由解析。
-  * 验证非法地址、不合规端口范围的边界防御。
-  * 验证 MTU 的默认加载以及如果配置值超过 `1150` 时的自动 Clamp 机制。
-* **`src/control.rs`**：
-  * **HMAC 双向校验**：控制面请求与响应的 HMAC-SHA256 生成与合法性判定。
-  * **防重放攻击**：利用 nonce replay cache 校验 `client_nonce`。
-  * **端口下发与验证**：验证服务端动态生成的 $N$ 个数据面端口列表，以及客户端对端口列表结构完整性的校验。
-* **`src/quic_pool.rs`**：
-  * **Datagram 协商机制**：验证 QUIC 握手期间的 Datagram 传输特性启用。
-  * **多 Connection 插槽分配**：验证 $N$ 个 QUIC 物理连接槽位（`PoolSlot`）的建立、缓存与状态切换。
-  * **链接断线自愈**：测试模拟其中某一个 Slot 的物理 QUIC 链接中断，健康检查后台异步触发单独 Slot 的控制面预协商和重连，不干扰其他活跃 Slot。
-* **`src/rtc_loop.rs`（RtcWorker 事件循环）**：
-  * **网卡多队列读写**：验证工作线程 $i$ 对 TUN 队列 $i$ 的独占非阻塞轮询。
-  * **Datagram 封装与解封装**：验证从 TUN 读出 IP 数据包后，直接作为 Payload 塞入 QUIC Datagram 发送，以及反向解析 Datagram 直接写回 TUN 的正确性（IP 头部必须完全保留）。
-  * **MTU 自动 Clamp 与零拷贝传输**：
-    * 验证从 TUN 读取数据包到 `BytesMut` 缓冲区时正确的零拷贝封装（偏移读取及 header 打标）。
-    * 验证对 `CellU64` 等非原子计数器的安全读写与聚合。
-  * **线程局部 BufferPool 循环**：
-    * 验证数据面转发逻辑中，所有报文缓冲区（`PooledBuf`）全部在当前工作线程的本地 BufferPool 内借用和释放。
-    * **测试用例**：通过内存分配追踪，确保包转发热路径上没有发生任何全局堆内存分配（`malloc` / `free`），实现 100% 内存静态化。
-* **`src/runtime.rs` & `src/main.rs`**：
-  * **对称宽度校验门禁**：验证客户端启动时的协商端口数 $N$ 建立基准，若后续 Peer 配置的端口数不为 $N$，必须拒绝初始化并报错。
-  * **策略路由下发**：验证 `SO_MARK` 策略路由规则的安装，确保外层 UDP 报文不会递归回环。
-* **`src/uds_server.rs` & `src/stats_cli.rs`**：
-  * 校验 UDS API 的 `Stats` 和 `Dump` 命令。
-  * 断言导出的遥测指标（如 `sent_datagrams`、`recv_datagrams`、`dropped_packets`、`active_connections`）数值准确。
-  * **验证内核态 WireGuard 遥测聚合**：通过 Mock/控制通道注入或读取真实的内核态 WireGuard 流量指标，断言其能正确汇入 `UnifiedTelemetry` 并对 `new-proxy-cli` 返回。
-* **`src/runtime.rs` & `src/config.rs`（混合与 Netlink 模块）**：
-  * **配置解析测试**：验证 `Type = wireguard` 与 `Type = quic` 对等体类型的正确识别，以及 `WgListenPort`（若缺失则默认为 `ListenPort + 1`）的动态端口推导。
-  * **自动命名逻辑**：验证在不同数据面模式下，虚拟网卡名是否自动按 `<config_name>-tun`、`<config_name>-veth` 以及 `<config_name>-wg` 生成。
-  * **Netlink 接口交互验证**：验证接口创建（`RTM_NEWLINK`）、参数设置（私钥、端口、对等体配置）的逻辑流程是否在没有外部 `wg` 依赖下能够独立正常跑通。
+1. 所有 v1 shell 的 `bash -n`。
+2. Python traffic helper 的语法编译。
+3. `cargo fmt --check`。
+4. 全部现存 target 的 offline Cargo check。
+5. 全部现存 target 的 Clippy `-D warnings`。
+6. 全部 library 单元测试。
+7. `tests/v1_flow_integration.rs`。
 
----
+完整 root E2E：
 
-## 3. 端到端（E2E）验收脚本
-
-验收测试需要在支持 Linux Network Namespace 的环境下运行，使用 `ip` 网络空间隔离并模拟真实的网络公网延迟与物理包传输。
-
-运行所有验收测试：
 ```bash
-sudo ./script/acceptance/run_acceptance.sh
+RUN_V1_E2E=1 ./script/acceptance/run_acceptance.sh
 ```
 
-### 3.1 核心 E2E 测试场景清单
+该模式额外构建内嵌 XDP ELF 的 release binary，并顺序执行七个隔离 netns 场景。
+可选长稳和性能基线也由同一入口启用：
 
-#### 1. 双栈 L3 Datagram 透明转发 (`e2e_test_dualstack.sh`)
-* **拓扑**：建立 `client_ns` $\leftrightarrow$ `router_ns` $\leftrightarrow$ `server_ns` 三层空间。
-* **验证点**：
-  * 通过客户端 TUN 网卡注入 TCP、UDP、ICMP（IPv4 及 IPv6）流量。
-  * 验证所有流量直接被打包为 QUIC Datagram 发送，服务端解包后转发给目标真实服务。
-  * 目标服务应能成功响应。通过 IPv6 HTTP curl 测试断言流量完美闭环。
-  * 检查 UDS Stats，断言 QUIC Datagram 收发字节与包计数非零，且无 stream 开启。
+```bash
+RUN_V1_SOAK=1 V1_SOAK_CYCLES=10 \
+  ./script/acceptance/run_acceptance.sh
 
-#### 2. 多客户端并发隔离 (`e2e_multi_client.sh`)
-* **拓扑**：两个 `client1_ns` & `client2_ns` 并发连接一个 `server_ns`。
-* **验证点**：
-  * 两个客户端分别建立各自独立的 QUIC 物理连接槽位，独立进行数据收发。
-  * 验证服务端可为多客户端并发进行数据面流量哈希和转发。
+RUN_V1_PERF=1 V1_PERF_ITERATIONS=100 \
+  ./script/acceptance/run_acceptance.sh
+```
 
-#### 3. 动态 Peer 增删与会话自愈 (`e2e_dynamic_client_peer.sh`)
-* **验证点**：
-  * 运行时通过 CLI 动态添加/删除对等体。
-  * 验证未配置 peer 前数据包拦截丢弃；动态 `add-peer` 之后隧道立即打通，流量恢复；`remove-peer` 之后拦截重建。
-  * 验证重新添加 Peer 后，QUIC 物理池能自动触发预协商并快速恢复。
+`RUN_V1_E2E`、`RUN_V1_SOAK` 和 `RUN_V1_PERF` 都需要 root 或可用的无密码
+`sudo`，并依赖 Linux netns、XDP、AF_XDP、BPF mount、`bpftool`、`iproute2`、
+`ethtool`、`openssl` 与 `python3`。
 
-#### 4. 客户端拓扑基准防御门禁 (`e2e_client_topology_gate.sh`)
-* **验证点**：
-  * 客户端首个添加的对等体其 QUIC 数据端口数 $N$ 确立本地静态基准（分配 $N$ 宽度队列和线程）。
-  * 动态添加新对等体时，如果其数据端口数不等于 $N$，校验机制必须拒绝添加并报错，以保护本地静态工作线程和 TUN 多队列网卡拓扑。
+## 2. 架构约束映射
 
-#### 5. 全隧道绕过与回环防御 (`e2e_full_tunnel_bypass.sh`)
-* **验证点**：
-  * 验证 `SO_MARK` 标记的下发和系统策略路由规则，防止在代理 `0.0.0.0/0` 全网流量时出现加密包重新注入 TUN 接口的物理回环。
+| 架构约束 | 实现位置 | 自动验证 |
+|---|---|---|
+| IO owner 使用完整 `(ifindex, queue_id)` | `IoOwnerKey`, `IoRegistry`, `build_runtime` | `v1_unit_io_registry_*`, `v1_unit_xdp_runtime_uses_complete_owner_keys`, `v1_integration_equal_queue_ids_on_different_interfaces_have_distinct_owners` |
+| 一个 owner 只有一套 XSK/UMEM/rings | `Xsk`, `build_runtime` | `v1_unit_io_registry_rejects_duplicate_owner`, `v1_unit_xdp_runtime_xsk_failure_starts_no_workers`, same-interface E2E |
+| IO worker 不拥有 Session/NAT | `IoWorker::handle_frame`, `FlowDispatcher` | `v1_unit_io_worker_*`, `v1_integration_bounded_dispatch_never_changes_the_selected_owner` |
+| Flow worker 独占 Session/NAT | `FlowWorkerState`, `SessionTable`, `NatTable` | `v1_unit_session_rejects_mutation_by_the_wrong_worker`, `v1_integration_session_owner_and_local_return_io_stay_stable` |
+| bounded channel 满时不改投 owner | `FlowDispatcher::dispatch_to` | `v1_integration_bounded_dispatch_never_changes_the_selected_owner` |
+| Session key 包含入口 ifindex | `SessionKey` | `v1_unit_session_distinguishes_same_flow_on_different_interfaces`, multi-intercept E2E |
+| client/server 分别执行本地 SNAT | `FlowWorkerState::handle_intercept`, runtime tunnel handling | NAT/session unit tests，client-to-target E2E 的 target peer 与双端 stats 断言 |
+| reverse NAT 原子发布与回收 | `ReverseNatDirectory`, `SessionTable::remove*` | `v1_unit_nat_*`, `v1_unit_session_remove_cleans_forward_reverse_and_port_state`, recovery E2E |
+| ICMP key 忽略 request/reply type 变化 | `ReverseNatKey`, `FlowWorkerState::handle_reverse` | `v1_unit_nat_icmp_reply_uses_identifier_not_changed_message_type`, `v1_integration_icmp_reverse_nat_restores_identifier_and_keeps_reply_type` |
+| QUIC flow 稳定绑定 tunnel queue | `QuicFlow` | `v1_unit_quic_flow_keeps_stable_tunnel_queue_across_dcid_rotation`, queue-space integration tests |
+| tunnel ingress 按 active DCID owner 分发 | `ActiveDcidIndex`, `IoWorker::handle_frame` | DCID lifecycle tests，`v1_unit_io_worker_reverse_nat_uses_session_owner_before_flow_hash` |
+| 未知 DCID 只能进入合法 Initial bootstrap | `bootstrap_owner`, QUIC parser | `v1_unit_quic_flow_bootstrap_*`, `v1_unit_io_worker_only_long_initial_bootstraps_unknown_dcid` |
+| QUIC Fixed Bit greasing 合法 | QUIC header classifier | `v1_unit_io_worker_accepts_greased_{long,short}_header_for_active_dcid` |
+| TLS pin 与 HMAC 双向认证 | `QuicEngine`, pinned rustls config | `v1_unit_quic_engine_authenticates_and_round_trips_inner_packets`, `v1_unit_quic_engine_rejects_data_before_auth_and_retires_dcids_on_close`, 所有 E2E |
+| 空闲连接与标准 MTU | QUIC transport config，Datagram fragmentation/reassembly | `v1_unit_quic_engine_keeps_authenticated_connection_alive_while_idle`, `v1_unit_quic_engine_fragments_and_reassembles_standard_mtu_inner_packet`, reliability E2E |
+| GSO segment 独立封装 | `OuterTransmit`, runtime outer encapsulation | `v1_unit_xdp_runtime_splits_quic_gso_transmits_before_udp_encapsulation` |
+| 同接口仅一个 owner、外层分类优先 | runtime owner assembly，XDP/IO classifier | `v1_unit_xdp_runtime_same_interface_has_one_owner_and_two_classifiers`, `v1_unit_io_worker_same_interface_prioritizes_outer_quic`, same-interface E2E |
+| 同接口业务 UDP 与 tunnel port 冲突不误分类 | local tunnel address + port classifier | `v1_unit_io_worker_same_interface_tunnel_port_to_remote_ip_is_intercepted`, same-interface E2E |
+| server queue 只被真实回包纠正一次 | `SessionTable::correct_intercept_io` | `v1_integration_server_default_queue_is_corrected_once`, server-return E2E |
+| 重连更换 flow identity 并清状态 | runtime SIGHUP path，`remove_by_quic_flow` | reconnect/session tests，recovery E2E，bounded soak |
+| stats 原子暴露 owner/flow/session 状态 | `stats::write_snapshot` | `v1_unit_runtime_stats_serializes_owner_and_flow_state`，全部 E2E stats 断言 |
+| SIGKILL 后安全恢复 | netns/ifindex lock，pinned program ID 校验 | reliability E2E |
 
-#### 6. TCP MSS 夹紧有效性与零分片 (`e2e_mss_clamping.sh`)
-* **验证点**：
-  * 将客户端/服务端配置为 MTU = 1100（或配置大 MTU 被自动 Clamp 为 1100），并发起大流量 TCP 传输。
-  * 在物理链路上抓包硬性断言：绝对不能出现 IP 层的分片包（Fragmentation），且 TCP 握手 SYN 的 MSS 字段被操作系统内核自动限制至 `1060` 安全值（即 MTU - 40 字节）。
+## 3. Rust 测试覆盖
 
-#### 7. UDP 与 ICMP 隧道穿透 (`e2e_udp_icmp_tunnel.sh`)
-* **验证点**：
-  * 验证非 TCP 流量（ICMP ping、UDP DNS）直接被无状态分包至 QUIC Datagram 传输并在对端恢复，支持 ICMP ping 双向闭环。
+### 配置
 
-#### 8. UDP-over-QUIC 性能极限吞吐 (`e2e_udp_over_quic.sh`)
-* **验证点**：
-  * 验证 UDP 数据流量在 QUIC Datagram 物理下的传输吞吐能力。
+`src/v1_config.rs` 直接测试 `conf/client.conf` 和 `conf/server.conf`，并覆盖：
 
-#### 9. 混合网关与内核 WireGuard 接入验证 (`e2e_hybrid_wireguard.sh`)
-* **拓扑**：建立 `mobile_ns` (模拟标准 WG 客户端，IP `10.0.0.3`) <-> `client_ns` (运行 `new_proxy` 混合模式，拥有 `client-wg` 内核设备和 `client-tun` 用户态 QUIC 设备，网卡共享 IP `10.0.0.2`) <-> `server_ns` (运行 `new_proxy` 服务端，IP `10.0.0.1`)。
-* **验证点**：
-  * **WireGuard 直接接入**：`mobile_ns` 的标准 WireGuard 握手直连 `client_ns` 的 `client-wg` 接口并建立原生加密隧道。
-  * **最长前缀路由分流**：从 `mobile_ns` 发起对 `server_ns` 的 ping，包在 `client_ns` 被内核解密后，通过本地主机路由匹配 `10.0.0.1/32` 发送给 `client-tun` 用户态接口，被 `new_proxy` 成功封装进 QUIC Datagram 并转发给服务端，实现双重隧道桥接和流量互通。
-  * **遥测标记与统计**：使用 `new-proxy-cli` 执行 stats 查询，验证移动端对等体被标记为 `source: wireguard` 并且 `wireguard` 收发字节与握手时间数据非零。
+- 单 client/server schema。
+- client 多 intercept、server 单 intercept。
+- tunnel/intercept 同接口。
+- worker/DCID/channel 数量、NAT 范围和 role addressing。
+- 旧 section、旧字段和未知字段 fail closed。
 
-#### 10. 混合网关高可用与自愈重连验证 (`e2e_hybrid_ha_reconnect.sh`)
-* **验证点**：
-  * **服务端意外重启自愈**：
-    * 启动服务端与两类对等体（QUIC 与 WireGuard）并确保正常通信。
-    * 杀死并重新拉起服务端进程。
-    * **QUIC 客户端**：其后台 `Health Checker` 自动检测到物理连接中断，并触发独立的 Slot 控制面预协商，应在 10s 内自动完成重连自愈。
-    * **WireGuard 客户端**：由于 WireGuard 协议在内核的无状态特性，其在发送新报文时自动触发握手，当服务端重新上线后，连接应即刻无缝恢复。
-    * 验证重连后两端数据传输自动恢复。
-  * **客户端重启与会话接管**：
-    * 意外中止并重新拉起客户端（QUIC 或 WireGuard）进程，验证服务端能安全接管新会话，对旧物理连接/槽位进行安全释放或覆盖，且不会出现路由重复安装或网口独占冲突错误。
-  * **混合客户端并发与转发隔离**：
-    * 同时拉起 `Type = quic` 与 `Type = wireguard` 的客户端并发向服务端发送高吞吐流量。
-    * 验证服务端能够在物理数据通道中正确进行多队列解复用与对称流哈希，两类客户端流量并行工作，互不干扰、不引发 CPU 死锁或套接字竞争。
+### Packet、NAT 与 Session
 
----
+`src/flow_plane/packet.rs` 覆盖 IPv4/IPv6 TCP、UDP、ICMP/ICMPv6 的解析、地址和
+端口/identifier 改写以及 checksum。IPv4 UDP 原始零 checksum 会保留禁用语义。
 
-## 4. 性能与线性度测试
+`src/flow_plane/nat.rs` 和 `session.rs` 覆盖：
 
-### 4.1 多核心线性度与吞吐测试 (`perf_cores_scalability.sh` / `perf_cores_scalability_xdp.sh`)
-* **执行方式**：
-  * **TUN 模式压测**：使用 [perf_cores_scalability.sh](file:///home/duanxiongchun/new_proxy/script/perf/perf_cores_scalability.sh) 脚本。
-  * **AF_XDP 模式压测**：使用 [perf_cores_scalability_xdp.sh](file:///home/duanxiongchun/new_proxy/script/perf/perf_cores_scalability_xdp.sh) 脚本。
-  * 通过 `taskset` 将客户端与服务端工作线程及网关绑定至特定 logical NUMA 核心（如 Node 0 上的核心），逐阶梯（1..4 Cores）配置 $N$（1..4）个数据端口，发起并行的 TCP 流量和 UDP 流量压测。
-* **主要考核指标**：
-  * **单核性能红线**：
-    * **TCP 吞吐**：单核 TCP 转发吞吐必须达到并超越 **300 MiB/s**。
-    * **UDP 饱合吞吐**：单核 UDP 饱合转发吞吐必须达到并超越 **350 MiB/s**。
-  * **线性度与可扩展效率**：
-    * **TUN 模式（超线性）**：因为去除了单物理网卡 FD 上的 read/write 锁同步及 CPU L1/L3 缓存抖动（Cache Eviction），多核心多队列模式下应呈现超线性增长。
-    * **AF_XDP 模式（亚线性）**：在虚拟机虚拟接口（`veth`）测试环境下，由于不支持硬件 DMA Zero-Copy，必须运行在 `XDP_COPY` 模式下，存在高频率的 SoftIRQ 软中断和内核-用户态数据拷贝（约占 39.49% ON-CPU 周期）。在极高吞吐下受内存总线带宽瓶颈限制，呈现正常的亚线性扩展（4核扩展率约 2.77x，效率约 69%）。在硬件 Zero-Copy 支持的生产物理网卡下，该扩展性将显著提高。
+- 双栈 SNAT tuple 唯一分配、耗尽、释放复用。
+- address family 不匹配不产生半状态。
+- reverse key 发布、命中和回收。
+- 重复包复用 Session。
+- worker ownership 拒绝越权修改。
+- 按 `quic_flow_id` 精确回收。
 
-### 4.2 热路径零分配校验 (Zero Heap Allocation Check)
-* **执行方式**：
-  * 在测试环境中使用 `valgrind --tool=massif` 或 `heaptrack` 启动代理进程。
-  * 进行 10 万个小包或高并发压力传输。
-* **成功标准**：
-  * **热路径硬门禁**：在连接建立成功并进入稳定转发状态后，massif 报告的分配曲线必须是一条水平线。任何由于包分发、解密、改写或写入 TUN 导致的堆分配（Heap Allocation）都被视为缺陷并阻断编译。
+### QUIC 与分发
 
----
+`src/flow_plane/quic_flow.rs`、`src/quic_engine.rs` 和
+`src/xdp_datapath/io_worker.rs` 覆盖：
 
-## 5. 长期稳定性测试 (`stability_stress_test.sh`)
+- deterministic Initial bootstrap。
+- active DCID 发布、轮换、退休、close。
+- flow-worker affinity 与稳定 tunnel queue。
+- TLS certificate pin、HMAC、认证前拒绝业务包。
+- long/short header 与 Quinn Fixed Bit greasing。
+- AllowedIPs 命中 redirect，未命中 pass。
+- reverse-NAT owner 优先于普通 flow hash。
 
-用于验证长期高负荷运行下系统资源的稳定性和无碎片内存回收表现。
+### Runtime 装配
 
-### 5.1 流量负载模型
-* **持续时间**：1 小时或更长（CI 自动触发）。
-* **负载混合比**：
-  * **60% TCP 并发大文件下载**：持续消耗带宽，验证 MSS 夹紧在大流下的表现。
-  * **30% UDP 洪水包传输**：通过 Datagram 压力通道，考验 TUN 队列的积压和丢包处理。
-  * **10% 周期性 ICMP Ping**：监测抖动和底层健康状态。
+`src/xdp_datapath/runtime.rs` 覆盖：
 
-### 5.2 资源增长门禁指标 (Strict Resource Thresholds)
-在稳定性测试结束时，进行如下监控断言，若不满足则测试失败：
-* **内存碎片与泄漏**：由于全部数据包均复用线程专属的固定大小 BufferPool，**物理内存（RSS）自 Warmup 阶段结束起，在后续运行中增长斜率必须为 0**（波动 $\le 3\%$）。严禁出现因动态内存碎片累积导致的 RSS 缓慢攀升。
-* **文件描述符（FD）**：FD 数量必须保持静态恒定，不允许存在任何因临时连接销毁失败引起的 FD 泄漏。
-* **CPU 稳定性**：CPU 负载与吞吐量成正比，不允许在流量平稳时出现 CPU 占用率线性抬升的情况。
+- 完整 owner key 和同接口双角色装配。
+- intercept/tunnel queue 空间独立。
+- 任意 XSK 创建失败时不启动部分 workers。
+- 多 Flow worker NAT port range 无重叠。
+- IPv4/IPv6 外层 UDP checksum。
+- QUIC GSO split 后逐 segment 封装。
 
----
+`tests/v1_flow_integration.rs` 在纯内存边界上验证 owner、bounded dispatch、
+Session/NAT、ICMP 回程、server queue correction 和同接口 queue 语义。
 
-## 6. 测试安全性与超时防卡死机制 (Safety Timeouts & Exception Cleanup)
+## 4. Root E2E
 
-为了防止测试用例或测试脚本在持续集成（CI）或本地运行中由于潜在的死锁、网络阻塞等原因无限期卡死（Hang），本架构设计引入了全局超时防护和自动捕获清理机制：
+七个脚本共用 `script/acceptance/v1/lib.sh`。每个场景创建隔离 netns、veth、
+独立 BPF mount、临时证书和严格 v1 配置，启动真实 release daemon 和 XSK。
 
-### 6.1 测试场景超时机制 (Timeout Wrappers)
-* **E2E 脚本超时包裹**：统一验收测试脚本 [run_acceptance.sh](file:///home/duanxiongchun/new_proxy/script/acceptance/run_acceptance.sh) 在循环执行各个 E2E 场景测试时，强制使用 `timeout --kill-after=10s 300s` 包裹：
-  ```bash
-  timeout --kill-after=10s 300s sudo -E bash "script/acceptance/${test_name}.sh"
-  ```
-  如果某个测试脚本执行超过 5 分钟，`timeout` 工具将强制终止其进程并返回错误码 `124`，该错误码会被主控脚本识别并输出 `[TIMEOUT]`，同时阻断后续的发布流程。
-* **Makefile 编译与测试门禁**：
-  * 在 [Makefile](file:///home/duanxiongchun/new_proxy/Makefile) 的 `test` 目标中，添加 `timeout 300s cargo test`，防止本地或单元测试死锁。
-  * 在 `coverage` 目标中，添加 `timeout 600s cargo tarpaulin`，防止测试覆盖率分析挂起。
+| 脚本 | 证明内容 |
+|---|---|
+| `e2e_v1_client_to_target.sh` | IPv4/IPv6 TCP、UDP、ICMP 闭环；target 只看到 server SNAT；双端 Session/NAT/DCID 存在 |
+| `e2e_v1_server_return.sh` | target 回包进入 server reverse NAT，并通过原 QUIC flow 返回 |
+| `e2e_v1_client_return.sh` | client reverse NAT 后从原 intercept owner 回投 |
+| `e2e_v1_same_interface.sh` | tunnel/intercept 同接口只创建一个双角色 IO owner，无递归封装 |
+| `e2e_v1_multi_intercept.sh` | 两个 client intercept 都建独立 Session，回程保留原 ifindex |
+| `e2e_v1_recovery.sh` | SIGHUP 后 `quic_flow_id` 改变、旧 Session/NAT 清零、重新认证并恢复业务 |
+| `e2e_v1_reliability.sh` | 1472-byte payload、12 秒双栈 TCP idle、2 workers、client SIGKILL 后 stale XDP 恢复 |
 
-### 6.2 退出与异常清理机制 (Trap Cleanup)
-* **命名空间与进程残留风险**：因为 E2E 测试严重依赖 Linux Network Namespace 和路由标记，如果测试因出错或超时异常终止，残留的后台进程（如 `new_proxy` 守护进程、Python HTTP 服务）以及未释放的 `netns` 可能会导致下一次测试运行发生端口冲突或路由混乱。
-* **自动 EXIT 信号捕获 (Trap EXIT)**：在核心端到端脚本（如 [e2e_multi_client.sh](file:///home/duanxiongchun/new_proxy/script/acceptance/e2e_multi_client.sh) 和 [e2e_udp_over_quic.sh](file:///home/duanxiongchun/new_proxy/script/acceptance/e2e_udp_over_quic.sh)）的头部注册：
-  ```bash
-  trap cleanup EXIT
-  ```
-  当脚本接收到退出信号（包括正常执行完毕、异常出错崩溃或因超时被 `timeout` 强制杀掉），操作系统会立即调用 `cleanup` 函数：
-  1. 依次向记录的后台服务进程 PID（`SERVER_PID`, `CLIENT_PID`, `HTTP_PID` 等）发送 `SIGTERM`，并在 1 秒后发送 `SIGKILL` 强杀。
-  2. 自动清理本次测试创建的所有 Network Namespaces（如 `scale_client_ns`, `scale_server_ns` 等），确保测试物理环境在任何情况下都能 100% 干净回滚。
+E2E 同时断言业务结果和 JSON stats，不只以“ping 通”作为成功标准。
 
+## 5. Soak 与性能
+
+`script/acceptance/v1/soak_v1.sh` 每轮运行完整双栈协议矩阵并强制重连。每轮重连后
+必须满足：
+
+- 双端重新认证。
+- Session、NAT、reverse NAT 全部为零。
+- active DCID 已重新建立。
+- 最终 FD 数无漂移。
+- IO owner 数无漂移。
+- RSS 增长不超过 `V1_SOAK_RSS_GROWTH_KB`，默认 32 MiB。
+
+`script/perf/perf_v1.sh` 是可复现性优先的功能性能基线，报告 v4/v6 TCP/UDP
+echo 的 p50/p99 延迟、总耗时以及每个 IO queue 的 RX/TX/drop。它不内置硬件无关
+的吞吐阈值，也不声称 veth `skb` 结果代表物理 NIC `native` XDP 性能。
+
+## 6. 明确未覆盖
+
+下列内容不属于当前 v1 自动门禁，不能从现有测试结果推导：
+
+- 具体物理 NIC/驱动的 native XDP、zero-copy 能力和线速吞吐。
+- 多队列 RSS、CPU/NUMA affinity 的性能扩展曲线。
+- IP 层分片、IPv6 extension header、PMTU discovery 和超过 65535 bytes 的 inner packet。
+- 动态 ARP/NDP；当前 next-hop MAC 由配置提供。
+- Session idle timeout；当前只在 QUIC flow close/reconnect 时整体回收。
+- supervisor 的具体重启时延；SIGKILL 后立即手工重启已进入 E2E。
+- 长时间公网丢包、乱序、NAT rebinding 与恶意流量压力。
+- 多 peer、多 server intercept、TUN、WireGuard、hybrid 或动态控制面；这些是非目标，
+  不是待恢复的兼容测试。
+
+物理上线前应在目标 NIC、queue 数、CPU/NUMA 绑定和真实 MTU 上单独执行 soak、
+故障注入与容量测试，并保存该环境的基线。
