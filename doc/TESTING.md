@@ -21,13 +21,16 @@ hybrid、动态 peer 和 multi-client runtime 测试已从门禁及仓库中删�
 6. 全部 library 单元测试。
 7. `tests/v1_flow_integration.rs`。
 
+默认命令通过只表示非特权阶段通过；完整发布门禁必须设置 `RUN_V1_E2E=1` 并让九个
+root/netns 场景全部通过。
+
 完整 root E2E：
 
 ```bash
 RUN_V1_E2E=1 ./script/acceptance/run_acceptance.sh
 ```
 
-该模式额外构建内嵌 XDP ELF 的 release binary，并顺序执行七个隔离 netns 场景。
+该模式额外构建内嵌 XDP ELF 的 release binary，并顺序执行九个隔离 netns 场景。
 可选长稳和性能基线也由同一入口启用：
 
 ```bash
@@ -59,15 +62,23 @@ RUN_V1_PERF=1 V1_PERF_ITERATIONS=100 \
 | tunnel ingress 按 active DCID owner 分发 | `ActiveDcidIndex`, `IoWorker::handle_frame` | DCID lifecycle tests，`v1_unit_io_worker_reverse_nat_uses_session_owner_before_flow_hash` |
 | 未知 DCID 只能进入合法 Initial bootstrap | `bootstrap_owner`, QUIC parser | `v1_unit_quic_flow_bootstrap_*`, `v1_unit_io_worker_only_long_initial_bootstraps_unknown_dcid` |
 | QUIC Fixed Bit greasing 合法 | QUIC header classifier | `v1_unit_io_worker_accepts_greased_{long,short}_header_for_active_dcid` |
-| TLS pin 与 HMAC 双向认证 | `QuicEngine`, pinned rustls config | `v1_unit_quic_engine_authenticates_and_round_trips_inner_packets`, `v1_unit_quic_engine_rejects_data_before_auth_and_retires_dcids_on_close`, 所有 E2E |
+| TLS pin 与可靠 HMAC 双向认证 | `QuicEngine`, pinned rustls config，双向 auth stream | `v1_unit_quic_engine_authenticates_and_round_trips_inner_packets`, `v1_unit_quic_engine_retransmits_hmac_authentication_after_packet_loss`, `v1_unit_quic_engine_rejects_data_before_auth_and_retires_dcids_on_close`, 所有 E2E |
+| candidate 认证前不替换 active、不发布 active DCID | `QuicEngine` active/candidate 槽位，staged DCID index | `v1_unit_quic_engine_does_not_publish_active_dcid_before_authentication`, `v1_unit_quic_engine_unauthenticated_candidate_does_not_replace_active_connection`, `v1_unit_quic_engine_authenticated_candidate_is_promoted_atomically`, `v1_unit_staged_dcid_routes_without_counting_as_active`, `v1_unit_close_flow_removes_staged_candidate_dcids_without_active_dcids` |
 | 空闲连接与标准 MTU | QUIC transport config，Datagram fragmentation/reassembly | `v1_unit_quic_engine_keeps_authenticated_connection_alive_while_idle`, `v1_unit_quic_engine_fragments_and_reassembles_standard_mtu_inner_packet`, reliability E2E |
 | GSO segment 独立封装 | `OuterTransmit`, runtime outer encapsulation | `v1_unit_xdp_runtime_splits_quic_gso_transmits_before_udp_encapsulation` |
 | 同接口仅一个 owner、外层分类优先 | runtime owner assembly，XDP/IO classifier | `v1_unit_xdp_runtime_same_interface_has_one_owner_and_two_classifiers`, `v1_unit_io_worker_same_interface_prioritizes_outer_quic`, same-interface E2E |
-| 同接口业务 UDP 与 tunnel port 冲突不误分类 | local tunnel address + port classifier | `v1_unit_io_worker_same_interface_tunnel_port_to_remote_ip_is_intercepted`, same-interface E2E |
-| server queue 只被真实回包纠正一次 | `SessionTable::correct_intercept_io` | `v1_integration_server_default_queue_is_corrected_once`, server-return E2E |
+| 同接口本机管理流量与 tunnel-port 业务流量不误分类 | local tunnel address + exact port classifier | `v1_unit_io_worker_same_interface_local_non_tunnel_traffic_passes`, `v1_unit_io_worker_same_interface_tunnel_port_to_remote_ip_is_intercepted`, same-interface E2E |
+| server queue 只被真实回包纠正一次，后续正向包使用纠正 queue | `SessionTable::correct_intercept_io`, `FlowWorkerState::handle_server_inner` | `v1_integration_server_default_queue_is_corrected_once`, server-return E2E |
 | 重连更换 flow identity 并清状态 | runtime SIGHUP path，`remove_by_quic_flow` | reconnect/session tests，recovery E2E，bounded soak |
 | stats 原子暴露 owner/flow/session 状态 | `stats::write_snapshot` | `v1_unit_runtime_stats_serializes_owner_and_flow_state`，全部 E2E stats 断言 |
-| SIGKILL 后安全恢复 | netns/ifindex lock，pinned program ID 校验 | reliability E2E |
+| XDP 在 workers ready 前保持 disabled | runtime two-phase classifier enable | `v1_unit_xdp_runtime_xsk_failure_starts_no_workers`, 全部 root E2E |
+| SIGKILL 后只清理自己留下的 XDP attachment | netns/ifindex lock，owner record，精确 program ID/mode 校验 | `v1_unit_bpf_owner_record_round_trips_program_and_attach_mode`, `v1_unit_bpf_owner_record_rejects_malformed_content`, reliability E2E |
+| server Listen 具体且属于 tunnel interface | strict config，runtime interface discovery | `v1_unit_config_rejects_wildcard_server_listen`, 所有 server root E2E |
+| V1 ICMP 只支持 Echo Request/Reply | packet parser | `v1_unit_parse_flow_key_rejects_non_echo_icmp`, ICMP unit/integration tests |
+| DNS VIP 独占且属于唯一 intercept | strict config，runtime interface discovery | `v1_unit_xdp_runtime_dns_vip_must_belong_to_one_intercept_and_not_nat_or_tunnel` |
+| DNS 查询按完整 transaction key 选择 owner | `IoWorker::handle_frame`, `transaction_key` | DNS IO/flow integration tests |
+| DNS resolver 响应必须匹配原查询 wire ID 与 Question | `response_matches_query`, `FlowWorkerState::handle_dns_response` | `v1_unit_dns_response_must_match_original_id_and_question`, `v1_integration_dns_wrong_wire_id_does_not_consume_transaction` |
+| DNS EDNS/MTU 上限 fail closed | `DNS_PAYLOAD_MAX`, EDNS clamp, packet rewrite | `v1_unit_dns_edns_clamp_updates_advertised_payload_size`, `v1_integration_dns_edns_is_clamped_and_oversized_query_servfails`, `v1_integration_dns_ipv6_edns_clamp_keeps_udp_checksum_valid`, `v1_integration_dns_oversized_response_returns_servfail_and_releases_state` |
 
 ## 3. Rust 测试覆盖
 
@@ -79,12 +90,18 @@ RUN_V1_PERF=1 V1_PERF_ITERATIONS=100 \
 - client 多 intercept、server 单 intercept。
 - tunnel/intercept 同接口。
 - worker/DCID/channel 数量、NAT 范围和 role addressing。
+- server wildcard Listen 拒绝；真实启动时 Listen 必须属于 tunnel interface。
+- `AllowedIPs.Prefixes` inline、`file:`、`!file:` 三种模式；server 拒绝无运行时语义的
+  `[AllowedIPs]`。
+- client `[DNS]` 字段、resolver address family、remote domain 文件规范化和重复拒绝；
+  server 拒绝 `[DNS]`。
 - 旧 section、旧字段和未知字段 fail closed。
 
 ### Packet、NAT 与 Session
 
 `src/flow_plane/packet.rs` 覆盖 IPv4/IPv6 TCP、UDP、ICMP/ICMPv6 的解析、地址和
-端口/identifier 改写以及 checksum。IPv4 UDP 原始零 checksum 会保留禁用语义。
+端口/identifier 改写以及 checksum。ICMP 只接受 Echo Request/Reply 且 code=0；
+IPv4 UDP 原始零 checksum 会保留禁用语义。
 
 `src/flow_plane/nat.rs` 和 `session.rs` 覆盖：
 
@@ -101,12 +118,43 @@ RUN_V1_PERF=1 V1_PERF_ITERATIONS=100 \
 `src/xdp_datapath/io_worker.rs` 覆盖：
 
 - deterministic Initial bootstrap。
-- active DCID 发布、轮换、退休、close。
+- staged/active DCID 发布、提升、轮换、退休、close。
 - flow-worker affinity 与稳定 tunnel queue。
-- TLS certificate pin、HMAC、认证前拒绝业务包。
+- TLS certificate pin、可靠双向 HMAC stream、认证首包丢失重传、认证前拒绝业务包。
+- 未认证 candidate 不替换 active；认证 candidate 以
+  `DcidRetired -> Replaced(candidate DCID batch) -> Authenticated` 顺序提升；DCID
+  batch 全量校验后一次提交，`Replaced` 不关闭当前 flow，也不触发 reconnect。
 - long/short header 与 Quinn Fixed Bit greasing。
 - AllowedIPs 命中 redirect，未命中 pass。
+- direct-prefix policy 命中 pass，未命中的公网地址 redirect，私网/保留地址不被默认
+  redirect。
 - reverse-NAT owner 优先于普通 flow hash。
+- direct-prefix 默认 redirect 前强制排除 tunnel endpoint、本机 tunnel/NAT address
+  与 DNS VIP 非 UDP/53；已发布 reverse tuple 保持最高优先级。
+- DNS VIP 分片包 fail closed；IPv6 Hop-by-Hop/Routing/Destination Options/AH 后的
+  UDP/Fragment header 按真实 transport offset 分类。LocalResolver 候选回包必须先
+  命中 DNS reverse directory。
+
+### DNS 策略纯逻辑
+
+`src/flow_plane/dns.rs` 覆盖：
+
+- 标准 DNS query、单 Question、QNAME 规范化和 label 边界后缀匹配。
+- 非标准 opcode、多 Question、坏 compression pointer/loop 和 malformed payload 的
+  local fallback。
+- remote/local domain 分类。
+- transaction key 隔离、重传复用、reverse tuple lookup。
+- EDNS advertised UDP payload clamp 到 1232，超限 DNS payload 返回 `SERVFAIL`。
+- resolver 响应 wire ID 和 Question 必须匹配原始查询，错误响应不消费 transaction。
+- transaction capacity 和 NAT port exhaustion。
+- FlowWorker DNS stats：local/remote query、local/remote response、SERVFAIL、
+  capacity/NAT exhaustion、timeout、malformed fallback、spoofed/late response drop 和
+  EDNS clamp、active transaction gauge。
+- DNS capacity 与 NAT port exhaustion 返回 `SERVFAIL`，response tuple 恢复为 DNS VIP。
+- QUIC 未认证时 remote domain 查询返回 `SERVFAIL`，不排队等待认证。
+- DNS transaction timeout 返回 `SERVFAIL`、释放 NAT port，并允许后续 query 复用端口。
+- runtime transport close/candidate replacement 会释放未完成 remote DNS transaction
+  的 NAT port 和 reverse directory；本地 DNS transaction 不因 QUIC 状态变化被清理。
 
 ### Runtime 装配
 
@@ -115,21 +163,31 @@ RUN_V1_PERF=1 V1_PERF_ITERATIONS=100 \
 - 完整 owner key 和同接口双角色装配。
 - intercept/tunnel queue 空间独立。
 - 任意 XSK 创建失败时不启动部分 workers。
+- XDP classifier 在全部 workers ready 前保持 disabled。
 - 多 Flow worker NAT port range 无重叠。
 - IPv4/IPv6 外层 UDP checksum。
 - QUIC GSO split 后逐 segment 封装。
+- DNS VIP 必须只属于一个 intercept，且不能复用 tunnel local IP 或 NAT address。
+- LocalResolver XDP 粗分类限制 resolver source、client NAT address 和已配置 NAT
+  port range。
 
 `tests/v1_flow_integration.rs` 在纯内存边界上验证 owner、bounded dispatch、
-Session/NAT、ICMP 回程、server queue correction 和同接口 queue 语义。
+Session/NAT、ICMP 回程、server queue correction 后续包目标、同接口 queue 语义，
+以及 DNS local/remote resolver 分流、重传复用 NAT port、DNS VIP response 恢复、
+EDNS clamp、超限 query/response `SERVFAIL`、错误 wire ID 不消费 transaction、
+分片 resolver response 不消费 transaction、malformed fallback opaque key、IPv6
+本地 DNS 闭环和 DNS cleanup 释放 NAT/reverse 状态。
 
 ## 4. Root E2E
 
-七个脚本共用 `script/acceptance/v1/lib.sh`。每个场景创建隔离 netns、veth、
+九个脚本共用 `script/acceptance/v1/lib.sh`。每个场景创建隔离 netns、veth、
 独立 BPF mount、临时证书和严格 v1 配置，启动真实 release daemon 和 XSK。
 
 | 脚本 | 证明内容 |
 |---|---|
 | `e2e_v1_client_to_target.sh` | IPv4/IPv6 TCP、UDP、ICMP 闭环；target 只看到 server SNAT；双端 Session/NAT/DCID 存在 |
+| `e2e_v1_dns_policy.sh` | DNS VIP UDP/53 本地/远端域名分流；local resolver 看到 client SNAT，remote resolver 看到 server SNAT；响应 source 恢复为 DNS VIP；remote resolver timeout 返回 SERVFAIL |
+| `e2e_v1_dns_policy_v6.sh` | IPv6 DNS VIP UDP/53 本地/远端域名分流；断言 IPv6 resolver peer、响应 source、rcode、wire ID 和 Question 匹配 |
 | `e2e_v1_server_return.sh` | target 回包进入 server reverse NAT，并通过原 QUIC flow 返回 |
 | `e2e_v1_client_return.sh` | client reverse NAT 后从原 intercept owner 回投 |
 | `e2e_v1_same_interface.sh` | tunnel/intercept 同接口只创建一个双角色 IO owner，无递归封装 |
@@ -155,13 +213,80 @@ E2E 同时断言业务结果和 JSON stats，不只以“ping 通”作为成功
 echo 的 p50/p99 延迟、总耗时以及每个 IO queue 的 RX/TX/drop。它不内置硬件无关
 的吞吐阈值，也不声称 veth `skb` 结果代表物理 NIC `native` XDP 性能。
 
-## 6. 明确未覆盖
+## 6. IP/DNS 策略分流新增覆盖
+
+`doc/IP_DNS_POLICY.md` 描述的 direct prefix 文件、反向分流和 UDP DNS VIP 是新增
+功能范围。配置解析、userspace IP policy、XDP policy mode、DNS parser/transaction、
+FlowWorker DNS packet rewrite、runtime query/response 路径和 root netns 下本地/远端
+resolver 闭环已有覆盖；下列清单作为当前覆盖映射，未列入当前测试资产的项目不能从
+现有结果推导。
+
+### 配置、文件和严格校验
+
+- `AllowedIPs.Prefixes` 的 inline、`file:`、`!file:` 三种互斥模式。
+- 混用模式、文件缺失、不可读、非法 CIDR 和 LPM capacity 溢出均启动失败；重复
+  CIDR 规范化后去重。
+- client `[DNS]` 的 `Listen`、`LocalResolver`、`RemoteResolver`、
+  `RemoteDomainsFile`、`TransactionCapacity` 和 `TimeoutSeconds` 完整校验。
+- server 拒绝 `[DNS]`，且不再要求没有运行时语义的 `[AllowedIPs]`。
+- remote domain 文件的大小写规范化、末尾点、非法 label、重复规则和 label 边界匹配。
+
+### IP 分类和 XDP 顺序
+
+- IPv4/IPv6 direct prefix 命中直连，未命中的公网地址进入 QUIC。
+- 正向 file mode 只 redirect 文件内 tunnel prefix，其他地址 `XDP_PASS`。
+- 私网、CGNAT、ULA、link-local、multicast、unspecified、tunnel endpoint、
+  本机 tunnel address 和本节点 NAT address 不被默认 redirect 误带入 QUIC。
+- DNS VIP UDP/53 优先于私网/direct prefix 规则；DNS VIP 非 UDP/53 本地处理。
+- `LocalResolver:53` 候选回包先 redirect 到 userspace，再由 DNS reverse directory
+  精确命中；未命中必须 fail closed。
+- DNS VIP 分片查询在 XDP/IO worker fail closed，不进入普通流量路径；IPv6 extension
+  header 后的 UDP/Fragment header 使用真实 transport offset 分类。
+- LPM map capacity 扩大、完整 map 写入和两阶段 classifier enable 失败回滚；attach
+  后 program ID/owner record 失败也按精确 program ID 回滚。
+
+### DNS parser、transaction 和错误路径
+
+- `google.com` 匹配自身与 `www.google.com`，不匹配 `notgoogle.com`。
+- 标准 query、单 Question、QNAME compression、compression loop、坏 QNAME、
+  多 Question 和非标准 opcode。
+- EDNS advertised UDP payload clamp 到 1232，并验证 IP/UDP checksum 正确。
+- 超过 1232 bytes 的 DNS query/response 返回 `SERVFAIL`；response 分片丢弃且不消费
+  transaction。
+- 相同 DNS ID 来自不同 client、不同 QNAME/QTYPE/QCLASS 时 transaction 不冲突。
+- transaction key 稳定选择 Flow worker；未完成重传复用 transaction 和 NAT port。
+- malformed 但可转发的 UDP/53 查询走 LocalResolver fallback，并使用 opaque key。
+- DNS `QR=1` payload 不作为 query 解析，进入 malformed local fallback。
+- capacity exhaustion、NAT port exhaustion、resolver timeout、QUIC 未认证 remote 查询
+  都返回 `SERVFAIL`，并释放 transaction、reverse index 和 NAT port。
+- resolver source/destination tuple、wire ID、Question 不匹配，或重复响应和迟到响应，
+  均丢弃并计数。
+
+### 集成、E2E 和可观测性
+
+- root E2E 中 mock local/remote resolver 返回不同固定答案，证明 domain 选择路径
+  正确。
+- root E2E 覆盖 IPv4/IPv6 本地域名经 client 本地 resolver 闭环；remote domain 经
+  client SNAT、QUIC、server SNAT 到 remote resolver 闭环。
+- root E2E 断言 local resolver 观察到 client NAT，remote resolver 观察到 server NAT。
+- root E2E 断言 DNS 响应返回给客户端时 source 恢复为 DNS VIP:53。
+- root E2E 覆盖 remote resolver timeout，并断言客户端收到 `SERVFAIL`。
+- QUIC 未认证时 remote domain 查询 `SERVFAIL`，local domain 查询仍可成功。
+- DNS response 不生成动态 IP 路由；后续业务连接仍按目的 IP direct prefix 决策。
+- server stats 和状态中不得出现 DNS transaction 或 DNS 专用 QUIC message。
+- stats 至少断言 local/remote query、local/remote response、`SERVFAIL`、timeout、
+  active transaction gauge。capacity/NAT exhaustion、malformed fallback、
+  spoofed/late drop、EDNS clamp、unknown DNS transaction drop 和 fragmented DNS drop
+  由 Rust 单元/集成测试断言，不从当前 root E2E 推导。
+
+## 7. 明确未覆盖
 
 下列内容不属于当前 v1 自动门禁，不能从现有测试结果推导：
 
 - 具体物理 NIC/驱动的 native XDP、zero-copy 能力和线速吞吐。
 - 多队列 RSS、CPU/NUMA affinity 的性能扩展曲线。
-- IP 层分片、IPv6 extension header、PMTU discovery 和超过 65535 bytes 的 inner packet。
+- 非 DNS IP 层分片、IPv6 ESP/未知 extension header、PMTU discovery 和超过 65535
+  bytes 的 inner packet。
 - 动态 ARP/NDP；当前 next-hop MAC 由配置提供。
 - Session idle timeout；当前只在 QUIC flow close/reconnect 时整体回收。
 - supervisor 的具体重启时延；SIGKILL 后立即手工重启已进入 E2E。

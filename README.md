@@ -87,7 +87,8 @@ Cargo build script 会编译并嵌入 XDP ELF；部署时不需要源码目录�
 make package
 ```
 
-包内包含 binary、`new_proxy@.service` 以及 client/server 示例配置。
+包内包含 binary、`new_proxy@.service`、client/server 示例配置、direct prefix
+和 remote domain 示例文件。
 `/etc/new_proxy/client.conf` 和 `server.conf` 作为 conffile 安装，升级不会静默覆盖。
 
 ## 配置
@@ -118,11 +119,16 @@ make package
 | `Intercept*` | `NextHopMac` | 本地网络下一跳 MAC |
 | `NAT` | `AddressV4/AddressV6` | 本节点 SNAT 地址，至少配置一个 |
 | `NAT` | `PortStart/PortEnd` | 本节点 SNAT 端口范围 |
-| `AllowedIPs` | `Prefixes` | client intercept 的目标前缀 |
+| `AllowedIPs` | `Prefixes` | client 的 inline/file tunnel prefix 或 `!file:` direct prefix |
+| `DNS` | `Listen` | client intercept 网络中的独立 UDP/53 VIP，且不能等于 NAT/tunnel/resolver address |
+| `DNS` | `LocalResolver` | 未命中 remote domain 时使用的 client 本地 UDP/53 resolver |
+| `DNS` | `RemoteResolver` | 命中 remote domain 时通过 server 访问的 UDP/53 resolver |
+| `DNS` | `RemoteDomainsFile` | remote domain 后缀文件 |
 | `XDP` | `Mode` | `native` 或 `skb` |
 
-配置 parser 是严格的。未知 section/field、旧字段、server 多 intercept、
-重复接口、空 AllowedIPs、无效 NAT 范围和错误 role addressing 都会在启动前失败。
+配置 parser 是严格的。未知 section/field、旧字段、server `[AllowedIPs]`/`[DNS]`、
+server 多 intercept、重复接口、空 client AllowedIPs、无效 NAT 范围和错误 role
+addressing 都会在启动前失败。
 示例配置中的全零 `SharedKey` 是不可启动的占位符，部署前必须替换为两端一致的
 随机 32-byte key；证书路径、pin、接口、地址和 MAC 也必须按现场修改。
 
@@ -169,21 +175,23 @@ attachment；不会无条件拆除其他 XDP program。
 ./script/acceptance/run_acceptance.sh
 ```
 
-完整 root E2E（构建包含 XDP ELF 的 release binary 后顺序运行七个隔离场景）：
+完整 root E2E（构建包含 XDP ELF 的 release binary 后顺序运行九个隔离场景）：
 
 ```bash
 RUN_V1_E2E=1 ./script/acceptance/run_acceptance.sh
 ```
 
-七个场景覆盖：
+九个场景覆盖：
 
 1. client 到 target 的双栈 TCP/UDP/ICMP 闭环。
-2. server reverse NAT 与回隧道。
-3. client reverse NAT 与本地回投。
-4. tunnel/intercept 同接口。
-5. client 多 intercept 回到原接口。
-6. SIGHUP 重连后的状态回收与新 flow identity。
-7. 1500-byte inner packet、12 秒双栈空闲 TCP、2 Flow workers 和 SIGKILL 恢复。
+2. IPv4 DNS VIP 的 local/remote resolver 分流、双端 SNAT、超时 `SERVFAIL` 与状态释放。
+3. IPv6 DNS VIP 的 local/remote resolver 分流、响应 rcode、wire ID 和 Question 匹配。
+4. server reverse NAT 与回隧道。
+5. client reverse NAT 与本地回投。
+6. tunnel/intercept 同接口。
+7. client 多 intercept 回到原接口。
+8. SIGHUP 重连后的状态回收与新 flow identity。
+9. 1500-byte inner packet、12 秒双栈空闲 TCP、2 Flow workers 和 SIGKILL 恢复。
 
 可选的有界长稳和性能基线：
 

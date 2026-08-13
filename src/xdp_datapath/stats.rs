@@ -18,6 +18,8 @@ pub struct IoStatsSlot {
     invalid_quic_drops: AtomicU64,
     malformed_drops: AtomicU64,
     dispatch_drops: AtomicU64,
+    dns_unknown_transaction_drops: AtomicU64,
+    dns_fragmented_drops: AtomicU64,
 }
 
 impl IoStatsSlot {
@@ -58,6 +60,11 @@ impl IoStatsSlot {
                     self.malformed_drops.fetch_add(1, Ordering::Relaxed);
                 } else if matches!(reason, DropReason::DispatchRejected(_)) {
                     self.dispatch_drops.fetch_add(1, Ordering::Relaxed);
+                } else if reason == DropReason::UnknownDnsTransaction {
+                    self.dns_unknown_transaction_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                } else if reason == DropReason::FragmentedDns {
+                    self.dns_fragmented_drops.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -75,6 +82,10 @@ impl IoStatsSlot {
             invalid_quic_drops: self.invalid_quic_drops.load(Ordering::Relaxed),
             malformed_drops: self.malformed_drops.load(Ordering::Relaxed),
             dispatch_drops: self.dispatch_drops.load(Ordering::Relaxed),
+            dns_unknown_transaction_drops: self
+                .dns_unknown_transaction_drops
+                .load(Ordering::Relaxed),
+            dns_fragmented_drops: self.dns_fragmented_drops.load(Ordering::Relaxed),
         }
     }
 }
@@ -171,6 +182,19 @@ impl FlowStatsSlot {
             reverse_nat_publish_drops: self.reverse_nat_publish_drops.load(Ordering::Relaxed),
             dcid_publish_drops: self.dcid_publish_drops.load(Ordering::Relaxed),
             reconnect_failures: self.reconnect_failures.load(Ordering::Relaxed),
+            dns_query_local: stats.dns_query_local,
+            dns_query_remote: stats.dns_query_remote,
+            dns_response_local: stats.dns_response_local,
+            dns_response_remote: stats.dns_response_remote,
+            dns_servfail: stats.dns_servfail,
+            dns_capacity_exhausted: stats.dns_capacity_exhausted,
+            dns_nat_exhausted: stats.dns_nat_exhausted,
+            dns_malformed_local_fallback: stats.dns_malformed_local_fallback,
+            dns_spoofed_response_drop: stats.dns_spoofed_response_drop,
+            dns_late_response_drop: stats.dns_late_response_drop,
+            dns_edns_clamped: stats.dns_edns_clamped,
+            dns_timeout: stats.dns_timeout,
+            dns_transactions_active: stats.dns_transactions_active,
             sessions,
         };
     }
@@ -224,6 +248,8 @@ struct IoCounters {
     invalid_quic_drops: u64,
     malformed_drops: u64,
     dispatch_drops: u64,
+    dns_unknown_transaction_drops: u64,
+    dns_fragmented_drops: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -244,6 +270,19 @@ struct FlowWorkerSnapshot {
     reverse_nat_publish_drops: u64,
     dcid_publish_drops: u64,
     reconnect_failures: u64,
+    dns_query_local: u64,
+    dns_query_remote: u64,
+    dns_response_local: u64,
+    dns_response_remote: u64,
+    dns_servfail: u64,
+    dns_capacity_exhausted: u64,
+    dns_nat_exhausted: u64,
+    dns_malformed_local_fallback: u64,
+    dns_spoofed_response_drop: u64,
+    dns_late_response_drop: u64,
+    dns_edns_clamped: u64,
+    dns_timeout: u64,
+    dns_transactions_active: u64,
     sessions: Vec<SessionSnapshot>,
 }
 
@@ -375,7 +414,7 @@ fn secure_stats_file(path: &Path) -> std::io::Result<(std::path::PathBuf, std::f
 mod tests {
     use super::*;
     use crate::flow_plane::{
-        bounded_flow_channels, FlowWorkerState, IoOwnerKey, QuicFlow, QuicFlowId,
+        bounded_flow_channels, DnsFlowConfig, FlowWorkerState, IoOwnerKey, QuicFlow, QuicFlowId,
     };
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -385,6 +424,8 @@ mod tests {
         let io_slot = Arc::new(IoStatsSlot::default());
         io_slot.record_rx(2);
         io_slot.record_ingress(IngressOutcome::Dropped(DropReason::UnknownDcid));
+        io_slot.record_ingress(IngressOutcome::Dropped(DropReason::UnknownDnsTransaction));
+        io_slot.record_ingress(IngressOutcome::Dropped(DropReason::FragmentedDns));
         let io_entries = vec![IoStatsEntry {
             owner: IoOwnerKey::new(10, 1),
             tunnel: true,
@@ -400,7 +441,23 @@ mod tests {
         flow_slot.record_reverse_nat_publish_drop();
         flow_slot.record_dcid_publish_drop();
         flow_slot.record_reconnect_failure();
-        let state = FlowWorkerState::new(0, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 40000..=40001)
+        let mut state =
+            FlowWorkerState::new(0, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 40000..=40001)
+                .unwrap();
+        state
+            .handle_dns_query(
+                IoOwnerKey::new(10, 1),
+                stats_dns_packet(53000, b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05local\x07example\x00\x00\x01\x00\x01"),
+                &DnsFlowConfig {
+                    listen: "10.0.0.53:53".parse().unwrap(),
+                    local_resolver: "192.0.2.53:53".parse().unwrap(),
+                    remote_resolver: "1.1.1.1:53".parse().unwrap(),
+                    remote_domains: vec!["google.com".to_string()],
+                    transaction_capacity: 4,
+                    timeout: std::time::Duration::from_secs(5),
+                    remote_available: true,
+                },
+            )
             .unwrap();
         let flow = QuicFlow::new(QuicFlowId(7), 0, b"stats", 2).unwrap();
         flow_slot.publish(&state, &flow, false);
@@ -433,6 +490,8 @@ mod tests {
         assert_eq!(value["role"], "client");
         assert_eq!(value["io_owners"][0]["ifindex"], 10);
         assert_eq!(value["io_owners"][0]["unknown_dcid_drops"], 1);
+        assert_eq!(value["io_owners"][0]["dns_unknown_transaction_drops"], 1);
+        assert_eq!(value["io_owners"][0]["dns_fragmented_drops"], 1);
         assert_eq!(value["flow_workers"][0]["quic_flow_id"], 7);
         assert_eq!(value["flow_workers"][0]["pending_inner_drops"], 1);
         assert_eq!(value["flow_workers"][0]["quic_send_drops"], 1);
@@ -442,8 +501,28 @@ mod tests {
         assert_eq!(value["flow_workers"][0]["reverse_nat_publish_drops"], 1);
         assert_eq!(value["flow_workers"][0]["dcid_publish_drops"], 1);
         assert_eq!(value["flow_workers"][0]["reconnect_failures"], 1);
+        assert_eq!(value["flow_workers"][0]["dns_query_local"], 1);
+        assert_eq!(value["flow_workers"][0]["dns_edns_clamped"], 0);
+        assert_eq!(value["flow_workers"][0]["dns_transactions_active"], 1);
         assert_eq!(value["active_dcid_count"], 3);
         #[cfg(unix)]
         assert_eq!(stats_mode, 0o600);
+    }
+
+    fn stats_dns_packet(source_port: u16, payload: &[u8]) -> bytes::Bytes {
+        let udp_len = 8 + payload.len();
+        let total_len = 20 + udp_len;
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        packet[16..20].copy_from_slice(&[10, 0, 0, 53]);
+        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&53u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        packet[28..].copy_from_slice(payload);
+        bytes::Bytes::from(packet)
     }
 }

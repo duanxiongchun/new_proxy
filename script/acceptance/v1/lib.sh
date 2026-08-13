@@ -15,6 +15,7 @@ TARGET_NS="${TOKEN}t"
 CLIENT_PID=""
 SERVER_PID=""
 TARGET_PID=""
+EXTRA_PIDS=()
 CLIENT_STATS="$ARTIFACT_DIR/client-stats.json"
 SERVER_STATS="$ARTIFACT_DIR/server-stats.json"
 CLIENT_TUNNEL_MAC="02:00:00:00:10:01"
@@ -27,6 +28,9 @@ SERVER_INTERCEPT_MAC="02:00:00:00:20:01"
 TARGET_MAC="02:00:00:00:20:02"
 SHARED_KEY="0101010101010101010101010101010101010101010101010101010101010101"
 FLOW_WORKER_COUNT="${V1_FLOW_WORKER_COUNT:-1}"
+CHANNEL_CAPACITY="${V1_CHANNEL_CAPACITY:-8192}"
+CLIENT_ALLOWED_IPS_PREFIXES="${CLIENT_ALLOWED_IPS_PREFIXES:-10.20.1.0/24,2001:db8:20::/64}"
+SERVER_ALLOWED_IPS_PREFIXES="${SERVER_ALLOWED_IPS_PREFIXES:-10.30.0.0/15,2001:db8:30::/47}"
 
 require_root() {
   if [[ "$EUID" -ne 0 ]]; then
@@ -47,13 +51,13 @@ require_root() {
 
 cleanup() {
   set +e
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$TARGET_PID"; do
+  for pid in "$CLIENT_PID" "$SERVER_PID" "$TARGET_PID" "${EXTRA_PIDS[@]}"; do
     if [[ -n "$pid" ]]; then
       kill -TERM "$pid" 2>/dev/null || true
     fi
   done
   sleep 0.2
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$TARGET_PID"; do
+  for pid in "$CLIENT_PID" "$SERVER_PID" "$TARGET_PID" "${EXTRA_PIDS[@]}"; do
     if [[ -n "$pid" ]]; then
       kill -KILL "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -209,7 +213,7 @@ write_configs() {
 [Appliance]
 Role=client
 FlowWorkerCount=$FLOW_WORKER_COUNT
-ChannelCapacity=1024
+ChannelCapacity=$CHANNEL_CAPACITY
 DcidLength=8
 StatsPath=$CLIENT_STATS
 SharedKey=$SHARED_KEY
@@ -228,8 +232,9 @@ AddressV6=$CLIENT_NAT_V6
 PortStart=40000
 PortEnd=49999
 
+${CLIENT_DNS_SECTION:-}
 [AllowedIPs]
-Prefixes=10.20.1.0/24,2001:db8:20::/64
+Prefixes=$CLIENT_ALLOWED_IPS_PREFIXES
 
 [XDP]
 Mode=skb
@@ -238,7 +243,7 @@ EOF
 [Appliance]
 Role=server
 FlowWorkerCount=$FLOW_WORKER_COUNT
-ChannelCapacity=1024
+ChannelCapacity=$CHANNEL_CAPACITY
 DcidLength=8
 StatsPath=$SERVER_STATS
 SharedKey=$SHARED_KEY
@@ -259,9 +264,6 @@ AddressV4=10.20.1.1
 AddressV6=2001:db8:20::1
 PortStart=50000
 PortEnd=59999
-
-[AllowedIPs]
-Prefixes=10.30.0.0/15,2001:db8:30::/47
 
 [XDP]
 Mode=skb

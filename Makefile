@@ -54,10 +54,14 @@ package: build
 	cp conf/client.conf $(DEB_DIR)/etc/new_proxy/client.conf.example
 	cp conf/server.conf $(DEB_DIR)/etc/new_proxy/server.conf
 	cp conf/client.conf $(DEB_DIR)/etc/new_proxy/client.conf
+	cp conf/direct-cidrs.txt $(DEB_DIR)/etc/new_proxy/direct-cidrs.txt
+	cp conf/remote-domains.txt $(DEB_DIR)/etc/new_proxy/remote-domains.txt
 	chmod 600 $(DEB_DIR)/etc/new_proxy/server.conf.example
 	chmod 600 $(DEB_DIR)/etc/new_proxy/client.conf.example
 	chmod 600 $(DEB_DIR)/etc/new_proxy/server.conf
 	chmod 600 $(DEB_DIR)/etc/new_proxy/client.conf
+	chmod 600 $(DEB_DIR)/etc/new_proxy/direct-cidrs.txt
+	chmod 600 $(DEB_DIR)/etc/new_proxy/remote-domains.txt
 
 	# Write control file
 	echo "Package: new-proxy" > $(DEB_DIR)/DEBIAN/control
@@ -68,7 +72,7 @@ package: build
 	echo "Depends: libc6, iproute2, bpftool" >> $(DEB_DIR)/DEBIAN/control
 	echo "Maintainer: Xiongchun Duan <duanxiongchun@bytedance.com>" >> $(DEB_DIR)/DEBIAN/control
 	echo "Description: AF_XDP QUIC appliance with userspace stateful SNAT" >> $(DEB_DIR)/DEBIAN/control
-	printf '/etc/new_proxy/client.conf\n/etc/new_proxy/server.conf\n' > $(DEB_DIR)/DEBIAN/conffiles
+	printf '/etc/new_proxy/client.conf\n/etc/new_proxy/server.conf\n/etc/new_proxy/direct-cidrs.txt\n/etc/new_proxy/remote-domains.txt\n' > $(DEB_DIR)/DEBIAN/conffiles
 
 	# Build deb package
 	dpkg-deb --root-owner-group --build $(DEB_DIR) $(DEB_FILE)

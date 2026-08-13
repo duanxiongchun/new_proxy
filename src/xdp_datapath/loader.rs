@@ -8,6 +8,13 @@ use std::process::Command;
 #[cfg(target_os = "linux")]
 const XDP_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/xdp_filter.o"));
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnerRecord {
+    program_id: u64,
+    mode: XdpAttachMode,
+}
+
 #[cfg(all(target_os = "linux", not(test)))]
 fn write_embedded_xdp_object(ifindex: u32) -> io::Result<PathBuf> {
     use std::io::Write;
@@ -50,8 +57,9 @@ pub struct BpfLinkManager {
     interface: String,
     mode: XdpAttachMode,
     pin_dir: PathBuf,
+    owner_path: PathBuf,
     _lock: File,
-    attached: bool,
+    owned_program_id: Option<u64>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -70,24 +78,44 @@ impl BpfLinkManager {
         }
 
         let pin_dir = PathBuf::from(format!("/sys/fs/bpf/new_proxy_{ifindex}"));
+        let owner_path = interface_owner_path(ifindex)?;
         let lock = claim_interface_lock(ifindex)?;
         let manager = Self {
             interface: interface.to_string(),
             mode,
             pin_dir,
+            owner_path,
             _lock: lock,
-            attached: false,
+            owned_program_id: None,
         };
 
         #[cfg(not(test))]
         {
             let mut manager = manager;
             let object_path = write_embedded_xdp_object(ifindex)?;
-            if manager.pin_dir.exists() {
-                if let Err(error) = manager.cleanup_stale_attachment() {
+            if let Err(error) = manager.detach_owned_stale_attachment() {
+                let _ = std::fs::remove_file(&object_path);
+                return Err(error);
+            }
+            let attached = match manager.attached_program_id() {
+                Ok(attached) => attached,
+                Err(error) => {
                     let _ = std::fs::remove_file(&object_path);
                     return Err(error);
                 }
+            };
+            if let Some(attached) = attached {
+                let _ = std::fs::remove_file(&object_path);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "interface {} has unowned XDP program {attached} attached",
+                        manager.interface
+                    ),
+                ));
+            }
+            if manager.pin_dir.exists() {
+                std::fs::remove_dir_all(&manager.pin_dir)?;
             }
             if let Err(error) = std::fs::create_dir(&manager.pin_dir) {
                 let _ = std::fs::remove_file(&object_path);
@@ -122,9 +150,20 @@ impl BpfLinkManager {
                 let _ = std::fs::remove_dir_all(&manager.pin_dir);
                 return Err(error);
             }
-            if let Err(error) = manager.detach_matching_stale_attachment() {
+            let program_id = bpftool_program_id(
+                Command::new("bpftool")
+                    .args(["-j", "prog", "show", "pinned"])
+                    .arg(manager.pin_dir.join("xdp_filter_prog")),
+            )?;
+            if let Ok(Some(attached)) = manager.attached_program_id() {
                 let _ = std::fs::remove_dir_all(&manager.pin_dir);
-                return Err(error);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "interface {} has unowned XDP program {attached} attached",
+                        manager.interface
+                    ),
+                ));
             }
             if let Err(error) = manager.run(
                 Command::new("bpftool")
@@ -136,7 +175,20 @@ impl BpfLinkManager {
                 let _ = std::fs::remove_dir_all(&manager.pin_dir);
                 return Err(error);
             }
-            manager.attached = true;
+            manager.owned_program_id = Some(program_id);
+            if manager.attached_program_id()? != Some(program_id) {
+                return Err(io::Error::other(format!(
+                    "interface {} attachment does not match loaded program {program_id}",
+                    manager.interface
+                )));
+            }
+            write_owner_record(
+                &manager.owner_path,
+                OwnerRecord {
+                    program_id,
+                    mode: manager.mode,
+                },
+            )?;
             Ok(manager)
         }
 
@@ -150,10 +202,7 @@ impl BpfLinkManager {
 
     #[cfg_attr(test, allow(dead_code))]
     fn attach_type(&self) -> &'static str {
-        match self.mode {
-            XdpAttachMode::Native => "xdp",
-            XdpAttachMode::Skb => "xdpgeneric",
-        }
+        attach_type(self.mode)
     }
 
     #[cfg_attr(test, allow(dead_code))]
@@ -170,70 +219,34 @@ impl BpfLinkManager {
     }
 
     #[cfg(not(test))]
-    fn cleanup_stale_attachment(&self) -> io::Result<()> {
-        let pinned_program = self.pin_dir.join("xdp_filter_prog");
-        if pinned_program.exists() {
-            let pinned_id = bpftool_program_id(
-                Command::new("bpftool")
-                    .args(["-j", "prog", "show", "pinned"])
-                    .arg(&pinned_program),
-            )?;
-            let attached = Command::new("bpftool")
-                .args(["-j", "net", "show", "dev", &self.interface])
-                .output()?;
-            if !attached.status.success() {
-                return Err(io::Error::other(format!(
-                    "query XDP attachment failed: {}",
-                    String::from_utf8_lossy(&attached.stderr).trim()
-                )));
-            }
-            let attached: serde_json::Value =
-                serde_json::from_slice(&attached.stdout).map_err(io::Error::other)?;
-            if json_contains_program_id(&attached, pinned_id) {
-                self.run(
-                    Command::new("bpftool").args([
-                        "net",
-                        "detach",
-                        self.attach_type(),
-                        "dev",
-                        &self.interface,
-                    ]),
-                    "detach stale XDP program",
-                )?;
-            }
-        }
-        std::fs::remove_dir_all(&self.pin_dir)
-    }
-
-    #[cfg(not(test))]
-    fn detach_matching_stale_attachment(&self) -> io::Result<()> {
-        let Some(attached_id) = self.attached_program_id()? else {
+    fn detach_owned_stale_attachment(&self) -> io::Result<()> {
+        let Some(owner) = read_owner_record(&self.owner_path)? else {
             return Ok(());
         };
-        let pinned_id = bpftool_program_id(
-            Command::new("bpftool")
-                .args(["-j", "prog", "show", "pinned"])
-                .arg(self.pin_dir.join("xdp_filter_prog")),
-        )?;
-        if attached_id != pinned_id {
+        let attached_id = self.attached_program_id()?;
+        if attached_id.is_some_and(|attached| attached != owner.program_id) {
+            let _ = std::fs::remove_file(&self.owner_path);
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "interface {} has a non-new_proxy XDP program attached",
-                    self.interface
+                    "interface {} attachment no longer matches owned program {}",
+                    self.interface, owner.program_id
                 ),
             ));
         }
-        self.run(
-            Command::new("bpftool").args([
-                "net",
-                "detach",
-                self.attach_type(),
-                "dev",
-                &self.interface,
-            ]),
-            "detach stale XDP program",
-        )
+        if attached_id == Some(owner.program_id) {
+            self.run(
+                Command::new("bpftool").args([
+                    "net",
+                    "detach",
+                    attach_type(owner.mode),
+                    "dev",
+                    &self.interface,
+                ]),
+                "detach stale XDP program",
+            )?;
+        }
+        remove_owner_record(&self.owner_path)
     }
 
     #[cfg(not(test))]
@@ -254,12 +267,104 @@ impl BpfLinkManager {
 }
 
 #[cfg(target_os = "linux")]
+fn attach_type(mode: XdpAttachMode) -> &'static str {
+    match mode {
+        XdpAttachMode::Native => "xdp",
+        XdpAttachMode::Skb => "xdpgeneric",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn netns_inode() -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata("/proc/self/ns/net")?.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn interface_owner_path(ifindex: u32) -> io::Result<PathBuf> {
+    let netns_inode = netns_inode()?;
+    #[cfg(not(test))]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let directory = PathBuf::from("/run/new_proxy");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+        Ok(directory.join(format!("xdp-{netns_inode}-{ifindex}.owner")))
+    }
+    #[cfg(test)]
+    Ok(std::env::temp_dir().join(format!(
+        "new_proxy-xdp-test-{}-{netns_inode}-{ifindex}.owner",
+        std::process::id(),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn write_owner_record(path: &std::path::Path, owner: OwnerRecord) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let temporary = path.with_extension(format!("owner.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let mode = match owner.mode {
+        XdpAttachMode::Native => "native",
+        XdpAttachMode::Skb => "skb",
+    };
+    if let Err(error) = writeln!(file, "{} {mode}", owner.program_id) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_owner_record(path: &std::path::Path) -> io::Result<Option<OwnerRecord>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut fields = text.split_whitespace();
+    let program_id = fields
+        .next()
+        .ok_or_else(|| io::Error::other("XDP owner record is missing program id"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("XDP owner record has invalid program id"))?;
+    let mode = match fields.next() {
+        Some("native") => XdpAttachMode::Native,
+        Some("skb") => XdpAttachMode::Skb,
+        _ => return Err(io::Error::other("XDP owner record has invalid mode")),
+    };
+    if fields.next().is_some() {
+        return Err(io::Error::other("XDP owner record has extra fields"));
+    }
+    Ok(Some(OwnerRecord { program_id, mode }))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owner_record(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn claim_interface_lock(ifindex: u32) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let netns = std::fs::metadata("/proc/self/ns/net")?;
-    use std::os::unix::fs::MetadataExt;
-    let netns_inode = netns.ino();
+    let netns_inode = netns_inode()?;
     #[cfg(not(test))]
     let path = {
         use std::os::unix::fs::DirBuilderExt;
@@ -310,22 +415,6 @@ fn bpftool_program_id(command: &mut Command) -> io::Result<u64> {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
-fn json_contains_program_id(value: &serde_json::Value, expected: u64) -> bool {
-    match value {
-        serde_json::Value::Object(fields) => {
-            fields.get("id").and_then(serde_json::Value::as_u64) == Some(expected)
-                || fields
-                    .values()
-                    .any(|value| json_contains_program_id(value, expected))
-        }
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| json_contains_program_id(value, expected)),
-        _ => false,
-    }
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
 fn find_xdp_program_id(value: &serde_json::Value) -> Option<u64> {
     match value {
         serde_json::Value::Object(fields) => fields
@@ -354,25 +443,46 @@ impl Drop for BpfLinkManager {
     fn drop(&mut self) {
         #[cfg(not(test))]
         {
-            if !self.attached {
-                return;
-            }
-            use std::process::Command;
-            let status = Command::new("bpftool")
-                .args(["net", "detach", self.attach_type(), "dev", &self.interface])
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    log::info!(
-                        "Successfully detached XDP program from interface {}",
-                        self.interface
-                    );
+            if let Some(owned_program_id) = self.owned_program_id {
+                match self.attached_program_id() {
+                    Ok(Some(attached_program_id)) if attached_program_id == owned_program_id => {
+                        let status = Command::new("bpftool")
+                            .args(["net", "detach", self.attach_type(), "dev", &self.interface])
+                            .status();
+                        match status {
+                            Ok(status) if status.success() => {
+                                log::info!(
+                                    "Successfully detached XDP program from interface {}",
+                                    self.interface
+                                );
+                            }
+                            other => {
+                                log::warn!(
+                                    "Failed to detach XDP program from interface {}: {:?}",
+                                    self.interface,
+                                    other
+                                );
+                            }
+                        }
+                    }
+                    Ok(Some(attached_program_id)) => {
+                        log::warn!(
+                            "leaving replacement XDP program {attached_program_id} attached to {}; owned program was {owned_program_id}",
+                            self.interface
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!(
+                            "failed to verify XDP ownership on {} during shutdown: {error}",
+                            self.interface
+                        );
+                    }
                 }
-                other => {
+                if let Err(error) = remove_owner_record(&self.owner_path) {
                     log::warn!(
-                        "Failed to detach XDP program from interface {}: {:?}",
-                        self.interface,
-                        other
+                        "failed to remove owner record {}: {error}",
+                        self.owner_path.display()
                     );
                 }
             }
@@ -416,5 +526,38 @@ mod tests {
     fn v1_unit_bpf_loader_uses_ifindex_scoped_maps() {
         let manager = BpfLinkManager::attach("lo", XdpAttachMode::Native).unwrap();
         assert!(manager.map_path("xsks_map").ends_with("maps/xsks_map"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn v1_unit_bpf_owner_record_round_trips_program_and_attach_mode() {
+        let path = std::env::temp_dir().join(format!(
+            "new_proxy-owner-record-{}-{}.owner",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let owner = OwnerRecord {
+            program_id: 42,
+            mode: XdpAttachMode::Skb,
+        };
+
+        write_owner_record(&path, owner).unwrap();
+        assert_eq!(read_owner_record(&path).unwrap(), Some(owner));
+        remove_owner_record(&path).unwrap();
+        assert_eq!(read_owner_record(&path).unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn v1_unit_bpf_owner_record_rejects_malformed_content() {
+        let path = std::env::temp_dir().join(format!(
+            "new_proxy-owner-record-invalid-{}-{}.owner",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&path, "not-an-id native\n").unwrap();
+
+        assert!(read_owner_record(&path).is_err());
+        remove_owner_record(&path).unwrap();
     }
 }
