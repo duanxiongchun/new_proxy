@@ -13,10 +13,11 @@
 - 单 client、单 server、固定 endpoint/listen。
 - client 支持一个或多个 intercept interface；server 只允许一个。
 - tunnel interface 与 intercept interface 可以相同。
-- IPv4/IPv6 TCP、UDP、ICMP/ICMPv6。
+- IPv4/IPv6 TCP、UDP、ICMP/ICMPv6 Echo Request/Reply。
 - TLS 服务端证书 pin 与共享密钥 HMAC 双向认证。
 - QUIC keepalive、标准 MTU inner packet 分片/重组。
 - QUIC 重连时按 epoch 回收旧 Session、NAT、reverse NAT、DCID 和 pending packet。
+- client direct-prefix 与 UDP/53 DNS 策略详见 `doc/IP_DNS_POLICY.md`。
 
 ### 非目标
 
@@ -38,9 +39,22 @@
 - `tunnel_port`：外层 QUIC UDP 目的端口。
 - `tunnel_v4` / `tunnel_v6`：本接口可作为 tunnel 目的地址的本地 IP。
 - `allowed_v4` / `allowed_v6`：intercept 目标前缀。
+- `intercept_policy_mode`：正向 tunnel-prefix 或反向 direct-prefix。
+- DNS VIP、LocalResolver 候选回包与 DNS NAT port range maps。
 
 目的地址为本接口 tunnel 地址且目的端口匹配的 UDP 优先进入 tunnel 分类；
 同端口但目的地址为业务地址的合法 inner UDP 会回落到 intercept pipeline。
+发往本机 tunnel 地址的其他端口直接 `XDP_PASS`，不会误进入 intercept pipeline，
+因此 tunnel/intercept 同接口时仍保留 SSH、监控等本机管理流量。
+
+XDP attach 后 `role_flags=0`，classifier 保持 disabled。只有所有 XSK、IO worker 和
+Flow worker 都成功启动后，runtime 才一次性写入最终 role flags；任一步失败都不会
+留下一个已 redirect、但没有 userspace consumer 的半启动数据面。
+
+client 反向 direct-prefix 模式默认只 redirect 公网目的地址。已发布 reverse-NAT
+tuple 优先；tunnel endpoint、本机 tunnel/NAT address、保留地址和 DNS VIP 非
+UDP/53 流量强制本地处理，防止隧道递归。DNS VIP UDP/53 与 LocalResolver 候选
+回包在该规则前分类。
 
 `build.rs` 在 Cargo build 时编译 XDP ELF 并将其嵌入 `new_proxy` binary。
 运行时从只允许新建的私有临时文件加载 ELF，加载后立即删除，因此部署不依赖
@@ -79,16 +93,25 @@ IO worker 不创建、不修改 Session、NAT 或 QUIC connection。
 - `QuicEngine`
 - `QuicFlow`
 - 属于该 worker 的 active DCID
+- client DNS transaction、resolver reverse index 和短生命周期 NAT binding
 
 IO/Flow 与 Flow/IO 之间使用有界 `sync_channel`。channel 满、断开或 owner
 缺失时明确丢包并记账，不会把包重投给其他 worker。
+
+DNS transaction 使用完整 intercept `IoOwnerKey`、client source、wire transaction ID、
+Question 或 opaque payload hash 选择 Flow worker，不使用普通 5-tuple hash。resolver 回包必须命中 DNS
+reverse directory，并且来源、NAT tuple、wire ID 和 Question 都匹配原查询后才消费
+transaction；EDNS advertised UDP payload 会 clamp 到 1232，超过 DNS payload 上限或
+分片的 DNS 包 fail closed。
 
 ### QUIC engine
 
 `src/quic_engine.rs` 直接驱动 `quinn-proto`：
 
 - client 固定 server certificate SHA-256。
-- QUIC transport 建立后，client/server 使用共享密钥完成 HMAC challenge。
+- QUIC transport 建立后，client/server 在一条可靠双向 QUIC stream 上完成四步
+  HMAC challenge：request、response、confirm、complete。认证控制帧由 QUIC
+  重传，丢失单个外层 UDP packet 不会永久卡住认证。
 - 认证前拒绝 inner packet。
 - inner IP packet 通过 QUIC Datagram 发送；超过当前 Datagram 上限时使用有界、
   带 packet id/total length/offset 的片段，最多重组 1 MiB、5 秒后清理残片。
@@ -96,6 +119,13 @@ IO/Flow 与 Flow/IO 之间使用有界 `sync_channel`。channel 满、断开或 
 - 正确处理 GSO `segment_size`，每个 QUIC UDP segment 独立封装。
 - 支持 Quinn 协商的 QUIC Fixed Bit greasing。
 - CID generator 产生归属指定 Flow worker 的 DCID。
+- 新 server connection 先进入 candidate 槽位。candidate 完成 TLS 和 HMAC 前
+  不替换 active connection，也不把 DCID 发布为 active；其 DCID 只进入 staged
+  路由索引以保证握手短头包仍回到同一 Flow worker。认证完成后按
+  `retire old DCID -> Replaced(candidate DCID batch) -> Authenticated` 提升。runtime
+  先全量校验 candidate DCID，再一次提交 staged-to-active；任一冲突都不产生部分发布。
+  `Replaced` 同时回收旧 connection 的 Session、remote DNS 和 pending packet，保持
+  当前 `QuicFlowId`；真实 transport 断开才触发 `Closed`、关闭 DCID flow 并重连。
 
 ## 3. Ownership 和索引
 
@@ -160,8 +190,8 @@ active DCID 只用于 tunnel ingress 分发，不是 Session 的长期主键。
 
 ### Intercept ingress
 
-1. XDP 对 client 目标地址执行 AllowedIPs LPM；server 只拦截本机 SNAT host
-   address 的回包。
+1. XDP 对 client 目标地址执行 tunnel/direct prefix policy，并在前面处理 DNS、
+   reverse NAT 与强制本地地址；server 只拦截本机 SNAT host address 的回包。
 2. IO worker 解析内层 flow。
 3. reverse-NAT 命中时直接使用记录的 Flow worker。
 4. 新 flow 使用稳定 hash 选择 Flow worker。
@@ -233,16 +263,27 @@ XSK/UMEM：
   `- intercept classifier: AllowedIPs / reverse NAT
 ```
 
-只有发往本接口 tunnel 地址的 tunnel-port UDP 才优先按 QUIC 分类；业务目的
-地址上的同端口 UDP 仍按 inner flow 处理，避免端口冲突误丢。
+只有发往本接口 tunnel 地址的 tunnel-port UDP 才优先按 QUIC 分类；发往本机
+tunnel 地址的其他端口 `PASS` 给内核，业务目的地址上的同端口 UDP 仍按 inner
+flow 处理，避免管理流量和端口冲突流量误分类。
 
 ## 7. 安全边界
 
 - TLS 提供 QUIC transport 加密。
 - client 只接受配置 pin 对应的 server DER certificate。
-- HMAC challenge 使用 32 字节共享密钥；两端都认证后才接受业务 Datagram。
+- HMAC challenge 使用 32 字节共享密钥和可靠 QUIC stream；client 收到最终
+  `complete`、server 验证 `confirm` 后才接受业务 Datagram。
+- 未认证 candidate 不能替换 active connection，candidate DCID 不计入 active
+  stats；candidate 失败、被覆盖或 flow close 时 staged DCID 必须清理。
 - malformed Ethernet/IP/UDP/QUIC、非法 DCID、未知非 Initial DCID 均 fail closed。
 - 配置 parser 拒绝未知字段和旧格式，避免静默启用错误路径。
+- server `Tunnel.Listen` 必须是具体单播地址，且启动时必须属于 tunnel interface；
+  wildcard `0.0.0.0`/`[::]` 直接拒绝。
+- V1 只接受 code=0 的 ICMPv4 Echo 0/8 和 ICMPv6 Echo 128/129；其他 ICMP 类型
+  不建立 stateful NAT Session。
+- DNS VIP 必须只属于一个 client intercept，且不能与 tunnel local IP、NAT address
+  或 resolver address 重复；resolver 必须使用 UDP/53。LocalResolver XDP 候选回包
+  还必须匹配 resolver source、client NAT address 和配置的 NAT port range。
 - 打包配置的全零 SharedKey 是 fail-closed 占位符，必须由部署系统替换。
 
 共享密钥和 DER 私钥由部署系统分发；JSON stats 可能包含业务 tuple，路径权限应由
@@ -253,13 +294,16 @@ XSK/UMEM：
 ### 启动
 
 1. 严格解析 v1 配置。
-2. 按真实接口/queue 发现 owner。
-3. 为每个 ifindex 加载并 attach 独立 XDP program/maps。
+2. 按真实接口/queue 发现 owner，并验证 server Listen 属于 tunnel interface。
+3. 为每个 ifindex 加载并 attach 独立 XDP program/maps，但保持 classifier disabled。
 4. 为每个 owner 创建独立 XSK/UMEM/rings。
 5. 启动 IO workers 和 Flow workers。
-6. client 发起 QUIC，完成 TLS pin 和 HMAC。
+6. 启用全部 XDP classifier。
+7. client 发起 QUIC，完成 TLS pin 和可靠 HMAC stream。
 
-任一接口、map、XSK 或配置步骤失败都会中止启动。
+任一接口、map、XSK 或配置步骤失败都会中止启动。XDP attach 后若 program ID
+校验或 owner record 写入失败，manager 只在 attachment 仍匹配本次 program ID 时
+回滚 detach，不留下无 owner 的 attachment，也不拆除外部替换程序。
 
 ### SIGHUP 重连
 
@@ -278,7 +322,10 @@ XSK/UMEM：
 `SIGTERM`/`SIGINT` 停止 workers、关闭 connection、写最后一份 stats、detach
 XDP 并删除 ifindex-scoped pins。接口地址、路由和邻居不是进程生命周期资源。
 异常退出后，进程级 `(netns, ifindex)` lock 会释放；下次启动仅在 pinned program
-ID 与当前 attachment 一致时 detach stale program，然后重建 pins。
+ID 与当前 attachment 一致时 detach stale program，然后重建 pins。每个 attachment
+另有 `/run/new_proxy/xdp-<netns_inode>-<ifindex>.owner`，记录精确 program ID 和
+native/SKB attach mode；正常 Drop 也只 detach 本实例仍实际拥有的 attachment，
+不会误删后来者或外部 XDP program。
 
 ## 9. Stats 契约
 
@@ -290,6 +337,9 @@ ID 与当前 attachment 一致时 detach stale program，然后重建 pins。
 - `active_dcid_count`、全局 `reverse_nat_count`。
 - bounded channel、pending inner、QUIC send、NAT/DCID publish 和 reconnect
   failure counters。
+- DNS local/remote query/response、SERVFAIL、timeout、capacity/NAT exhaustion、
+  malformed/spoofed/late drop、EDNS clamp、active transaction gauge，以及 IO 级
+  unknown DNS transaction / fragmented DNS drop counters。
 
 stats 是只读观测面，不是控制面。
 

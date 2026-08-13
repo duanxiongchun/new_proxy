@@ -1,13 +1,17 @@
 use crate::flow_plane::{
-    bounded_flow_channels, ActiveDcidIndex, FlowMessage, FlowWorkerState, IoOwnerKey, IoRegistry,
-    IoTransmit, OuterRoute, QuicFlow, QuicFlowId, ReverseNatDirectory, SessionLocator,
+    bounded_flow_channels, ActiveDcidIndex, DnsFlowConfig, DnsFlowError, FlowMessage,
+    FlowWorkerError, FlowWorkerState, HandledDnsQuery, IoOwnerKey, IoRegistry, IoTransmit,
+    NatBinding, OuterRoute, QuicFlow, QuicFlowId, ReverseNatDirectory, SessionLocator,
 };
 use crate::quic_engine::{
     pinned_client_config, server_config, QuicEngine, QuicEngineError, QuicEngineEvent,
 };
-use crate::v1_config::{ApplianceConfig, InterceptConfig, MacAddress, Role, XdpAttachMode};
+use crate::v1_config::{
+    ApplianceConfig, InterceptConfig, IpPolicy, MacAddress, Role, XdpAttachMode,
+};
 use crate::xdp_datapath::io_worker::{
-    InterceptPolicy, IoClassifierConfig, IoWorker as ClassifyingIoWorker,
+    DnsLocalResponseClassifier, InterceptPolicy, IoClassifierConfig,
+    IoWorker as ClassifyingIoWorker,
 };
 use crate::xdp_datapath::loader::BpfLinkManager;
 use crate::xdp_datapath::stats::{write_snapshot, FlowStatsSlot, IoStatsEntry, IoStatsSlot};
@@ -29,6 +33,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const XSK_MAP_MAX_ENTRIES: u32 = 4096;
+const POLICY_TUNNEL_PREFIXES: u8 = 0;
+const POLICY_DIRECT_PREFIXES: u8 = 1;
+const POLICY_ACTION_PASS: u8 = 0;
+const POLICY_ACTION_REDIRECT: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IoClassifiers {
@@ -273,6 +281,7 @@ struct InterfaceInfo {
     ifindex: u32,
     queue_count: u32,
     mac: [u8; 6],
+    addresses: Vec<IpAddr>,
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
 }
@@ -313,9 +322,10 @@ impl XskFactory for LinuxXskFactory {
 struct PreparedRuntime {
     config: ApplianceConfig,
     tunnel: InterfaceInfo,
+    tunnel_local_ips: Vec<IpAddr>,
     intercepts: Vec<(InterceptConfig, InterfaceInfo)>,
     links: HashMap<u32, IoLinkConfig>,
-    _bpf_links: Vec<BpfLinkManager>,
+    bpf_links: Vec<(u32, BpfLinkManager, IoClassifiers)>,
     io_runtime: XdpRuntime<Xsk>,
     flow_dispatcher: crate::flow_plane::FlowDispatcher,
     flow_receivers: Vec<Receiver<FlowMessage>>,
@@ -324,12 +334,14 @@ struct PreparedRuntime {
     engines: Vec<QuicEngine>,
     active_dcids: Arc<RwLock<ActiveDcidIndex>>,
     reverse_nat: Arc<RwLock<ReverseNatDirectory>>,
+    dns_intercept_ifindex: Option<u32>,
 }
 
 #[cfg(target_os = "linux")]
 impl PreparedRuntime {
     fn build(config: ApplianceConfig) -> Result<Self, RuntimeError> {
         let tunnel = discover_interface(config.tunnel_interface.as_str())?;
+        let tunnel_local_ips = resolve_tunnel_local_ips(&config, &tunnel)?;
         let intercepts = config
             .intercept_interfaces
             .iter()
@@ -338,6 +350,8 @@ impl PreparedRuntime {
                     .map(|info| (intercept.clone(), info))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let dns_intercept_ifindex =
+            validate_dns_runtime_addresses(&config, &tunnel_local_ips, &intercepts)?;
 
         let mut unique_interfaces = BTreeMap::new();
         unique_interfaces.insert(tunnel.ifindex, tunnel.clone());
@@ -364,9 +378,17 @@ impl PreparedRuntime {
                 .get(ifindex)
                 .map(|(_, roles)| *roles)
                 .expect("every interface has classifier roles");
-            configure_bpf_maps(&link, interface, roles, local_tunnel_port, &config)?;
+            configure_bpf_maps(
+                *ifindex,
+                &link,
+                &tunnel_local_ips,
+                roles,
+                local_tunnel_port,
+                &config,
+                dns_intercept_ifindex,
+            )?;
             xsk_maps.insert(*ifindex, link.map_path("xsks_map"));
-            bpf_links.push(link);
+            bpf_links.push((*ifindex, link, roles));
         }
 
         let mut factory = LinuxXskFactory {
@@ -417,9 +439,10 @@ impl PreparedRuntime {
         Ok(Self {
             config,
             tunnel,
+            tunnel_local_ips,
             intercepts,
             links,
-            _bpf_links: bpf_links,
+            bpf_links,
             io_runtime,
             flow_dispatcher,
             flow_receivers,
@@ -428,6 +451,7 @@ impl PreparedRuntime {
             engines,
             active_dcids: Arc::new(RwLock::new(ActiveDcidIndex::default())),
             reverse_nat: Arc::new(RwLock::new(ReverseNatDirectory::default())),
+            dns_intercept_ifindex,
         })
     }
 
@@ -447,27 +471,32 @@ impl PreparedRuntime {
                 .get(&owner.ifindex)
                 .expect("every IO owner has link configuration")
                 .clone();
+            let dns_owner =
+                classifiers.intercept && self.dns_intercept_ifindex == Some(owner.ifindex);
             let classifier = ClassifyingIoWorker::new(
                 IoClassifierConfig {
                     owner,
                     tunnel: classifiers.tunnel,
                     intercept: classifiers.intercept,
                     tunnel_port: tunnel_port(&self.config),
-                    tunnel_local_ips: link
-                        .interface
-                        .ipv4
-                        .map(IpAddr::V4)
-                        .into_iter()
-                        .chain(link.interface.ipv6.map(IpAddr::V6))
-                        .collect(),
+                    tunnel_local_ips: if classifiers.tunnel {
+                        self.tunnel_local_ips.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    forced_local_ips: forced_local_ips(&self.config, &self.tunnel_local_ips),
+                    dns_listen: dns_owner
+                        .then(|| self.config.dns.as_ref().map(|dns| dns.listen))
+                        .flatten(),
+                    dns_local_response: dns_owner
+                        .then(|| dns_local_response_classifier(&self.config))
+                        .flatten(),
                     dcid_len: self.config.dcid_len,
                     flow_worker_count: self.config.flow_worker_count,
                     intercept_policy: match self.config.role {
-                        Role::Client => {
-                            InterceptPolicy::AllowedIps(self.config.allowed_ips.clone())
-                        }
+                        Role::Client => intercept_policy_from_config(&self.config.ip_policy),
                         Role::Server => {
-                            InterceptPolicy::AllowedIps(nat_host_prefixes(&self.config))
+                            InterceptPolicy::TunnelPrefixes(nat_host_prefixes(&self.config))
                         }
                     },
                 },
@@ -548,6 +577,8 @@ impl PreparedRuntime {
                 tunnel_ifindex,
                 default_intercept,
                 local_port,
+                dns_config: dns_flow_config(&self.config),
+                dns_local_response: dns_local_response_classifier(&self.config),
                 io_senders: self.io_senders.clone(),
                 active_dcids: self.active_dcids.clone(),
                 reverse_nat: self.reverse_nat.clone(),
@@ -559,6 +590,14 @@ impl PreparedRuntime {
                     .spawn(move || flow_loop(context))
                     .map_err(|error| RuntimeError::Interface(error.to_string()))?,
             );
+        }
+
+        if let Err(error) = enable_bpf_classifiers(&self.bpf_links) {
+            EXIT_REQUESTED.store(true, Ordering::Release);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(error);
         }
 
         let stats_path = PathBuf::from(&self.config.stats_path);
@@ -631,6 +670,8 @@ struct FlowLoopContext {
     tunnel_ifindex: u32,
     default_intercept: IoOwnerKey,
     local_port: u16,
+    dns_config: Option<DnsFlowConfig>,
+    dns_local_response: Option<DnsLocalResponseClassifier>,
     io_senders: Arc<IoRegistry<SyncSender<IoTransmit>>>,
     active_dcids: Arc<RwLock<ActiveDcidIndex>>,
     reverse_nat: Arc<RwLock<ReverseNatDirectory>>,
@@ -699,6 +740,7 @@ fn flow_loop(mut context: FlowLoopContext) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         drain_engine(&mut context, reconnect_epoch, &mut pending_inner);
+        expire_dns_transactions(&mut context);
         if Instant::now() >= next_stats {
             context.stats.publish(
                 &context.state,
@@ -718,6 +760,23 @@ fn flow_loop(mut context: FlowLoopContext) {
 }
 
 #[cfg(target_os = "linux")]
+fn expire_dns_transactions(context: &mut FlowLoopContext) {
+    let Some(dns_config) = context.dns_config.clone() else {
+        return;
+    };
+    let Ok(transmits) = context
+        .state
+        .expire_dns_transactions(Instant::now(), &dns_config)
+    else {
+        return;
+    };
+    for expired in transmits {
+        retire_dns_reverse(context, &expired.binding);
+        send_io(&context.io_senders, expired.transmit, &context.stats);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn handle_flow_message(
     context: &mut FlowLoopContext,
     message: FlowMessage,
@@ -727,6 +786,74 @@ fn handle_flow_message(
     match message {
         FlowMessage::InterceptIngress { io_owner, packet } => match context.role {
             Role::Client => {
+                if let Some(mut dns_config) = context.dns_config.clone() {
+                    if context
+                        .dns_local_response
+                        .as_ref()
+                        .is_some_and(|classifier| {
+                            is_dns_local_resolver_candidate(&packet, classifier)
+                        })
+                    {
+                        if let Ok(Some(restored)) = context.state.handle_dns_response(packet) {
+                            retire_dns_reverse(context, &restored.binding);
+                            send_io(
+                                &context.io_senders,
+                                IoTransmit {
+                                    target: restored.local_target,
+                                    packet: restored.packet,
+                                    outer: None,
+                                },
+                                &context.stats,
+                            );
+                        }
+                        return;
+                    }
+                    dns_config.remote_available = context.engine.is_authenticated();
+                    match context
+                        .state
+                        .handle_dns_query(io_owner, packet.clone(), &dns_config)
+                    {
+                        Ok(HandledDnsQuery::Local {
+                            transmit,
+                            binding,
+                            transaction_id,
+                        }) => {
+                            if publish_dns_reverse(context, &binding, transaction_id) {
+                                send_io(&context.io_senders, transmit, &context.stats);
+                            } else if let Ok(Some(aborted)) =
+                                context.state.abort_dns_transaction(&binding, &dns_config)
+                            {
+                                send_io(&context.io_senders, aborted.transmit, &context.stats);
+                            }
+                            return;
+                        }
+                        Ok(HandledDnsQuery::Servfail(transmit)) => {
+                            send_io(&context.io_senders, transmit, &context.stats);
+                            return;
+                        }
+                        Ok(HandledDnsQuery::Remote {
+                            packet,
+                            binding,
+                            transaction_id,
+                        }) => {
+                            if publish_dns_reverse(context, &binding, transaction_id) {
+                                send_or_queue_inner(
+                                    context,
+                                    packet,
+                                    reconnect_epoch,
+                                    pending_inner,
+                                );
+                            } else if let Ok(Some(aborted)) =
+                                context.state.abort_dns_transaction(&binding, &dns_config)
+                            {
+                                send_io(&context.io_senders, aborted.transmit, &context.stats);
+                            }
+                            return;
+                        }
+                        Err(FlowWorkerError::Dns(DnsFlowError::NotDnsQuery)) => {}
+                        Err(_) => return,
+                    }
+                }
                 let tunnel_target =
                     IoOwnerKey::new(context.tunnel_ifindex, context.quic_flow.tunnel_queue_id());
                 if let Ok(handled) = context.state.handle_intercept(
@@ -833,11 +960,10 @@ fn drain_engine(
             }
             QuicEngineEvent::InnerPacket(packet) => match context.role {
                 Role::Server => {
-                    if let Ok(handled) = context.state.handle_intercept(
+                    if let Ok(handled) = context.state.handle_server_inner(
                         context.default_intercept,
                         packet,
                         &context.quic_flow,
-                        context.default_intercept,
                     ) {
                         if publish_session(context, handled.session_id) {
                             send_io(&context.io_senders, handled.transmit, &context.stats);
@@ -845,6 +971,28 @@ fn drain_engine(
                     }
                 }
                 Role::Client => {
+                    let dns_flow = crate::flow_plane::parse_flow_key(&packet)
+                        .ok()
+                        .filter(|flow| context.state.has_dns_reverse(flow));
+                    if dns_flow.is_some() {
+                        match context.state.handle_dns_response(packet.clone()) {
+                            Ok(Some(restored)) => {
+                                retire_dns_reverse(context, &restored.binding);
+                                send_io(
+                                    &context.io_senders,
+                                    IoTransmit {
+                                        target: restored.local_target,
+                                        packet: restored.packet,
+                                        outer: None,
+                                    },
+                                    &context.stats,
+                                );
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(_) => continue,
+                        }
+                    }
                     if let Ok(Some(restored)) = context.state.handle_reverse(packet) {
                         send_io(
                             &context.io_senders,
@@ -870,6 +1018,18 @@ fn drain_engine(
                     context.engine.close(Instant::now());
                 }
             }
+            QuicEngineEvent::DcidStaged(dcid) => {
+                if context
+                    .active_dcids
+                    .write()
+                    .expect("active DCID index is not poisoned")
+                    .stage_for_flow(&dcid, &context.quic_flow)
+                    .is_err()
+                {
+                    context.stats.record_dcid_publish_drop();
+                    context.engine.close(Instant::now());
+                }
+            }
             QuicEngineEvent::DcidRetired(dcid) => {
                 context
                     .active_dcids
@@ -877,22 +1037,24 @@ fn drain_engine(
                     .expect("active DCID index is not poisoned")
                     .retire(&dcid);
             }
+            QuicEngineEvent::Replaced(dcids) => {
+                pending_inner.advance(reconnect_epoch);
+                retire_quic_flow_state(context);
+                if context
+                    .active_dcids
+                    .write()
+                    .expect("active DCID index is not poisoned")
+                    .publish_batch_for_flow(&dcids, &context.quic_flow)
+                    .is_err()
+                {
+                    context.stats.record_dcid_publish_drop();
+                    context.engine.close(Instant::now());
+                }
+            }
             QuicEngineEvent::Closed => {
                 pending_inner.advance(reconnect_epoch);
                 let closed_flow_id = context.quic_flow.id();
-                let removed = context
-                    .state
-                    .remove_by_quic_flow(closed_flow_id)
-                    .unwrap_or_default();
-                {
-                    let mut directory = context
-                        .reverse_nat
-                        .write()
-                        .expect("reverse NAT directory is not poisoned");
-                    for session in removed {
-                        directory.retire(&session.nat);
-                    }
-                }
+                retire_quic_flow_state(context);
                 context
                     .active_dcids
                     .write()
@@ -918,6 +1080,34 @@ fn drain_engine(
                 }
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn retire_quic_flow_state(context: &mut FlowLoopContext) {
+    let removed = context
+        .state
+        .remove_by_quic_flow(context.quic_flow.id())
+        .unwrap_or_default();
+    let removed_dns = context
+        .dns_config
+        .as_ref()
+        .and_then(|config| context.state.abort_remote_dns_transactions(config).ok())
+        .unwrap_or_default();
+    {
+        let mut directory = context
+            .reverse_nat
+            .write()
+            .expect("reverse NAT directory is not poisoned");
+        for session in removed {
+            directory.retire(&session.nat);
+        }
+        for transaction in &removed_dns {
+            directory.retire(&transaction.binding);
+        }
+    }
+    for transaction in removed_dns {
+        send_io(&context.io_senders, transaction.transmit, &context.stats);
     }
 }
 
@@ -958,6 +1148,67 @@ fn publish_session(
         return false;
     }
     true
+}
+
+#[cfg(target_os = "linux")]
+fn dns_local_response_classifier(config: &ApplianceConfig) -> Option<DnsLocalResponseClassifier> {
+    let dns = config.dns.as_ref()?;
+    let nat_ip = match dns.local_resolver {
+        SocketAddr::V4(_) => config.nat.address_v4.map(IpAddr::V4),
+        SocketAddr::V6(_) => config.nat.address_v6.map(IpAddr::V6),
+    }?;
+    Some(DnsLocalResponseClassifier {
+        resolver: dns.local_resolver,
+        nat_ip,
+        nat_ports: config.nat.ports.clone(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_dns_local_resolver_candidate(
+    packet: &Bytes,
+    classifier: &DnsLocalResponseClassifier,
+) -> bool {
+    crate::flow_plane::parse_flow_key(packet).is_ok_and(|flow| {
+        flow.protocol == crate::flow_plane::TransportProtocol::Udp
+            && flow.source == classifier.resolver.ip()
+            && flow.source_port == classifier.resolver.port()
+            && flow.destination == classifier.nat_ip
+            && classifier.nat_ports.contains(&flow.destination_port)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn publish_dns_reverse(
+    context: &mut FlowLoopContext,
+    binding: &NatBinding,
+    transaction_id: crate::flow_plane::SessionId,
+) -> bool {
+    let result = context
+        .reverse_nat
+        .write()
+        .expect("reverse NAT directory is not poisoned")
+        .publish(
+            binding,
+            SessionLocator {
+                flow_worker_id: context.worker_id,
+                session_id: transaction_id,
+            },
+        );
+    if result.is_err() {
+        context.stats.record_reverse_nat_publish_drop();
+        return false;
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn retire_dns_reverse(context: &mut FlowLoopContext, binding: &NatBinding) {
+    context
+        .reverse_nat
+        .write()
+        .expect("reverse NAT directory is not poisoned")
+        .retire(binding);
 }
 
 #[cfg(target_os = "linux")]
@@ -1282,27 +1533,35 @@ fn discover_interface(name: &str) -> Result<InterfaceInfo, RuntimeError> {
     let mac = MacAddress::parse(mac_text.trim())
         .map_err(|error| RuntimeError::Interface(error.to_string()))?
         .octets();
-    let (ipv4, ipv6) = interface_addresses(name)?;
+    let addresses = interface_addresses(name)?;
+    let ipv4 = addresses.iter().find_map(|address| match address {
+        IpAddr::V4(address) => Some(*address),
+        IpAddr::V6(_) => None,
+    });
+    let ipv6 = addresses.iter().find_map(|address| match address {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(address) => Some(*address),
+    });
     Ok(InterfaceInfo {
         name: name.to_string(),
         ifindex,
         queue_count,
         mac,
+        addresses,
         ipv4,
         ipv6,
     })
 }
 
 #[cfg(target_os = "linux")]
-fn interface_addresses(name: &str) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), RuntimeError> {
+fn interface_addresses(name: &str) -> Result<Vec<IpAddr>, RuntimeError> {
     let mut addresses = std::ptr::null_mut::<libc::ifaddrs>();
     if unsafe { libc::getifaddrs(&mut addresses) } != 0 {
         return Err(RuntimeError::Interface(
             io::Error::last_os_error().to_string(),
         ));
     }
-    let mut ipv4 = None;
-    let mut ipv6 = None;
+    let mut found = Vec::new();
     let mut current = addresses;
     while !current.is_null() {
         let entry = unsafe { &*current };
@@ -1313,12 +1572,14 @@ fn interface_addresses(name: &str) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>
             let family = unsafe { (*entry.ifa_addr).sa_family as i32 };
             if family == libc::AF_INET {
                 let address = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
-                ipv4.get_or_insert(Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()));
+                found.push(IpAddr::V4(Ipv4Addr::from(
+                    address.sin_addr.s_addr.to_ne_bytes(),
+                )));
             } else if family == libc::AF_INET6 {
                 let address = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in6) };
                 let candidate = Ipv6Addr::from(address.sin6_addr.s6_addr);
                 if !candidate.is_unicast_link_local() {
-                    ipv6.get_or_insert(candidate);
+                    found.push(IpAddr::V6(candidate));
                 }
             }
         }
@@ -1327,31 +1588,98 @@ fn interface_addresses(name: &str) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>
     unsafe {
         libc::freeifaddrs(addresses);
     }
-    Ok((ipv4, ipv6))
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_tunnel_local_ips(
+    config: &ApplianceConfig,
+    tunnel: &InterfaceInfo,
+) -> Result<Vec<IpAddr>, RuntimeError> {
+    match config.role {
+        Role::Client => Ok(tunnel
+            .ipv4
+            .map(IpAddr::V4)
+            .into_iter()
+            .chain(tunnel.ipv6.map(IpAddr::V6))
+            .collect()),
+        Role::Server => {
+            let listen_ip = config.listen.expect("validated server listen").ip();
+            if !tunnel.addresses.contains(&listen_ip) {
+                return Err(RuntimeError::Interface(format!(
+                    "Tunnel.Listen address {listen_ip} does not belong to interface {}",
+                    tunnel.name
+                )));
+            }
+            Ok(vec![listen_ip])
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_dns_runtime_addresses(
+    config: &ApplianceConfig,
+    tunnel_local_ips: &[IpAddr],
+    intercepts: &[(InterceptConfig, InterfaceInfo)],
+) -> Result<Option<u32>, RuntimeError> {
+    let Some(dns) = &config.dns else {
+        return Ok(None);
+    };
+    let listen = dns.listen.ip();
+    if tunnel_local_ips.contains(&listen)
+        || Some(listen) == config.nat.address_v4.map(IpAddr::V4)
+        || Some(listen) == config.nat.address_v6.map(IpAddr::V6)
+    {
+        return Err(RuntimeError::Interface(format!(
+            "DNS.Listen address {listen} must be distinct from tunnel and NAT addresses"
+        )));
+    }
+    let owners = intercepts
+        .iter()
+        .filter(|(_, interface)| interface.addresses.contains(&listen))
+        .map(|(intercept, interface)| (intercept.interface.as_str(), interface.ifindex))
+        .collect::<Vec<_>>();
+    if owners.len() != 1 {
+        let names = owners.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        return Err(RuntimeError::Interface(format!(
+            "DNS.Listen address {listen} must belong to exactly one intercept interface, got {names:?}"
+        )));
+    }
+    Ok(Some(owners[0].1))
 }
 
 #[cfg(target_os = "linux")]
 fn configure_bpf_maps(
+    ifindex: u32,
     link: &BpfLinkManager,
-    interface: &InterfaceInfo,
+    tunnel_local_ips: &[IpAddr],
     roles: IoClassifiers,
     port: u16,
     config: &ApplianceConfig,
+    dns_intercept_ifindex: Option<u32>,
 ) -> Result<(), RuntimeError> {
     update_pinned_map(&link.map_path("tunnel_port"), &0u32, &port.to_be())?;
-    let flags = u8::from(roles.tunnel) | (u8::from(roles.intercept) << 1);
-    update_pinned_map(&link.map_path("role_flags"), &0u32, &flags)?;
-    let tunnel_ip_flags =
-        u8::from(interface.ipv4.is_some()) | (u8::from(interface.ipv6.is_some()) << 1);
+    update_pinned_map(&link.map_path("role_flags"), &0u32, &0u8)?;
+    let tunnel_ipv4 = tunnel_local_ips.iter().find_map(|address| match address {
+        IpAddr::V4(address) => Some(*address),
+        IpAddr::V6(_) => None,
+    });
+    let tunnel_ipv6 = tunnel_local_ips.iter().find_map(|address| match address {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(address) => Some(*address),
+    });
+    let tunnel_ip_flags = u8::from(tunnel_ipv4.is_some()) | (u8::from(tunnel_ipv6.is_some()) << 1);
     update_pinned_map(&link.map_path("tunnel_ip_flags"), &0u32, &tunnel_ip_flags)?;
-    if let Some(address) = interface.ipv4 {
+    if let Some(address) = tunnel_ipv4 {
         update_pinned_map(
             &link.map_path("tunnel_v4"),
             &0u32,
             &u32::from_ne_bytes(address.octets()),
         )?;
     }
-    if let Some(address) = interface.ipv6 {
+    if let Some(address) = tunnel_ipv6 {
         update_pinned_map(
             &link.map_path("tunnel_v6"),
             &0u32,
@@ -1360,11 +1688,134 @@ fn configure_bpf_maps(
             },
         )?;
     }
+    let dns_owner = roles.intercept && dns_intercept_ifindex == Some(ifindex);
+    let dns_listen = dns_owner
+        .then(|| config.dns.as_ref().map(|dns| dns.listen.ip()))
+        .flatten();
+    let dns_ipv4 = match dns_listen {
+        Some(IpAddr::V4(address)) => Some(address),
+        _ => None,
+    };
+    let dns_ipv6 = match dns_listen {
+        Some(IpAddr::V6(address)) => Some(address),
+        _ => None,
+    };
+    let dns_ip_flags = u8::from(dns_ipv4.is_some()) | (u8::from(dns_ipv6.is_some()) << 1);
+    update_pinned_map(&link.map_path("dns_ip_flags"), &0u32, &dns_ip_flags)?;
+    if let Some(address) = dns_ipv4 {
+        update_pinned_map(
+            &link.map_path("dns_v4"),
+            &0u32,
+            &u32::from_ne_bytes(address.octets()),
+        )?;
+    }
+    if let Some(address) = dns_ipv6 {
+        update_pinned_map(
+            &link.map_path("dns_v6"),
+            &0u32,
+            &TunnelV6Value {
+                address: address.octets(),
+            },
+        )?;
+    }
+    let dns_local_resolver = dns_owner
+        .then_some(config.dns.as_ref())
+        .flatten()
+        .map(|dns| dns.local_resolver);
+    let dns_local_ipv4 = match dns_local_resolver {
+        Some(SocketAddr::V4(address)) => config
+            .nat
+            .address_v4
+            .map(|nat| (*address.ip(), nat, address.port())),
+        _ => None,
+    };
+    let dns_local_ipv6 = match dns_local_resolver {
+        Some(SocketAddr::V6(address)) => config
+            .nat
+            .address_v6
+            .map(|nat| (*address.ip(), nat, address.port())),
+        _ => None,
+    };
+    let dns_local_flags =
+        u8::from(dns_local_ipv4.is_some()) | (u8::from(dns_local_ipv6.is_some()) << 1);
+    update_pinned_map(&link.map_path("dns_local_flags"), &0u32, &dns_local_flags)?;
+    if let Some((resolver, nat, port)) = dns_local_ipv4 {
+        update_pinned_map(
+            &link.map_path("dns_local_resolver_v4"),
+            &0u32,
+            &u32::from_ne_bytes(resolver.octets()),
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_nat_v4"),
+            &0u32,
+            &u32::from_ne_bytes(nat.octets()),
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_local_resolver_port"),
+            &0u32,
+            &port.to_be(),
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_nat_port_start"),
+            &0u32,
+            config.nat.ports.start(),
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_nat_port_end"),
+            &0u32,
+            config.nat.ports.end(),
+        )?;
+    }
+    if let Some((resolver, nat, port)) = dns_local_ipv6 {
+        update_pinned_map(
+            &link.map_path("dns_local_resolver_v6"),
+            &0u32,
+            &TunnelV6Value {
+                address: resolver.octets(),
+            },
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_nat_v6"),
+            &0u32,
+            &TunnelV6Value {
+                address: nat.octets(),
+            },
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_local_resolver_port"),
+            &0u32,
+            &port.to_be(),
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_nat_port_start"),
+            &0u32,
+            config.nat.ports.start(),
+        )?;
+        update_pinned_map(
+            &link.map_path("dns_nat_port_end"),
+            &0u32,
+            config.nat.ports.end(),
+        )?;
+    }
     if roles.intercept {
-        let prefixes = match config.role {
-            Role::Client => config.allowed_ips.clone(),
-            Role::Server => nat_host_prefixes(config),
+        let (policy_mode, prefixes, action) = match config.role {
+            Role::Client => match &config.ip_policy {
+                IpPolicy::TunnelPrefixes(prefixes) => (
+                    POLICY_TUNNEL_PREFIXES,
+                    prefixes.clone(),
+                    POLICY_ACTION_REDIRECT,
+                ),
+                IpPolicy::DirectPrefixes(prefixes) => {
+                    (POLICY_DIRECT_PREFIXES, prefixes.clone(), POLICY_ACTION_PASS)
+                }
+            },
+            Role::Server => (
+                POLICY_TUNNEL_PREFIXES,
+                nat_host_prefixes(config),
+                POLICY_ACTION_REDIRECT,
+            ),
         };
+        update_pinned_map(&link.map_path("intercept_policy_mode"), &0u32, &policy_mode)?;
         for prefix in prefixes {
             match prefix {
                 IpNet::V4(network) => {
@@ -1372,17 +1823,76 @@ fn configure_bpf_maps(
                         prefix_len: network.prefix_len() as u32,
                         address: u32::from_ne_bytes(network.network().octets()),
                     };
-                    update_pinned_map(&link.map_path("allowed_v4"), &key, &1u8)?;
+                    update_pinned_map(&link.map_path("allowed_v4"), &key, &action)?;
                 }
                 IpNet::V6(network) => {
                     let key = LpmV6Key {
                         prefix_len: network.prefix_len() as u32,
                         address: network.network().octets(),
                     };
-                    update_pinned_map(&link.map_path("allowed_v6"), &key, &1u8)?;
+                    update_pinned_map(&link.map_path("allowed_v6"), &key, &action)?;
                 }
             }
         }
+        for address in xdp_forced_local_ips(config, tunnel_local_ips) {
+            match address {
+                IpAddr::V4(address) => {
+                    let key = LpmV4Key {
+                        prefix_len: 32,
+                        address: u32::from_ne_bytes(address.octets()),
+                    };
+                    update_pinned_map(&link.map_path("allowed_v4"), &key, &POLICY_ACTION_PASS)?;
+                }
+                IpAddr::V6(address) => {
+                    let key = LpmV6Key {
+                        prefix_len: 128,
+                        address: address.octets(),
+                    };
+                    update_pinned_map(&link.map_path("allowed_v6"), &key, &POLICY_ACTION_PASS)?;
+                }
+            }
+        }
+        for address in nat_return_ips(config) {
+            match address {
+                IpAddr::V4(address) => {
+                    let key = LpmV4Key {
+                        prefix_len: 32,
+                        address: u32::from_ne_bytes(address.octets()),
+                    };
+                    update_pinned_map(&link.map_path("allowed_v4"), &key, &POLICY_ACTION_REDIRECT)?;
+                }
+                IpAddr::V6(address) => {
+                    let key = LpmV6Key {
+                        prefix_len: 128,
+                        address: address.octets(),
+                    };
+                    update_pinned_map(&link.map_path("allowed_v6"), &key, &POLICY_ACTION_REDIRECT)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn enable_bpf_classifiers(
+    links: &[(u32, BpfLinkManager, IoClassifiers)],
+) -> Result<(), RuntimeError> {
+    let mut enabled = Vec::new();
+    for (ifindex, link, roles) in links {
+        let flags = u8::from(roles.tunnel) | (u8::from(roles.intercept) << 1);
+        if let Err(error) = update_pinned_map(&link.map_path("role_flags"), &0u32, &flags) {
+            for enabled_ifindex in enabled {
+                if let Some((_, enabled_link, _)) = links
+                    .iter()
+                    .find(|(ifindex, _, _)| *ifindex == enabled_ifindex)
+                {
+                    let _ = update_pinned_map(&enabled_link.map_path("role_flags"), &0u32, &0u8);
+                }
+            }
+            return Err(error);
+        }
+        enabled.push(*ifindex);
     }
     Ok(())
 }
@@ -1423,6 +1933,62 @@ fn tunnel_port(config: &ApplianceConfig) -> u16 {
         .or(config.endpoint)
         .expect("validated tunnel address")
         .port()
+}
+
+fn intercept_policy_from_config(policy: &IpPolicy) -> InterceptPolicy {
+    match policy {
+        IpPolicy::TunnelPrefixes(prefixes) => InterceptPolicy::TunnelPrefixes(prefixes.clone()),
+        IpPolicy::DirectPrefixes(prefixes) => InterceptPolicy::DirectPrefixes(prefixes.clone()),
+    }
+}
+
+fn forced_local_ips(config: &ApplianceConfig, tunnel_local_ips: &[IpAddr]) -> Vec<IpAddr> {
+    let mut addresses = xdp_forced_local_ips(config, tunnel_local_ips);
+    if config.role == Role::Client {
+        addresses.extend(config.nat.address_v4.map(IpAddr::V4));
+        addresses.extend(config.nat.address_v6.map(IpAddr::V6));
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn xdp_forced_local_ips(config: &ApplianceConfig, tunnel_local_ips: &[IpAddr]) -> Vec<IpAddr> {
+    let mut addresses = tunnel_local_ips.to_vec();
+    addresses.extend(
+        config
+            .endpoint
+            .or(config.listen)
+            .map(|address| address.ip()),
+    );
+    if let Some(dns) = &config.dns {
+        addresses.push(dns.listen.ip());
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn nat_return_ips(config: &ApplianceConfig) -> Vec<IpAddr> {
+    config
+        .nat
+        .address_v4
+        .map(IpAddr::V4)
+        .into_iter()
+        .chain(config.nat.address_v6.map(IpAddr::V6))
+        .collect()
+}
+
+fn dns_flow_config(config: &ApplianceConfig) -> Option<DnsFlowConfig> {
+    config.dns.as_ref().map(|dns| DnsFlowConfig {
+        listen: dns.listen,
+        local_resolver: dns.local_resolver,
+        remote_resolver: dns.remote_resolver,
+        remote_domains: dns.remote_domains.clone(),
+        transaction_capacity: dns.transaction_capacity,
+        timeout: Duration::from_secs(dns.timeout_seconds),
+        remote_available: false,
+    })
 }
 
 fn nat_host_prefixes(config: &ApplianceConfig) -> Vec<IpNet> {
@@ -1476,11 +2042,17 @@ fn install_signal_handlers() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime, InterfaceSpec, IoClassifiers, PendingInner, RuntimeBuildError, XskFactory,
+        build_runtime, forced_local_ips, nat_return_ips, validate_dns_runtime_addresses,
+        xdp_forced_local_ips, InterfaceInfo, InterfaceSpec, IoClassifiers, PendingInner,
+        RuntimeBuildError, XskFactory,
     };
     use crate::flow_plane::IoOwnerKey;
+    use crate::v1_config::{
+        ApplianceConfig, DnsConfig, InterceptConfig, InterfaceName, IpPolicy, MacAddress,
+        NatConfig, Role, XdpAttachMode,
+    };
     use std::collections::HashSet;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{mpsc, Arc};
 
     #[derive(Debug)]
@@ -1508,6 +2080,148 @@ mod tests {
         fn start(&mut self, xsk: &mut Self::Xsk) {
             self.started.push(xsk.0);
         }
+    }
+
+    fn interface(name: &str, ifindex: u32, addresses: Vec<IpAddr>) -> InterfaceInfo {
+        InterfaceInfo {
+            name: name.to_string(),
+            ifindex,
+            queue_count: 1,
+            mac: [2, 0, 0, 0, 0, ifindex as u8],
+            ipv4: addresses.iter().find_map(|address| match address {
+                IpAddr::V4(address) => Some(*address),
+                IpAddr::V6(_) => None,
+            }),
+            ipv6: addresses.iter().find_map(|address| match address {
+                IpAddr::V4(_) => None,
+                IpAddr::V6(address) => Some(*address),
+            }),
+            addresses,
+        }
+    }
+
+    fn dns_config(listen: &str) -> ApplianceConfig {
+        ApplianceConfig {
+            role: Role::Client,
+            tunnel_interface: InterfaceName::parse("tun0").unwrap(),
+            tunnel_next_hop_mac: MacAddress::parse("02:00:00:00:00:01").unwrap(),
+            intercept_interfaces: vec![InterceptConfig {
+                interface: InterfaceName::parse("eth1").unwrap(),
+                next_hop_mac: MacAddress::parse("02:00:00:00:00:02").unwrap(),
+            }],
+            endpoint: Some("192.0.2.20:4433".parse().unwrap()),
+            listen: None,
+            flow_worker_count: 1,
+            channel_capacity: 16,
+            dcid_len: 8,
+            stats_path: "/tmp/new-proxy-stats.json".to_string(),
+            shared_key: [1; 32],
+            server_certificate: None,
+            server_private_key: None,
+            server_certificate_sha256: Some([2; 32]),
+            nat: NatConfig {
+                address_v4: Some("192.0.2.1".parse().unwrap()),
+                address_v6: None,
+                ports: 40000..=40010,
+            },
+            ip_policy: IpPolicy::TunnelPrefixes(Vec::new()),
+            dns: Some(DnsConfig {
+                listen: listen.parse().unwrap(),
+                local_resolver: "198.51.100.53:53".parse().unwrap(),
+                remote_resolver: "203.0.113.53:53".parse().unwrap(),
+                remote_domains: vec!["example.com".to_string()],
+                transaction_capacity: 16,
+                timeout_seconds: 5,
+            }),
+            xdp_mode: XdpAttachMode::Skb,
+        }
+    }
+
+    #[test]
+    fn v1_unit_xdp_runtime_dns_vip_must_belong_to_one_intercept_and_not_nat_or_tunnel() {
+        let tunnel_ips = vec!["192.0.2.20".parse().unwrap()];
+        let intercept = InterceptConfig {
+            interface: InterfaceName::parse("eth1").unwrap(),
+            next_hop_mac: MacAddress::parse("02:00:00:00:00:02").unwrap(),
+        };
+        let intercept_info = interface("eth1", 20, vec!["10.30.1.53".parse().unwrap()]);
+
+        assert_eq!(
+            validate_dns_runtime_addresses(
+                &dns_config("10.30.1.53:53"),
+                &tunnel_ips,
+                &[(intercept.clone(), intercept_info.clone())],
+            )
+            .unwrap(),
+            Some(20)
+        );
+        assert!(validate_dns_runtime_addresses(
+            &dns_config("10.30.1.53:53"),
+            &tunnel_ips,
+            &[
+                (intercept.clone(), intercept_info.clone()),
+                (
+                    InterceptConfig {
+                        interface: InterfaceName::parse("eth2").unwrap(),
+                        next_hop_mac: MacAddress::parse("02:00:00:00:00:03").unwrap(),
+                    },
+                    interface("eth2", 30, vec!["10.30.1.53".parse().unwrap()]),
+                ),
+            ],
+        )
+        .is_err());
+        assert!(validate_dns_runtime_addresses(
+            &dns_config("10.30.1.99:53"),
+            &tunnel_ips,
+            &[(intercept.clone(), intercept_info.clone())],
+        )
+        .is_err());
+        assert!(validate_dns_runtime_addresses(
+            &dns_config("192.0.2.1:53"),
+            &tunnel_ips,
+            &[(intercept.clone(), intercept_info.clone())],
+        )
+        .is_err());
+        assert!(validate_dns_runtime_addresses(
+            &dns_config("192.0.2.20:53"),
+            &tunnel_ips,
+            &[(intercept.clone(), intercept_info.clone())],
+        )
+        .is_err());
+
+        let same_interface = interface(
+            "eth0",
+            10,
+            vec!["192.0.2.20".parse().unwrap(), "10.30.1.53".parse().unwrap()],
+        );
+        let same_intercept = InterceptConfig {
+            interface: InterfaceName::parse("eth0").unwrap(),
+            next_hop_mac: MacAddress::parse("02:00:00:00:00:04").unwrap(),
+        };
+        assert_eq!(
+            validate_dns_runtime_addresses(
+                &dns_config("10.30.1.53:53"),
+                &tunnel_ips,
+                &[(same_intercept, same_interface)],
+            )
+            .unwrap(),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn v1_unit_xdp_runtime_nat_hosts_redirect_before_io_forced_local_fallback() {
+        let config = dns_config("10.30.1.53:53");
+        let tunnel_ips = vec!["192.0.2.30".parse().unwrap()];
+
+        assert!(forced_local_ips(&config, &tunnel_ips)
+            .contains(&IpAddr::V4("192.0.2.1".parse().unwrap())));
+        assert!(!xdp_forced_local_ips(&config, &tunnel_ips)
+            .contains(&IpAddr::V4("192.0.2.1".parse().unwrap())));
+        assert_eq!(
+            nat_return_ips(&config),
+            vec![IpAddr::V4("192.0.2.1".parse().unwrap())]
+        );
     }
 
     #[test]

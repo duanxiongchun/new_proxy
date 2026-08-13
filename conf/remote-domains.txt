@@ -1,0 +1,2 @@
+# Queries for these suffixes use the resolver reached through the server.
+example.com

@@ -1,4 +1,5 @@
 use crate::flow_plane::QuicFlowId;
+use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,10 +81,34 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[derive(Debug, Default)]
 pub struct ActiveDcidIndex {
     by_dcid: HashMap<Vec<u8>, DcidOwner>,
+    staged_by_dcid: HashMap<Vec<u8>, DcidOwner>,
     by_flow: HashMap<QuicFlowId, HashSet<Vec<u8>>>,
 }
 
 impl ActiveDcidIndex {
+    pub fn stage_for_flow(&mut self, dcid: &[u8], flow: &QuicFlow) -> Result<(), QuicFlowError> {
+        if dcid.is_empty() {
+            return Err(QuicFlowError::EmptyDcid);
+        }
+        let owner = DcidOwner {
+            flow_worker_id: flow.flow_worker_id(),
+            quic_flow_id: flow.id(),
+        };
+        if let Some(existing) = self
+            .by_dcid
+            .get(dcid)
+            .or_else(|| self.staged_by_dcid.get(dcid))
+        {
+            return if *existing == owner {
+                Ok(())
+            } else {
+                Err(QuicFlowError::DuplicateDcid(*existing))
+            };
+        }
+        self.staged_by_dcid.insert(dcid.to_vec(), owner);
+        Ok(())
+    }
+
     pub fn publish_for_flow(&mut self, dcid: &[u8], flow: &QuicFlow) -> Result<(), QuicFlowError> {
         self.publish(
             dcid,
@@ -92,6 +117,45 @@ impl ActiveDcidIndex {
                 quic_flow_id: flow.id(),
             },
         )
+    }
+
+    pub fn publish_batch_for_flow(
+        &mut self,
+        dcids: &[Bytes],
+        flow: &QuicFlow,
+    ) -> Result<(), QuicFlowError> {
+        let owner = DcidOwner {
+            flow_worker_id: flow.flow_worker_id(),
+            quic_flow_id: flow.id(),
+        };
+        let mut unique = HashSet::new();
+        for dcid in dcids {
+            if dcid.is_empty() {
+                return Err(QuicFlowError::EmptyDcid);
+            }
+            if !unique.insert(dcid.as_ref()) {
+                continue;
+            }
+            if let Some(existing) = self
+                .by_dcid
+                .get(dcid.as_ref())
+                .or_else(|| self.staged_by_dcid.get(dcid.as_ref()))
+            {
+                if *existing != owner {
+                    return Err(QuicFlowError::DuplicateDcid(*existing));
+                }
+            }
+        }
+        for dcid in unique {
+            self.staged_by_dcid.remove(dcid);
+            let dcid = dcid.to_vec();
+            self.by_dcid.insert(dcid.clone(), owner);
+            self.by_flow
+                .entry(owner.quic_flow_id)
+                .or_default()
+                .insert(dcid);
+        }
+        Ok(())
     }
 
     fn publish(&mut self, dcid: &[u8], owner: DcidOwner) -> Result<(), QuicFlowError> {
@@ -105,6 +169,12 @@ impl ActiveDcidIndex {
                 Err(QuicFlowError::DuplicateDcid(*existing))
             };
         }
+        if let Some(existing) = self.staged_by_dcid.remove(dcid) {
+            if existing != owner {
+                self.staged_by_dcid.insert(dcid.to_vec(), existing);
+                return Err(QuicFlowError::DuplicateDcid(existing));
+            }
+        }
         let dcid = dcid.to_vec();
         self.by_dcid.insert(dcid.clone(), owner);
         self.by_flow
@@ -115,11 +185,17 @@ impl ActiveDcidIndex {
     }
 
     pub fn resolve(&self, dcid: &[u8]) -> Option<DcidOwner> {
-        self.by_dcid.get(dcid).copied()
+        self.by_dcid
+            .get(dcid)
+            .or_else(|| self.staged_by_dcid.get(dcid))
+            .copied()
     }
 
     pub fn retire(&mut self, dcid: &[u8]) -> Option<DcidOwner> {
-        let owner = self.by_dcid.remove(dcid)?;
+        let owner = self
+            .by_dcid
+            .remove(dcid)
+            .or_else(|| self.staged_by_dcid.remove(dcid))?;
         if let Some(dcids) = self.by_flow.get_mut(&owner.quic_flow_id) {
             dcids.remove(dcid);
             if dcids.is_empty() {
@@ -130,18 +206,30 @@ impl ActiveDcidIndex {
     }
 
     pub fn close_flow(&mut self, quic_flow_id: QuicFlowId) -> usize {
-        let Some(dcids) = self.by_flow.remove(&quic_flow_id) else {
-            return 0;
+        let removed = if let Some(dcids) = self.by_flow.remove(&quic_flow_id) {
+            let removed = dcids.len();
+            for dcid in dcids {
+                self.by_dcid.remove(&dcid);
+            }
+            removed
+        } else {
+            0
         };
-        let removed = dcids.len();
-        for dcid in dcids {
-            self.by_dcid.remove(&dcid);
-        }
+        self.staged_by_dcid
+            .retain(|_, owner| owner.quic_flow_id != quic_flow_id);
         removed
     }
 
-    pub fn len(&self) -> usize {
+    pub fn active_len(&self) -> usize {
         self.by_dcid.len()
+    }
+
+    pub fn staged_len(&self) -> usize {
+        self.staged_by_dcid.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.active_len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -221,5 +309,66 @@ mod tests {
         assert_eq!(index.resolve(b"a"), None);
         assert_eq!(index.close_flow(QuicFlowId(7)), 1);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn v1_unit_staged_dcid_routes_without_counting_as_active() {
+        let flow = QuicFlow::new(QuicFlowId(7), 1, b"bootstrap", 2).unwrap();
+        let mut index = ActiveDcidIndex::default();
+
+        index.stage_for_flow(b"candidate", &flow).unwrap();
+
+        assert_eq!(
+            index.resolve(b"candidate"),
+            Some(DcidOwner {
+                flow_worker_id: 1,
+                quic_flow_id: QuicFlowId(7),
+            })
+        );
+        assert_eq!(index.len(), 0);
+
+        index.publish_for_flow(b"candidate", &flow).unwrap();
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn v1_unit_close_flow_removes_staged_candidate_dcids_without_active_dcids() {
+        let flow = QuicFlow::new(QuicFlowId(7), 1, b"bootstrap", 2).unwrap();
+        let mut index = ActiveDcidIndex::default();
+
+        index.stage_for_flow(b"candidate", &flow).unwrap();
+
+        assert_eq!(index.close_flow(flow.id()), 0);
+        assert_eq!(index.resolve(b"candidate"), None);
+        assert_eq!(index.staged_len(), 0);
+    }
+
+    #[test]
+    fn v1_unit_dcid_batch_publish_is_atomic_on_conflict() {
+        let flow = QuicFlow::new(QuicFlowId(7), 1, b"bootstrap", 2).unwrap();
+        let conflicting = QuicFlow::new(QuicFlowId(8), 0, b"other", 2).unwrap();
+        let mut index = ActiveDcidIndex::default();
+        index.stage_for_flow(b"candidate", &flow).unwrap();
+        index.publish_for_flow(b"conflict", &conflicting).unwrap();
+
+        assert!(matches!(
+            index.publish_batch_for_flow(
+                &[
+                    Bytes::from_static(b"candidate"),
+                    Bytes::from_static(b"conflict"),
+                ],
+                &flow,
+            ),
+            Err(QuicFlowError::DuplicateDcid(_))
+        ));
+        assert_eq!(index.active_len(), 1);
+        assert_eq!(index.staged_len(), 1);
+        assert_eq!(
+            index.resolve(b"candidate"),
+            Some(DcidOwner {
+                flow_worker_id: 1,
+                quic_flow_id: QuicFlowId(7),
+            })
+        );
     }
 }

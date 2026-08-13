@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod io_registry;
 pub mod nat;
 pub mod packet;
@@ -5,14 +6,23 @@ pub mod quic_flow;
 pub mod session;
 pub mod worker;
 
+pub use dns::{
+    clamp_edns_udp_payload, classify_query, domain_matches, parse_question as parse_dns_question,
+    response_matches_query, transaction_key, DnsError, DnsQuestion, DnsReverseKey, DnsRoute,
+    DnsTransaction, DnsTransactionKey, DnsTransactionTable, DNS_PAYLOAD_MAX,
+};
 pub use io_registry::{IoOwnerKey, IoRegistry, RegistryError};
 pub use nat::{NatBinding, NatError, NatTable, ReverseNatDirectory, ReverseNatKey, SessionLocator};
-pub use packet::{parse_flow_key, rewrite_packet, FlowKey, PacketError, TransportProtocol};
+pub use packet::{
+    ip_packet_is_fragmented, parse_flow_key, rewrite_packet, udp_payload, udp_payload_mut, FlowKey,
+    PacketError, TransportProtocol,
+};
 pub use quic_flow::{bootstrap_owner, ActiveDcidIndex, DcidOwner, QuicFlow, QuicFlowError};
 pub use session::{InterceptIoUpdate, Session, SessionError, SessionKey, SessionTable};
 pub use worker::{
-    bounded_flow_channels, DispatchOutcome, DispatchStats, FlowChannelError, FlowDispatcher,
-    FlowMessage, FlowWorkerError, FlowWorkerState, FlowWorkerStats, HandledIntercept,
+    bounded_flow_channels, DispatchOutcome, DispatchStats, DnsFlowConfig, DnsFlowError,
+    ExpiredDnsTransaction, FlowChannelError, FlowDispatcher, FlowMessage, FlowWorkerError,
+    FlowWorkerState, FlowWorkerStats, HandledDnsQuery, HandledDnsResponse, HandledIntercept,
     HandledReverse, IoTransmit, OuterRoute,
 };
 

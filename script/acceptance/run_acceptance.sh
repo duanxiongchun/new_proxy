@@ -39,6 +39,8 @@ run "v1 integration tests" cargo test --offline --test v1_flow_integration
 
 V1_E2E_SCRIPTS=(
   "script/acceptance/v1/e2e_v1_client_to_target.sh"
+  "script/acceptance/v1/e2e_v1_dns_policy.sh"
+  "script/acceptance/v1/e2e_v1_dns_policy_v6.sh"
   "script/acceptance/v1/e2e_v1_server_return.sh"
   "script/acceptance/v1/e2e_v1_client_return.sh"
   "script/acceptance/v1/e2e_v1_same_interface.sh"
@@ -58,7 +60,7 @@ if [[ "${RUN_V1_E2E:-0}" == "1" ]]; then
   done
 else
   echo
-  echo "Privileged v1 E2E deferred; set RUN_V1_E2E=1 to run all seven scenarios."
+  echo "Privileged v1 E2E deferred; set RUN_V1_E2E=1 to run all nine scenarios."
 fi
 
 if [[ "${RUN_V1_SOAK:-0}" == "1" ]]; then
@@ -81,4 +83,8 @@ if [[ "${RUN_V1_PERF:-0}" == "1" ]]; then
 fi
 
 echo
-echo "AF_XDP QUIC Appliance v1 gate passed."
+if [[ "${RUN_V1_E2E:-0}" == "1" ]]; then
+  echo "AF_XDP QUIC Appliance v1 full gate passed (non-privileged checks + nine E2E scenarios)."
+else
+  echo "AF_XDP QUIC Appliance v1 non-privileged checks passed; full gate requires RUN_V1_E2E=1."
+fi

@@ -144,7 +144,31 @@ impl SessionTable {
         self.nat
             .lookup_reverse(return_flow)
             .filter(|locator| locator.flow_worker_id == self.owner_worker_id)
+            .filter(|locator| self.sessions.contains_key(&locator.session_id))
             .map(|locator| locator.session_id)
+    }
+
+    pub fn allocate_ephemeral_nat(
+        &mut self,
+        caller_worker_id: usize,
+        token: SessionId,
+        original: FlowKey,
+    ) -> Result<NatBinding, SessionError> {
+        self.ensure_owner(caller_worker_id)?;
+        let locator = SessionLocator {
+            flow_worker_id: self.owner_worker_id,
+            session_id: token,
+        };
+        Ok(self.nat.allocate(token, original, locator)?.clone())
+    }
+
+    pub fn release_ephemeral_nat(
+        &mut self,
+        caller_worker_id: usize,
+        token: SessionId,
+    ) -> Result<NatBinding, SessionError> {
+        self.ensure_owner(caller_worker_id)?;
+        Ok(self.nat.remove(token)?)
     }
 
     pub fn remove(

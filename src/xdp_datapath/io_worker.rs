@@ -1,20 +1,36 @@
 use crate::flow_plane::{
-    bootstrap_owner, parse_flow_key, ActiveDcidIndex, DispatchOutcome, FlowDispatcher, FlowMessage,
-    IoOwnerKey, ReverseNatDirectory,
+    bootstrap_owner, parse_flow_key, transaction_key, ActiveDcidIndex, DispatchOutcome,
+    FlowDispatcher, FlowMessage, IoOwnerKey, ReverseNatDirectory,
 };
 use bytes::Bytes;
 use ipnet::IpNet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::RangeInclusive;
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const ETH_P_IPV4: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86dd;
 const IP_PROTOCOL_UDP: u8 = 17;
+const IP_PROTOCOL_ROUTING: u8 = 43;
+const IP_PROTOCOL_FRAGMENT: u8 = 44;
+const IP_PROTOCOL_AH: u8 = 51;
+const IP_PROTOCOL_DESTINATION_OPTIONS: u8 = 60;
+const IP_PROTOCOL_HOP_BY_HOP: u8 = 0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InterceptPolicy {
-    AllowedIps(Vec<IpNet>),
+    TunnelPrefixes(Vec<IpNet>),
+    DirectPrefixes(Vec<IpNet>),
     All,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DnsLocalResponseClassifier {
+    pub resolver: SocketAddr,
+    pub nat_ip: IpAddr,
+    pub nat_ports: RangeInclusive<u16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +40,9 @@ pub struct IoClassifierConfig {
     pub intercept: bool,
     pub tunnel_port: u16,
     pub tunnel_local_ips: Vec<IpAddr>,
+    pub forced_local_ips: Vec<IpAddr>,
+    pub dns_listen: Option<SocketAddr>,
+    pub dns_local_response: Option<DnsLocalResponseClassifier>,
     pub dcid_len: usize,
     pub flow_worker_count: usize,
     pub intercept_policy: InterceptPolicy,
@@ -36,6 +55,8 @@ pub enum DropReason {
     MalformedUdp,
     InvalidQuic,
     UnknownDcid,
+    UnknownDnsTransaction,
+    FragmentedDns,
     InvalidFlow,
     DispatchRejected(DispatchOutcome),
 }
@@ -117,19 +138,80 @@ impl IoWorker {
                     return IngressOutcome::Dropped(reason);
                 }
             }
+            return IngressOutcome::Passed;
         }
 
-        if !self.config.intercept || !self.intercept_allowed(parsed.ip_packet) {
+        if !self.config.intercept {
             return IngressOutcome::Passed;
+        }
+        if self.is_dns_vip_query(&parsed) {
+            if parsed.fragmented {
+                return IngressOutcome::Dropped(DropReason::FragmentedDns);
+            }
+            let flow = match parse_flow_key(parsed.ip_packet) {
+                Ok(flow) => flow,
+                Err(_) => return IngressOutcome::Dropped(DropReason::InvalidFlow),
+            };
+            let payload = match udp_payload(&parsed) {
+                Ok(payload) => payload,
+                Err(reason) => return IngressOutcome::Dropped(reason),
+            };
+            let worker_id = stable_dns_owner(
+                self.config.owner,
+                &flow,
+                payload,
+                self.config.flow_worker_count,
+            );
+            let outcome = self.dispatcher.dispatch_to(
+                worker_id,
+                FlowMessage::InterceptIngress {
+                    io_owner: self.config.owner,
+                    packet: Bytes::copy_from_slice(parsed.ip_packet),
+                },
+            );
+            return dispatch_outcome(worker_id, outcome);
+        }
+        if self.is_dns_local_resolver_response(&parsed) {
+            if parsed.fragmented {
+                return IngressOutcome::Dropped(DropReason::FragmentedDns);
+            }
+            let flow = match parse_flow_key(parsed.ip_packet) {
+                Ok(flow) => flow,
+                Err(_) => return IngressOutcome::Dropped(DropReason::InvalidFlow),
+            };
+            let Some(locator) = reverse_nat.lookup(&flow) else {
+                return IngressOutcome::Dropped(DropReason::UnknownDnsTransaction);
+            };
+            let outcome = self.dispatcher.dispatch_to(
+                locator.flow_worker_id,
+                FlowMessage::InterceptIngress {
+                    io_owner: self.config.owner,
+                    packet: Bytes::copy_from_slice(parsed.ip_packet),
+                },
+            );
+            return dispatch_outcome(locator.flow_worker_id, outcome);
         }
         let flow = match parse_flow_key(parsed.ip_packet) {
             Ok(flow) => flow,
             Err(_) => return IngressOutcome::Dropped(DropReason::InvalidFlow),
         };
-        let worker_id = reverse_nat
-            .lookup(&flow)
-            .map(|locator| locator.flow_worker_id)
-            .unwrap_or_else(|| stable_flow_owner(&flow, self.config.flow_worker_count));
+        if let Some(locator) = reverse_nat.lookup(&flow) {
+            let outcome = self.dispatcher.dispatch_to(
+                locator.flow_worker_id,
+                FlowMessage::InterceptIngress {
+                    io_owner: self.config.owner,
+                    packet: Bytes::copy_from_slice(parsed.ip_packet),
+                },
+            );
+            return dispatch_outcome(locator.flow_worker_id, outcome);
+        }
+        if self.config.forced_local_ips.contains(&parsed.destination) {
+            return IngressOutcome::Passed;
+        }
+        if !self.intercept_allowed(parsed.ip_packet) {
+            return IngressOutcome::Passed;
+        }
+        let worker_id = stable_flow_owner(&flow, self.config.flow_worker_count);
         let outcome = self.dispatcher.dispatch_to(
             worker_id,
             FlowMessage::InterceptIngress {
@@ -143,11 +225,78 @@ impl IoWorker {
     fn intercept_allowed(&self, packet: &[u8]) -> bool {
         match &self.config.intercept_policy {
             InterceptPolicy::All => true,
-            InterceptPolicy::AllowedIps(prefixes) => {
+            InterceptPolicy::TunnelPrefixes(prefixes) => {
                 destination_ip(packet).is_some_and(|destination| {
                     prefixes.iter().any(|prefix| prefix.contains(&destination))
                 })
             }
+            InterceptPolicy::DirectPrefixes(prefixes) => {
+                destination_ip(packet).is_some_and(|destination| {
+                    is_public_destination(destination)
+                        && !prefixes.iter().any(|prefix| prefix.contains(&destination))
+                })
+            }
+        }
+    }
+
+    fn is_dns_vip_query(&self, parsed: &ParsedIpFrame<'_>) -> bool {
+        let Some(listen) = self.config.dns_listen else {
+            return false;
+        };
+        if parsed.destination != listen.ip() || parsed.protocol != IP_PROTOCOL_UDP {
+            return false;
+        }
+        let Some(udp) = parsed
+            .ip_packet
+            .get(parsed.transport_offset..parsed.transport_offset + 4)
+        else {
+            return false;
+        };
+        u16::from_be_bytes([udp[2], udp[3]]) == listen.port()
+    }
+
+    fn is_dns_local_resolver_response(&self, parsed: &ParsedIpFrame<'_>) -> bool {
+        let Some(classifier) = &self.config.dns_local_response else {
+            return false;
+        };
+        if parsed.source != classifier.resolver.ip()
+            || parsed.destination != classifier.nat_ip
+            || parsed.protocol != IP_PROTOCOL_UDP
+        {
+            return false;
+        }
+        let Some(udp) = parsed
+            .ip_packet
+            .get(parsed.transport_offset..parsed.transport_offset + 4)
+        else {
+            return false;
+        };
+        let source_port = u16::from_be_bytes([udp[0], udp[1]]);
+        let destination_port = u16::from_be_bytes([udp[2], udp[3]]);
+        source_port == classifier.resolver.port()
+            && classifier.nat_ports.contains(&destination_port)
+    }
+}
+
+fn is_public_destination(destination: IpAddr) -> bool {
+    match destination {
+        IpAddr::V4(address) => {
+            let [a, b, _, _] = address.octets();
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_private()
+                && !address.is_link_local()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+                && !(a == 100 && (64..=127).contains(&b))
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && (segments[0] & 0xffc0 != 0xfe80)
+                && (segments[0] & 0xfe00 != 0xfc00)
         }
     }
 }
@@ -165,6 +314,7 @@ struct ParsedIpFrame<'a> {
     destination: IpAddr,
     protocol: u8,
     transport_offset: usize,
+    fragmented: bool,
 }
 
 fn parse_ip_frame(frame: &[u8]) -> Result<ParsedIpFrame<'_>, DropReason> {
@@ -190,6 +340,7 @@ fn parse_ipv4_frame(packet: &[u8]) -> Result<ParsedIpFrame<'_>, DropReason> {
     if header_len < 20 || total_len < header_len || packet.len() < total_len {
         return Err(DropReason::MalformedIp);
     }
+    let fragment = u16::from_be_bytes([header[6], header[7]]);
     Ok(ParsedIpFrame {
         ip_packet: &packet[..total_len],
         source: IpAddr::V4(Ipv4Addr::new(
@@ -200,6 +351,7 @@ fn parse_ipv4_frame(packet: &[u8]) -> Result<ParsedIpFrame<'_>, DropReason> {
         )),
         protocol: header[9],
         transport_offset: header_len,
+        fragmented: fragment & 0x3fff != 0,
     })
 }
 
@@ -212,6 +364,8 @@ fn parse_ipv6_frame(packet: &[u8]) -> Result<ParsedIpFrame<'_>, DropReason> {
         .checked_add(usize::from(u16::from_be_bytes([header[4], header[5]])))
         .filter(|length| *length <= packet.len())
         .ok_or(DropReason::MalformedIp)?;
+    let (protocol, transport_offset, fragmented) =
+        ipv6_transport_offset(packet, total_len, header[6], 40)?;
     Ok(ParsedIpFrame {
         ip_packet: &packet[..total_len],
         source: IpAddr::V6(Ipv6Addr::from(
@@ -220,9 +374,58 @@ fn parse_ipv6_frame(packet: &[u8]) -> Result<ParsedIpFrame<'_>, DropReason> {
         destination: IpAddr::V6(Ipv6Addr::from(
             <[u8; 16]>::try_from(&header[24..40]).expect("fixed IPv6 destination"),
         )),
-        protocol: header[6],
-        transport_offset: 40,
+        protocol,
+        transport_offset,
+        fragmented,
     })
+}
+
+fn ipv6_transport_offset(
+    packet: &[u8],
+    total_len: usize,
+    mut next_header: u8,
+    mut offset: usize,
+) -> Result<(u8, usize, bool), DropReason> {
+    let mut fragmented = false;
+    for _ in 0..8 {
+        match next_header {
+            IP_PROTOCOL_HOP_BY_HOP | IP_PROTOCOL_ROUTING | IP_PROTOCOL_DESTINATION_OPTIONS => {
+                let header = packet
+                    .get(offset..offset + 2)
+                    .ok_or(DropReason::MalformedIp)?;
+                next_header = header[0];
+                let header_len = (usize::from(header[1]) + 1) * 8;
+                offset = offset
+                    .checked_add(header_len)
+                    .filter(|end| *end <= total_len)
+                    .ok_or(DropReason::MalformedIp)?;
+            }
+            IP_PROTOCOL_FRAGMENT => {
+                let header = packet
+                    .get(offset..offset + 8)
+                    .ok_or(DropReason::MalformedIp)?;
+                fragmented = true;
+                next_header = header[0];
+                offset = offset
+                    .checked_add(8)
+                    .filter(|end| *end <= total_len)
+                    .ok_or(DropReason::MalformedIp)?;
+            }
+            IP_PROTOCOL_AH => {
+                let header = packet
+                    .get(offset..offset + 2)
+                    .ok_or(DropReason::MalformedIp)?;
+                next_header = header[0];
+                let header_len = (usize::from(header[1]) + 2) * 4;
+                offset = offset
+                    .checked_add(header_len)
+                    .filter(|end| *end <= total_len)
+                    .ok_or(DropReason::MalformedIp)?;
+            }
+            _ => return Ok((next_header, offset, fragmented)),
+        }
+    }
+    Err(DropReason::MalformedIp)
 }
 
 struct OuterQuic {
@@ -330,10 +533,40 @@ fn stable_flow_owner(flow: &crate::flow_plane::FlowKey, worker_count: usize) -> 
     (hash % worker_count as u64) as usize
 }
 
+fn stable_dns_owner(
+    owner: IoOwnerKey,
+    flow: &crate::flow_plane::FlowKey,
+    payload: &[u8],
+    worker_count: usize,
+) -> usize {
+    if worker_count == 0 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    owner.hash(&mut hasher);
+    transaction_key(SocketAddr::new(flow.source, flow.source_port), payload).hash(&mut hasher);
+    (hasher.finish() % worker_count as u64) as usize
+}
+
+fn udp_payload<'a>(parsed: &ParsedIpFrame<'a>) -> Result<&'a [u8], DropReason> {
+    let udp = parsed
+        .ip_packet
+        .get(parsed.transport_offset..)
+        .ok_or(DropReason::MalformedUdp)?;
+    let header = udp.get(..8).ok_or(DropReason::MalformedUdp)?;
+    let udp_len = usize::from(u16::from_be_bytes([header[4], header[5]]));
+    udp.get(8..udp_len)
+        .filter(|_| udp_len >= 8)
+        .ok_or(DropReason::MalformedUdp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow_plane::{bounded_flow_channels, QuicFlow, QuicFlowId};
+    use crate::flow_plane::{
+        bounded_flow_channels, FlowKey, NatBinding, QuicFlow, QuicFlowId, SessionId,
+        SessionLocator, TransportProtocol,
+    };
 
     fn config(tunnel: bool, intercept: bool) -> IoClassifierConfig {
         IoClassifierConfig {
@@ -342,9 +575,17 @@ mod tests {
             intercept,
             tunnel_port: 4433,
             tunnel_local_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))],
+            forced_local_ips: vec![
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ],
+            dns_listen: None,
+            dns_local_response: None,
             dcid_len: 8,
             flow_worker_count: 2,
-            intercept_policy: InterceptPolicy::AllowedIps(vec!["203.0.113.0/24".parse().unwrap()]),
+            intercept_policy: InterceptPolicy::TunnelPrefixes(vec!["203.0.113.0/24"
+                .parse()
+                .unwrap()]),
         }
     }
 
@@ -368,6 +609,32 @@ mod tests {
         ip[22..24].copy_from_slice(&destination_port.to_be_bytes());
         ip[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
         ip[28..].copy_from_slice(payload);
+        frame
+    }
+
+    fn ipv6_udp_hop_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp_len = 8 + payload.len();
+        let payload_len = 8 + udp_len;
+        let mut frame = vec![0u8; ETHERNET_HEADER_LEN + 40 + payload_len];
+        frame[12..14].copy_from_slice(&ETH_P_IPV6.to_be_bytes());
+        let ip = &mut frame[ETHERNET_HEADER_LEN..];
+        ip[0] = 0x60;
+        ip[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        ip[6] = IP_PROTOCOL_HOP_BY_HOP;
+        ip[7] = 64;
+        ip[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        ip[24..40].copy_from_slice(
+            &Ipv6Addr::from([
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+            ])
+            .octets(),
+        );
+        ip[40] = IP_PROTOCOL_UDP;
+        ip[41] = 0;
+        ip[48..50].copy_from_slice(&source_port.to_be_bytes());
+        ip[50..52].copy_from_slice(&destination_port.to_be_bytes());
+        ip[52..54].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        ip[56..].copy_from_slice(payload);
         frame
     }
 
@@ -416,6 +683,273 @@ mod tests {
         assert_eq!(
             worker.handle_frame(
                 &inner_tcp_frame([198, 51, 100, 9]),
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Passed
+        );
+    }
+
+    #[test]
+    fn v1_unit_io_worker_direct_prefix_policy_redirects_only_public_non_direct() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(false, true);
+        worker_config.intercept_policy =
+            InterceptPolicy::DirectPrefixes(vec!["203.0.113.0/24".parse().unwrap()]);
+        let worker = IoWorker::new(worker_config, dispatcher);
+
+        assert_eq!(
+            worker.handle_frame(
+                &inner_tcp_frame([203, 0, 113, 9]),
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Passed
+        );
+        assert!(matches!(
+            worker.handle_frame(
+                &inner_tcp_frame([8, 8, 8, 8]),
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Dispatched { .. }
+        ));
+        assert_eq!(
+            worker.handle_frame(
+                &inner_tcp_frame([10, 0, 0, 1]),
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Passed
+        );
+        assert_eq!(
+            receivers.iter().filter_map(|rx| rx.try_recv().ok()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn v1_unit_io_worker_direct_policy_forces_appliance_addresses_local() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(false, true);
+        worker_config.intercept_policy = InterceptPolicy::DirectPrefixes(vec![]);
+        worker_config
+            .forced_local_ips
+            .push("198.51.100.20".parse().unwrap());
+        let worker = IoWorker::new(worker_config, dispatcher);
+
+        for destination in [[192, 0, 2, 20], [192, 0, 2, 1], [198, 51, 100, 20]] {
+            assert_eq!(
+                worker.handle_frame(
+                    &inner_tcp_frame(destination),
+                    &ActiveDcidIndex::default(),
+                    &ReverseNatDirectory::default(),
+                ),
+                IngressOutcome::Passed
+            );
+        }
+        assert!(receivers
+            .iter()
+            .all(|receiver| receiver.try_recv().is_err()));
+    }
+
+    #[test]
+    fn v1_unit_io_worker_reverse_nat_precedes_forced_local_address() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(false, true);
+        worker_config.intercept_policy = InterceptPolicy::DirectPrefixes(vec![]);
+        let worker = IoWorker::new(worker_config, dispatcher);
+        let binding = NatBinding {
+            original: FlowKey {
+                source: "10.0.0.2".parse().unwrap(),
+                destination: "8.8.8.8".parse().unwrap(),
+                source_port: 10000,
+                destination_port: 443,
+                protocol: TransportProtocol::Tcp,
+            },
+            translated: FlowKey {
+                source: "192.0.2.1".parse().unwrap(),
+                destination: "8.8.8.8".parse().unwrap(),
+                source_port: 40000,
+                destination_port: 443,
+                protocol: TransportProtocol::Tcp,
+            },
+        };
+        let mut directory = ReverseNatDirectory::default();
+        directory
+            .publish(
+                &binding,
+                SessionLocator {
+                    flow_worker_id: 1,
+                    session_id: SessionId(42),
+                },
+            )
+            .unwrap();
+        let mut frame = inner_tcp_frame([192, 0, 2, 1]);
+        let ip = &mut frame[ETHERNET_HEADER_LEN..];
+        ip[12..16].copy_from_slice(&[8, 8, 8, 8]);
+        ip[20..22].copy_from_slice(&443u16.to_be_bytes());
+        ip[22..24].copy_from_slice(&40000u16.to_be_bytes());
+
+        assert_eq!(
+            worker.handle_frame(&frame, &ActiveDcidIndex::default(), &directory),
+            IngressOutcome::Dispatched { worker_id: 1 }
+        );
+        assert!(matches!(
+            receivers[1].try_recv().unwrap(),
+            FlowMessage::InterceptIngress { .. }
+        ));
+    }
+
+    #[test]
+    fn v1_unit_io_worker_dns_vip_query_bypasses_private_direct_policy() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(false, true);
+        worker_config.dns_listen = Some("10.0.0.53:53".parse().unwrap());
+        worker_config.intercept_policy =
+            InterceptPolicy::DirectPrefixes(vec!["10.0.0.0/8".parse().unwrap()]);
+        let worker = IoWorker::new(worker_config, dispatcher);
+        let mut frame = ipv4_udp_frame(53000, 53, b"dns payload");
+        frame[ETHERNET_HEADER_LEN + 16..ETHERNET_HEADER_LEN + 20].copy_from_slice(&[10, 0, 0, 53]);
+
+        assert!(matches!(
+            worker.handle_frame(
+                &frame,
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Dispatched { .. }
+        ));
+        assert_eq!(
+            receivers.iter().filter_map(|rx| rx.try_recv().ok()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn v1_unit_io_worker_dns_vip_fragment_is_dropped() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(false, true);
+        worker_config.dns_listen = Some("10.0.0.53:53".parse().unwrap());
+        let worker = IoWorker::new(worker_config, dispatcher);
+        let mut frame = ipv4_udp_frame(53000, 53, b"dns payload");
+        frame[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8]
+            .copy_from_slice(&0x2000u16.to_be_bytes());
+        frame[ETHERNET_HEADER_LEN + 16..ETHERNET_HEADER_LEN + 20].copy_from_slice(&[10, 0, 0, 53]);
+
+        assert_eq!(
+            worker.handle_frame(
+                &frame,
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Dropped(DropReason::FragmentedDns)
+        );
+        assert_eq!(
+            receivers.iter().filter_map(|rx| rx.try_recv().ok()).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn v1_unit_io_worker_dns_vip_ipv6_extension_header_is_dispatched() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(false, true);
+        worker_config.dns_listen = Some("[2001:db8::53]:53".parse().unwrap());
+        let worker = IoWorker::new(worker_config, dispatcher);
+        let frame = ipv6_udp_hop_frame(53000, 53, b"dns payload");
+
+        assert!(matches!(
+            worker.handle_frame(
+                &frame,
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Dispatched { .. }
+        ));
+        assert_eq!(
+            receivers.iter().filter_map(|rx| rx.try_recv().ok()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn v1_unit_io_worker_dns_local_resolver_response_uses_reverse_directory() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(false, true);
+        worker_config.dns_local_response = Some(DnsLocalResponseClassifier {
+            resolver: "192.0.2.53:53".parse().unwrap(),
+            nat_ip: "192.0.2.1".parse().unwrap(),
+            nat_ports: 40000..=40010,
+        });
+        worker_config.intercept_policy = InterceptPolicy::TunnelPrefixes(vec![]);
+        let worker = IoWorker::new(worker_config, dispatcher);
+        let binding = NatBinding {
+            original: FlowKey {
+                source: "192.0.2.10".parse().unwrap(),
+                destination: "192.0.2.53".parse().unwrap(),
+                source_port: 53000,
+                destination_port: 53,
+                protocol: TransportProtocol::Udp,
+            },
+            translated: FlowKey {
+                source: "192.0.2.1".parse().unwrap(),
+                destination: "192.0.2.53".parse().unwrap(),
+                source_port: 40000,
+                destination_port: 53,
+                protocol: TransportProtocol::Udp,
+            },
+        };
+        let mut directory = ReverseNatDirectory::default();
+        directory
+            .publish(
+                &binding,
+                SessionLocator {
+                    flow_worker_id: 1,
+                    session_id: SessionId(99),
+                },
+            )
+            .unwrap();
+        let mut frame = ipv4_udp_frame(53, 40000, b"dns response");
+        frame[ETHERNET_HEADER_LEN + 12..ETHERNET_HEADER_LEN + 16].copy_from_slice(&[192, 0, 2, 53]);
+        frame[ETHERNET_HEADER_LEN + 16..ETHERNET_HEADER_LEN + 20].copy_from_slice(&[192, 0, 2, 1]);
+
+        assert_eq!(
+            worker.handle_frame(&frame, &ActiveDcidIndex::default(), &directory),
+            IngressOutcome::Dispatched { worker_id: 1 }
+        );
+        assert!(matches!(
+            receivers[1].try_recv().unwrap(),
+            FlowMessage::InterceptIngress { io_owner, .. } if io_owner == IoOwnerKey::new(10, 0)
+        ));
+
+        assert_eq!(
+            worker.handle_frame(
+                &frame,
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Dropped(DropReason::UnknownDnsTransaction)
+        );
+
+        let mut wrong_nat = frame.clone();
+        wrong_nat[ETHERNET_HEADER_LEN + 16..ETHERNET_HEADER_LEN + 20]
+            .copy_from_slice(&[192, 0, 2, 99]);
+        assert_eq!(
+            worker.handle_frame(
+                &wrong_nat,
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Passed
+        );
+
+        let mut wrong_port = frame;
+        wrong_port[ETHERNET_HEADER_LEN + 22..ETHERNET_HEADER_LEN + 24]
+            .copy_from_slice(&39999u16.to_be_bytes());
+        assert_eq!(
+            worker.handle_frame(
+                &wrong_port,
                 &ActiveDcidIndex::default(),
                 &ReverseNatDirectory::default(),
             ),
@@ -474,6 +1008,26 @@ mod tests {
             receivers[worker_id].try_recv().unwrap(),
             FlowMessage::InterceptIngress { .. }
         ));
+    }
+
+    #[test]
+    fn v1_unit_io_worker_same_interface_local_non_tunnel_traffic_passes() {
+        let (dispatcher, receivers) = bounded_flow_channels(2, 2).unwrap();
+        let mut worker_config = config(true, true);
+        worker_config.intercept_policy = InterceptPolicy::All;
+        let worker = IoWorker::new(worker_config, dispatcher);
+
+        assert_eq!(
+            worker.handle_frame(
+                &inner_tcp_frame([192, 0, 2, 20]),
+                &ActiveDcidIndex::default(),
+                &ReverseNatDirectory::default(),
+            ),
+            IngressOutcome::Passed
+        );
+        assert!(receivers
+            .iter()
+            .all(|receiver| receiver.try_recv().is_err()));
     }
 
     #[test]
