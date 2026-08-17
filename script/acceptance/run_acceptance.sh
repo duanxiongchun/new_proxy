@@ -18,7 +18,12 @@ echo "======================================================================"
 if [[ "$(id -u)" == "0" ]]; then
   V1_PRIVILEGE=(env)
 else
-  V1_PRIVILEGE=(sudo -E env)
+  V1_PRIVILEGE=(
+    sudo
+    --preserve-env=V1_KEEP_ARTIFACTS,V1_RUST_LOG,V1_TARGET_LOG_EVERY
+    env
+    -u V1_ARTIFACT_DIR
+  )
 fi
 
 mapfile -t V1_SHELL_SCRIPTS < <(
@@ -30,6 +35,7 @@ done
 run "Python syntax: v1 traffic helper" \
   env PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/new_proxy_pycache" \
   python3 -m py_compile script/acceptance/v1/traffic.py
+run "deployment contract" bash script/acceptance/v1/verify_deployment.sh
 
 run "Rust formatting" cargo fmt --check
 run "v1 Cargo check" cargo check --offline --all-targets
@@ -39,12 +45,16 @@ run "v1 integration tests" cargo test --offline --test v1_flow_integration
 
 V1_E2E_SCRIPTS=(
   "script/acceptance/v1/e2e_v1_client_to_target.sh"
+  "script/acceptance/v1/e2e_v1_auth_rejection.sh"
   "script/acceptance/v1/e2e_v1_dns_policy.sh"
   "script/acceptance/v1/e2e_v1_dns_policy_v6.sh"
+  "script/acceptance/v1/e2e_v1_ip_policy.sh"
   "script/acceptance/v1/e2e_v1_server_return.sh"
   "script/acceptance/v1/e2e_v1_client_return.sh"
   "script/acceptance/v1/e2e_v1_same_interface.sh"
   "script/acceptance/v1/e2e_v1_multi_intercept.sh"
+  "script/acceptance/v1/e2e_v1_malformed_ingress.sh"
+  "script/acceptance/v1/e2e_v1_nat_capacity.sh"
   "script/acceptance/v1/e2e_v1_recovery.sh"
   "script/acceptance/v1/e2e_v1_reliability.sh"
 )
@@ -60,7 +70,7 @@ if [[ "${RUN_V1_E2E:-0}" == "1" ]]; then
   done
 else
   echo
-  echo "Privileged v1 E2E deferred; set RUN_V1_E2E=1 to run all nine scenarios."
+  echo "Privileged v1 E2E deferred; set RUN_V1_E2E=1 to run all thirteen scenarios."
 fi
 
 if [[ "${RUN_V1_SOAK:-0}" == "1" ]]; then
@@ -84,7 +94,7 @@ fi
 
 echo
 if [[ "${RUN_V1_E2E:-0}" == "1" ]]; then
-  echo "AF_XDP QUIC Appliance v1 full gate passed (non-privileged checks + nine E2E scenarios)."
+  echo "AF_XDP QUIC Appliance v1 full gate passed (non-privileged checks + thirteen E2E scenarios)."
 else
   echo "AF_XDP QUIC Appliance v1 non-privileged checks passed; full gate requires RUN_V1_E2E=1."
 fi

@@ -17,7 +17,10 @@ const AUTH_REQUEST: u8 = 1;
 const AUTH_RESPONSE: u8 = 2;
 const AUTH_CONFIRM: u8 = 3;
 const AUTH_COMPLETE: u8 = 4;
-const AUTH_FRAME_LEN: usize = 49;
+const AUTH_FRAME_LEN: usize = 65;
+const AUTH_PROTOCOL: &[u8] = b"new-proxy-auth-v2";
+const AUTH_EXPORTER_LABEL: &[u8] = b"EXPORTER-new-proxy-v1-auth";
+const EMPTY_NONCE: [u8; 16] = [0; 16];
 const INNER_PACKET: u8 = 16;
 const INNER_FRAGMENT: u8 = 17;
 const ALPN: &[u8] = b"new-proxy-v1";
@@ -26,8 +29,11 @@ const MAX_INNER_PACKET_LEN: usize = u16::MAX as usize;
 const MAX_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const MAX_REASSEMBLY_ENTRIES: usize = 4096;
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const AUTH_STREAM_WINDOW: u32 = 4096;
+const MAX_TRACKED_DCIDS: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -98,6 +104,7 @@ pub struct QuicEngine {
     dcid_len: usize,
     generated_dcids: Arc<Mutex<VecDeque<Bytes>>>,
     published_dcids: HashSet<Bytes>,
+    candidate_promotion_pending: bool,
     next_inner_packet_id: u64,
     reassembly: HashMap<u64, InnerReassembly>,
     reassembly_bytes: usize,
@@ -109,17 +116,29 @@ struct ManagedConnection {
     connection: Connection,
     auth: AuthState,
     dcids: HashSet<Bytes>,
+    auth_deadline: Instant,
+    endpoint_registered: bool,
+    dcid_limit_exceeded: bool,
+    retired_dcid_frames: u64,
 }
 
 #[derive(Default)]
 struct AuthState {
     client_nonce: Option<[u8; 16]>,
-    server_pending_nonce: Option<[u8; 16]>,
+    server_nonce: Option<[u8; 16]>,
     stream: Option<StreamId>,
     receive: BytesMut,
     transmit: VecDeque<Bytes>,
     transmit_offset: usize,
+    authenticate_after_flush: bool,
     authenticated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthFlushOutcome {
+    Complete,
+    Blocked,
+    Failed,
 }
 
 #[derive(Default)]
@@ -132,13 +151,28 @@ struct ConnectionDrive {
 }
 
 impl ManagedConnection {
-    fn new(handle: ConnectionHandle, connection: Connection) -> Self {
+    fn new(handle: ConnectionHandle, connection: Connection, now: Instant) -> Self {
         Self {
             handle,
             connection,
             auth: AuthState::default(),
             dcids: HashSet::new(),
+            auth_deadline: now + AUTH_TIMEOUT,
+            endpoint_registered: true,
+            dcid_limit_exceeded: false,
+            retired_dcid_frames: 0,
         }
+    }
+
+    fn track_dcid(&mut self, dcid: Bytes) {
+        if self.dcids.contains(&dcid) {
+            return;
+        }
+        if self.dcids.len() >= MAX_TRACKED_DCIDS {
+            self.dcid_limit_exceeded = true;
+            return;
+        }
+        self.dcids.insert(dcid);
     }
 }
 
@@ -203,10 +237,11 @@ impl QuicEngine {
                 .connect(client_config.clone(), remote, server_name)
                 .map_err(|error| QuicEngineError::Connect(error.to_string()))?;
             let (handle, connection) = connection;
+            let now = Instant::now();
             let mut engine = Self {
                 role: QuicRole::Client,
                 endpoint,
-                connection: Some(ManagedConnection::new(handle, connection)),
+                connection: Some(ManagedConnection::new(handle, connection, now)),
                 candidate: None,
                 client_reconnect: Some(ClientReconnect {
                     client_config: client_config.clone(),
@@ -219,13 +254,14 @@ impl QuicEngine {
                 dcid_len,
                 generated_dcids,
                 published_dcids: HashSet::new(),
+                candidate_promotion_pending: false,
                 next_inner_packet_id: 0,
                 reassembly: HashMap::new(),
                 reassembly_bytes: 0,
                 events: VecDeque::new(),
             };
             engine.stage_generated_dcids(handle);
-            engine.drive(Instant::now());
+            engine.drive(now);
             let owner_matches = engine.events.iter().find_map(|event| {
                 let QuicEngineEvent::Transmit(transmit) = event else {
                     return None;
@@ -273,6 +309,7 @@ impl QuicEngine {
             dcid_len,
             generated_dcids,
             published_dcids: HashSet::new(),
+            candidate_promotion_pending: false,
             next_inner_packet_id: 0,
             reassembly: HashMap::new(),
             reassembly_bytes: 0,
@@ -288,29 +325,22 @@ impl QuicEngine {
         packet: Bytes,
     ) {
         let accepted_dcid = extract_dcid(&packet, self.dcid_len);
-        let Some((handle, event)) =
-            self.endpoint
-                .handle(now, remote, local_ip, None, BytesMut::from(packet))
-        else {
+        self.discard_generated_dcids();
+        let handled = self
+            .endpoint
+            .handle(now, remote, local_ip, None, BytesMut::from(packet));
+        let generated_dcids = self.take_generated_dcids();
+        let Some((handle, event)) = handled else {
             self.drive(now);
             return;
         };
         match event {
             DatagramEvent::NewConnection(connection) => {
-                let incoming = ManagedConnection::new(handle, connection);
-                let same_peer_active = self
-                    .connection
-                    .as_ref()
-                    .is_some_and(|active| active.connection.remote_address() == remote);
-                if self.connection.is_none() {
-                    self.connection = Some(incoming);
-                } else if same_peer_active {
-                    if let Some(previous) = self.candidate.replace(incoming) {
-                        self.retire_staged_dcids(&previous.dcids);
-                        self.close_managed_connection(previous, now, b"superseded candidate");
-                    }
+                let incoming = ManagedConnection::new(handle, connection, now);
+                if self.candidate.is_some() {
+                    self.dispose_managed_connection(incoming, now, Some(b"candidate busy"));
                 } else {
-                    self.close_managed_connection(incoming, now, b"unexpected peer");
+                    self.candidate = Some(incoming);
                 }
             }
             DatagramEvent::ConnectionEvent(event) => {
@@ -321,10 +351,10 @@ impl QuicEngine {
         }
         if let Some(dcid) = accepted_dcid {
             if let Some(connection) = self.connection_for_handle_mut(handle) {
-                connection.dcids.insert(dcid);
+                connection.track_dcid(dcid);
             }
         }
-        self.stage_generated_dcids(handle);
+        self.stage_dcids_for_handle(handle, generated_dcids);
         self.drive(now);
     }
 
@@ -354,22 +384,15 @@ impl QuicEngine {
     }
 
     pub fn close(&mut self, now: Instant) {
-        if let Some(connection) = self.connection.as_mut() {
-            connection
-                .connection
-                .close(now, VarInt::from(0u32), Bytes::from_static(b"closed"));
+        if let Some(connection) = self.connection.take() {
+            self.dispose_managed_connection(connection, now, Some(b"closed"));
         }
-        if let Some(candidate) = self.candidate.as_mut() {
-            candidate
-                .connection
-                .close(now, VarInt::from(0u32), Bytes::from_static(b"closed"));
+        if let Some(candidate) = self.candidate.take() {
+            self.dispose_managed_connection(candidate, now, Some(b"closed"));
         }
         self.clear_reassembly();
         self.retire_all_dcids();
         self.events.push_back(QuicEngineEvent::Closed);
-        self.drive(now);
-        self.connection = None;
-        self.candidate = None;
     }
 
     pub fn poll(&mut self, now: Instant) -> Option<QuicEngineEvent> {
@@ -400,6 +423,19 @@ impl QuicEngine {
         Ok(())
     }
 
+    pub fn resolve_candidate_replacement(&mut self, now: Instant, publish_succeeded: bool) {
+        if !self.candidate_promotion_pending {
+            return;
+        }
+        self.candidate_promotion_pending = false;
+        if publish_succeeded {
+            self.commit_candidate_replacement(now);
+        } else if let Some(candidate) = self.candidate.take() {
+            self.retire_staged_dcids(&candidate.dcids);
+            self.dispose_managed_connection(candidate, now, Some(b"DCID publication rejected"));
+        }
+    }
+
     fn drive(&mut self, now: Instant) {
         let mut transmits = Vec::new();
         let mut endpoint_events = Vec::new();
@@ -421,12 +457,20 @@ impl QuicEngine {
         }
 
         for (handle, event) in endpoint_events {
-            if let Some(connection_event) = self.endpoint.handle_event(handle, event) {
+            if event.is_drained() {
+                if let Some(connection) = self.connection_for_handle_mut(handle) {
+                    connection.endpoint_registered = false;
+                }
+            }
+            self.discard_generated_dcids();
+            let connection_event = self.endpoint.handle_event(handle, event);
+            let generated_dcids = self.take_generated_dcids();
+            if let Some(connection_event) = connection_event {
                 if let Some(connection) = self.connection_for_handle_mut(handle) {
                     connection.connection.handle_event(connection_event);
                 }
             }
-            self.stage_generated_dcids(handle);
+            self.stage_dcids_for_handle(handle, generated_dcids);
         }
         while let Some(transmit) = self.endpoint.poll_transmit() {
             transmits.push(transmit);
@@ -446,18 +490,21 @@ impl QuicEngine {
             self.events.push_back(QuicEngineEvent::Authenticated);
         }
         if candidate_authenticated_now {
-            self.promote_candidate(now);
+            self.promote_candidate();
         } else if candidate_lost {
             if let Some(candidate) = self.candidate.take() {
                 self.retire_staged_dcids(&candidate.dcids);
+                self.dispose_managed_connection(candidate, now, None);
             }
         }
         if active_lost && !candidate_authenticated_now {
             if let Some(candidate) = self.candidate.take() {
                 self.retire_staged_dcids(&candidate.dcids);
-                self.close_managed_connection(candidate, now, b"active connection lost");
+                self.dispose_managed_connection(candidate, now, Some(b"active connection lost"));
             }
-            self.connection = None;
+            if let Some(active) = self.connection.take() {
+                self.dispose_managed_connection(active, now, None);
+            }
             self.clear_reassembly();
             self.retire_all_dcids();
             self.events.push_back(QuicEngineEvent::Closed);
@@ -647,18 +694,34 @@ impl QuicEngine {
     }
 
     fn stage_generated_dcids(&mut self, handle: ConnectionHandle) {
-        let generated = {
-            let mut generated = self
-                .generated_dcids
-                .lock()
-                .expect("CID publication queue is not poisoned");
-            generated.drain(..).collect::<Vec<_>>()
-        };
+        let generated = self.take_generated_dcids();
+        self.stage_dcids_for_handle(handle, generated);
+    }
+
+    fn take_generated_dcids(&self) -> Vec<Bytes> {
+        self.generated_dcids
+            .lock()
+            .expect("CID publication queue is not poisoned")
+            .drain(..)
+            .collect()
+    }
+
+    fn discard_generated_dcids(&self) {
+        self.generated_dcids
+            .lock()
+            .expect("CID publication queue is not poisoned")
+            .clear();
+    }
+
+    fn stage_dcids_for_handle(&mut self, handle: ConnectionHandle, generated: Vec<Bytes>) {
         let Some(connection) = self.connection_for_handle_mut(handle) else {
             return;
         };
         for dcid in &generated {
-            connection.dcids.insert(dcid.clone());
+            connection.track_dcid(dcid.clone());
+        }
+        if connection.dcid_limit_exceeded {
+            return;
         }
         let authenticated = connection.auth.authenticated;
         for dcid in generated {
@@ -690,33 +753,71 @@ impl QuicEngine {
         }
     }
 
-    fn promote_candidate(&mut self, now: Instant) {
-        let Some(candidate) = self.candidate.take() else {
+    fn promote_candidate(&mut self) {
+        let Some(candidate) = self.candidate.as_ref() else {
             return;
         };
         let candidate_dcids = candidate.dcids.iter().cloned().collect::<Vec<_>>();
-        if let Some(active) = self.connection.replace(candidate) {
-            self.close_managed_connection(active, now, b"peer restarted");
+        if self.connection.is_some() {
+            self.candidate_promotion_pending = true;
+            self.events
+                .push_back(QuicEngineEvent::Replaced(candidate_dcids));
+        } else {
+            let candidate = self.candidate.take().expect("candidate exists");
+            self.connection = Some(candidate);
+            for dcid in candidate_dcids {
+                self.publish_dcid(dcid);
+            }
+            self.events.push_back(QuicEngineEvent::Authenticated);
+        }
+    }
+
+    fn commit_candidate_replacement(&mut self, now: Instant) {
+        let Some(candidate) = self.candidate.take() else {
+            return;
+        };
+        let candidate_dcids = candidate.dcids.clone();
+        let previous = self.connection.replace(candidate);
+        if let Some(active) = previous {
+            self.dispose_managed_connection(active, now, Some(b"peer restarted"));
         }
         self.clear_reassembly();
-        self.retire_all_dcids();
-        self.published_dcids.extend(candidate_dcids.iter().cloned());
-        self.events
-            .push_back(QuicEngineEvent::Replaced(candidate_dcids));
+        for dcid in self
+            .published_dcids
+            .drain()
+            .filter(|dcid| !candidate_dcids.contains(dcid))
+        {
+            self.events.push_back(QuicEngineEvent::DcidRetired(dcid));
+        }
+        self.published_dcids.extend(candidate_dcids);
         self.events.push_back(QuicEngineEvent::Authenticated);
     }
 
-    fn close_managed_connection(
+    fn dispose_managed_connection(
         &mut self,
         mut managed: ManagedConnection,
         now: Instant,
-        reason: &'static [u8],
+        reason: Option<&'static [u8]>,
     ) {
-        managed
-            .connection
-            .close(now, VarInt::from(0u32), Bytes::from_static(reason));
+        if let Some(reason) = reason {
+            managed
+                .connection
+                .close(now, VarInt::from(0u32), Bytes::from_static(reason));
+        }
         while let Some(event) = managed.connection.poll_endpoint_events() {
+            if event.is_drained() {
+                managed.endpoint_registered = false;
+            }
+            self.discard_generated_dcids();
             let _ = self.endpoint.handle_event(managed.handle, event);
+            self.discard_generated_dcids();
+        }
+        if managed.endpoint_registered {
+            self.discard_generated_dcids();
+            let _ = self
+                .endpoint
+                .handle_event(managed.handle, quinn_proto::EndpointEvent::drained());
+            self.discard_generated_dcids();
         }
     }
 
@@ -750,6 +851,15 @@ fn drive_connection(
     managed: &mut ManagedConnection,
 ) -> ConnectionDrive {
     let mut drive = ConnectionDrive::default();
+    let was_authenticated = managed.auth.authenticated;
+    if managed.dcid_limit_exceeded {
+        log::warn!("QUIC connection exceeded tracked DCID limit");
+        drive.lost = true;
+    }
+    if !managed.auth.authenticated && now >= managed.auth_deadline {
+        log::warn!("QUIC authentication timed out");
+        drive.lost = true;
+    }
     if managed
         .connection
         .poll_timeout()
@@ -761,8 +871,11 @@ fn drive_connection(
     while let Some(event) = managed.connection.poll() {
         log::trace!("QUIC connection event role={role:?}: {event:?}");
         match event {
-            Event::Connected if role == QuicRole::Client => {
-                start_client_authentication(shared_key, managed);
+            Event::Connected
+                if role == QuicRole::Client
+                    && !start_client_authentication(shared_key, managed) =>
+            {
+                drive.lost = true;
             }
             Event::DatagramReceived => {
                 while let Some(datagram) = managed.connection.datagrams().recv() {
@@ -780,7 +893,39 @@ fn drive_connection(
     for event in stream_events {
         handle_stream_event(role, shared_key, managed, event, &mut drive);
     }
-    flush_auth_stream(managed);
+    if drive.lost {
+        return finish_connection_drive(now, managed, drive);
+    }
+    match flush_auth_stream(managed) {
+        AuthFlushOutcome::Complete if managed.auth.authenticate_after_flush => {
+            managed.auth.authenticate_after_flush = false;
+            managed.auth.authenticated = true;
+            drive.authenticated_now = true;
+        }
+        AuthFlushOutcome::Failed => {
+            managed.auth.authenticated = false;
+            drive.lost = true;
+        }
+        AuthFlushOutcome::Complete | AuthFlushOutcome::Blocked => {}
+    }
+    let retired_dcid_frames = managed.connection.stats().frame_rx.retire_connection_id;
+    if !was_authenticated && managed.auth.authenticated {
+        managed.retired_dcid_frames = retired_dcid_frames;
+    } else if managed.auth.authenticated && retired_dcid_frames > managed.retired_dcid_frames {
+        managed.retired_dcid_frames = retired_dcid_frames;
+        log::warn!("peer retired a QUIC DCID after authentication; closing v1 transport");
+        drive.lost = true;
+    } else if !managed.auth.authenticated {
+        managed.retired_dcid_frames = retired_dcid_frames;
+    }
+    finish_connection_drive(now, managed, drive)
+}
+
+fn finish_connection_drive(
+    now: Instant,
+    managed: &mut ManagedConnection,
+    mut drive: ConnectionDrive,
+) -> ConnectionDrive {
     while let Some(event) = managed.connection.poll_endpoint_events() {
         drive.endpoint_events.push((managed.handle, event));
     }
@@ -790,15 +935,22 @@ fn drive_connection(
     drive
 }
 
-fn start_client_authentication(shared_key: &[u8; 32], managed: &mut ManagedConnection) {
+fn start_client_authentication(shared_key: &[u8; 32], managed: &mut ManagedConnection) -> bool {
     let Some(stream) = managed.connection.streams().open(Dir::Bi) else {
         log::warn!("failed to open v1 HMAC authentication stream");
-        return;
+        return false;
     };
     let nonce = rand::random::<[u8; 16]>();
     managed.auth.stream = Some(stream);
     managed.auth.client_nonce = Some(nonce);
-    queue_auth_frame(shared_key, managed, AUTH_REQUEST, b"client", nonce);
+    queue_auth_frame(
+        shared_key,
+        managed,
+        AUTH_REQUEST,
+        b"client",
+        nonce,
+        EMPTY_NONCE,
+    ) != AuthFlushOutcome::Failed
 }
 
 fn handle_stream_event(
@@ -818,16 +970,34 @@ fn handle_stream_event(
                 if managed.auth.stream.is_none() {
                     managed.auth.stream = Some(stream);
                     drain_auth_stream(role, shared_key, managed, drive);
+                } else {
+                    drive.lost = true;
                 }
             }
         }
+        StreamEvent::Opened { .. } => drive.lost = true,
         StreamEvent::Readable { id } if managed.auth.stream == Some(id) => {
             drain_auth_stream(role, shared_key, managed, drive);
         }
         StreamEvent::Writable { id } if managed.auth.stream == Some(id) => {
-            flush_auth_stream(managed);
+            match flush_auth_stream(managed) {
+                AuthFlushOutcome::Complete if managed.auth.authenticate_after_flush => {
+                    managed.auth.authenticate_after_flush = false;
+                    managed.auth.authenticated = true;
+                    drive.authenticated_now = true;
+                }
+                AuthFlushOutcome::Failed => {
+                    managed.auth.authenticated = false;
+                    drive.lost = true;
+                }
+                AuthFlushOutcome::Complete | AuthFlushOutcome::Blocked => {}
+            }
         }
-        _ => {}
+        StreamEvent::Readable { .. }
+        | StreamEvent::Writable { .. }
+        | StreamEvent::Stopped { .. } => drive.lost = true,
+        StreamEvent::Finished { id } if managed.auth.stream != Some(id) => drive.lost = true,
+        StreamEvent::Finished { .. } | StreamEvent::Available { .. } => {}
     }
 }
 
@@ -862,10 +1032,15 @@ fn drain_auth_stream(
         };
     }
     if failed {
-        managed.auth = AuthState::default();
+        managed.auth.authenticated = false;
+        drive.lost = true;
         return;
     }
     managed.auth.receive.extend_from_slice(&received);
+    if managed.auth.receive.len() > AUTH_FRAME_LEN {
+        drive.lost = true;
+        return;
+    }
     while managed.auth.receive.len() >= AUTH_FRAME_LEN {
         let frame = managed.auth.receive.split_to(AUTH_FRAME_LEN).freeze();
         handle_auth_frame(role, shared_key, managed, &frame, drive);
@@ -880,39 +1055,121 @@ fn handle_auth_frame(
     drive: &mut ConnectionDrive,
 ) {
     let kind = frame[0];
-    let nonce: [u8; 16] = frame[1..17].try_into().expect("fixed auth nonce");
-    let received_mac: [u8; 32] = frame[17..].try_into().expect("fixed auth MAC");
+    let client_nonce: [u8; 16] = frame[1..17].try_into().expect("fixed client nonce");
+    let server_nonce: [u8; 16] = frame[17..33].try_into().expect("fixed server nonce");
+    let received_mac: [u8; 32] = frame[33..].try_into().expect("fixed auth MAC");
+    let Some(exporter) = auth_exporter(managed) else {
+        drive.lost = true;
+        return;
+    };
     match (role, kind) {
         (QuicRole::Server, AUTH_REQUEST)
-            if constant_time_eq(&received_mac, &auth_mac(shared_key, b"client", &nonce)) =>
+            if server_nonce == EMPTY_NONCE
+                && constant_time_eq(
+                    &received_mac,
+                    &auth_mac(
+                        shared_key,
+                        b"client",
+                        &client_nonce,
+                        &server_nonce,
+                        &exporter,
+                    ),
+                ) =>
         {
-            managed.auth.server_pending_nonce = Some(nonce);
-            queue_auth_frame(shared_key, managed, AUTH_RESPONSE, b"server", nonce);
+            let server_nonce = rand::random::<[u8; 16]>();
+            managed.auth.client_nonce = Some(client_nonce);
+            managed.auth.server_nonce = Some(server_nonce);
+            if queue_auth_frame(
+                shared_key,
+                managed,
+                AUTH_RESPONSE,
+                b"server",
+                client_nonce,
+                server_nonce,
+            ) == AuthFlushOutcome::Failed
+            {
+                drive.lost = true;
+            }
         }
         (QuicRole::Client, AUTH_RESPONSE)
-            if managed.auth.client_nonce == Some(nonce)
-                && constant_time_eq(&received_mac, &auth_mac(shared_key, b"server", &nonce)) =>
+            if managed.auth.client_nonce == Some(client_nonce)
+                && server_nonce != EMPTY_NONCE
+                && constant_time_eq(
+                    &received_mac,
+                    &auth_mac(
+                        shared_key,
+                        b"server",
+                        &client_nonce,
+                        &server_nonce,
+                        &exporter,
+                    ),
+                ) =>
         {
-            queue_auth_frame(shared_key, managed, AUTH_CONFIRM, b"confirm", nonce);
+            managed.auth.server_nonce = Some(server_nonce);
+            if queue_auth_frame(
+                shared_key,
+                managed,
+                AUTH_CONFIRM,
+                b"confirm",
+                client_nonce,
+                server_nonce,
+            ) == AuthFlushOutcome::Failed
+            {
+                drive.lost = true;
+            }
         }
         (QuicRole::Server, AUTH_CONFIRM)
-            if managed.auth.server_pending_nonce == Some(nonce)
-                && constant_time_eq(&received_mac, &auth_mac(shared_key, b"confirm", &nonce)) =>
+            if managed.auth.client_nonce == Some(client_nonce)
+                && managed.auth.server_nonce == Some(server_nonce)
+                && constant_time_eq(
+                    &received_mac,
+                    &auth_mac(
+                        shared_key,
+                        b"confirm",
+                        &client_nonce,
+                        &server_nonce,
+                        &exporter,
+                    ),
+                ) =>
         {
-            managed.auth.server_pending_nonce = None;
-            managed.auth.authenticated = true;
-            queue_auth_frame(shared_key, managed, AUTH_COMPLETE, b"complete", nonce);
-            drive.authenticated_now = true;
+            match queue_auth_frame(
+                shared_key,
+                managed,
+                AUTH_COMPLETE,
+                b"complete",
+                client_nonce,
+                server_nonce,
+            ) {
+                AuthFlushOutcome::Complete => {
+                    managed.auth.authenticated = true;
+                    drive.authenticated_now = true;
+                }
+                AuthFlushOutcome::Blocked => {
+                    managed.auth.authenticate_after_flush = true;
+                }
+                AuthFlushOutcome::Failed => drive.lost = true,
+            }
         }
         (QuicRole::Client, AUTH_COMPLETE)
-            if managed.auth.client_nonce == Some(nonce)
-                && constant_time_eq(&received_mac, &auth_mac(shared_key, b"complete", &nonce)) =>
+            if managed.auth.client_nonce == Some(client_nonce)
+                && managed.auth.server_nonce == Some(server_nonce)
+                && constant_time_eq(
+                    &received_mac,
+                    &auth_mac(
+                        shared_key,
+                        b"complete",
+                        &client_nonce,
+                        &server_nonce,
+                        &exporter,
+                    ),
+                ) =>
         {
-            managed.auth.client_nonce = None;
+            managed.auth.client_nonce = Some(client_nonce);
+            managed.auth.server_nonce = Some(server_nonce);
             managed.auth.authenticated = true;
             drive.authenticated_now = true;
         }
-        _ => {}
+        _ => drive.lost = true,
     }
 }
 
@@ -921,19 +1178,34 @@ fn queue_auth_frame(
     managed: &mut ManagedConnection,
     kind: u8,
     label: &[u8],
-    nonce: [u8; 16],
-) {
+    client_nonce: [u8; 16],
+    server_nonce: [u8; 16],
+) -> AuthFlushOutcome {
+    let Some(exporter) = auth_exporter(managed) else {
+        return AuthFlushOutcome::Failed;
+    };
     let mut frame = Vec::with_capacity(AUTH_FRAME_LEN);
     frame.push(kind);
-    frame.extend_from_slice(&nonce);
-    frame.extend_from_slice(&auth_mac(shared_key, label, &nonce));
+    frame.extend_from_slice(&client_nonce);
+    frame.extend_from_slice(&server_nonce);
+    frame.extend_from_slice(&auth_mac(
+        shared_key,
+        label,
+        &client_nonce,
+        &server_nonce,
+        &exporter,
+    ));
     managed.auth.transmit.push_back(Bytes::from(frame));
-    flush_auth_stream(managed);
+    flush_auth_stream(managed)
 }
 
-fn flush_auth_stream(managed: &mut ManagedConnection) {
+fn flush_auth_stream(managed: &mut ManagedConnection) -> AuthFlushOutcome {
     let Some(stream) = managed.auth.stream else {
-        return;
+        return if managed.auth.transmit.is_empty() {
+            AuthFlushOutcome::Complete
+        } else {
+            AuthFlushOutcome::Failed
+        };
     };
     while let Some(frame) = managed.auth.transmit.front() {
         match managed
@@ -948,13 +1220,11 @@ fn flush_auth_stream(managed: &mut ManagedConnection) {
                     managed.auth.transmit_offset = 0;
                 }
             }
-            Err(WriteError::Blocked) => break,
-            Err(_) => {
-                managed.auth = AuthState::default();
-                break;
-            }
+            Err(WriteError::Blocked) => return AuthFlushOutcome::Blocked,
+            Err(_) => return AuthFlushOutcome::Failed,
         }
     }
+    AuthFlushOutcome::Complete
 }
 
 pub fn pinned_client_config(expected_sha256: [u8; 32]) -> Result<ClientConfig, rustls::Error> {
@@ -981,18 +1251,30 @@ pub fn server_config(
         )?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let mut config = ServerConfig::with_crypto(Arc::new(tls));
+    config.use_retry(true);
+    config.concurrent_connections(2);
+    config.migration(false);
     config.transport_config(stable_transport_config());
     Ok(config)
 }
 
 fn stable_transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
+    config.initial_mtu(1452);
+    config.min_mtu(1452);
+    config.mtu_discovery_config(None);
     config.max_idle_timeout(Some(
         QUIC_IDLE_TIMEOUT
             .try_into()
             .expect("QUIC idle timeout fits QUIC varint"),
     ));
     config.keep_alive_interval(Some(QUIC_KEEP_ALIVE_INTERVAL));
+    config.max_concurrent_bidi_streams(VarInt::from(1u32));
+    config.max_concurrent_uni_streams(VarInt::from(0u32));
+    config.stream_receive_window(VarInt::from(AUTH_STREAM_WINDOW));
+    config.receive_window(VarInt::from(AUTH_STREAM_WINDOW));
+    config.datagram_receive_buffer_size(Some(1024 * 1024 * 8));
+    config.datagram_send_buffer_size(1024 * 1024 * 8);
     Arc::new(config)
 }
 
@@ -1081,10 +1363,29 @@ fn validate_dcid_len(dcid_len: usize) -> Result<(), QuicEngineError> {
     }
 }
 
-fn auth_mac(key: &[u8; 32], label: &[u8], nonce: &[u8; 16]) -> [u8; 32] {
+fn auth_exporter(managed: &ManagedConnection) -> Option<[u8; 32]> {
+    let mut exporter = [0u8; 32];
+    managed
+        .connection
+        .crypto_session()
+        .export_keying_material(&mut exporter, AUTH_EXPORTER_LABEL, AUTH_PROTOCOL)
+        .ok()?;
+    Some(exporter)
+}
+
+fn auth_mac(
+    key: &[u8; 32],
+    label: &[u8],
+    client_nonce: &[u8; 16],
+    server_nonce: &[u8; 16],
+    exporter: &[u8; 32],
+) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts 32-byte key");
+    mac.update(AUTH_PROTOCOL);
     mac.update(label);
-    mac.update(nonce);
+    mac.update(client_nonce);
+    mac.update(server_nonce);
+    mac.update(exporter);
     let mut output = [0u8; 32];
     output.copy_from_slice(&mac.finalize().into_bytes());
     output
@@ -1190,6 +1491,63 @@ mod tests {
         observed
     }
 
+    fn drive_two_clients(
+        first: (&mut QuicEngine, SocketAddr),
+        second: (&mut QuicEngine, SocketAddr),
+        server: &mut QuicEngine,
+        server_addr: SocketAddr,
+        now: &mut Instant,
+    ) {
+        let (first_client, first_addr) = first;
+        let (second_client, second_addr) = second;
+        for _ in 0..2000 {
+            while let Some(event) = first_client.poll(*now) {
+                if let QuicEngineEvent::Transmit(transmit) = event {
+                    server.handle_outer(
+                        *now,
+                        first_addr,
+                        Some(server_addr.ip()),
+                        transmit.contents,
+                    );
+                }
+            }
+            while let Some(event) = second_client.poll(*now) {
+                if let QuicEngineEvent::Transmit(transmit) = event {
+                    server.handle_outer(
+                        *now,
+                        second_addr,
+                        Some(server_addr.ip()),
+                        transmit.contents,
+                    );
+                }
+            }
+            while let Some(event) = server.poll(*now) {
+                let QuicEngineEvent::Transmit(transmit) = event else {
+                    continue;
+                };
+                if transmit.destination == first_addr {
+                    first_client.handle_outer(
+                        *now,
+                        server_addr,
+                        Some(first_addr.ip()),
+                        transmit.contents,
+                    );
+                } else if transmit.destination == second_addr {
+                    second_client.handle_outer(
+                        *now,
+                        server_addr,
+                        Some(second_addr.ip()),
+                        transmit.contents,
+                    );
+                }
+            }
+            if second_client.is_authenticated() && server.is_authenticated() {
+                break;
+            }
+            *now += Duration::from_millis(2);
+        }
+    }
+
     #[test]
     fn v1_unit_quic_engine_authenticates_and_round_trips_inner_packets() {
         let (mut client, mut server, client_addr, server_addr) = engine_pair();
@@ -1205,6 +1563,11 @@ mod tests {
         );
         assert!(client.is_authenticated());
         assert!(server.is_authenticated());
+        assert!(client
+            .connection
+            .as_mut()
+            .and_then(|connection| connection.connection.datagrams().max_size())
+            .is_some_and(|maximum| maximum >= 1394));
 
         let ipv4 = Bytes::from_static(&[
             0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
@@ -1313,6 +1676,28 @@ mod tests {
     }
 
     #[test]
+    fn v1_unit_quic_engine_discards_cids_generated_for_stateless_initial_handling() {
+        let (mut client, mut server, client_addr, server_addr) = engine_pair();
+        let now = Instant::now();
+        let initial = std::iter::from_fn(|| client.poll(now))
+            .find_map(|event| match event {
+                QuicEngineEvent::Transmit(transmit) => Some(transmit.contents),
+                _ => None,
+            })
+            .expect("client emits an Initial");
+
+        server.handle_outer(now, client_addr, Some(server_addr.ip()), initial);
+
+        assert!(server
+            .generated_dcids
+            .lock()
+            .expect("CID publication queue is not poisoned")
+            .is_empty());
+        assert!(server.connection.is_none());
+        assert!(server.candidate.is_none());
+    }
+
+    #[test]
     fn v1_unit_quic_engine_unauthenticated_candidate_does_not_replace_active_connection() {
         let (mut client, mut server, client_addr, server_addr) = engine_pair();
         let mut now = Instant::now();
@@ -1372,6 +1757,110 @@ mod tests {
     }
 
     #[test]
+    fn v1_unit_quic_engine_wrong_key_cold_start_cannot_block_a_different_peer() {
+        let (mut client, mut server, client_addr, server_addr) = engine_pair();
+        let reconnect = client.client_reconnect.as_ref().unwrap().clone();
+        let attacker_addr = "127.0.0.2:41000".parse().unwrap();
+        let mut attacker = QuicEngine::client(
+            reconnect.client_config,
+            reconnect.remote,
+            &reconnect.server_name,
+            [9u8; 32],
+            8,
+        )
+        .unwrap();
+        let mut now = Instant::now();
+
+        drive_two_clients(
+            (&mut attacker, attacker_addr),
+            (&mut client, client_addr),
+            &mut server,
+            server_addr,
+            &mut now,
+        );
+
+        assert!(client.is_authenticated());
+        assert!(server.is_authenticated());
+        assert_eq!(
+            server
+                .connection
+                .as_ref()
+                .map(|connection| connection.connection.remote_address()),
+            Some(client_addr)
+        );
+    }
+
+    #[test]
+    fn v1_unit_quic_engine_auth_timeout_releases_candidate_and_endpoint_slot() {
+        let (mut client, mut server, client_addr, server_addr) = engine_pair();
+        let reconnect = client.client_reconnect.as_ref().unwrap().clone();
+        let stalled_addr = "127.0.0.2:42000".parse().unwrap();
+        let mut stalled = QuicEngine::client(
+            reconnect.client_config.clone(),
+            reconnect.remote,
+            &reconnect.server_name,
+            [9u8; 32],
+            8,
+        )
+        .unwrap();
+        let mut now = Instant::now();
+
+        for _ in 0..500 {
+            while let Some(event) = stalled.poll(now) {
+                if let QuicEngineEvent::Transmit(transmit) = event {
+                    server.handle_outer(
+                        now,
+                        stalled_addr,
+                        Some(server_addr.ip()),
+                        transmit.contents,
+                    );
+                }
+            }
+            while let Some(event) = server.poll(now) {
+                if let QuicEngineEvent::Transmit(transmit) = event {
+                    stalled.handle_outer(
+                        now,
+                        server_addr,
+                        Some(stalled_addr.ip()),
+                        transmit.contents,
+                    );
+                }
+            }
+            if server.candidate.is_some() {
+                break;
+            }
+            now += Duration::from_millis(2);
+        }
+        assert!(server.candidate.is_some());
+
+        now += AUTH_TIMEOUT + Duration::from_millis(1);
+        while server.poll(now).is_some() {}
+        assert!(server.candidate.is_none());
+        assert!(server.connection.is_none());
+
+        client = QuicEngine::client(
+            reconnect.client_config,
+            reconnect.remote,
+            &reconnect.server_name,
+            [7u8; 32],
+            8,
+        )
+        .unwrap();
+        now = Instant::now();
+        let mut captured = Vec::new();
+        let _ = drive_pair(
+            &mut client,
+            &mut server,
+            client_addr,
+            server_addr,
+            &mut now,
+            &mut captured,
+        );
+        assert!(client.is_authenticated());
+        assert!(server.is_authenticated());
+    }
+
+    #[test]
     fn v1_unit_quic_engine_authenticated_candidate_is_promoted_atomically() {
         let (mut client, mut server, client_addr, server_addr) = engine_pair();
         let mut now = Instant::now();
@@ -1407,6 +1896,10 @@ mod tests {
                 match event {
                     QuicEngineEvent::Transmit(transmit) => {
                         pending.push_back((false, transmit.contents));
+                    }
+                    QuicEngineEvent::Replaced(dcids) => {
+                        server_events.push(QuicEngineEvent::Replaced(dcids));
+                        server.resolve_candidate_replacement(now, true);
                     }
                     other => server_events.push(other),
                 }
@@ -1447,6 +1940,82 @@ mod tests {
         assert!(!server_events.contains(&QuicEngineEvent::Closed));
         assert_eq!(replaced, published);
         assert!(published < authenticated);
+    }
+
+    #[test]
+    fn v1_unit_quic_engine_rejected_candidate_replacement_keeps_active_connection() {
+        let (mut client, mut server, client_addr, server_addr) = engine_pair();
+        let mut now = Instant::now();
+        let mut captured = Vec::new();
+        let _ = drive_pair(
+            &mut client,
+            &mut server,
+            client_addr,
+            server_addr,
+            &mut now,
+            &mut captured,
+        );
+        while server.poll(now).is_some() {}
+        let active_handle = server.connection.as_ref().unwrap().handle;
+
+        let reconnect = client.client_reconnect.as_ref().unwrap().clone();
+        let candidate_addr = "127.0.0.2:43000".parse().unwrap();
+        let mut candidate = QuicEngine::client(
+            reconnect.client_config,
+            reconnect.remote,
+            &reconnect.server_name,
+            [7u8; 32],
+            8,
+        )
+        .unwrap();
+        let mut pending = VecDeque::new();
+        let mut rejected = false;
+        let mut server_events = Vec::new();
+        for _ in 0..2000 {
+            while let Some(event) = candidate.poll(now) {
+                if let QuicEngineEvent::Transmit(transmit) = event {
+                    pending.push_back((true, transmit.contents));
+                }
+            }
+            while let Some(event) = server.poll(now) {
+                match event {
+                    QuicEngineEvent::Transmit(transmit) => {
+                        pending.push_back((false, transmit.contents));
+                    }
+                    QuicEngineEvent::Replaced(dcids) => {
+                        assert!(!dcids.is_empty());
+                        rejected = true;
+                        server.resolve_candidate_replacement(now, false);
+                    }
+                    other => server_events.push(other),
+                }
+            }
+            if rejected {
+                while let Some(event) = server.poll(now) {
+                    server_events.push(event);
+                }
+                break;
+            }
+            if let Some((to_server, packet)) = pending.pop_front() {
+                if to_server {
+                    server.handle_outer(now, candidate_addr, Some(server_addr.ip()), packet);
+                } else {
+                    candidate.handle_outer(now, server_addr, Some(candidate_addr.ip()), packet);
+                }
+            } else {
+                now += Duration::from_millis(2);
+            }
+        }
+
+        assert!(rejected);
+        assert!(server.is_authenticated());
+        assert_eq!(server.connection.as_ref().unwrap().handle, active_handle);
+        assert!(server.candidate.is_none());
+        assert!(!server_events.contains(&QuicEngineEvent::Closed));
+        assert!(!server_events.contains(&QuicEngineEvent::Authenticated));
+        assert!(server_events
+            .iter()
+            .any(|event| matches!(event, QuicEngineEvent::DcidRetired(_))));
     }
 
     #[test]
@@ -1555,6 +2124,38 @@ mod tests {
         assert!(!server.is_authenticated());
         assert!(std::iter::from_fn(|| server.poll(now))
             .all(|event| !matches!(event, QuicEngineEvent::InnerPacket(_))));
+    }
+
+    #[test]
+    fn v1_unit_auth_mac_binds_both_nonces_and_tls_exporter() {
+        let key = [7u8; 32];
+        let client_nonce = [1u8; 16];
+        let server_nonce = [2u8; 16];
+        let other_server_nonce = [3u8; 16];
+        let exporter = [4u8; 32];
+        let other_exporter = [5u8; 32];
+
+        let expected = auth_mac(&key, b"confirm", &client_nonce, &server_nonce, &exporter);
+        assert_ne!(
+            expected,
+            auth_mac(
+                &key,
+                b"confirm",
+                &client_nonce,
+                &other_server_nonce,
+                &exporter,
+            )
+        );
+        assert_ne!(
+            expected,
+            auth_mac(
+                &key,
+                b"confirm",
+                &client_nonce,
+                &server_nonce,
+                &other_exporter,
+            )
+        );
     }
 
     #[test]

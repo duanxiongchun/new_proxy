@@ -26,8 +26,12 @@ ip netns exec "$SOURCE_NS" python3 "$ROOT_DIR/script/acceptance/v1/traffic.py" \
   --port 53 \
   --answer 198.51.100.10 \
   --log "$ARTIFACT_DIR/local-dns.log" \
-  --tag local-v6 >"$ARTIFACT_DIR/local-dns-server.log" 2>&1 &
+  --tag local-v6 \
+  --ready "$ARTIFACT_DIR/local-dns.ready" \
+  >"$ARTIFACT_DIR/local-dns-server.log" 2>&1 &
 EXTRA_PIDS+=("$!")
+wait_for_ready "$ARTIFACT_DIR/local-dns.ready" "${EXTRA_PIDS[-1]}" \
+  "$ARTIFACT_DIR/local-dns-server.log"
 
 ip netns exec "$TARGET_NS" python3 "$ROOT_DIR/script/acceptance/v1/traffic.py" \
   dns-server \
@@ -35,8 +39,12 @@ ip netns exec "$TARGET_NS" python3 "$ROOT_DIR/script/acceptance/v1/traffic.py" \
   --port 53 \
   --answer 203.0.113.10 \
   --log "$ARTIFACT_DIR/remote-dns.log" \
-  --tag remote-v6 >"$ARTIFACT_DIR/remote-dns-server.log" 2>&1 &
+  --tag remote-v6 \
+  --ready "$ARTIFACT_DIR/remote-dns.ready" \
+  >"$ARTIFACT_DIR/remote-dns-server.log" 2>&1 &
 EXTRA_PIDS+=("$!")
+wait_for_ready "$ARTIFACT_DIR/remote-dns.ready" "${EXTRA_PIDS[-1]}" \
+  "$ARTIFACT_DIR/remote-dns-server.log"
 
 ip netns exec "$SOURCE_NS" timeout 20s python3 \
   "$ROOT_DIR/script/acceptance/v1/traffic.py" dns-client \
@@ -83,3 +91,18 @@ wait_for_json "$CLIENT_STATS" \
 
 wait_for_json "$SERVER_STATS" \
   'sum(worker["dns_query_local"] + worker["dns_query_remote"] + worker["dns_transactions_active"] for worker in value["flow_workers"]) == 0'
+
+xdp_dns_fragment_before="$(
+  read_stats_metric "$CLIENT_STATS" 'value["xdp_dns_fragment_drops"]'
+)"
+ip netns exec "$SOURCE_NS" python3 "$ROOT_DIR/script/acceptance/v1/traffic.py" \
+  xdp-parser-drop \
+  --kind dns-ipv6-non-initial-fragment \
+  --interface sw0 \
+  --source-mac "$SOURCE_MAC" \
+  --destination-mac "$CLIENT_INTERCEPT_MAC" \
+  --source-ip 2001:db8:30::2 \
+  --destination-ip 2001:db8:30::53
+wait_for_json "$CLIENT_STATS" \
+  "value[\"xdp_dns_fragment_drops\"] > $xdp_dns_fragment_before"
+assert_daemon_running "$CLIENT_PID" "$ARTIFACT_DIR/client.log"

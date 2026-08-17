@@ -2,6 +2,11 @@ use crate::flow_plane::{FlowKey, SessionId, TransportProtocol};
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
+use std::time::{Duration, Instant};
+
+const TCP_REUSE_QUARANTINE: Duration = Duration::from_secs(120);
+const UDP_REUSE_QUARANTINE: Duration = Duration::from_secs(60);
+const ICMP_REUSE_QUARANTINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionLocator {
@@ -71,9 +76,16 @@ impl ReverseNatDirectory {
             .copied()
     }
 
-    pub fn retire(&mut self, binding: &NatBinding) -> Option<SessionLocator> {
-        self.entries
-            .remove(&ReverseNatKey::from_translated_flow(&binding.translated))
+    pub fn retire(
+        &mut self,
+        binding: &NatBinding,
+        expected: SessionLocator,
+    ) -> Option<SessionLocator> {
+        let key = ReverseNatKey::from_translated_flow(&binding.translated);
+        if self.entries.get(&key) != Some(&expected) {
+            return None;
+        }
+        self.entries.remove(&key)
     }
 
     pub fn len(&self) -> usize {
@@ -114,6 +126,7 @@ pub struct NatTable {
     available_ports: BTreeSet<u16>,
     forward: HashMap<SessionId, NatBinding>,
     reverse: HashMap<ReverseNatKey, SessionLocator>,
+    quarantined: HashMap<ReverseNatKey, Instant>,
 }
 
 impl NatTable {
@@ -139,6 +152,7 @@ impl NatTable {
             available_ports: ports.collect(),
             forward: HashMap::new(),
             reverse: HashMap::new(),
+            quarantined: HashMap::new(),
         })
     }
 
@@ -147,6 +161,16 @@ impl NatTable {
         session_id: SessionId,
         original: FlowKey,
         locator: SessionLocator,
+    ) -> Result<&NatBinding, NatError> {
+        self.allocate_at(session_id, original, locator, Instant::now())
+    }
+
+    fn allocate_at(
+        &mut self,
+        session_id: SessionId,
+        original: FlowKey,
+        locator: SessionLocator,
+        now: Instant,
     ) -> Result<&NatBinding, NatError> {
         if self.forward.contains_key(&session_id) {
             return Err(NatError::DuplicateSession(session_id));
@@ -157,18 +181,21 @@ impl NatTable {
         }
         .ok_or(NatError::AddressFamilyMismatch)?;
 
-        let port = self
+        self.quarantined.retain(|_, expires_at| *expires_at > now);
+        let (port, translated, reverse_key) = self
             .available_ports
-            .first()
+            .iter()
             .copied()
+            .find_map(|port| {
+                let mut translated = original.clone();
+                translated.source = snat_ip;
+                translated.source_port = port;
+                let reverse_key = ReverseNatKey::from_translated_flow(&translated);
+                (!self.reverse.contains_key(&reverse_key)
+                    && !self.quarantined.contains_key(&reverse_key))
+                .then_some((port, translated, reverse_key))
+            })
             .ok_or(NatError::PortRangeExhausted)?;
-        let mut translated = original.clone();
-        translated.source = snat_ip;
-        translated.source_port = port;
-        let reverse_key = ReverseNatKey::from_translated_flow(&translated);
-        if self.reverse.contains_key(&reverse_key) {
-            return Err(NatError::DuplicateReverseKey(reverse_key));
-        }
 
         self.available_ports.remove(&port);
         self.reverse.insert(reverse_key, locator);
@@ -196,12 +223,20 @@ impl NatTable {
     }
 
     pub fn remove(&mut self, session_id: SessionId) -> Result<NatBinding, NatError> {
+        self.remove_at(session_id, Instant::now())
+    }
+
+    fn remove_at(&mut self, session_id: SessionId, now: Instant) -> Result<NatBinding, NatError> {
         let binding = self
             .forward
             .remove(&session_id)
             .ok_or(NatError::UnknownSession(session_id))?;
-        self.reverse
-            .remove(&ReverseNatKey::from_translated_flow(&binding.translated));
+        let reverse_key = ReverseNatKey::from_translated_flow(&binding.translated);
+        self.reverse.remove(&reverse_key);
+        self.quarantined.insert(
+            reverse_key,
+            now + reuse_quarantine(binding.translated.protocol),
+        );
         self.available_ports.insert(binding.translated.source_port);
         Ok(binding)
     }
@@ -216,6 +251,14 @@ impl NatTable {
 
     pub fn reverse_len(&self) -> usize {
         self.reverse.len()
+    }
+}
+
+const fn reuse_quarantine(protocol: TransportProtocol) -> Duration {
+    match protocol {
+        TransportProtocol::Tcp => TCP_REUSE_QUARANTINE,
+        TransportProtocol::Udp => UDP_REUSE_QUARANTINE,
+        TransportProtocol::Icmp | TransportProtocol::Icmpv6 => ICMP_REUSE_QUARANTINE,
     }
 }
 
@@ -290,26 +333,53 @@ mod tests {
     }
 
     #[test]
-    fn v1_unit_nat_reports_exhaustion_and_reuses_explicitly_released_port() {
+    fn v1_unit_nat_quarantines_released_reverse_tuple_before_reuse() {
         let mut table =
             NatTable::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 40000..=40001).unwrap();
+        let now = Instant::now();
         table
-            .allocate(SessionId(1), flow(10001), locator(1))
+            .allocate_at(SessionId(1), flow(10001), locator(1), now)
             .unwrap();
         table
-            .allocate(SessionId(2), flow(10002), locator(2))
+            .allocate_at(SessionId(2), flow(10002), locator(2), now)
             .unwrap();
 
         assert_eq!(
-            table.allocate(SessionId(3), flow(10003), locator(3)),
+            table.allocate_at(SessionId(3), flow(10003), locator(3), now),
             Err(NatError::PortRangeExhausted)
         );
 
-        table.remove(SessionId(1)).unwrap();
+        table.remove_at(SessionId(1), now).unwrap();
+        assert_eq!(
+            table.allocate_at(SessionId(3), flow(10003), locator(3), now),
+            Err(NatError::PortRangeExhausted)
+        );
+        let reused_at = now + TCP_REUSE_QUARANTINE;
         let reused = table
-            .allocate(SessionId(3), flow(10003), locator(3))
+            .allocate_at(SessionId(3), flow(10003), locator(3), reused_at)
             .unwrap();
         assert_eq!(reused.translated.source_port, 40000);
+    }
+
+    #[test]
+    fn v1_unit_reverse_directory_retire_is_locator_compare_and_swap() {
+        let mut directory = ReverseNatDirectory::default();
+        let binding = NatBinding {
+            original: flow(10001),
+            translated: FlowKey {
+                source: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                source_port: 40000,
+                ..flow(10001)
+            },
+        };
+        directory.publish(&binding, locator(1)).unwrap();
+
+        assert_eq!(directory.retire(&binding, locator(2)), None);
+        assert_eq!(
+            directory.lookup(&binding.translated.reverse()),
+            Some(locator(1))
+        );
+        assert_eq!(directory.retire(&binding, locator(1)), Some(locator(1)));
     }
 
     #[test]

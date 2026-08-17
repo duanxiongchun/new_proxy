@@ -9,7 +9,7 @@
 ### 目标
 
 - direct prefix 内的目的 IP 本地直连，其他公网目的 IP 通过 QUIC。
-- direct prefix 从文件加载，更新文件后重启 client 生效。
+- direct prefix 从文件加载，支持通过 SIGUSR1 信号进行运行时热重载，无需重启 client。
 - client appliance 提供一个独立 DNS VIP，只接收发往该 VIP 的 UDP/53 查询。
 - remote domain 文件命中的查询使用 server 出口访问可信远端 resolver。
 - 其他查询使用 client 本地 resolver。
@@ -21,7 +21,7 @@
 - TCP/53、DoH、DoT 和 DoQ。
 - DNS cache、请求合并、预取、多 resolver、健康检查和自动故障转移。
 - 根据 DNS 响应动态生成目的 IP 路由规则。
-- direct prefix 或 remote domain 文件热更新。
+- 动态 BGP/OSPF 协议分发（目前通过 static/file 配置配合 SIGUSR1 热重载实现）。
 - server 侧域名解析、DNS transaction table、DNS 专用 QUIC 消息或 DNS 专用端口段。
 
 ## 2. 配置
@@ -106,8 +106,10 @@ github.com
 - `google.com` 不匹配 `notgoogle.com`。
 - 不支持 `*` 通配符。
 - 空 label、非法域名和重复规范化规则导致启动失败。
+- 文件最大 4 MiB，规范化后最多 65536 条规则；超过限制启动失败。
 
-文件只在 client 启动时加载；更新后重启生效。
+文件只在 client 启动时加载并编译为后缀集合；查询按 QNAME label 后缀查找，不随
+规则总数线性扫描。更新后重启生效。
 
 ## 3. 目的 IP 分流
 
@@ -125,7 +127,8 @@ destination not in direct-cidrs.txt
     -> target
 ```
 
-XDP 中 IPv4 和 IPv6 LPM trie 的 `max_entries` 分别从 256 提升到 65536，并继续使用
+XDP 中 IPv4 和 IPv6 LPM trie 的 `max_entries` 分别为 65536，其中每个地址族为
+runtime 的 tunnel、DNS 和 NAT host overlay 预留 16 项，其余 65520 项供 policy 文件使用，并继续使用
 `BPF_F_NO_PREALLOC`。实际内存随加载条目增长。runtime 必须在启用 classifier 前
 验证并完整写入 map；任一写入失败时启动失败。
 
@@ -145,16 +148,18 @@ LPM value 表示明确 action，而不是简单把“map 是否命中”取反�
 address、管理/保留地址和 NAT return tuple 在进入地理 policy 前处理，不能被默认
 action 覆盖。
 
-下列目的地址不由地理文件决定，始终本地处理：
+下列目的地址不由 direct-prefix 文件决定：
 
 - IPv4/IPv6 loopback、link-local、multicast 和 unspecified。
 - RFC1918、IPv4 CGNAT 和 IPv6 ULA。
 - tunnel endpoint 和本机 tunnel 地址。
 - 除 UDP/53 特例外的 DNS VIP 流量。
-- 本节点 NAT address 上不属于已发布 reverse tuple 的流量。
+- 本节点 NAT address 是 appliance 专用资源：已发布 reverse tuple 才允许进入
+  reverse NAT；其他发往 NAT address 的流量 fail closed，不回退内核。
 
-强制规则优先于文件规则，防止管理流量、邻居流量和隧道自身递归进入 QUIC。
-已发布的普通 reverse-NAT tuple 和 DNS reverse tuple 优先于上述本地处理规则。
+除 NAT address 的 fail-closed 规则外，其余强制地址由内核本地处理，防止管理流量、
+邻居流量和隧道自身递归进入 QUIC。已发布的普通 reverse-NAT tuple 和 DNS reverse
+tuple 优先于 NAT address 的 fail-closed 规则。
 
 ## 4. DNS 分类和数据流
 
@@ -196,8 +201,10 @@ client 只对下列查询执行域名后缀匹配：
 - 恰好一个 Question。
 - QNAME 可安全展开且不存在 compression loop。
 
-多 Question、非标准 opcode、非法 QNAME、异常 compression pointer 或其他无法分类
-的 UDP/53 查询不丢弃，原始 payload 转发给 `LocalResolver`。
+无法安全取得唯一 Question 的 UDP/53 请求，例如多 Question、非标准 opcode、非法
+QNAME 或异常 compression pointer，立即返回 `SERVFAIL`，不建立 transaction。
+Question 可安全解析、但 Additional/EDNS 等后续 section 损坏时，原始 payload 只转发
+给 `LocalResolver`，不会因 QNAME 命中 remote-domain 规则而走 remote resolver。
 
 ### 本地域名
 
@@ -266,7 +273,8 @@ NAT port allocator。现有全局 NAT port range 仍按 Flow worker 无重叠分
 )
 ```
 
-无法安全取得规范化 Question、但需要转发给 `LocalResolver` 的查询使用 opaque key：
+Question 可安全取得、但完整报文因后续 section 损坏而回退 `LocalResolver` 时，
+transaction key 使用完整 payload hash：
 
 ```text
 (
@@ -281,9 +289,9 @@ NAT port allocator。现有全局 NAT port range 仍按 Flow worker 无重叠分
 每个 transaction 另有 Flow worker 内唯一、单调递增的 `dns_transaction_id`。该 ID
 只用于内部 owner 和反向索引，不写入 DNS payload，也不通过 QUIC 发送。
 
-IO worker 使用完整 transaction key 的稳定 hash 选择 Flow worker。opaque key 使用
-同一规则。相同查询的重传因此进入同一个 owner；remote domain 查询使用该 owner 已绑定的
-QUIC flow，远端响应也回到同一个 client Flow worker。
+IO worker 使用完整 transaction key 的稳定 hash 选择 Flow worker。payload-hash key
+使用同一规则。相同查询的重传因此进入同一个 owner；remote domain 查询使用该 owner
+已绑定的 QUIC flow，远端响应也回到同一个 client Flow worker。
 
 transaction 至少保存：
 
@@ -327,8 +335,8 @@ DNS wire 内容不匹配的响应丢弃并计数。
 - 转发前将 EDNS advertised UDP payload 大于 1232 的值 clamp 到 1232，并重算 UDP
   checksum；没有 EDNS 的请求保持不变。
 - DNS payload 最大 1232 bytes，使 IPv4/IPv6 UDP packet 都不超过 IPv6 最小 MTU
-  1280；超过上限的查询返回 `SERVFAIL`，超过上限的 resolver 响应丢弃并返回
-  `SERVFAIL`。
+  1280；超过上限的查询返回 `SERVFAIL`。超过上限的 resolver 响应丢弃且不消费
+  transaction，仍等待有效响应或 timeout；timeout 再向客户端返回 `SERVFAIL`。
 - resolver 返回 `TC=1` 时原样返回客户端。
 - 客户端随后发起的 TCP/53 查询不属于 DNS 域名分流 V1。
 - 原始 DNS transaction ID 不改写；冲突隔离由完整 transaction key 和 NAT port
@@ -343,12 +351,13 @@ packet Datagram 和现有有界分片/重组路径传输。
   `SERVFAIL`。
 - 该 Flow worker 的 NAT port allocator 耗尽：返回 `SERVFAIL`。
 - remote domain 查询到达时 QUIC 未认证或断开：返回 `SERVFAIL`；本地查询仍可工作。
-- resolver 在 `TimeoutSeconds` 内没有响应：删除 transaction、释放 NAT port并返回
-  `SERVFAIL`。
+- resolver 在 `TimeoutSeconds` 内没有响应：删除 transaction、释放 NAT port 并返回
+  `SERVFAIL`；对应 reverse tuple 按 UDP 规则隔离 60 秒，不能立即复用。
 - resolver 响应来源地址、source port、destination NAT tuple、原始 DNS wire
   transaction ID 或 Question 不匹配：丢弃。
 - 重复和迟到响应：丢弃。
-- malformed DNS 但仍是完整 UDP packet：转发给 `LocalResolver`。
+- Question 可解析、但后续 DNS section malformed：转发给 `LocalResolver`。
+- Question 本身无法安全解析：立即返回 `SERVFAIL`。
 - malformed IP/UDP、分片或超过 payload 上限：丢弃或按可识别原请求返回
   `SERVFAIL`，并记录明确 drop reason。
 
@@ -411,14 +420,14 @@ IO owner 级 counter。日志不得输出完整 DNS payload；若记录 DNS 决�
 - 模式混用、文件缺失、不可读、坏 CIDR、去重和容量溢出。
 - client `[DNS]` 完整校验，server 拒绝 `[DNS]`。
 - server 不再要求 `[AllowedIPs]`。
-- 域名大小写、末尾点、非法 label、重复规则和 label 边界。
+- 域名大小写、末尾点、非法 label、重复规则、容量限制和 label 边界。
 
 ### IP 分类
 
 - IPv4/IPv6 direct prefix 直连，其他公网地址 redirect。
 - 正向 file mode 只 redirect 文件内地址。
-- 私网、CGNAT、ULA、link-local、multicast、tunnel endpoint 和本节点 NAT address
-  不误入 QUIC。
+- 私网、CGNAT、ULA、link-local、multicast、unspecified、文档/基准/协议保留地址、
+  tunnel endpoint 和本节点 NAT address 不误入 QUIC。
 - DNS VIP 优先于私网和 direct prefix 规则。
 - `LocalResolver` 候选回包在 XDP redirect 后必须命中 DNS reverse directory。
 - LPM map capacity 和两阶段 classifier enable。
@@ -431,10 +440,12 @@ IO owner 级 counter。日志不得输出完整 DNS payload；若记录 DNS 决�
 - 相同 DNS ID 来自不同 client 时不冲突。
 - 同一 client 并发 local domain 和 remote domain 查询。
 - transaction key 稳定选择 Flow worker，重传不发生 owner 漂移。
-- malformed local fallback 使用 opaque transaction key，不与正常查询冲突。
+- Question 可解析但后续 section malformed 时使用 payload-hash transaction key，
+  不与正常查询冲突。
 - 未完成重传复用 transaction。
 - resolver 欺骗响应、重复响应和迟到响应丢弃。
-- capacity、NAT port exhaustion 和 5 秒超时生成 `SERVFAIL` 并释放状态。
+- capacity、NAT port exhaustion 和超时生成 `SERVFAIL` 并释放 active 状态；释放的
+  UDP reverse tuple 进入 60 秒隔离，避免迟到响应命中新 transaction。
 
 ### 集成和 E2E
 

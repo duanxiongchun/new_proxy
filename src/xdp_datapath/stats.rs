@@ -5,6 +5,45 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug)]
+pub struct SnapshotIdentity {
+    instance_id: String,
+    pid: u32,
+    started_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotMetadata {
+    identity: SnapshotIdentity,
+    sequence: u64,
+    role: &'static str,
+}
+
+impl SnapshotMetadata {
+    pub fn new(role: &'static str) -> Self {
+        Self {
+            identity: SnapshotIdentity::new(),
+            sequence: 1,
+            role,
+        }
+    }
+
+    pub fn advance(&mut self) {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+    }
+}
+
+impl SnapshotIdentity {
+    pub fn new() -> Self {
+        Self {
+            instance_id: format!("{:032x}", rand::random::<u128>()),
+            pid: std::process::id(),
+            started_at_unix_ms: unix_time_ms(),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct IoStatsSlot {
@@ -18,6 +57,7 @@ pub struct IoStatsSlot {
     invalid_quic_drops: AtomicU64,
     malformed_drops: AtomicU64,
     dispatch_drops: AtomicU64,
+    unknown_nat_tuple_drops: AtomicU64,
     dns_unknown_transaction_drops: AtomicU64,
     dns_fragmented_drops: AtomicU64,
 }
@@ -60,6 +100,8 @@ impl IoStatsSlot {
                     self.malformed_drops.fetch_add(1, Ordering::Relaxed);
                 } else if matches!(reason, DropReason::DispatchRejected(_)) {
                     self.dispatch_drops.fetch_add(1, Ordering::Relaxed);
+                } else if reason == DropReason::UnknownNatTuple {
+                    self.unknown_nat_tuple_drops.fetch_add(1, Ordering::Relaxed);
                 } else if reason == DropReason::UnknownDnsTransaction {
                     self.dns_unknown_transaction_drops
                         .fetch_add(1, Ordering::Relaxed);
@@ -82,6 +124,7 @@ impl IoStatsSlot {
             invalid_quic_drops: self.invalid_quic_drops.load(Ordering::Relaxed),
             malformed_drops: self.malformed_drops.load(Ordering::Relaxed),
             dispatch_drops: self.dispatch_drops.load(Ordering::Relaxed),
+            unknown_nat_tuple_drops: self.unknown_nat_tuple_drops.load(Ordering::Relaxed),
             dns_unknown_transaction_drops: self
                 .dns_unknown_transaction_drops
                 .load(Ordering::Relaxed),
@@ -169,9 +212,10 @@ impl FlowStatsSlot {
             tunnel_queue_id: quic_flow.tunnel_queue_id(),
             authenticated,
             session_count: sessions.len(),
-            nat_count: sessions.len(),
-            reverse_nat_count: sessions.len(),
+            nat_count: state.nat_count(),
+            reverse_nat_count: state.reverse_nat_count(),
             queue_mismatch_drops: stats.queue_mismatch_drops,
+            session_nat_exhausted: stats.session_nat_exhausted,
             pending_inner_drops: self.pending_inner_drops.load(Ordering::Relaxed),
             quic_send_drops: self.quic_send_drops.load(Ordering::Relaxed),
             io_missing_owner_drops: self.io_missing_owner_drops.load(Ordering::Relaxed),
@@ -218,11 +262,20 @@ impl FlowStatsSlot {
 
 #[derive(Serialize)]
 struct RuntimeSnapshot {
+    instance_id: String,
+    pid: u32,
+    started_at_unix_ms: u128,
+    generated_at_unix_ms: u128,
+    sequence: u64,
     role: &'static str,
     io_owners: Vec<IoOwnerSnapshot>,
     flow_workers: Vec<FlowWorkerSnapshot>,
     active_dcid_count: usize,
     reverse_nat_count: usize,
+    xdp_parser_drops: u64,
+    xdp_dns_fragment_drops: u64,
+    stats_read_failures: u64,
+    stats_write_failures: u64,
     dispatch: DispatchStatsSnapshot,
 }
 
@@ -248,6 +301,7 @@ struct IoCounters {
     invalid_quic_drops: u64,
     malformed_drops: u64,
     dispatch_drops: u64,
+    unknown_nat_tuple_drops: u64,
     dns_unknown_transaction_drops: u64,
     dns_fragmented_drops: u64,
 }
@@ -262,6 +316,7 @@ struct FlowWorkerSnapshot {
     nat_count: usize,
     reverse_nat_count: usize,
     queue_mismatch_drops: u64,
+    session_nat_exhausted: u64,
     pending_inner_drops: u64,
     quic_send_drops: u64,
     io_missing_owner_drops: u64,
@@ -340,20 +395,34 @@ impl From<DispatchStats> for DispatchStatsSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuntimeGauges {
+    pub active_dcid_count: usize,
+    pub reverse_nat_count: usize,
+    pub xdp_parser_drops: u64,
+    pub xdp_dns_fragment_drops: u64,
+    pub stats_read_failures: u64,
+    pub stats_write_failures: u64,
+}
+
 pub fn write_snapshot(
     path: &Path,
-    role: &'static str,
+    metadata: &SnapshotMetadata,
     io_entries: &[IoStatsEntry],
     flow_slots: &[std::sync::Arc<FlowStatsSlot>],
     dispatcher: &FlowDispatcher,
-    active_dcid_count: usize,
-    reverse_nat_count: usize,
+    gauges: RuntimeGauges,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let snapshot = RuntimeSnapshot {
-        role,
+        instance_id: metadata.identity.instance_id.clone(),
+        pid: metadata.identity.pid,
+        started_at_unix_ms: metadata.identity.started_at_unix_ms,
+        generated_at_unix_ms: unix_time_ms(),
+        sequence: metadata.sequence,
+        role: metadata.role,
         io_owners: io_entries
             .iter()
             .map(|entry| IoOwnerSnapshot {
@@ -365,8 +434,12 @@ pub fn write_snapshot(
             })
             .collect(),
         flow_workers: flow_slots.iter().map(|slot| slot.snapshot()).collect(),
-        active_dcid_count,
-        reverse_nat_count,
+        active_dcid_count: gauges.active_dcid_count,
+        reverse_nat_count: gauges.reverse_nat_count,
+        xdp_parser_drops: gauges.xdp_parser_drops,
+        xdp_dns_fragment_drops: gauges.xdp_dns_fragment_drops,
+        stats_read_failures: gauges.stats_read_failures,
+        stats_write_failures: gauges.stats_write_failures,
         dispatch: dispatcher.stats().into(),
     };
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?;
@@ -382,6 +455,23 @@ pub fn write_snapshot(
         return Err(error);
     }
     Ok(())
+}
+
+pub fn preflight_snapshot_path(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (temporary, output) = secure_stats_file(path)?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::remove_file(temporary)
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn secure_stats_file(path: &Path) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
@@ -424,6 +514,7 @@ mod tests {
         let io_slot = Arc::new(IoStatsSlot::default());
         io_slot.record_rx(2);
         io_slot.record_ingress(IngressOutcome::Dropped(DropReason::UnknownDcid));
+        io_slot.record_ingress(IngressOutcome::Dropped(DropReason::UnknownNatTuple));
         io_slot.record_ingress(IngressOutcome::Dropped(DropReason::UnknownDnsTransaction));
         io_slot.record_ingress(IngressOutcome::Dropped(DropReason::FragmentedDns));
         let io_entries = vec![IoStatsEntry {
@@ -452,7 +543,7 @@ mod tests {
                     listen: "10.0.0.53:53".parse().unwrap(),
                     local_resolver: "192.0.2.53:53".parse().unwrap(),
                     remote_resolver: "1.1.1.1:53".parse().unwrap(),
-                    remote_domains: vec!["google.com".to_string()],
+                    remote_domains: vec!["google.com".to_string()].into(),
                     transaction_capacity: 4,
                     timeout: std::time::Duration::from_secs(5),
                     remote_available: true,
@@ -470,12 +561,18 @@ mod tests {
 
         write_snapshot(
             &path,
-            "client",
+            &SnapshotMetadata::new("client"),
             &io_entries,
             &[flow_slot],
             &dispatcher,
-            3,
-            0,
+            RuntimeGauges {
+                active_dcid_count: 3,
+                reverse_nat_count: 0,
+                xdp_parser_drops: 4,
+                xdp_dns_fragment_drops: 3,
+                stats_read_failures: 2,
+                stats_write_failures: 1,
+            },
         )
         .unwrap();
         let value: serde_json::Value =
@@ -488,11 +585,17 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         assert_eq!(value["role"], "client");
+        assert_eq!(value["pid"], std::process::id());
+        assert_eq!(value["sequence"], 1);
+        assert!(value["instance_id"].as_str().unwrap().len() == 32);
+        assert!(value["generated_at_unix_ms"].as_u64().is_some());
         assert_eq!(value["io_owners"][0]["ifindex"], 10);
         assert_eq!(value["io_owners"][0]["unknown_dcid_drops"], 1);
+        assert_eq!(value["io_owners"][0]["unknown_nat_tuple_drops"], 1);
         assert_eq!(value["io_owners"][0]["dns_unknown_transaction_drops"], 1);
         assert_eq!(value["io_owners"][0]["dns_fragmented_drops"], 1);
         assert_eq!(value["flow_workers"][0]["quic_flow_id"], 7);
+        assert_eq!(value["flow_workers"][0]["session_nat_exhausted"], 0);
         assert_eq!(value["flow_workers"][0]["pending_inner_drops"], 1);
         assert_eq!(value["flow_workers"][0]["quic_send_drops"], 1);
         assert_eq!(value["flow_workers"][0]["io_missing_owner_drops"], 1);
@@ -505,6 +608,10 @@ mod tests {
         assert_eq!(value["flow_workers"][0]["dns_edns_clamped"], 0);
         assert_eq!(value["flow_workers"][0]["dns_transactions_active"], 1);
         assert_eq!(value["active_dcid_count"], 3);
+        assert_eq!(value["xdp_parser_drops"], 4);
+        assert_eq!(value["xdp_dns_fragment_drops"], 3);
+        assert_eq!(value["stats_read_failures"], 2);
+        assert_eq!(value["stats_write_failures"], 1);
         #[cfg(unix)]
         assert_eq!(stats_mode, 0o600);
     }
@@ -523,6 +630,8 @@ mod tests {
         packet[22..24].copy_from_slice(&53u16.to_be_bytes());
         packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
         packet[28..].copy_from_slice(payload);
+        let flow = crate::flow_plane::parse_flow_key(&packet).unwrap();
+        crate::flow_plane::rewrite_packet(&mut packet, &flow).unwrap();
         bytes::Bytes::from(packet)
     }
 }

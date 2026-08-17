@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 pub const DNS_PAYLOAD_MAX: usize = 1232;
 
@@ -174,22 +175,50 @@ impl DnsTransactionTable {
     }
 }
 
-pub fn classify_query(payload: &[u8], remote_domains: &[String]) -> DnsRoute {
-    match parse_question(payload) {
-        Ok(question)
-            if remote_domains
-                .iter()
-                .any(|rule| domain_matches(rule, &question.qname)) =>
-        {
-            DnsRoute::Remote(question)
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemoteDomainRules {
+    suffixes: Arc<HashSet<String>>,
+}
+
+impl RemoteDomainRules {
+    pub fn new(domains: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            suffixes: Arc::new(domains.into_iter().collect()),
         }
+    }
+
+    pub fn matches(&self, qname: &str) -> bool {
+        self.suffixes.contains(qname)
+            || qname
+                .match_indices('.')
+                .any(|(offset, _)| self.suffixes.contains(&qname[offset + 1..]))
+    }
+
+    pub fn len(&self) -> usize {
+        self.suffixes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.suffixes.is_empty()
+    }
+}
+
+impl From<Vec<String>> for RemoteDomainRules {
+    fn from(domains: Vec<String>) -> Self {
+        Self::new(domains)
+    }
+}
+
+pub fn classify_query(payload: &[u8], remote_domains: &RemoteDomainRules) -> DnsRoute {
+    match validate_query(payload) {
+        Ok(question) if remote_domains.matches(&question.qname) => DnsRoute::Remote(question),
         Ok(question) => DnsRoute::Local(question),
         Err(_) => DnsRoute::LocalFallback,
     }
 }
 
 pub fn transaction_key(client: SocketAddr, payload: &[u8]) -> DnsTransactionKey {
-    match parse_question(payload) {
+    match validate_query(payload) {
         Ok(question) => DnsTransactionKey::Question {
             client,
             id: dns_id(payload).expect("parse_question requires DNS header"),
@@ -216,11 +245,11 @@ pub fn response_matches_query(query: &[u8], response: &[u8]) -> Result<(), DnsEr
     if flags & 0x8000 == 0 || flags & 0x7800 != 0 {
         return Err(DnsError::ResponseMismatch);
     }
-    if let Ok(query_question) = parse_question(query) {
-        let response_question = parse_question_fields(response)?;
-        if response_question != query_question {
-            return Err(DnsError::ResponseMismatch);
-        }
+    let query_question = parse_question(query).map_err(|_| DnsError::ResponseMismatch)?;
+    let response_question =
+        validate_message(response, true).map_err(|_| DnsError::ResponseMismatch)?;
+    if response_question != query_question {
+        return Err(DnsError::ResponseMismatch);
     }
     Ok(())
 }
@@ -265,6 +294,9 @@ pub fn clamp_edns_udp_payload(payload: &mut [u8]) -> Result<bool, DnsError> {
             return Err(DnsError::Truncated);
         }
     }
+    if offset != payload.len() {
+        return Err(DnsError::Truncated);
+    }
     Ok(clamped)
 }
 
@@ -278,6 +310,39 @@ pub fn parse_question(payload: &[u8]) -> Result<DnsQuestion, DnsError> {
         return Err(DnsError::NonStandardOpcode);
     }
     parse_question_fields(payload)
+}
+
+fn validate_query(payload: &[u8]) -> Result<DnsQuestion, DnsError> {
+    validate_message(payload, false)
+}
+
+fn validate_message(payload: &[u8], response: bool) -> Result<DnsQuestion, DnsError> {
+    let header = payload.get(..12).ok_or(DnsError::Truncated)?;
+    let flags = u16::from_be_bytes([header[2], header[3]]);
+    if (flags & 0x8000 != 0) != response {
+        return Err(if response {
+            DnsError::ResponseMismatch
+        } else {
+            DnsError::NotQuery
+        });
+    }
+    if flags & 0x7800 != 0 {
+        return Err(DnsError::NonStandardOpcode);
+    }
+    let question = parse_question_fields(payload)?;
+    let ancount = u16::from_be_bytes([header[6], header[7]]);
+    let nscount = u16::from_be_bytes([header[8], header[9]]);
+    let arcount = u16::from_be_bytes([header[10], header[11]]);
+    let mut offset = skip_name(payload, 12)?
+        .checked_add(4)
+        .ok_or(DnsError::Truncated)?;
+    for _ in 0..ancount.saturating_add(nscount).saturating_add(arcount) {
+        offset = skip_resource_record(payload, offset)?;
+    }
+    if offset != payload.len() {
+        return Err(DnsError::Truncated);
+    }
+    Ok(question)
 }
 
 fn parse_question_fields(payload: &[u8]) -> Result<DnsQuestion, DnsError> {
@@ -309,10 +374,11 @@ fn skip_resource_record(payload: &[u8], offset: usize) -> Result<usize, DnsError
 }
 
 fn skip_name(payload: &[u8], mut offset: usize) -> Result<usize, DnsError> {
+    let start = offset;
     for _ in 0..128 {
         let length = *payload.get(offset).ok_or(DnsError::Truncated)?;
         if length & 0xc0 == 0xc0 {
-            payload.get(offset + 1).ok_or(DnsError::Truncated)?;
+            validate_name_pointer(payload, offset, start)?;
             return Ok(offset + 2);
         }
         if length & 0xc0 != 0 {
@@ -328,6 +394,20 @@ fn skip_name(payload: &[u8], mut offset: usize) -> Result<usize, DnsError> {
             .ok_or(DnsError::Truncated)?;
     }
     Err(DnsError::MalformedName)
+}
+
+fn validate_name_pointer(
+    payload: &[u8],
+    offset: usize,
+    owner_start: usize,
+) -> Result<(), DnsError> {
+    let next = *payload.get(offset + 1).ok_or(DnsError::Truncated)?;
+    let first = payload[offset];
+    let pointer = (usize::from(first & 0x3f) << 8) | usize::from(next);
+    if pointer >= owner_start {
+        return Err(DnsError::MalformedName);
+    }
+    parse_name(payload, pointer).map(|_| ())
 }
 
 pub fn domain_matches(rule: &str, qname: &str) -> bool {
@@ -468,8 +548,25 @@ mod tests {
     }
 
     #[test]
+    fn v1_unit_dns_validation_rejects_invalid_resource_record_pointer() {
+        let query = query(1, "example.com", 1);
+        let mut response = response_for(&query);
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0xff]);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u32.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+
+        assert_eq!(
+            validate_message(&response, true),
+            Err(DnsError::MalformedName)
+        );
+    }
+
+    #[test]
     fn v1_unit_dns_classification_uses_remote_suffix_or_local_fallback() {
-        let rules = vec!["google.com".to_string(), "github.com".to_string()];
+        let rules = RemoteDomainRules::new(["google.com".to_string(), "github.com".to_string()]);
 
         assert!(matches!(
             classify_query(&query(1, "www.google.com", 1), &rules),
@@ -480,6 +577,19 @@ mod tests {
             DnsRoute::Local(question) if question.qname == "local.example"
         ));
         assert_eq!(classify_query(&[0, 1, 2], &rules), DnsRoute::LocalFallback);
+    }
+
+    #[test]
+    fn v1_unit_remote_domain_rules_match_only_label_suffixes() {
+        let rules =
+            RemoteDomainRules::new(["example.com".to_string(), "deep.service.test".to_string()]);
+
+        assert!(rules.matches("example.com"));
+        assert!(rules.matches("www.example.com"));
+        assert!(rules.matches("a.b.deep.service.test"));
+        assert!(!rules.matches("notexample.com"));
+        assert!(!rules.matches("service.test"));
+        assert_eq!(rules.len(), 2);
     }
 
     #[test]

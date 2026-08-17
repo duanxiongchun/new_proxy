@@ -9,16 +9,19 @@ pub mod worker;
 pub use dns::{
     clamp_edns_udp_payload, classify_query, domain_matches, parse_question as parse_dns_question,
     response_matches_query, transaction_key, DnsError, DnsQuestion, DnsReverseKey, DnsRoute,
-    DnsTransaction, DnsTransactionKey, DnsTransactionTable, DNS_PAYLOAD_MAX,
+    DnsTransaction, DnsTransactionKey, DnsTransactionTable, RemoteDomainRules, DNS_PAYLOAD_MAX,
 };
 pub use io_registry::{IoOwnerKey, IoRegistry, RegistryError};
 pub use nat::{NatBinding, NatError, NatTable, ReverseNatDirectory, ReverseNatKey, SessionLocator};
 pub use packet::{
-    ip_packet_is_fragmented, parse_flow_key, rewrite_packet, udp_payload, udp_payload_mut, FlowKey,
-    PacketError, TransportProtocol,
+    clamp_tcp_mss, ensure_udp_payload_len, ip_packet_is_fragmented, parse_flow_key,
+    parse_tcp_flags, prepare_forwarded_packet, rewrite_packet, udp_payload, udp_payload_mut,
+    FlowKey, PacketError, TransportProtocol, TCP_MAX_SAFE_MSS,
 };
 pub use quic_flow::{bootstrap_owner, ActiveDcidIndex, DcidOwner, QuicFlow, QuicFlowError};
-pub use session::{InterceptIoUpdate, Session, SessionError, SessionKey, SessionTable};
+pub use session::{
+    InterceptIoUpdate, Session, SessionError, SessionKey, SessionTable, TcpSessionState,
+};
 pub use worker::{
     bounded_flow_channels, DispatchOutcome, DispatchStats, DnsFlowConfig, DnsFlowError,
     ExpiredDnsTransaction, FlowChannelError, FlowDispatcher, FlowMessage, FlowWorkerError,

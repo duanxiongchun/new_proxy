@@ -12,12 +12,15 @@ QUIC Datagram 加密传输 IPv4/IPv6 TCP、UDP、ICMP 流量。
 - AF_XDP/XSK 收发；每个 `(ifindex, queue_id)` 只有一个 IO owner。
 - client 可配置多个本地 intercept interface；server 只能配置一个。
 - tunnel interface 与 intercept interface 可以是同一接口。
-- 每个 Flow worker 独占自己的 Session、NAT、reverse-NAT 和 QUIC 状态。
+- 每个 Flow worker 独占自己的 Session、NAT 和 QUIC 状态，并向共享 reverse-NAT
+  路由索引发布 owner。
 - client/server 分别执行本地 stateful SNAT。
 - IPv4/IPv6 TCP、UDP、ICMP/ICMPv6。
-- TLS 服务端证书 SHA-256 pin 和共享密钥 HMAC 双向认证。
+- TLS 服务端证书 SHA-256 pin，以及绑定 TLS exporter 和双随机 nonce 的共享密钥
+  HMAC 双向认证。
 - QUIC Datagram 内有界分片/重组，支持标准 1500-byte inner packet。
-- QUIC keepalive 保持健康空闲长连接；断线后清理旧 Session/NAT/DCID 并重连。
+- QUIC keepalive 保持健康空闲长连接；断线后退休旧 DCID、重连，并将普通业务
+  Session/NAT rebind 到新 QUIC flow。
 - 以 `0600` 原子写入的只读 JSON stats 文件。
 
 不支持：
@@ -46,7 +49,9 @@ encrypted QUIC/UDP
 
 - IO worker 独占一个 XSK 的 RX/TX/Fill/Completion rings，只做轻量分类和收发。
 - Flow worker 是唯一可创建、修改和回收 Session/NAT/QUIC 状态的线程。
-- intercept ingress 按内层 flow 稳定选择 Flow worker。
+- 每个 Flow worker 对应一条固定 QUIC Datagram lane，拥有独立 connection、
+  congestion control 和 pacing；示例默认启动 2 条 lane。
+- intercept ingress 按内层五元组稳定选择 lane；同一 flow 不跨 lane 迁移。
 - tunnel ingress 先按 active DCID 定位 Flow worker；只有合法 Initial 可以走
   deterministic bootstrap。
 - 每个 QUIC flow 绑定稳定 tunnel queue；本地回投使用 Session 记录的
@@ -103,7 +108,7 @@ make package
 | Section | Field | 含义 |
 |---|---|---|
 | `Appliance` | `Role` | `client` 或 `server` |
-| `Appliance` | `FlowWorkerCount` | Flow worker 数量，必须大于 0 |
+| `Appliance` | `FlowWorkerCount` | Flow worker/QUIC Datagram lane 数；两端必须一致，示例默认 2 |
 | `Appliance` | `ChannelCapacity` | IO/Flow bounded channel 容量 |
 | `Appliance` | `DcidLength` | 固定 DCID 长度，范围 `8..=20` |
 | `Appliance` | `StatsPath` | 原子更新的只读 JSON stats 路径 |
@@ -119,6 +124,7 @@ make package
 | `Intercept*` | `NextHopMac` | 本地网络下一跳 MAC |
 | `NAT` | `AddressV4/AddressV6` | 本节点 SNAT 地址，至少配置一个 |
 | `NAT` | `PortStart/PortEnd` | 本节点 SNAT 端口范围 |
+| `NAT` | `AutoReservePorts` | 只接受 `no`；启动前校验端口已由部署系统预留 |
 | `AllowedIPs` | `Prefixes` | client 的 inline/file tunnel prefix 或 `!file:` direct prefix |
 | `DNS` | `Listen` | client intercept 网络中的独立 UDP/53 VIP，且不能等于 NAT/tunnel/resolver address |
 | `DNS` | `LocalResolver` | 未命中 remote domain 时使用的 client 本地 UDP/53 resolver |
@@ -129,29 +135,42 @@ make package
 配置 parser 是严格的。未知 section/field、旧字段、server `[AllowedIPs]`/`[DNS]`、
 server 多 intercept、重复接口、空 client AllowedIPs、无效 NAT 范围和错误 role
 addressing 都会在启动前失败。
+`RemoteDomainsFile` 最大 4 MiB、最多 65536 条规范化规则；运行时将规则编译为后缀
+集合，每次查询只检查 QNAME 的 label 后缀。
 示例配置中的全零 `SharedKey` 是不可启动的占位符，部署前必须替换为两端一致的
 随机 32-byte key；证书路径、pin、接口、地址和 MAC 也必须按现场修改。
+client/server 的 `FlowWorkerCount` 必须相同。每条 lane 都是独立 QUIC connection，
+不是为每条 TCP 建 connection；增加 lane 会增加线程、连接和内存开销，应按 CPU、
+NIC queue、NUMA 和真实负载做相邻 A/B，而不是无界增加。
 
 ## 运行
 
-先确保 stats 目录存在，并准备接口、地址、邻居与路由：
+先确保 bpffs 已挂载可写、stats 目录存在，并准备接口、地址、邻居、路由与 NAT
+端口 reservation：
 
 ```bash
 sudo install -d -m 0700 /run/new_proxy
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=40000-59999
 sudo target/release/new_proxy --config /etc/new_proxy/server.conf
 sudo target/release/new_proxy --config /etc/new_proxy/client.conf
 ```
 
+生产环境应使用 `sysctl.d` 合并现有 `ip_local_reserved_ports`，不要覆盖其他服务已经
+预留的范围。
+
+`--config PATH` 是必填参数；程序不会隐式选择仓库中的占位示例。
+
 systemd 示例：
 
 ```bash
-sudo cp conf/server.conf /etc/new_proxy/server.conf
+sudo install -o root -g root -m 0600 conf/server.conf /etc/new_proxy/server.conf
 sudo systemctl enable --now new_proxy@server
 sudo journalctl -u new_proxy@server -f
 ```
 
-`SIGHUP` 请求 QUIC 重连。重连会回收旧连接绑定的 Session、NAT 和 DCID；
-后续业务包重新建 Session。`SIGTERM`/`SIGINT` 执行有界关闭并 detach XDP。
+`SIGHUP` 请求所有 lane 的 QUIC 重连。重连会退休旧 DCID、推进 flow identity，
+并把普通业务 Session/NAT rebind 到新 flow；重连窗口内 pending packet 不保证保留。
+`SIGTERM`/`SIGINT` 执行有界关闭并 detach XDP。
 若进程被 `SIGKILL`，下一实例会在确认 pinned program 属于本项目后清理 stale
 attachment；不会无条件拆除其他 XDP program。
 
@@ -159,13 +178,16 @@ attachment；不会无条件拆除其他 XDP program。
 
 读取配置中的 `StatsPath` 即可获得：
 
+- 当前实例的随机 `instance_id`、PID、启动/生成时间和单实例递增 `sequence`。
 - 每个 IO owner 的 ifindex、queue、role、RX/TX/drop 计数。
 - 每个 Flow worker 的 `quic_flow_id`、tunnel queue、认证状态。
 - Session 原始 tuple、本地 SNAT tuple 和原始 intercept owner。
-- active DCID、reverse NAT、IO/Flow channel、QUIC send、pending queue、NAT/DCID
-  发布和重连失败计数。
+- active DCID、reverse NAT、内核 XDP parser drop、IO/Flow channel、QUIC send、
+  pending queue、NAT/DCID 发布和重连失败计数。
 
-该文件是只读观测契约，不提供运行时修改接口。
+该文件是只读观测契约，不提供运行时修改接口。监控端必须校验 `instance_id`、
+PID 存活、`generated_at_unix_ms` 新鲜度和 `sequence` 持续前进；文件存在本身不代表
+daemon 仍存活。
 
 ## 测试
 
@@ -175,23 +197,29 @@ attachment；不会无条件拆除其他 XDP program。
 ./script/acceptance/run_acceptance.sh
 ```
 
-完整 root E2E（构建包含 XDP ELF 的 release binary 后顺序运行九个隔离场景）：
+完整 root E2E（构建包含 XDP ELF 的 release binary 后顺序运行十三个隔离场景）：
 
 ```bash
 RUN_V1_E2E=1 ./script/acceptance/run_acceptance.sh
 ```
 
-九个场景覆盖：
+十三个场景覆盖：
 
 1. client 到 target 的双栈 TCP/UDP/ICMP 闭环。
-2. IPv4 DNS VIP 的 local/remote resolver 分流、双端 SNAT、超时 `SERVFAIL` 与状态释放。
-3. IPv6 DNS VIP 的 local/remote resolver 分流、响应 rcode、wire ID 和 Question 匹配。
-4. server reverse NAT 与回隧道。
-5. client reverse NAT 与本地回投。
-6. tunnel/intercept 同接口。
-7. client 多 intercept 回到原接口。
-8. SIGHUP 重连后的状态回收与新 flow identity。
-9. 1500-byte inner packet、12 秒双栈空闲 TCP、2 Flow workers 和 SIGKILL 恢复。
+2. wrong-key 冷启动时双端都拒绝认证、状态和转发，恢复正确配置后业务恢复。
+3. IPv4 DNS VIP 的 local/remote resolver 分流、双端 SNAT、超时 `SERVFAIL` 与状态释放。
+4. IPv6 DNS VIP 的 local/remote resolver 分流、响应 rcode、wire ID 和 Question 匹配。
+5. `!file:` direct-prefix 命中直连、未命中公网地址走双端 SNAT/QUIC。
+6. server reverse NAT 与回隧道。
+7. client reverse NAT 与本地回投。
+8. tunnel/intercept 同接口。
+9. client 多 intercept 回到原接口。
+10. XDP 与 userspace malformed ingress、invalid QUIC 和 unknown NAT tuple 分层
+    fail closed，专用计数增长，攻击后合法业务恢复。
+11. NAT 端口耗尽拒绝新流且保留已有 UDP flow。
+12. SIGHUP 后所有 lane 重新认证、普通 Session/NAT rebind 与新 flow identity。
+13. 1500-byte inner packet、12 秒双栈空闲 TCP、2 Flow workers、SIGKILL/stale stats
+    恢复、SIGTERM detach 和 foreign XDP ownership 保护。
 
 可选的有界长稳和性能基线：
 

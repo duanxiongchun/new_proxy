@@ -5,6 +5,7 @@ SCENARIO=client_return
 source "$(dirname "$0")/lib.sh"
 
 setup_runtime standard
+client_return_tx_before="$(read_owner_metric "$CLIENT_STATS" intercept tx_frames)"
 exercise_matrix "$SOURCE_NS" client-return
-wait_for_json "$CLIENT_STATS" 'value["io_owners"][0]["tx_frames"] > 0 or value["io_owners"][1]["tx_frames"] > 0'
+wait_for_owner_metric_gt "$CLIENT_STATS" intercept tx_frames "$client_return_tx_before"
 assert_runtime_state 6
