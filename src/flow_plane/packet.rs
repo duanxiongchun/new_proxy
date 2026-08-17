@@ -56,12 +56,18 @@ pub enum PacketError {
     UnsupportedProtocol(u8),
     #[error("ICMP type {0} is unsupported; v1 supports echo only")]
     UnsupportedIcmpType(u8),
-    #[error("non-initial IP fragments do not contain a complete flow key")]
+    #[error("fragmented IP packets are unsupported in v1")]
     NonInitialFragment,
     #[error("IPv6 extension header chain is too long")]
     ExtensionHeaderChainTooLong,
     #[error("translated flow uses a different IP version or transport protocol")]
     InvalidTranslation,
+    #[error("IP header checksum is invalid")]
+    InvalidIpChecksum,
+    #[error("transport checksum is invalid")]
+    InvalidTransportChecksum,
+    #[error("IP packet hop limit is exhausted")]
+    HopLimitExceeded,
 }
 
 pub fn parse_flow_key(packet: &[u8]) -> Result<FlowKey, PacketError> {
@@ -113,9 +119,116 @@ pub fn udp_payload(packet: &[u8]) -> Result<&[u8], PacketError> {
     Ok(&packet[range])
 }
 
+pub const TCP_MAX_SAFE_MSS: u16 = 1333;
+
+pub fn parse_tcp_flags(packet: &[u8]) -> Result<Option<u8>, PacketError> {
+    let (protocol, transport_offset, total_len) = transport_metadata(packet)?;
+    if protocol != IP_PROTOCOL_TCP {
+        return Ok(None);
+    }
+    let header = packet
+        .get(transport_offset..transport_offset + 20)
+        .ok_or(PacketError::TruncatedTransportHeader)?;
+    let header_len = usize::from(header[12] >> 4) * 4;
+    if header_len < 20 || transport_offset + header_len > total_len {
+        return Err(PacketError::TruncatedTransportHeader);
+    }
+    Ok(Some(header[13]))
+}
+
+pub fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> Result<bool, PacketError> {
+    let (protocol, transport_offset, total_len) = transport_metadata(packet)?;
+    if protocol != IP_PROTOCOL_TCP {
+        return Ok(false);
+    }
+    let header = packet
+        .get(transport_offset..transport_offset + 20)
+        .ok_or(PacketError::TruncatedTransportHeader)?;
+    let flags = header[13];
+    if flags & 0x02 == 0 {
+        return Ok(false);
+    }
+    let header_len = usize::from(header[12] >> 4) * 4;
+    if header_len < 20 || transport_offset + header_len > total_len {
+        return Err(PacketError::TruncatedTransportHeader);
+    }
+    let mut modified = false;
+    let mut opt_offset = transport_offset + 20;
+    let opt_end = transport_offset + header_len;
+    while opt_offset < opt_end {
+        let kind = packet[opt_offset];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            opt_offset += 1;
+            continue;
+        }
+        if opt_offset + 1 >= opt_end {
+            break;
+        }
+        let len = packet[opt_offset + 1] as usize;
+        if len < 2 || opt_offset + len > opt_end {
+            break;
+        }
+        if kind == 2 && len == 4 {
+            let current_mss = u16::from_be_bytes([packet[opt_offset + 2], packet[opt_offset + 3]]);
+            if current_mss > max_mss {
+                packet[opt_offset + 2..opt_offset + 4].copy_from_slice(&max_mss.to_be_bytes());
+                modified = true;
+            }
+        }
+        opt_offset += len;
+    }
+    Ok(modified)
+}
+
 pub fn udp_payload_mut(packet: &mut [u8]) -> Result<&mut [u8], PacketError> {
     let range = udp_payload_range(packet)?;
     Ok(&mut packet[range])
+}
+
+pub fn ensure_udp_payload_len(packet: &mut Vec<u8>, minimum: usize) -> Result<(), PacketError> {
+    let (protocol, transport_offset, total_len) = transport_metadata(packet)?;
+    if protocol != IP_PROTOCOL_UDP {
+        return Err(PacketError::UnsupportedProtocol(protocol));
+    }
+    let udp_len = validate_udp_layout(packet, transport_offset, total_len)?;
+    let payload_len = udp_len - 8;
+    if payload_len >= minimum {
+        return Ok(());
+    }
+    let missing = minimum - payload_len;
+    let new_udp_len = udp_len
+        .checked_add(missing)
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or(PacketError::InvalidIpLength)?;
+    packet.resize(
+        total_len
+            .checked_add(missing)
+            .ok_or(PacketError::InvalidIpLength)?,
+        0,
+    );
+    packet[transport_offset + 4..transport_offset + 6].copy_from_slice(&new_udp_len.to_be_bytes());
+    match packet[0] >> 4 {
+        4 => {
+            let new_total_len = total_len
+                .checked_add(missing)
+                .and_then(|length| u16::try_from(length).ok())
+                .ok_or(PacketError::InvalidIpLength)?;
+            packet[2..4].copy_from_slice(&new_total_len.to_be_bytes());
+        }
+        6 => {
+            let new_payload_len = total_len
+                .checked_sub(40)
+                .and_then(|length| length.checked_add(missing))
+                .and_then(|length| u16::try_from(length).ok())
+                .ok_or(PacketError::InvalidIpLength)?;
+            packet[4..6].copy_from_slice(&new_payload_len.to_be_bytes());
+        }
+        version => return Err(PacketError::UnsupportedIpVersion(version)),
+    }
+    Ok(())
 }
 
 pub fn rewrite_packet(packet: &mut [u8], translated: &FlowKey) -> Result<(), PacketError> {
@@ -152,11 +265,109 @@ pub fn rewrite_packet(packet: &mut [u8], translated: &FlowKey) -> Result<(), Pac
     }
 }
 
+pub fn prepare_forwarded_packet(packet: &mut [u8]) -> Result<(), PacketError> {
+    if ip_packet_is_fragmented(packet)? {
+        return Err(PacketError::NonInitialFragment);
+    }
+    validate_packet_checksums(packet)?;
+    match packet.first().ok_or(PacketError::TruncatedIpHeader)? >> 4 {
+        4 => {
+            let header_len = usize::from(packet[0] & 0x0f) * 4;
+            if header_len < 20 || packet.len() < header_len {
+                return Err(PacketError::TruncatedIpHeader);
+            }
+            if packet[8] <= 1 {
+                return Err(PacketError::HopLimitExceeded);
+            }
+            packet[8] -= 1;
+            packet[10..12].fill(0);
+            let checksum = internet_checksum(&packet[..header_len]);
+            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+            Ok(())
+        }
+        6 => {
+            if packet.len() < 40 {
+                return Err(PacketError::TruncatedIpHeader);
+            }
+            if packet[7] <= 1 {
+                return Err(PacketError::HopLimitExceeded);
+            }
+            packet[7] -= 1;
+            Ok(())
+        }
+        other => Err(PacketError::UnsupportedIpVersion(other)),
+    }
+}
+
+fn validate_packet_checksums(packet: &[u8]) -> Result<(), PacketError> {
+    let (protocol, transport_offset, total_len) = transport_metadata(packet)?;
+    if protocol == IP_PROTOCOL_UDP {
+        validate_udp_layout(packet, transport_offset, total_len)?;
+    }
+    match packet[0] >> 4 {
+        4 => {
+            if internet_checksum(&packet[..transport_offset]) != 0 {
+                return Err(PacketError::InvalidIpChecksum);
+            }
+            if protocol == IP_PROTOCOL_UDP
+                && packet
+                    .get(transport_offset + 6..transport_offset + 8)
+                    .is_some_and(|checksum| checksum == [0, 0])
+            {
+                return Ok(());
+            }
+            let valid = if protocol == IP_PROTOCOL_ICMP {
+                internet_checksum(&packet[transport_offset..total_len]) == 0
+            } else {
+                let mut sum = checksum_add(0, &packet[12..20]);
+                sum += u32::from(protocol);
+                sum += (total_len - transport_offset) as u32;
+                sum = checksum_add(sum, &packet[transport_offset..total_len]);
+                checksum_finish(sum) == 0
+            };
+            if valid {
+                Ok(())
+            } else {
+                Err(PacketError::InvalidTransportChecksum)
+            }
+        }
+        6 => {
+            let checksum_offset = checksum_offset(protocol)?;
+            if protocol == IP_PROTOCOL_UDP
+                && packet
+                    .get(transport_offset + checksum_offset..transport_offset + checksum_offset + 2)
+                    .is_some_and(|checksum| checksum == [0, 0])
+            {
+                return Err(PacketError::InvalidTransportChecksum);
+            }
+            let mut sum = checksum_add(0, &packet[8..40]);
+            sum = checksum_add(sum, &((total_len - transport_offset) as u32).to_be_bytes());
+            sum = checksum_add(sum, &[0, 0, 0, protocol]);
+            sum = checksum_add(sum, &packet[transport_offset..total_len]);
+            if checksum_finish(sum) == 0 {
+                Ok(())
+            } else {
+                Err(PacketError::InvalidTransportChecksum)
+            }
+        }
+        other => Err(PacketError::UnsupportedIpVersion(other)),
+    }
+}
+
 fn udp_payload_range(packet: &[u8]) -> Result<Range<usize>, PacketError> {
     let (protocol, transport_offset, total_len) = transport_metadata(packet)?;
     if protocol != IP_PROTOCOL_UDP {
         return Err(PacketError::UnsupportedProtocol(protocol));
     }
+    let udp_len = validate_udp_layout(packet, transport_offset, total_len)?;
+    Ok(transport_offset + 8..transport_offset + udp_len)
+}
+
+fn validate_udp_layout(
+    packet: &[u8],
+    transport_offset: usize,
+    total_len: usize,
+) -> Result<usize, PacketError> {
     let header = packet
         .get(transport_offset..transport_offset + 8)
         .ok_or(PacketError::TruncatedTransportHeader)?;
@@ -164,12 +375,14 @@ fn udp_payload_range(packet: &[u8]) -> Result<Range<usize>, PacketError> {
     if udp_len < 8 {
         return Err(PacketError::InvalidIpLength);
     }
-    let payload_start = transport_offset + 8;
-    let payload_end = transport_offset
+    let udp_end = transport_offset
         .checked_add(udp_len)
-        .filter(|end| *end <= total_len)
+        .filter(|end| *end == total_len)
         .ok_or(PacketError::InvalidIpLength)?;
-    Ok(payload_start..payload_end)
+    if udp_end > packet.len() {
+        return Err(PacketError::InvalidIpLength);
+    }
+    Ok(udp_len)
 }
 
 fn transport_metadata(packet: &[u8]) -> Result<(u8, usize, usize), PacketError> {
@@ -291,7 +504,7 @@ fn write_transport_checksum_ipv4(
     sum += u32::from(protocol);
     sum += transport_len as u32;
     sum = checksum_add(sum, &packet[transport_offset..total_len]);
-    let checksum = checksum_finish(sum);
+    let checksum = encode_udp_zero_checksum(protocol, checksum_finish(sum));
     packet[transport_offset + checksum_offset..transport_offset + checksum_offset + 2]
         .copy_from_slice(&checksum.to_be_bytes());
     Ok(())
@@ -311,7 +524,7 @@ fn write_transport_checksum_ipv6(
     sum = checksum_add(sum, &(transport_len as u32).to_be_bytes());
     sum = checksum_add(sum, &[0, 0, 0, protocol]);
     sum = checksum_add(sum, &packet[transport_offset..total_len]);
-    let checksum = checksum_finish(sum);
+    let checksum = encode_udp_zero_checksum(protocol, checksum_finish(sum));
     packet[transport_offset + checksum_offset..transport_offset + checksum_offset + 2]
         .copy_from_slice(&checksum.to_be_bytes());
     Ok(())
@@ -323,6 +536,14 @@ fn checksum_offset(protocol: u8) -> Result<usize, PacketError> {
         IP_PROTOCOL_UDP => Ok(6),
         IP_PROTOCOL_ICMP | IP_PROTOCOL_ICMPV6 => Ok(2),
         other => Err(PacketError::UnsupportedProtocol(other)),
+    }
+}
+
+fn encode_udp_zero_checksum(protocol: u8, checksum: u16) -> u16 {
+    if protocol == IP_PROTOCOL_UDP && checksum == 0 {
+        u16::MAX
+    } else {
+        checksum
     }
 }
 
@@ -361,7 +582,7 @@ fn parse_ipv4_flow_key(packet: &[u8]) -> Result<FlowKey, PacketError> {
         return Err(PacketError::InvalidIpLength);
     }
     let fragment = u16::from_be_bytes([packet[6], packet[7]]);
-    if fragment & 0x1fff != 0 {
+    if fragment & 0x3fff != 0 {
         return Err(PacketError::NonInitialFragment);
     }
 
@@ -429,12 +650,8 @@ fn ipv6_transport_offset(
                 let header = packet
                     .get(offset..offset + 8)
                     .ok_or(PacketError::TruncatedTransportHeader)?;
-                let fragment = u16::from_be_bytes([header[2], header[3]]);
-                if fragment & 0xfff8 != 0 {
-                    return Err(PacketError::NonInitialFragment);
-                }
-                next_header = header[0];
-                offset += 8;
+                let _ = header;
+                return Err(PacketError::NonInitialFragment);
             }
             IP_PROTOCOL_AH => {
                 let header = packet
@@ -518,6 +735,10 @@ fn build_flow_key(
             let ports = transport
                 .get(..8)
                 .ok_or(PacketError::TruncatedTransportHeader)?;
+            let udp_len = usize::from(u16::from_be_bytes([ports[4], ports[5]]));
+            if udp_len < 8 || udp_len != transport.len() {
+                return Err(PacketError::InvalidIpLength);
+            }
             (
                 u16::from_be_bytes([ports[0], ports[1]]),
                 u16::from_be_bytes([ports[2], ports[3]]),
@@ -572,6 +793,9 @@ mod tests {
         packet[12..16].copy_from_slice(&[192, 0, 2, 10]);
         packet[16..20].copy_from_slice(&[198, 51, 100, 20]);
         packet[20..].copy_from_slice(transport);
+        if protocol == IP_PROTOCOL_UDP && transport.len() >= 8 {
+            packet[24..26].copy_from_slice(&(transport.len() as u16).to_be_bytes());
+        }
         packet
     }
 
@@ -584,6 +808,9 @@ mod tests {
         packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
         packet[24..40].copy_from_slice(&"2001:db8::20".parse::<Ipv6Addr>().unwrap().octets());
         packet[40..].copy_from_slice(transport);
+        if next_header == IP_PROTOCOL_UDP && transport.len() >= 8 {
+            packet[44..46].copy_from_slice(&(transport.len() as u16).to_be_bytes());
+        }
         packet
     }
 
@@ -625,6 +852,11 @@ mod tests {
         sum = checksum_add(sum, &[0, 0, 0, protocol]);
         sum = checksum_add(sum, &packet[offset..total_len]);
         assert_eq!(checksum_finish(sum), 0);
+    }
+
+    fn finalize_checksums(packet: &mut [u8]) {
+        let flow = parse_flow_key(packet).unwrap();
+        rewrite_packet(packet, &flow).unwrap();
     }
 
     #[test]
@@ -719,6 +951,23 @@ mod tests {
     }
 
     #[test]
+    fn v1_unit_ensure_udp_payload_len_uses_ipv6_extension_transport_offset() {
+        let mut udp = [0u8; 10];
+        udp[0..2].copy_from_slice(&60000u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+        udp[4..6].copy_from_slice(&10u16.to_be_bytes());
+        udp[8..10].copy_from_slice(&[0x12, 0x34]);
+        let mut packet = ipv6_packet_with_hop_by_hop(IP_PROTOCOL_UDP, &udp);
+
+        ensure_udp_payload_len(&mut packet, 12).unwrap();
+
+        assert_eq!(udp_payload(&packet).unwrap().len(), 12);
+        assert_eq!(&udp_payload(&packet).unwrap()[..2], &[0x12, 0x34]);
+        assert_eq!(u16::from_be_bytes([packet[52], packet[53]]), 20);
+        assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 28);
+    }
+
+    #[test]
     fn v1_unit_ip_packet_is_fragmented_detects_first_fragments() {
         let mut udp = [0u8; 8];
         udp[0..2].copy_from_slice(&60000u16.to_be_bytes());
@@ -793,6 +1042,95 @@ mod tests {
             parse_flow_key(&ipv6_packet(IP_PROTOCOL_TCP, &truncated_tcp)),
             Err(PacketError::TruncatedTransportHeader)
         );
+    }
+
+    #[test]
+    fn v1_unit_prepare_forwarded_packet_validates_checksums_and_decrements_ttl() {
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[12] = 0x50;
+        let mut packet = ipv4_packet(IP_PROTOCOL_TCP, &tcp);
+        finalize_checksums(&mut packet);
+
+        prepare_forwarded_packet(&mut packet).unwrap();
+
+        assert_eq!(packet[8], 63);
+        assert_ipv4_checksums(&packet);
+
+        packet[30] ^= 1;
+        assert_eq!(
+            prepare_forwarded_packet(&mut packet),
+            Err(PacketError::InvalidTransportChecksum)
+        );
+    }
+
+    #[test]
+    fn v1_unit_prepare_forwarded_packet_rejects_all_fragments() {
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&5353u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+
+        let mut ipv4 = ipv4_packet(IP_PROTOCOL_UDP, &udp);
+        finalize_checksums(&mut ipv4);
+        ipv4[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        ipv4[10..12].fill(0);
+        let header_checksum = internet_checksum(&ipv4[..20]);
+        ipv4[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+        assert_eq!(
+            prepare_forwarded_packet(&mut ipv4),
+            Err(PacketError::NonInitialFragment)
+        );
+
+        let mut ipv6 = ipv6_packet(IP_PROTOCOL_UDP, &udp);
+        finalize_checksums(&mut ipv6);
+        ipv6.splice(40..40, [IP_PROTOCOL_UDP, 0, 0, 0, 0, 0, 0, 1]);
+        ipv6[4..6].copy_from_slice(&16u16.to_be_bytes());
+        ipv6[6] = IP_PROTOCOL_FRAGMENT;
+        assert_eq!(
+            prepare_forwarded_packet(&mut ipv6),
+            Err(PacketError::NonInitialFragment)
+        );
+    }
+
+    #[test]
+    fn v1_unit_prepare_forwarded_packet_rejects_bad_ipv4_header_and_exhausted_hops() {
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&5353u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+        let mut bad_header = ipv4_packet(IP_PROTOCOL_UDP, &udp);
+        finalize_checksums(&mut bad_header);
+        bad_header[1] ^= 1;
+        assert_eq!(
+            prepare_forwarded_packet(&mut bad_header),
+            Err(PacketError::InvalidIpChecksum)
+        );
+
+        let mut exhausted = ipv4_packet(IP_PROTOCOL_UDP, &udp);
+        exhausted[8] = 1;
+        finalize_checksums(&mut exhausted);
+        assert_eq!(
+            prepare_forwarded_packet(&mut exhausted),
+            Err(PacketError::HopLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn v1_unit_prepare_forwarded_packet_requires_ipv6_udp_checksum_and_decrements_hop_limit() {
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&5353u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+        let mut missing_checksum = ipv6_packet(IP_PROTOCOL_UDP, &udp);
+        assert_eq!(
+            prepare_forwarded_packet(&mut missing_checksum),
+            Err(PacketError::InvalidTransportChecksum)
+        );
+
+        let mut packet = ipv6_packet(IP_PROTOCOL_UDP, &udp);
+        finalize_checksums(&mut packet);
+        prepare_forwarded_packet(&mut packet).unwrap();
+        assert_eq!(packet[7], 63);
+        assert_ipv6_transport_checksum(&packet);
     }
 
     #[test]
@@ -897,5 +1235,36 @@ mod tests {
             assert_eq!(parse_flow_key(&packet).unwrap(), translated);
             assert_ipv6_transport_checksum(&packet);
         }
+    }
+    #[test]
+    fn v1_unit_quic_safe_tcp_mss_fits_ipv4_and_ipv6_in_one_datagram() {
+        assert_eq!(TCP_MAX_SAFE_MSS, 1333);
+        assert!(usize::from(TCP_MAX_SAFE_MSS) + 40 + 20 <= 1393);
+        assert!(usize::from(TCP_MAX_SAFE_MSS) + 20 + 20 <= 1393);
+    }
+
+    #[test]
+    fn v1_unit_clamp_tcp_mss_rewrites_syn_options_above_limit() {
+        let mut tcp = vec![0u8; 24];
+        tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[12] = 0x60; // 24 bytes header (6 * 4)
+        tcp[13] = 0x02; // SYN
+        tcp[20] = 2; // Option Kind 2 (MSS)
+        tcp[21] = 4; // Option Len 4
+        tcp[22..24].copy_from_slice(&1460u16.to_be_bytes());
+
+        let mut packet = ipv4_packet(IP_PROTOCOL_TCP, &tcp);
+        assert_eq!(parse_tcp_flags(&packet), Ok(Some(0x02)));
+        assert_eq!(clamp_tcp_mss(&mut packet, 1360), Ok(true));
+        assert_eq!(u16::from_be_bytes([packet[42], packet[43]]), 1360);
+
+        let mut no_syn = packet.clone();
+        no_syn[33] = 0x10; // ACK only
+        assert_eq!(clamp_tcp_mss(&mut no_syn, 1200), Ok(false));
+
+        let mut small_mss = packet.clone();
+        small_mss[42..44].copy_from_slice(&1200u16.to_be_bytes());
+        assert_eq!(clamp_tcp_mss(&mut small_mss, 1360), Ok(false));
     }
 }

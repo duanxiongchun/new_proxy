@@ -4,7 +4,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-const LPM_PREFIX_CAPACITY_PER_FAMILY: usize = 65_536;
+const LPM_MAP_CAPACITY_PER_FAMILY: usize = 65_536;
+const LPM_INTERNAL_ENTRY_RESERVE_PER_FAMILY: usize = 16;
+const LPM_PREFIX_CAPACITY_PER_FAMILY: usize =
+    LPM_MAP_CAPACITY_PER_FAMILY - LPM_INTERNAL_ENTRY_RESERVE_PER_FAMILY;
+const REMOTE_DOMAIN_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const REMOTE_DOMAIN_RULE_CAPACITY: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Role {
@@ -16,6 +21,11 @@ pub enum Role {
 pub enum XdpAttachMode {
     Native,
     Skb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoReservePorts {
+    No,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -70,6 +80,7 @@ pub struct NatConfig {
     pub address_v4: Option<Ipv4Addr>,
     pub address_v6: Option<Ipv6Addr>,
     pub ports: RangeInclusive<u16>,
+    pub auto_reserve_ports: AutoReservePorts,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +127,7 @@ pub struct ApplianceConfig {
     pub ip_policy: IpPolicy,
     pub dns: Option<DnsConfig>,
     pub xdp_mode: XdpAttachMode,
+    pub config_source_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -160,6 +172,10 @@ pub enum ConfigError {
     InvalidRemoteDomain(String),
     #[error("duplicate remote domain: {0}")]
     DuplicateRemoteDomain(String),
+    #[error("RemoteDomainsFile exceeds the {capacity} byte limit")]
+    RemoteDomainFileTooLarge { capacity: u64 },
+    #[error("RemoteDomainsFile exceeds the rule capacity of {capacity}")]
+    RemoteDomainCapacity { capacity: usize },
     #[error("server requires exactly one intercept interface")]
     ServerInterceptCount,
     #[error("interface {0} is declared more than once")]
@@ -184,6 +200,8 @@ pub enum ConfigError {
     InvalidNatPortRange,
     #[error("NAT port range must provide at least one port per Flow worker")]
     NatRangeTooSmall,
+    #[error("NAT.AutoReservePorts must be no; reserve the range before starting new_proxy")]
+    InvalidAutoReservePorts,
     #[error("AllowedIPs must not be empty")]
     EmptyAllowedIps,
     #[error("AllowedIPs exceeds the {family} LPM capacity of {capacity}")]
@@ -195,9 +213,22 @@ pub enum ConfigError {
 
 impl ApplianceConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let text =
-            std::fs::read_to_string(path).map_err(|error| ConfigError::Io(error.to_string()))?;
-        Self::parse(&text)
+        let path_ref = path.as_ref();
+        let text = std::fs::read_to_string(path_ref)
+            .map_err(|error| ConfigError::Io(error.to_string()))?;
+        let mut config = Self::parse(&text)?;
+        config.config_source_path = Some(path_ref.to_string_lossy().into_owned());
+        Ok(config)
+    }
+
+    pub fn reload_policy_from_source(&mut self) -> Result<(), ConfigError> {
+        let Some(path) = &self.config_source_path else {
+            return Ok(());
+        };
+        let reloaded = Self::load(path)?;
+        self.ip_policy = reloaded.ip_policy;
+        self.dns = reloaded.dns;
+        Ok(())
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -237,7 +268,14 @@ impl ApplianceConfig {
         validate_fields(
             "NAT",
             nat,
-            &["AddressV4", "AddressV6", "PortStart", "PortEnd"],
+            [
+                "AddressV4",
+                "AddressV6",
+                "PortStart",
+                "PortEnd",
+                "AutoReservePorts",
+            ]
+            .as_slice(),
         )?;
         if let Some(allowed) = allowed {
             validate_fields("AllowedIPs", allowed, &["Prefixes"])?;
@@ -340,6 +378,16 @@ impl ApplianceConfig {
         if listen.is_some_and(|address| address.ip().is_unspecified()) {
             return Err(ConfigError::WildcardListen);
         }
+        if endpoint.is_some_and(|address| !is_usable_host_address(address.ip())) {
+            return Err(ConfigError::InvalidIpAddress(
+                "Tunnel.Endpoint must use a usable unicast address".to_string(),
+            ));
+        }
+        if listen.is_some_and(|address| !is_usable_host_address(address.ip())) {
+            return Err(ConfigError::InvalidIpAddress(
+                "Tunnel.Listen must use a usable unicast address".to_string(),
+            ));
+        }
         if role == Role::Server && intercepts.len() != 1 {
             return Err(ConfigError::ServerInterceptCount);
         }
@@ -368,6 +416,17 @@ impl ApplianceConfig {
         if nat_address_v4.is_none() && nat_address_v6.is_none() {
             return Err(ConfigError::MissingNatAddress);
         }
+        if nat_address_v4
+            .map(IpAddr::V4)
+            .is_some_and(|address| !is_usable_host_address(address))
+            || nat_address_v6
+                .map(IpAddr::V6)
+                .is_some_and(|address| !is_usable_host_address(address))
+        {
+            return Err(ConfigError::InvalidIpAddress(
+                "NAT address must use a usable unicast address".to_string(),
+            ));
+        }
         let port_start = parse_u16(nat, "PortStart")?;
         let port_end = parse_u16(nat, "PortEnd")?;
         if port_start == 0 || port_start > port_end {
@@ -382,9 +441,9 @@ impl ApplianceConfig {
             (Role::Server, Some(_)) => unreachable!("server AllowedIPs rejected above"),
             (Role::Server, None) => IpPolicy::TunnelPrefixes(Vec::new()),
         };
-        let xdp_mode = match required(xdp, "Mode")?.to_ascii_lowercase().as_str() {
-            "native" | "driver" => XdpAttachMode::Native,
-            "skb" | "generic" => XdpAttachMode::Skb,
+        let xdp_mode = match required(xdp, "Mode")? {
+            "native" => XdpAttachMode::Native,
+            "skb" => XdpAttachMode::Skb,
             value => {
                 return Err(ConfigError::UnknownField {
                     section: "XDP".to_string(),
@@ -405,6 +464,7 @@ impl ApplianceConfig {
             address_v4: nat_address_v4,
             address_v6: nat_address_v6,
             ports: port_start..=port_end,
+            auto_reserve_ports: parse_auto_reserve_ports(optional(nat, "AutoReservePorts"))?,
         };
         if endpoint.or(listen).is_some_and(|tunnel| {
             Some(tunnel.ip()) == nat_config.address_v4.map(IpAddr::V4)
@@ -444,6 +504,7 @@ impl ApplianceConfig {
             ip_policy,
             dns,
             xdp_mode,
+            config_source_path: None,
         })
     }
 }
@@ -616,6 +677,13 @@ fn parse_optional_u64(
         .unwrap_or(Ok(default))
 }
 
+fn parse_auto_reserve_ports(value: Option<&str>) -> Result<AutoReservePorts, ConfigError> {
+    match value.map(str::trim).unwrap_or("no") {
+        "no" => Ok(AutoReservePorts::No),
+        _ => Err(ConfigError::InvalidAutoReservePorts),
+    }
+}
+
 fn parse_hex_key(value: &str) -> Result<[u8; 32], ConfigError> {
     if value.len() != 64 {
         return Err(ConfigError::InvalidInteger(
@@ -747,6 +815,22 @@ fn parse_dns_config(
             "DNS resolvers must use UDP port 53".to_string(),
         ));
     }
+    if !is_usable_host_address(listen.ip())
+        || !is_usable_host_address(local_resolver.ip())
+        || !is_usable_host_address(remote_resolver.ip())
+    {
+        return Err(ConfigError::InvalidDns(
+            "DNS addresses must use usable unicast addresses".to_string(),
+        ));
+    }
+    if listen.ip().is_ipv4() != local_resolver.ip().is_ipv4()
+        || listen.ip().is_ipv4() != remote_resolver.ip().is_ipv4()
+    {
+        return Err(ConfigError::InvalidDns(
+            "DNS.Listen, LocalResolver and RemoteResolver must use the same address family"
+                .to_string(),
+        ));
+    }
     ensure_resolver_family("DNS.LocalResolver", local_resolver.ip(), nat)?;
     ensure_resolver_family("DNS.RemoteResolver", remote_resolver.ip(), nat)?;
     if Some(listen.ip()) == nat.address_v4.map(IpAddr::V4)
@@ -784,6 +868,15 @@ fn parse_dns_config(
     }))
 }
 
+fn is_usable_host_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified() && !address.is_multicast() && address != Ipv4Addr::BROADCAST
+        }
+        IpAddr::V6(address) => !address.is_unspecified() && !address.is_multicast(),
+    }
+}
+
 fn parse_dns_socket(
     fields: &HashMap<String, String>,
     field: &'static str,
@@ -810,12 +903,28 @@ fn ensure_resolver_family(
 }
 
 fn load_remote_domains(path: &str) -> Result<Vec<String>, ConfigError> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| {
+            ConfigError::InvalidDns(format!("failed to read RemoteDomainsFile: {error}"))
+        })?
+        .len();
+    if size > REMOTE_DOMAIN_FILE_MAX_BYTES {
+        return Err(ConfigError::RemoteDomainFileTooLarge {
+            capacity: REMOTE_DOMAIN_FILE_MAX_BYTES,
+        });
+    }
     let text = std::fs::read_to_string(path).map_err(|error| {
         ConfigError::InvalidDns(format!("failed to read RemoteDomainsFile: {error}"))
     })?;
+    parse_remote_domain_lines(text.lines())
+}
+
+fn parse_remote_domain_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<String>, ConfigError> {
     let mut seen = HashSet::new();
     let mut domains = Vec::new();
-    for line in text.lines() {
+    for line in lines {
         let value = line.split('#').next().unwrap_or("").trim();
         if value.is_empty() {
             continue;
@@ -825,6 +934,11 @@ fn load_remote_domains(path: &str) -> Result<Vec<String>, ConfigError> {
             return Err(ConfigError::DuplicateRemoteDomain(domain));
         }
         domains.push(domain);
+        if domains.len() > REMOTE_DOMAIN_RULE_CAPACITY {
+            return Err(ConfigError::RemoteDomainCapacity {
+                capacity: REMOTE_DOMAIN_RULE_CAPACITY,
+            });
+        }
     }
     if domains.is_empty() {
         return Err(ConfigError::InvalidRemoteDomain(
@@ -835,7 +949,9 @@ fn load_remote_domains(path: &str) -> Result<Vec<String>, ConfigError> {
 }
 
 fn normalize_domain(value: &str) -> Result<String, ConfigError> {
-    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    let value = value.trim();
+    let value = value.strip_suffix('.').unwrap_or(value);
+    let value = value.to_ascii_lowercase();
     if value.is_empty() || value.len() > 253 || value.contains('*') {
         return Err(ConfigError::InvalidRemoteDomain(value));
     }
@@ -894,6 +1010,7 @@ mod tests {
         .unwrap();
         assert_eq!(client.role, Role::Client);
         assert_eq!(client.intercept_interfaces.len(), 2);
+        assert_eq!(client.nat.auto_reserve_ports, AutoReservePorts::No);
 
         let server = ApplianceConfig::parse(&valid(
             "server",
@@ -902,6 +1019,24 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(server.role, Role::Server);
+    }
+
+    #[test]
+    fn v1_unit_config_requires_pre_reserved_nat_ports() {
+        let client = valid(
+            "client",
+            "Endpoint=127.0.0.1:4433\nServerCertificateSha256=0202020202020202020202020202020202020202020202020202020202020202",
+            "[Intercept]\nInterface=eth1\nNextHopMac=02:00:00:00:00:02\n",
+        );
+        for invalid in ["yes", "cleanup", "false", "0", "NO", "delete"] {
+            assert_eq!(
+                ApplianceConfig::parse(&client.replace(
+                    "PortEnd=41000\n",
+                    &format!("PortEnd=41000\nAutoReservePorts={invalid}\n")
+                )),
+                Err(ConfigError::InvalidAutoReservePorts)
+            );
+        }
     }
 
     #[test]
@@ -1090,7 +1225,7 @@ mod tests {
         .replace(
             "[NAT]\n",
             &format!(
-                "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:53\nRemoteResolver=[2001:db8:53::1]:53\nRemoteDomainsFile={domains}\nTransactionCapacity=128\nTimeoutSeconds=3\n[NAT]\n"
+                "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:53\nRemoteResolver=203.0.113.53:53\nRemoteDomainsFile={domains}\nTransactionCapacity=128\nTimeoutSeconds=3\n[NAT]\n"
             ),
         );
         let parsed = ApplianceConfig::parse(&config).unwrap();
@@ -1143,6 +1278,28 @@ mod tests {
     }
 
     #[test]
+    fn v1_unit_config_rejects_remote_domain_with_multiple_root_dots() {
+        assert!(matches!(
+            normalize_domain("google.com.."),
+            Err(ConfigError::InvalidRemoteDomain(_))
+        ));
+    }
+
+    #[test]
+    fn v1_unit_config_rejects_remote_domain_capacity_overflow() {
+        let domains = (0..=REMOTE_DOMAIN_RULE_CAPACITY)
+            .map(|index| format!("d{index}.example"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            parse_remote_domain_lines(domains.iter().map(String::as_str)),
+            Err(ConfigError::RemoteDomainCapacity {
+                capacity: REMOTE_DOMAIN_RULE_CAPACITY,
+            })
+        );
+    }
+
+    #[test]
     fn v1_unit_config_rejects_invalid_dns_fields() {
         let domains = temp_file("valid-dns-domains.txt", "google.com\n");
         let base = valid(
@@ -1164,10 +1321,13 @@ mod tests {
                 "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:5353\nRemoteResolver=1.1.1.1:53\nRemoteDomainsFile={domains}\n[NAT]\n"
             ),
             format!(
-                "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:53\nRemoteResolver=[2001:db8:53::1]:53\nRemoteDomainsFile={domains}\nTransactionCapacity=0\n[NAT]\n"
+                "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:53\nRemoteResolver=[2001:db8:53::1]:53\nRemoteDomainsFile={domains}\n[NAT]\n"
             ),
             format!(
-                "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:53\nRemoteResolver=[2001:db8:53::1]:53\nRemoteDomainsFile={domains}\nTimeoutSeconds=0\n[NAT]\n"
+                "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:53\nRemoteResolver=203.0.113.53:53\nRemoteDomainsFile={domains}\nTransactionCapacity=0\n[NAT]\n"
+            ),
+            format!(
+                "[DNS]\nListen=192.168.1.53:53\nLocalResolver=192.0.2.53:53\nRemoteResolver=203.0.113.53:53\nRemoteDomainsFile={domains}\nTimeoutSeconds=0\n[NAT]\n"
             ),
         ] {
             let config = base.replace("[NAT]\n", &dns);
@@ -1281,6 +1441,8 @@ mod tests {
 
         assert_eq!(client.role, Role::Client);
         assert_eq!(server.role, Role::Server);
+        assert_eq!(client.flow_worker_count, 2);
+        assert_eq!(server.flow_worker_count, 2);
         assert_eq!(client.shared_key, server.shared_key);
         assert_eq!(client.dcid_len, server.dcid_len);
     }

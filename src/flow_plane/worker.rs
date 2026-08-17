@@ -1,9 +1,10 @@
 use crate::flow_plane::{
-    clamp_edns_udp_payload, classify_query, ip_packet_is_fragmented, parse_flow_key,
-    response_matches_query, rewrite_packet, transaction_key, udp_payload, udp_payload_mut,
-    DnsRoute, DnsTransactionKey, FlowKey, InterceptIoUpdate, IoOwnerKey, NatBinding, NatError,
-    QuicFlow, QuicFlowId, Session, SessionError, SessionId, SessionTable, TransportProtocol,
-    DNS_PAYLOAD_MAX,
+    clamp_edns_udp_payload, clamp_tcp_mss, classify_query, ensure_udp_payload_len,
+    ip_packet_is_fragmented, parse_dns_question, parse_flow_key, parse_tcp_flags,
+    prepare_forwarded_packet, response_matches_query, rewrite_packet, transaction_key, udp_payload,
+    udp_payload_mut, DnsRoute, DnsTransactionKey, FlowKey, InterceptIoUpdate, IoOwnerKey,
+    NatBinding, NatError, QuicFlow, QuicFlowId, RemoteDomainRules, Session, SessionError,
+    SessionId, SessionLocator, SessionTable, TransportProtocol, DNS_PAYLOAD_MAX, TCP_MAX_SAFE_MSS,
 };
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
@@ -19,6 +20,7 @@ pub enum FlowMessage {
     InterceptIngress {
         io_owner: IoOwnerKey,
         packet: Bytes,
+        expected_locator: Option<SessionLocator>,
     },
     TunnelIngress {
         io_owner: IoOwnerKey,
@@ -26,6 +28,9 @@ pub enum FlowMessage {
         remote: SocketAddr,
         local_ip: IpAddr,
         packet: Bytes,
+    },
+    ReloadPolicies {
+        remote_domains: Option<RemoteDomainRules>,
     },
 }
 
@@ -80,6 +85,12 @@ pub struct FlowDispatcher {
 }
 
 impl FlowDispatcher {
+    pub fn broadcast(&self, message: FlowMessage) {
+        for sender in self.senders.iter() {
+            let _ = sender.send(message.clone());
+        }
+    }
+
     pub fn dispatch_to(&self, worker_id: usize, message: FlowMessage) -> DispatchOutcome {
         let Some(sender) = self.senders.get(worker_id) else {
             self.counters
@@ -146,6 +157,7 @@ pub fn bounded_flow_channels(
 pub struct FlowWorkerStats {
     pub queue_mismatch_drops: u64,
     pub unknown_dcid_drops: u64,
+    pub session_nat_exhausted: u64,
     pub dns_query_local: u64,
     pub dns_query_remote: u64,
     pub dns_response_local: u64,
@@ -180,7 +192,7 @@ pub struct DnsFlowConfig {
     pub listen: SocketAddr,
     pub local_resolver: SocketAddr,
     pub remote_resolver: SocketAddr,
-    pub remote_domains: Vec<String>,
+    pub remote_domains: RemoteDomainRules,
     pub transaction_capacity: usize,
     pub timeout: Duration,
     pub remote_available: bool,
@@ -206,12 +218,14 @@ pub struct HandledDnsResponse {
     pub local_target: IoOwnerKey,
     pub packet: Bytes,
     pub binding: NatBinding,
+    pub transaction_id: SessionId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpiredDnsTransaction {
     pub transmit: IoTransmit,
     pub binding: NatBinding,
+    pub transaction_id: SessionId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +237,7 @@ struct DnsFlowTransaction {
     local_target: IoOwnerKey,
     remote: bool,
     created_at: Instant,
+    expires_at: Instant,
     original_packet: Bytes,
 }
 
@@ -261,6 +276,7 @@ pub struct FlowWorkerState {
     next_dns_token: u64,
     dns_by_key: HashMap<DnsFlowTransactionKey, DnsFlowTransaction>,
     dns_by_reverse: HashMap<FlowKey, DnsFlowTransactionKey>,
+    dns_deadlines: BTreeMap<Instant, HashMap<DnsFlowTransactionKey, ()>>,
     dns_completed_reverse: HashMap<FlowKey, u64>,
     dns_completed_order: BTreeMap<u64, FlowKey>,
     next_dns_completed_sequence: u64,
@@ -292,6 +308,7 @@ impl FlowWorkerState {
             next_dns_token: 1,
             dns_by_key: HashMap::new(),
             dns_by_reverse: HashMap::new(),
+            dns_deadlines: BTreeMap::new(),
             dns_completed_reverse: HashMap::new(),
             dns_completed_order: BTreeMap::new(),
             next_dns_completed_sequence: 1,
@@ -312,10 +329,27 @@ impl FlowWorkerState {
                 actual: quic_flow.flow_worker_id(),
             });
         }
+        let mut packet = packet.to_vec();
+        prepare_forwarded_packet(&mut packet)?;
         let flow = parse_flow_key(&packet)?;
-        let session_id =
-            self.sessions
-                .get_or_create(self.worker_id, flow, io_owner, quic_flow.id())?;
+        clamp_tcp_mss(&mut packet, TCP_MAX_SAFE_MSS)?;
+        let tcp_flags = parse_tcp_flags(&packet)?;
+        let session_id = match self.sessions.get_or_create_with_flags_at(
+            self.worker_id,
+            flow,
+            io_owner,
+            quic_flow.id(),
+            tcp_flags,
+            false,
+            Instant::now(),
+        ) {
+            Ok(session_id) => session_id,
+            Err(SessionError::Nat(NatError::PortRangeExhausted)) => {
+                self.stats.session_nat_exhausted += 1;
+                return Err(SessionError::Nat(NatError::PortRangeExhausted).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let translated = self
             .sessions
             .get(session_id)
@@ -323,7 +357,6 @@ impl FlowWorkerState {
             .nat
             .translated
             .clone();
-        let mut packet = packet.to_vec();
         rewrite_packet(&mut packet, &translated)?;
         Ok(HandledIntercept {
             session_id,
@@ -347,15 +380,31 @@ impl FlowWorkerState {
                 actual: quic_flow.flow_worker_id(),
             });
         }
+        let mut packet = packet.to_vec();
+        prepare_forwarded_packet(&mut packet)?;
         let flow = parse_flow_key(&packet)?;
-        let session_id =
-            self.sessions
-                .get_or_create(self.worker_id, flow, default_intercept, quic_flow.id())?;
+        clamp_tcp_mss(&mut packet, TCP_MAX_SAFE_MSS)?;
+        let tcp_flags = parse_tcp_flags(&packet)?;
+        let session_id = match self.sessions.get_or_create_with_flags_at(
+            self.worker_id,
+            flow,
+            default_intercept,
+            quic_flow.id(),
+            tcp_flags,
+            false,
+            Instant::now(),
+        ) {
+            Ok(session_id) => session_id,
+            Err(SessionError::Nat(NatError::PortRangeExhausted)) => {
+                self.stats.session_nat_exhausted += 1;
+                return Err(SessionError::Nat(NatError::PortRangeExhausted).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let session = self
             .sessions
             .get(session_id)
             .expect("newly created session exists");
-        let mut packet = packet.to_vec();
         rewrite_packet(&mut packet, &session.nat.translated)?;
         Ok(HandledIntercept {
             session_id,
@@ -367,16 +416,61 @@ impl FlowWorkerState {
         })
     }
 
-    pub fn handle_reverse(&self, packet: Bytes) -> Result<Option<HandledReverse>, FlowWorkerError> {
-        let return_flow = parse_flow_key(&packet)?;
-        let Some(session_id) = self.sessions.lookup_reverse(&return_flow) else {
+    pub fn handle_reverse(
+        &mut self,
+        packet: Bytes,
+    ) -> Result<Option<HandledReverse>, FlowWorkerError> {
+        let flow = parse_flow_key(&packet)?;
+        let Some(locator) = self.sessions.lookup_reverse_locator(&flow) else {
             return Ok(None);
         };
+        self.handle_reverse_for(packet, locator)
+    }
+
+    pub fn handle_reverse_for(
+        &mut self,
+        packet: Bytes,
+        expected_locator: SessionLocator,
+    ) -> Result<Option<HandledReverse>, FlowWorkerError> {
+        self.handle_reverse_for_inner(packet, expected_locator, None)
+    }
+
+    pub fn handle_server_reverse(
+        &mut self,
+        observed: IoOwnerKey,
+        packet: Bytes,
+        expected_locator: SessionLocator,
+    ) -> Result<Option<HandledReverse>, FlowWorkerError> {
+        self.handle_reverse_for_inner(packet, expected_locator, Some(observed))
+    }
+
+    fn handle_reverse_for_inner(
+        &mut self,
+        packet: Bytes,
+        expected_locator: SessionLocator,
+        observed: Option<IoOwnerKey>,
+    ) -> Result<Option<HandledReverse>, FlowWorkerError> {
+        let mut restored = packet.to_vec();
+        prepare_forwarded_packet(&mut restored)?;
+        let return_flow = parse_flow_key(&restored)?;
+        let Some(locator) = self.sessions.lookup_reverse_locator(&return_flow) else {
+            return Ok(None);
+        };
+        if locator != expected_locator || locator.flow_worker_id != self.worker_id {
+            return Ok(None);
+        }
+        clamp_tcp_mss(&mut restored, TCP_MAX_SAFE_MSS)?;
+        let tcp_flags = parse_tcp_flags(&restored)?;
+        let session_id = locator.session_id;
+        if observed.is_some_and(|owner| !self.correct_server_return_io(session_id, owner)) {
+            return Ok(None);
+        }
+        self.sessions
+            .touch_tcp(self.worker_id, session_id, tcp_flags, true, Instant::now())?;
         let session = self
             .sessions
             .get(session_id)
             .expect("reverse NAT index points to an existing session");
-        let mut restored = packet.to_vec();
         let restored_flow = match session.original.protocol {
             TransportProtocol::Tcp | TransportProtocol::Udp => session.original.reverse(),
             TransportProtocol::Icmp | TransportProtocol::Icmpv6 => FlowKey {
@@ -412,6 +506,9 @@ impl FlowWorkerState {
         config: &DnsFlowConfig,
         now: Instant,
     ) -> Result<HandledDnsQuery, FlowWorkerError> {
+        let mut packet = packet.to_vec();
+        prepare_forwarded_packet(&mut packet)?;
+        let mut packet = Bytes::from(packet);
         let flow = parse_flow_key(&packet)?;
         if flow.protocol != TransportProtocol::Udp
             || flow.destination != config.listen.ip()
@@ -419,7 +516,6 @@ impl FlowWorkerState {
         {
             return Err(DnsFlowError::NotDnsQuery.into());
         }
-        let mut packet = packet;
         if ip_packet_is_fragmented(&packet)? {
             self.stats.dns_servfail += 1;
             return Ok(HandledDnsQuery::Servfail(dns_servfail_transmit(
@@ -433,10 +529,21 @@ impl FlowWorkerState {
                 io_owner, packet, &flow, config,
             )?));
         }
-        if edns_clamp_packet(&mut packet)? {
-            self.stats.dns_edns_clamped += 1;
-        }
+        let malformed_sections = match edns_clamp_packet(&mut packet)? {
+            Some(true) => {
+                self.stats.dns_edns_clamped += 1;
+                false
+            }
+            Some(false) => false,
+            None => true,
+        };
         let payload = udp_payload(&packet)?;
+        if parse_dns_question(payload).is_err() {
+            self.stats.dns_servfail += 1;
+            return Ok(HandledDnsQuery::Servfail(dns_servfail_transmit(
+                io_owner, packet, &flow, config,
+            )?));
+        }
         let client = SocketAddr::new(flow.source, flow.source_port);
         let key = DnsFlowTransactionKey {
             io_owner,
@@ -446,7 +553,11 @@ impl FlowWorkerState {
             return self.rewrite_dns_query(packet, &transaction);
         }
 
-        let route = classify_query(payload, &config.remote_domains);
+        let route = if malformed_sections {
+            DnsRoute::LocalFallback
+        } else {
+            classify_query(payload, &config.remote_domains)
+        };
         let (resolver, remote) = match route {
             DnsRoute::Remote(_) => (config.remote_resolver, true),
             DnsRoute::Local(_) => (config.local_resolver, false),
@@ -492,6 +603,7 @@ impl FlowWorkerState {
                 Err(error) => return Err(error.into()),
             };
         let reverse_key = binding.translated.reverse();
+        let expires_at = now + config.timeout;
         let transaction = DnsFlowTransaction {
             token,
             client,
@@ -500,11 +612,19 @@ impl FlowWorkerState {
             local_target: io_owner,
             remote,
             created_at: now,
+            expires_at,
             original_packet: packet.clone(),
         };
         self.forget_completed_dns_reverse(&reverse_key);
         self.dns_by_reverse.insert(reverse_key, key.clone());
         self.dns_by_key.insert(key, transaction.clone());
+        self.dns_deadlines.entry(expires_at).or_default().insert(
+            DnsFlowTransactionKey {
+                io_owner,
+                dns: transaction_key(client, payload),
+            },
+            (),
+        );
         self.stats.dns_transactions_active = self.dns_by_key.len() as u64;
         if remote {
             self.stats.dns_query_remote += 1;
@@ -518,6 +638,13 @@ impl FlowWorkerState {
         &mut self,
         packet: Bytes,
     ) -> Result<Option<HandledDnsResponse>, FlowWorkerError> {
+        if ip_packet_is_fragmented(&packet)? {
+            self.stats.dns_spoofed_response_drop += 1;
+            return Ok(None);
+        }
+        let mut packet = packet.to_vec();
+        prepare_forwarded_packet(&mut packet)?;
+        let packet = Bytes::from(packet);
         let flow = parse_flow_key(&packet)?;
         let Some(key) = self.dns_by_reverse.get(&flow).cloned() else {
             if self.dns_completed_reverse.contains_key(&flow) {
@@ -531,10 +658,6 @@ impl FlowWorkerState {
             self.stats.dns_spoofed_response_drop += 1;
             return Ok(None);
         };
-        if ip_packet_is_fragmented(&packet)? {
-            self.stats.dns_spoofed_response_drop += 1;
-            return Ok(None);
-        }
         let payload = udp_payload(&packet)?;
         if response_matches_query(udp_payload(&transaction.original_packet)?, payload).is_err() {
             self.stats.dns_spoofed_response_drop += 1;
@@ -558,6 +681,7 @@ impl FlowWorkerState {
                 )?
                 .packet,
                 binding: transaction.binding,
+                transaction_id: transaction.token,
             }));
         }
         if transaction.remote {
@@ -580,6 +704,7 @@ impl FlowWorkerState {
             local_target: transaction.local_target,
             packet: Bytes::from(packet),
             binding: transaction.binding,
+            transaction_id: transaction.token,
         }))
     }
 
@@ -588,21 +713,23 @@ impl FlowWorkerState {
         now: Instant,
         config: &DnsFlowConfig,
     ) -> Result<Vec<ExpiredDnsTransaction>, FlowWorkerError> {
-        let expired = self
-            .dns_by_key
-            .iter()
-            .filter(|(_, transaction)| now.duration_since(transaction.created_at) >= config.timeout)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
+        let mut expired = Vec::new();
+        while self
+            .dns_deadlines
+            .first_key_value()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let (_, keys) = self
+                .dns_deadlines
+                .pop_first()
+                .expect("checked earliest DNS deadline");
+            expired.extend(keys.into_keys());
+        }
         let mut transmits = Vec::with_capacity(expired.len());
         for key in expired {
-            let Some(transaction) = self.dns_by_key.remove(&key) else {
+            let Some(transaction) = self.remove_dns_transaction(&key)? else {
                 continue;
             };
-            self.dns_by_reverse
-                .remove(&transaction.binding.translated.reverse());
-            self.sessions
-                .release_ephemeral_nat(self.worker_id, transaction.token)?;
             let flow = parse_flow_key(&transaction.original_packet)?;
             let transmit = dns_servfail_transmit(
                 transaction.local_target,
@@ -613,6 +740,7 @@ impl FlowWorkerState {
             transmits.push(ExpiredDnsTransaction {
                 transmit,
                 binding: transaction.binding,
+                transaction_id: transaction.token,
             });
             self.stats.dns_timeout += 1;
             self.stats.dns_servfail += 1;
@@ -666,6 +794,15 @@ impl FlowWorkerState {
         self.sessions.iter().map(|(_, session)| session)
     }
 
+    pub fn rebind_quic_flow(
+        &mut self,
+        old_quic_flow_id: QuicFlowId,
+        new_quic_flow_id: QuicFlowId,
+    ) -> Result<usize, SessionError> {
+        self.sessions
+            .rebind_quic_flow(self.worker_id, old_quic_flow_id, new_quic_flow_id)
+    }
+
     pub fn remove_by_quic_flow(
         &mut self,
         quic_flow_id: QuicFlowId,
@@ -688,6 +825,7 @@ impl FlowWorkerState {
             .map(|(_, transaction)| transaction)
             .collect::<Vec<_>>();
         self.dns_by_reverse.clear();
+        self.dns_deadlines.clear();
         self.dns_completed_reverse.clear();
         self.dns_completed_order.clear();
         let mut bindings = Vec::with_capacity(transactions.len());
@@ -702,6 +840,10 @@ impl FlowWorkerState {
 
     pub fn remove_session(&mut self, session_id: SessionId) -> Result<Session, SessionError> {
         self.sessions.remove(self.worker_id, session_id)
+    }
+
+    pub fn expire_idle_sessions(&mut self, now: Instant) -> Result<Vec<Session>, SessionError> {
+        self.sessions.expire_idle(self.worker_id, now)
     }
 
     pub fn local_return_target(&self, session_id: SessionId) -> Option<IoOwnerKey> {
@@ -731,12 +873,33 @@ impl FlowWorkerState {
         self.sessions.lookup_reverse(flow)
     }
 
+    pub fn lookup_reverse_locator(&self, flow: &FlowKey) -> Option<SessionLocator> {
+        self.sessions.lookup_reverse_locator(flow)
+    }
+
+    pub fn dns_reverse_matches(&self, flow: &FlowKey, locator: SessionLocator) -> bool {
+        locator.flow_worker_id == self.worker_id
+            && self
+                .dns_by_reverse
+                .get(flow)
+                .and_then(|key| self.dns_by_key.get(key))
+                .is_some_and(|transaction| transaction.token == locator.session_id)
+    }
+
     pub fn has_dns_reverse(&self, flow: &FlowKey) -> bool {
         self.dns_by_reverse.contains_key(flow)
     }
 
     pub const fn stats(&self) -> FlowWorkerStats {
         self.stats
+    }
+
+    pub fn nat_count(&self) -> usize {
+        self.sessions.nat_len()
+    }
+
+    pub fn reverse_nat_count(&self) -> usize {
+        self.sessions.reverse_nat_len()
     }
 
     fn rewrite_dns_query(
@@ -779,6 +942,12 @@ impl FlowWorkerState {
         let Some(transaction) = self.dns_by_key.remove(key) else {
             return Ok(None);
         };
+        if let Some(keys) = self.dns_deadlines.get_mut(&transaction.expires_at) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.dns_deadlines.remove(&transaction.expires_at);
+            }
+        }
         self.dns_by_reverse
             .remove(&transaction.binding.translated.reverse());
         self.sessions
@@ -801,6 +970,7 @@ impl FlowWorkerState {
                 config,
             )?,
             binding: transaction.binding,
+            transaction_id: transaction.token,
         })
     }
 
@@ -827,14 +997,14 @@ impl FlowWorkerState {
     }
 }
 
-fn edns_clamp_packet(packet: &mut Bytes) -> Result<bool, crate::flow_plane::PacketError> {
+fn edns_clamp_packet(packet: &mut Bytes) -> Result<Option<bool>, crate::flow_plane::PacketError> {
     let flow = parse_flow_key(packet)?;
     let mut buffer = packet.to_vec();
     let clamped = {
         let payload = udp_payload_mut(&mut buffer)?;
-        clamp_edns_udp_payload(payload).unwrap_or(false)
+        clamp_edns_udp_payload(payload).ok()
     };
-    if clamped {
+    if clamped == Some(true) {
         rewrite_packet(&mut buffer, &flow)?;
         *packet = Bytes::from(buffer);
     }
@@ -857,15 +1027,14 @@ fn dns_servfail_transmit_to_listen(
     listen: SocketAddr,
 ) -> Result<IoTransmit, crate::flow_plane::PacketError> {
     let mut packet = packet.to_vec();
+    ensure_minimum_dns_response(&mut packet)?;
     {
         let payload = udp_payload_mut(&mut packet)?;
-        if payload.len() >= 12 {
-            let mut flags = u16::from_be_bytes([payload[2], payload[3]]);
-            flags |= 0x8000;
-            flags = (flags & !0x000f) | 0x0002;
-            payload[2..4].copy_from_slice(&flags.to_be_bytes());
-            payload[6..12].fill(0);
-        }
+        let mut flags = u16::from_be_bytes([payload[2], payload[3]]);
+        flags |= 0x8000;
+        flags = (flags & !0x000f) | 0x0002;
+        payload[2..4].copy_from_slice(&flags.to_be_bytes());
+        payload[6..12].fill(0);
     }
     rewrite_packet(
         &mut packet,
@@ -882,4 +1051,8 @@ fn dns_servfail_transmit_to_listen(
         packet: Bytes::from(packet),
         outer: None,
     })
+}
+
+fn ensure_minimum_dns_response(packet: &mut Vec<u8>) -> Result<(), crate::flow_plane::PacketError> {
+    ensure_udp_payload_len(packet, 12)
 }

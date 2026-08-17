@@ -205,6 +205,17 @@ impl ActiveDcidIndex {
         Some(owner)
     }
 
+    pub fn retire_for_flow(&mut self, dcid: &[u8], flow: &QuicFlow) -> Option<DcidOwner> {
+        let expected = DcidOwner {
+            flow_worker_id: flow.flow_worker_id(),
+            quic_flow_id: flow.id(),
+        };
+        if self.resolve(dcid) != Some(expected) {
+            return None;
+        }
+        self.retire(dcid)
+    }
+
     pub fn close_flow(&mut self, quic_flow_id: QuicFlowId) -> usize {
         let removed = if let Some(dcids) = self.by_flow.remove(&quic_flow_id) {
             let removed = dcids.len();
@@ -309,6 +320,30 @@ mod tests {
         assert_eq!(index.resolve(b"a"), None);
         assert_eq!(index.close_flow(QuicFlowId(7)), 1);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn v1_unit_dcid_retire_rejects_a_different_flow_owner() {
+        let owner = QuicFlow::new(QuicFlowId(7), 1, b"owner", 2).unwrap();
+        let conflicting = QuicFlow::new(QuicFlowId(8), 0, b"conflicting", 2).unwrap();
+        let mut index = ActiveDcidIndex::default();
+        index.publish_for_flow(b"shared-dcid", &owner).unwrap();
+
+        assert_eq!(index.retire_for_flow(b"shared-dcid", &conflicting), None);
+        assert_eq!(
+            index.resolve(b"shared-dcid"),
+            Some(DcidOwner {
+                flow_worker_id: 1,
+                quic_flow_id: QuicFlowId(7),
+            })
+        );
+        assert_eq!(
+            index.retire_for_flow(b"shared-dcid", &owner),
+            Some(DcidOwner {
+                flow_worker_id: 1,
+                quic_flow_id: QuicFlowId(7),
+            })
+        );
     }
 
     #[test]

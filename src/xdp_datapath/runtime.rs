@@ -9,14 +9,20 @@ use crate::quic_engine::{
 use crate::v1_config::{
     ApplianceConfig, InterceptConfig, IpPolicy, MacAddress, Role, XdpAttachMode,
 };
+#[cfg(target_os = "linux")]
+use crate::xdp_datapath::io_wakeup::IoWakeup;
 use crate::xdp_datapath::io_worker::{
     DnsLocalResponseClassifier, InterceptPolicy, IoClassifierConfig,
     IoWorker as ClassifyingIoWorker,
 };
 use crate::xdp_datapath::loader::BpfLinkManager;
-use crate::xdp_datapath::stats::{write_snapshot, FlowStatsSlot, IoStatsEntry, IoStatsSlot};
+use crate::xdp_datapath::port_reservation::ensure_nat_ports_reserved;
+use crate::xdp_datapath::stats::{
+    preflight_snapshot_path, write_snapshot, FlowStatsSlot, IoStatsEntry, IoStatsSlot,
+    RuntimeGauges, SnapshotMetadata,
+};
 #[cfg(target_os = "linux")]
-use crate::xdp_datapath::xsk::{open_bpf_map, update_bpf_map, Xsk};
+use crate::xdp_datapath::xsk::{lookup_bpf_map, open_bpf_map, update_bpf_map, Xsk};
 use bytes::Bytes;
 use ipnet::IpNet;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -123,6 +129,8 @@ pub enum RuntimeError {
     Tls(String),
     #[error("QUIC engine setup failed: {0}")]
     Quic(String),
+    #[error("NAT port reservation failed: {0}")]
+    PortReservation(String),
     #[error("worker thread panicked")]
     WorkerPanic,
     #[error("worker thread exited unexpectedly")]
@@ -136,6 +144,8 @@ pub fn run(_config: ApplianceConfig) -> Result<(), RuntimeError> {
 
 #[cfg(target_os = "linux")]
 pub fn run(config: ApplianceConfig) -> Result<(), RuntimeError> {
+    preflight_snapshot_path(Path::new(&config.stats_path))
+        .map_err(|error| RuntimeError::Interface(format!("StatsPath is not writable: {error}")))?;
     let prepared = PreparedRuntime::build(config)?;
     prepared.run()
 }
@@ -319,6 +329,19 @@ impl XskFactory for LinuxXskFactory {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct IoTxChannel {
+    sender: SyncSender<IoTransmit>,
+    wakeup: Arc<IoWakeup>,
+}
+
+#[cfg(target_os = "linux")]
+struct IoRxChannel {
+    receiver: Receiver<IoTransmit>,
+    wakeup: Arc<IoWakeup>,
+}
+
+#[cfg(target_os = "linux")]
 struct PreparedRuntime {
     config: ApplianceConfig,
     tunnel: InterfaceInfo,
@@ -329,8 +352,8 @@ struct PreparedRuntime {
     io_runtime: XdpRuntime<Xsk>,
     flow_dispatcher: crate::flow_plane::FlowDispatcher,
     flow_receivers: Vec<Receiver<FlowMessage>>,
-    io_senders: Arc<IoRegistry<SyncSender<IoTransmit>>>,
-    io_receivers: HashMap<IoOwnerKey, Receiver<IoTransmit>>,
+    io_senders: Arc<IoRegistry<IoTxChannel>>,
+    io_receivers: HashMap<IoOwnerKey, IoRxChannel>,
     engines: Vec<QuicEngine>,
     active_dcids: Arc<RwLock<ActiveDcidIndex>>,
     reverse_nat: Arc<RwLock<ReverseNatDirectory>>,
@@ -342,6 +365,8 @@ impl PreparedRuntime {
     fn build(config: ApplianceConfig) -> Result<Self, RuntimeError> {
         let tunnel = discover_interface(config.tunnel_interface.as_str())?;
         let tunnel_local_ips = resolve_tunnel_local_ips(&config, &tunnel)?;
+        ensure_nat_ports_reserved(config.nat.ports.clone())
+            .map_err(|error| RuntimeError::PortReservation(error.to_string()))?;
         let intercepts = config
             .intercept_interfaces
             .iter()
@@ -413,10 +438,19 @@ impl PreparedRuntime {
         let mut io_receivers = HashMap::new();
         for owner in io_runtime.owners() {
             let (sender, receiver) = mpsc::sync_channel(config.channel_capacity);
+            let wakeup = Arc::new(
+                IoWakeup::new().map_err(|error| RuntimeError::Interface(error.to_string()))?,
+            );
             io_senders
-                .register(owner, sender)
+                .register(
+                    owner,
+                    IoTxChannel {
+                        sender,
+                        wakeup: wakeup.clone(),
+                    },
+                )
                 .expect("IO runtime owners are unique");
-            io_receivers.insert(owner, receiver);
+            io_receivers.insert(owner, IoRxChannel { receiver, wakeup });
         }
 
         let mut links = HashMap::new();
@@ -462,7 +496,7 @@ impl PreparedRuntime {
         let mut io_stats = Vec::new();
 
         for (owner, classifiers, xsk) in self.io_runtime.into_entries() {
-            let receiver = self
+            let channel = self
                 .io_receivers
                 .remove(&owner)
                 .expect("every IO owner has a transmit receiver");
@@ -484,7 +518,7 @@ impl PreparedRuntime {
                     } else {
                         Vec::new()
                     },
-                    forced_local_ips: forced_local_ips(&self.config, &self.tunnel_local_ips),
+                    nat_return_ips: nat_return_ips(&self.config),
                     dns_listen: dns_owner
                         .then(|| self.config.dns.as_ref().map(|dns| dns.listen))
                         .flatten(),
@@ -518,7 +552,7 @@ impl PreparedRuntime {
                         io_loop(
                             xsk,
                             classifier,
-                            receiver,
+                            channel,
                             active_dcids,
                             reverse_nat,
                             link,
@@ -605,54 +639,156 @@ impl PreparedRuntime {
             Role::Client => "client",
             Role::Server => "server",
         };
+        let mut stats_metadata = SnapshotMetadata::new(role);
         let mut worker_exited = false;
+        let mut xdp_parser_drops = 0;
+        let mut xdp_dns_fragment_drops = 0;
+        let mut stats_read_failures = 0u64;
+        let mut stats_write_failures = 0u64;
+        let mut last_policy_epoch = RELOAD_POLICY_EPOCH.load(Ordering::Acquire);
         while !EXIT_REQUESTED.load(Ordering::Acquire) {
+            let current_policy_epoch = RELOAD_POLICY_EPOCH.load(Ordering::Acquire);
+            if current_policy_epoch != last_policy_epoch {
+                last_policy_epoch = current_policy_epoch;
+                log::info!(
+                    "SIGUSR1 received: reloading policies (epoch {})",
+                    current_policy_epoch
+                );
+                if let Err(error) = self.config.reload_policy_from_source() {
+                    log::error!("failed to reload policy configuration: {}", error);
+                } else {
+                    let port = tunnel_port(&self.config);
+                    for (ifindex, link, roles) in &self.bpf_links {
+                        if let Err(error) = configure_bpf_maps(
+                            *ifindex,
+                            link,
+                            &self.tunnel_local_ips,
+                            *roles,
+                            port,
+                            &self.config,
+                            self.dns_intercept_ifindex,
+                        ) {
+                            log::error!(
+                                "failed to reconfigure BPF maps for ifindex {}: {}",
+                                ifindex,
+                                error
+                            );
+                        }
+                    }
+                    let remote_rules = self
+                        .config
+                        .dns
+                        .as_ref()
+                        .map(|d| d.remote_domains.clone().into());
+                    self.flow_dispatcher.broadcast(FlowMessage::ReloadPolicies {
+                        remote_domains: remote_rules,
+                    });
+                    log::info!(
+                        "policies successfully reloaded (epoch {})",
+                        current_policy_epoch
+                    );
+                }
+            }
             if handles.iter().any(thread::JoinHandle::is_finished) {
                 worker_exited = true;
                 EXIT_REQUESTED.store(true, Ordering::Release);
                 break;
             }
+            match read_xdp_parser_drops(&self.bpf_links) {
+                Ok(drops) => xdp_parser_drops = drops,
+                Err(error) => {
+                    stats_read_failures = stats_read_failures.saturating_add(1);
+                    log::warn!("failed to read XDP parser-drop stats: {error}");
+                }
+            }
+            match read_xdp_dns_fragment_drops(&self.bpf_links) {
+                Ok(drops) => xdp_dns_fragment_drops = drops,
+                Err(error) => {
+                    stats_read_failures = stats_read_failures.saturating_add(1);
+                    log::warn!("failed to read XDP DNS-fragment stats: {error}");
+                }
+            }
             if let Err(error) = write_snapshot(
                 &stats_path,
-                role,
+                &stats_metadata,
                 &io_stats,
                 &flow_stats,
                 &self.flow_dispatcher,
-                self.active_dcids
-                    .read()
-                    .expect("active DCID index is not poisoned")
-                    .len(),
-                self.reverse_nat
-                    .read()
-                    .expect("reverse NAT directory is not poisoned")
-                    .len(),
+                RuntimeGauges {
+                    active_dcid_count: self
+                        .active_dcids
+                        .read()
+                        .expect("active DCID index is not poisoned")
+                        .len(),
+                    reverse_nat_count: self
+                        .reverse_nat
+                        .read()
+                        .expect("reverse NAT directory is not poisoned")
+                        .len(),
+                    xdp_parser_drops,
+                    xdp_dns_fragment_drops,
+                    stats_read_failures,
+                    stats_write_failures,
+                },
             ) {
+                stats_write_failures = stats_write_failures.saturating_add(1);
                 log::warn!("failed to write v1 stats {}: {error}", stats_path.display());
             }
+            stats_metadata.advance();
             thread::sleep(Duration::from_millis(100));
         }
+        let disable_result = disable_bpf_classifiers(&self.bpf_links);
+        let mut worker_panicked = false;
         for handle in handles {
-            handle.join().map_err(|_| RuntimeError::WorkerPanic)?;
+            if handle.join().is_err() {
+                worker_panicked = true;
+            }
+        }
+        if worker_panicked {
+            return Err(RuntimeError::WorkerPanic);
         }
         if worker_exited {
             return Err(RuntimeError::WorkerExited);
         }
-        write_snapshot(
+        disable_result?;
+        if let Ok(drops) = read_xdp_parser_drops(&self.bpf_links) {
+            xdp_parser_drops = drops;
+        } else {
+            stats_read_failures = stats_read_failures.saturating_add(1);
+        }
+        if let Ok(drops) = read_xdp_dns_fragment_drops(&self.bpf_links) {
+            xdp_dns_fragment_drops = drops;
+        } else {
+            stats_read_failures = stats_read_failures.saturating_add(1);
+        }
+        if let Err(error) = write_snapshot(
             &stats_path,
-            role,
+            &stats_metadata,
             &io_stats,
             &flow_stats,
             &self.flow_dispatcher,
-            self.active_dcids
-                .read()
-                .expect("active DCID index is not poisoned")
-                .len(),
-            self.reverse_nat
-                .read()
-                .expect("reverse NAT directory is not poisoned")
-                .len(),
-        )
-        .map_err(|error| RuntimeError::Interface(error.to_string()))?;
+            RuntimeGauges {
+                active_dcid_count: self
+                    .active_dcids
+                    .read()
+                    .expect("active DCID index is not poisoned")
+                    .len(),
+                reverse_nat_count: self
+                    .reverse_nat
+                    .read()
+                    .expect("reverse NAT directory is not poisoned")
+                    .len(),
+                xdp_parser_drops,
+                xdp_dns_fragment_drops,
+                stats_read_failures,
+                stats_write_failures,
+            },
+        ) {
+            log::warn!(
+                "failed to write final v1 stats {}: {error}",
+                stats_path.display()
+            );
+        }
         Ok(())
     }
 }
@@ -672,7 +808,7 @@ struct FlowLoopContext {
     local_port: u16,
     dns_config: Option<DnsFlowConfig>,
     dns_local_response: Option<DnsLocalResponseClassifier>,
-    io_senders: Arc<IoRegistry<SyncSender<IoTransmit>>>,
+    io_senders: Arc<IoRegistry<IoTxChannel>>,
     active_dcids: Arc<RwLock<ActiveDcidIndex>>,
     reverse_nat: Arc<RwLock<ReverseNatDirectory>>,
     stats: Arc<FlowStatsSlot>,
@@ -683,6 +819,14 @@ struct FlowLoopContext {
 struct PendingInner {
     epoch: u64,
     packets: VecDeque<Bytes>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InnerSendOutcome {
+    Sent,
+    Queued,
+    Dropped,
 }
 
 #[cfg(target_os = "linux")]
@@ -741,6 +885,7 @@ fn flow_loop(mut context: FlowLoopContext) {
         }
         drain_engine(&mut context, reconnect_epoch, &mut pending_inner);
         expire_dns_transactions(&mut context);
+        expire_idle_sessions(&mut context);
         if Instant::now() >= next_stats {
             context.stats.publish(
                 &context.state,
@@ -760,6 +905,29 @@ fn flow_loop(mut context: FlowLoopContext) {
 }
 
 #[cfg(target_os = "linux")]
+fn expire_idle_sessions(context: &mut FlowLoopContext) {
+    let Ok(expired) = context.state.expire_idle_sessions(Instant::now()) else {
+        return;
+    };
+    if expired.is_empty() {
+        return;
+    }
+    let mut directory = context
+        .reverse_nat
+        .write()
+        .expect("reverse NAT directory is not poisoned");
+    for session in expired {
+        directory.retire(
+            &session.nat,
+            SessionLocator {
+                flow_worker_id: context.worker_id,
+                session_id: session.id,
+            },
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn expire_dns_transactions(context: &mut FlowLoopContext) {
     let Some(dns_config) = context.dns_config.clone() else {
         return;
@@ -771,7 +939,7 @@ fn expire_dns_transactions(context: &mut FlowLoopContext) {
         return;
     };
     for expired in transmits {
-        retire_dns_reverse(context, &expired.binding);
+        retire_dns_reverse(context, &expired.binding, expired.transaction_id);
         send_io(&context.io_senders, expired.transmit, &context.stats);
     }
 }
@@ -784,7 +952,22 @@ fn handle_flow_message(
     pending_inner: &mut PendingInner,
 ) {
     match message {
-        FlowMessage::InterceptIngress { io_owner, packet } => match context.role {
+        FlowMessage::ReloadPolicies { remote_domains } => {
+            if let (Some(dns_config), Some(remote_domains)) =
+                (&mut context.dns_config, remote_domains)
+            {
+                dns_config.remote_domains = remote_domains;
+                log::info!(
+                    "flow worker {} updated remote domain rules",
+                    context.worker_id
+                );
+            }
+        }
+        FlowMessage::InterceptIngress {
+            io_owner,
+            packet,
+            expected_locator,
+        } => match context.role {
             Role::Client => {
                 if let Some(mut dns_config) = context.dns_config.clone() {
                     if context
@@ -794,19 +977,47 @@ fn handle_flow_message(
                             is_dns_local_resolver_candidate(&packet, classifier)
                         })
                     {
-                        if let Ok(Some(restored)) = context.state.handle_dns_response(packet) {
-                            retire_dns_reverse(context, &restored.binding);
-                            send_io(
-                                &context.io_senders,
-                                IoTransmit {
-                                    target: restored.local_target,
-                                    packet: restored.packet,
-                                    outer: None,
-                                },
-                                &context.stats,
-                            );
+                        let dns_reverse =
+                            expected_locator.is_some_and(|locator| {
+                                crate::flow_plane::parse_flow_key(&packet).ok().is_some_and(
+                                    |flow| context.state.dns_reverse_matches(&flow, locator),
+                                )
+                            });
+                        if dns_reverse {
+                            if let Ok(Some(restored)) = context.state.handle_dns_response(packet) {
+                                retire_dns_reverse(
+                                    context,
+                                    &restored.binding,
+                                    restored.transaction_id,
+                                );
+                                send_io(
+                                    &context.io_senders,
+                                    IoTransmit {
+                                        target: restored.local_target,
+                                        packet: restored.packet,
+                                        outer: None,
+                                    },
+                                    &context.stats,
+                                );
+                            }
+                            return;
                         }
-                        return;
+                        if let Some(locator) = expected_locator {
+                            if let Ok(Some(restored)) =
+                                context.state.handle_reverse_for(packet, locator)
+                            {
+                                send_io(
+                                    &context.io_senders,
+                                    IoTransmit {
+                                        target: restored.local_target,
+                                        packet: restored.packet,
+                                        outer: None,
+                                    },
+                                    &context.stats,
+                                );
+                            }
+                            return;
+                        }
                     }
                     dns_config.remote_available = context.engine.is_authenticated();
                     match context
@@ -854,6 +1065,10 @@ fn handle_flow_message(
                         Err(_) => return,
                     }
                 }
+                if !context.engine.is_authenticated() {
+                    context.stats.record_pending_inner_drop();
+                    return;
+                }
                 let tunnel_target =
                     IoOwnerKey::new(context.tunnel_ifindex, context.quic_flow.tunnel_queue_id());
                 if let Ok(handled) = context.state.handle_intercept(
@@ -862,27 +1077,29 @@ fn handle_flow_message(
                     &context.quic_flow,
                     tunnel_target,
                 ) {
-                    if publish_session(context, handled.session_id) {
-                        send_or_queue_inner(
+                    if publish_session(context, handled.session_id)
+                        && send_or_queue_inner(
                             context,
                             handled.transmit.packet,
                             reconnect_epoch,
                             pending_inner,
-                        );
+                        ) == InnerSendOutcome::Dropped
+                    {
+                        retire_session(context, handled.session_id);
                     }
                 }
             }
             Role::Server => {
-                let Ok(flow) = crate::flow_plane::parse_flow_key(&packet) else {
+                let Some(locator) = expected_locator else {
                     return;
                 };
-                let Some(session_id) = context.state.lookup_reverse(&flow) else {
-                    return;
-                };
-                if !context.state.correct_server_return_io(session_id, io_owner) {
+                if locator.flow_worker_id != context.worker_id {
                     return;
                 }
-                if let Ok(Some(restored)) = context.state.handle_reverse(packet) {
+                if let Ok(Some(restored)) = context
+                    .state
+                    .handle_server_reverse(io_owner, packet, locator)
+                {
                     send_or_queue_inner(context, restored.packet, reconnect_epoch, pending_inner);
                 }
             }
@@ -906,15 +1123,21 @@ fn send_or_queue_inner(
     packet: Bytes,
     reconnect_epoch: u64,
     pending_inner: &mut PendingInner,
-) {
+) -> InnerSendOutcome {
     match context.engine.send_inner(Instant::now(), packet.clone()) {
-        Ok(()) => {}
+        Ok(()) => InnerSendOutcome::Sent,
         Err(QuicEngineError::NotAuthenticated | QuicEngineError::NotConnected) => {
-            if !pending_inner.push(reconnect_epoch, packet) {
+            if pending_inner.push(reconnect_epoch, packet) {
+                InnerSendOutcome::Queued
+            } else {
                 context.stats.record_pending_inner_drop();
+                InnerSendOutcome::Dropped
             }
         }
-        Err(_) => context.stats.record_quic_send_drop(),
+        Err(_) => {
+            context.stats.record_quic_send_drop();
+            InnerSendOutcome::Dropped
+        }
     }
 }
 
@@ -977,7 +1200,11 @@ fn drain_engine(
                     if dns_flow.is_some() {
                         match context.state.handle_dns_response(packet.clone()) {
                             Ok(Some(restored)) => {
-                                retire_dns_reverse(context, &restored.binding);
+                                retire_dns_reverse(
+                                    context,
+                                    &restored.binding,
+                                    restored.transaction_id,
+                                );
                                 send_io(
                                     &context.io_senders,
                                     IoTransmit {
@@ -1035,26 +1262,30 @@ fn drain_engine(
                     .active_dcids
                     .write()
                     .expect("active DCID index is not poisoned")
-                    .retire(&dcid);
+                    .retire_for_flow(&dcid, &context.quic_flow);
             }
             QuicEngineEvent::Replaced(dcids) => {
-                pending_inner.advance(reconnect_epoch);
-                retire_quic_flow_state(context);
-                if context
+                let published = context
                     .active_dcids
                     .write()
                     .expect("active DCID index is not poisoned")
                     .publish_batch_for_flow(&dcids, &context.quic_flow)
-                    .is_err()
-                {
+                    .is_ok();
+                context
+                    .engine
+                    .resolve_candidate_replacement(Instant::now(), published);
+                if published {
+                    pending_inner.advance(reconnect_epoch);
+                } else {
                     context.stats.record_dcid_publish_drop();
-                    context.engine.close(Instant::now());
                 }
             }
             QuicEngineEvent::Closed => {
                 pending_inner.advance(reconnect_epoch);
                 let closed_flow_id = context.quic_flow.id();
-                retire_quic_flow_state(context);
+                if let Some(config) = context.dns_config.as_ref() {
+                    let _ = context.state.abort_remote_dns_transactions(config);
+                }
                 context
                     .active_dcids
                     .write()
@@ -1071,6 +1302,7 @@ fn drain_engine(
                         context.tunnel_queue_count,
                     ) {
                         context.quic_flow = quic_flow;
+                        let _ = context.state.rebind_quic_flow(closed_flow_id, next_flow_id);
                         if context.role == Role::Client
                             && context.engine.reconnect_client().is_err()
                         {
@@ -1084,6 +1316,7 @@ fn drain_engine(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn retire_quic_flow_state(context: &mut FlowLoopContext) {
     let removed = context
         .state
@@ -1100,10 +1333,22 @@ fn retire_quic_flow_state(context: &mut FlowLoopContext) {
             .write()
             .expect("reverse NAT directory is not poisoned");
         for session in removed {
-            directory.retire(&session.nat);
+            directory.retire(
+                &session.nat,
+                SessionLocator {
+                    flow_worker_id: context.worker_id,
+                    session_id: session.id,
+                },
+            );
         }
         for transaction in &removed_dns {
-            directory.retire(&transaction.binding);
+            directory.retire(
+                &transaction.binding,
+                SessionLocator {
+                    flow_worker_id: context.worker_id,
+                    session_id: transaction.transaction_id,
+                },
+            );
         }
     }
     for transaction in removed_dns {
@@ -1148,6 +1393,24 @@ fn publish_session(
         return false;
     }
     true
+}
+
+#[cfg(target_os = "linux")]
+fn retire_session(context: &mut FlowLoopContext, session_id: crate::flow_plane::SessionId) {
+    let Ok(session) = context.state.remove_session(session_id) else {
+        return;
+    };
+    context
+        .reverse_nat
+        .write()
+        .expect("reverse NAT directory is not poisoned")
+        .retire(
+            &session.nat,
+            SessionLocator {
+                flow_worker_id: context.worker_id,
+                session_id,
+            },
+        );
 }
 
 #[cfg(target_os = "linux")]
@@ -1203,26 +1466,36 @@ fn publish_dns_reverse(
 }
 
 #[cfg(target_os = "linux")]
-fn retire_dns_reverse(context: &mut FlowLoopContext, binding: &NatBinding) {
+fn retire_dns_reverse(
+    context: &mut FlowLoopContext,
+    binding: &NatBinding,
+    transaction_id: crate::flow_plane::SessionId,
+) {
     context
         .reverse_nat
         .write()
         .expect("reverse NAT directory is not poisoned")
-        .retire(binding);
+        .retire(
+            binding,
+            SessionLocator {
+                flow_worker_id: context.worker_id,
+                session_id: transaction_id,
+            },
+        );
 }
 
 #[cfg(target_os = "linux")]
-fn send_io(
-    senders: &IoRegistry<SyncSender<IoTransmit>>,
-    transmit: IoTransmit,
-    stats: &FlowStatsSlot,
-) {
-    let Some(sender) = senders.get(transmit.target) else {
+fn send_io(senders: &IoRegistry<IoTxChannel>, transmit: IoTransmit, stats: &FlowStatsSlot) {
+    let Some(channel) = senders.get(transmit.target) else {
         stats.record_io_missing_owner_drop();
         return;
     };
-    match sender.try_send(transmit) {
-        Ok(()) => {}
+    match channel.sender.try_send(transmit) {
+        Ok(()) => {
+            if let Err(error) = channel.wakeup.notify() {
+                log::warn!("failed to wake IO worker: {error}");
+            }
+        }
         Err(TrySendError::Full(_)) => stats.record_io_channel_full_drop(),
         Err(TrySendError::Disconnected(_)) => stats.record_io_channel_disconnected_drop(),
     }
@@ -1232,18 +1505,19 @@ fn send_io(
 fn io_loop(
     mut xsk: Xsk,
     classifier: ClassifyingIoWorker,
-    receiver: Receiver<IoTransmit>,
+    channel: IoRxChannel,
     active_dcids: Arc<RwLock<ActiveDcidIndex>>,
     reverse_nat: Arc<RwLock<ReverseNatDirectory>>,
     link: IoLinkConfig,
     stats: Arc<IoStatsSlot>,
 ) {
-    let mut frames = Vec::with_capacity(64);
+    const IO_BATCH_SIZE: usize = 64;
+    const FRAME_BUFFER_CAPACITY: usize = 4096;
+    let mut tx_frames = (0..IO_BATCH_SIZE)
+        .map(|_| Vec::with_capacity(FRAME_BUFFER_CAPACITY))
+        .collect::<Vec<_>>();
     while !EXIT_REQUESTED.load(Ordering::Acquire) {
-        frames.clear();
-        let received = xsk.receive(&mut frames, 64);
-        stats.record_rx(received);
-        for frame in &frames {
+        let received = xsk.receive_with(IO_BATCH_SIZE as u32, |frame| {
             let outcome = classifier.handle_frame(
                 frame,
                 &active_dcids
@@ -1254,81 +1528,128 @@ fn io_loop(
                     .expect("reverse NAT directory is not poisoned"),
             );
             stats.record_ingress(outcome);
-        }
+        });
+        stats.record_rx(received);
 
         let mut transmitted = false;
         loop {
-            match receiver.try_recv() {
-                Ok(transmit) => {
-                    if let Some(frame) = build_ethernet_frame(&link, &transmit) {
-                        match xsk.transmit(&frame) {
-                            Ok(true) => {
-                                transmitted = true;
-                                stats.record_tx();
-                            }
-                            Ok(false) | Err(_) => stats.record_tx_drop(),
+            let mut tx_count = 0;
+            while tx_count < IO_BATCH_SIZE {
+                match channel.receiver.try_recv() {
+                    Ok(transmit) => {
+                        if fill_ethernet_frame(&link, &transmit, &mut tx_frames[tx_count]) {
+                            tx_count += 1;
+                        } else {
+                            stats.record_tx_drop();
                         }
-                    } else {
-                        stats.record_tx_drop();
                     }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+            }
+            if tx_count == 0 {
+                break;
+            }
+            let sent = xsk.transmit_batch(&tx_frames[..tx_count]).unwrap_or(0);
+            transmitted |= sent > 0;
+            for _ in 0..sent {
+                stats.record_tx();
+            }
+            for _ in sent..tx_count {
+                stats.record_tx_drop();
             }
         }
         if received == 0 && !transmitted {
-            let mut descriptor = libc::pollfd {
-                fd: xsk.fd(),
-                events: libc::POLLIN,
-                revents: 0,
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: xsk.fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: channel.wakeup.fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let result = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    100,
+                )
             };
-            let result = unsafe { libc::poll(&mut descriptor, 1, 5) };
             if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 break;
+            }
+            if result > 0 && descriptors[1].revents & libc::POLLIN != 0 {
+                if channel.wakeup.drain().is_err() {
+                    break;
+                }
+                channel.wakeup.clear_pending();
             }
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn build_ethernet_frame(link: &IoLinkConfig, transmit: &IoTransmit) -> Option<Vec<u8>> {
-    let (next_hop, ether_type, payload) = match &transmit.outer {
+fn fill_ethernet_frame(link: &IoLinkConfig, transmit: &IoTransmit, frame: &mut Vec<u8>) -> bool {
+    let (next_hop, ether_type, payload_len) = match &transmit.outer {
         Some(route) => {
-            let payload = build_outer_packet(&link.interface, route, &transmit.packet)?;
-            let ether_type = if route.destination.is_ipv4() {
-                0x0800
-            } else {
-                0x86dd
-            };
-            (link.tunnel_next_hop?, ether_type, payload)
-        }
-        None => {
-            let ether_type = match transmit.packet.first()? >> 4 {
-                4 => 0x0800,
-                6 => 0x86dd,
-                _ => return None,
+            let (ether_type, header_len) = match route.destination {
+                SocketAddr::V4(_) => (0x0800, 28),
+                SocketAddr::V6(_) => (0x86dd, 48),
             };
             (
-                link.intercept_next_hop?,
+                match link.tunnel_next_hop {
+                    Some(next_hop) => next_hop,
+                    None => return false,
+                },
                 ether_type,
-                transmit.packet.to_vec(),
+                header_len + transmit.packet.len(),
+            )
+        }
+        None => {
+            let ether_type = match transmit.packet.first().map(|byte| byte >> 4) {
+                Some(4) => 0x0800,
+                Some(6) => 0x86dd,
+                _ => return false,
+            };
+            (
+                match link.intercept_next_hop {
+                    Some(next_hop) => next_hop,
+                    None => return false,
+                },
+                ether_type,
+                transmit.packet.len(),
             )
         }
     };
-    let mut frame = Vec::with_capacity(14 + payload.len());
-    frame.extend_from_slice(&next_hop);
-    frame.extend_from_slice(&link.interface.mac);
-    frame.extend_from_slice(&u16::to_be_bytes(ether_type));
-    frame.extend_from_slice(&payload);
-    Some(frame)
+    frame.clear();
+    frame.resize(14 + payload_len, 0);
+    frame[..6].copy_from_slice(&next_hop);
+    frame[6..12].copy_from_slice(&link.interface.mac);
+    frame[12..14].copy_from_slice(&u16::to_be_bytes(ether_type));
+    match &transmit.outer {
+        Some(route) => {
+            if fill_outer_packet(&link.interface, route, &transmit.packet, &mut frame[14..])
+                .is_none()
+            {
+                return false;
+            }
+        }
+        None => frame[14..].copy_from_slice(&transmit.packet),
+    }
+    true
 }
 
 #[cfg(target_os = "linux")]
-fn build_outer_packet(
+fn fill_outer_packet(
     interface: &InterfaceInfo,
     route: &OuterRoute,
     payload: &[u8],
-) -> Option<Vec<u8>> {
+    packet: &mut [u8],
+) -> Option<()> {
     match route.destination {
         SocketAddr::V4(destination) => {
             let source = match route.source_ip {
@@ -1336,13 +1657,14 @@ fn build_outer_packet(
                 None => interface.ipv4?,
                 Some(IpAddr::V6(_)) => return None,
             };
-            Some(build_ipv4_udp(
+            fill_ipv4_udp(
+                packet,
                 source,
                 *destination.ip(),
                 route.source_port,
                 destination.port(),
                 payload,
-            ))
+            );
         }
         SocketAddr::V6(destination) => {
             let source = match route.source_ip {
@@ -1350,18 +1672,20 @@ fn build_outer_packet(
                 None => interface.ipv6?,
                 Some(IpAddr::V4(_)) => return None,
             };
-            Some(build_ipv6_udp(
+            fill_ipv6_udp(
+                packet,
                 source,
                 *destination.ip(),
                 route.source_port,
                 destination.port(),
                 payload,
-            ))
+            );
         }
     }
+    Some(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn build_ipv4_udp(
     source: Ipv4Addr,
     destination: Ipv4Addr,
@@ -1372,6 +1696,29 @@ fn build_ipv4_udp(
     let udp_len = 8 + payload.len();
     let total_len = 20 + udp_len;
     let mut packet = vec![0u8; total_len];
+    fill_ipv4_udp(
+        &mut packet,
+        source,
+        destination,
+        source_port,
+        destination_port,
+        payload,
+    );
+    packet
+}
+
+#[cfg(target_os = "linux")]
+fn fill_ipv4_udp(
+    packet: &mut [u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) {
+    let udp_len = 8 + payload.len();
+    let total_len = 20 + udp_len;
+    debug_assert_eq!(packet.len(), total_len);
     packet[0] = 0x45;
     packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
     packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
@@ -1387,10 +1734,9 @@ fn build_ipv4_udp(
     packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
     let udp_checksum = transport_checksum(&packet[12..20], 17, &packet[20..]);
     packet[26..28].copy_from_slice(&udp_checksum.to_be_bytes());
-    packet
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn build_ipv6_udp(
     source: Ipv6Addr,
     destination: Ipv6Addr,
@@ -1400,6 +1746,28 @@ fn build_ipv6_udp(
 ) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let mut packet = vec![0u8; 40 + udp_len];
+    fill_ipv6_udp(
+        &mut packet,
+        source,
+        destination,
+        source_port,
+        destination_port,
+        payload,
+    );
+    packet
+}
+
+#[cfg(target_os = "linux")]
+fn fill_ipv6_udp(
+    packet: &mut [u8],
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) {
+    let udp_len = 8 + payload.len();
+    debug_assert_eq!(packet.len(), 40 + udp_len);
     packet[0] = 0x60;
     packet[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
     packet[6] = 17;
@@ -1410,25 +1778,26 @@ fn build_ipv6_udp(
     packet[42..44].copy_from_slice(&destination_port.to_be_bytes());
     packet[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
     packet[48..].copy_from_slice(payload);
-    let mut pseudo = Vec::with_capacity(40);
-    pseudo.extend_from_slice(&packet[8..40]);
-    pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 17]);
-    let udp_checksum = transport_checksum(&pseudo, 0, &packet[40..]);
+    let udp_len = (udp_len as u32).to_be_bytes();
+    let next_header = [0, 0, 0, 17];
+    let udp_checksum = checksum_parts(&[&packet[8..40], &udp_len, &next_header, &packet[40..]]);
+    let udp_checksum = if udp_checksum == 0 {
+        0xffff
+    } else {
+        udp_checksum
+    };
     packet[46..48].copy_from_slice(&udp_checksum.to_be_bytes());
-    packet
 }
 
 #[cfg(target_os = "linux")]
 fn transport_checksum(pseudo: &[u8], protocol: u8, transport: &[u8]) -> u16 {
-    let mut bytes = Vec::with_capacity(pseudo.len() + transport.len() + 4);
-    bytes.extend_from_slice(pseudo);
-    if protocol != 0 {
-        bytes.extend_from_slice(&[0, protocol]);
-        bytes.extend_from_slice(&(transport.len() as u16).to_be_bytes());
-    }
-    bytes.extend_from_slice(transport);
-    let checksum = checksum(&bytes);
+    let protocol_and_len = [
+        0,
+        protocol,
+        (transport.len() >> 8) as u8,
+        transport.len() as u8,
+    ];
+    let checksum = checksum_parts(&[pseudo, &protocol_and_len, transport]);
     if checksum == 0 {
         0xffff
     } else {
@@ -1438,13 +1807,32 @@ fn transport_checksum(pseudo: &[u8], protocol: u8, transport: &[u8]) -> u16 {
 
 #[cfg(target_os = "linux")]
 fn checksum(bytes: &[u8]) -> u16 {
+    checksum_parts(&[bytes])
+}
+
+#[cfg(target_os = "linux")]
+fn checksum_parts(parts: &[&[u8]]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let mut high_byte = None;
+    for part in parts {
+        let mut offset = 0;
+        if let Some(high) = high_byte.take() {
+            if let Some(&low) = part.first() {
+                sum += u32::from(u16::from_be_bytes([high, low]));
+                offset = 1;
+            } else {
+                high_byte = Some(high);
+                continue;
+            }
+        }
+        let mut chunks = part[offset..].chunks_exact(2);
+        for chunk in &mut chunks {
+            sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        high_byte = chunks.remainder().first().copied();
     }
-    if let Some(byte) = chunks.remainder().first() {
-        sum += u32::from(*byte) << 8;
+    if let Some(high) = high_byte {
+        sum += u32::from(high) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -1599,12 +1987,22 @@ fn resolve_tunnel_local_ips(
     tunnel: &InterfaceInfo,
 ) -> Result<Vec<IpAddr>, RuntimeError> {
     match config.role {
-        Role::Client => Ok(tunnel
-            .ipv4
-            .map(IpAddr::V4)
-            .into_iter()
-            .chain(tunnel.ipv6.map(IpAddr::V6))
-            .collect()),
+        Role::Client => {
+            let endpoint = config.endpoint.expect("validated client endpoint");
+            let candidates = tunnel
+                .addresses
+                .iter()
+                .copied()
+                .filter(|address| address.is_ipv4() == endpoint.is_ipv4())
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 {
+                return Err(RuntimeError::Interface(format!(
+                    "tunnel interface {} must have exactly one address matching Endpoint family",
+                    tunnel.name
+                )));
+            }
+            Ok(candidates)
+        }
         Role::Server => {
             let listen_ip = config.listen.expect("validated server listen").ip();
             if !tunnel.addresses.contains(&listen_ip) {
@@ -1898,6 +2296,21 @@ fn enable_bpf_classifiers(
 }
 
 #[cfg(target_os = "linux")]
+fn disable_bpf_classifiers(
+    links: &[(u32, BpfLinkManager, IoClassifiers)],
+) -> Result<(), RuntimeError> {
+    let mut first_error = None;
+    for (_, link, _) in links {
+        if let Err(error) = update_pinned_map(&link.map_path("role_flags"), &0u32, &0u8) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct LpmV4Key {
     prefix_len: u32,
@@ -1927,6 +2340,28 @@ fn update_pinned_map<K, V>(path: &Path, key: &K, value: &V) -> Result<(), Runtim
     result.map_err(|error| RuntimeError::Bpf(error.to_string()))
 }
 
+#[cfg(target_os = "linux")]
+fn read_xdp_parser_drops(links: &[(u32, BpfLinkManager, IoClassifiers)]) -> io::Result<u64> {
+    read_xdp_counter(links, "parser_drops")
+}
+
+#[cfg(target_os = "linux")]
+fn read_xdp_dns_fragment_drops(links: &[(u32, BpfLinkManager, IoClassifiers)]) -> io::Result<u64> {
+    read_xdp_counter(links, "dns_fragment_drops")
+}
+
+#[cfg(target_os = "linux")]
+fn read_xdp_counter(links: &[(u32, BpfLinkManager, IoClassifiers)], name: &str) -> io::Result<u64> {
+    links.iter().try_fold(0u64, |total, (_, link, _)| {
+        let fd = open_bpf_map(&link.map_path(name))?;
+        let result = lookup_bpf_map::<_, u64>(fd, &0u32);
+        unsafe {
+            libc::close(fd);
+        }
+        result.map(|value| total.saturating_add(value))
+    })
+}
+
 fn tunnel_port(config: &ApplianceConfig) -> u16 {
     config
         .listen
@@ -1940,17 +2375,6 @@ fn intercept_policy_from_config(policy: &IpPolicy) -> InterceptPolicy {
         IpPolicy::TunnelPrefixes(prefixes) => InterceptPolicy::TunnelPrefixes(prefixes.clone()),
         IpPolicy::DirectPrefixes(prefixes) => InterceptPolicy::DirectPrefixes(prefixes.clone()),
     }
-}
-
-fn forced_local_ips(config: &ApplianceConfig, tunnel_local_ips: &[IpAddr]) -> Vec<IpAddr> {
-    let mut addresses = xdp_forced_local_ips(config, tunnel_local_ips);
-    if config.role == Role::Client {
-        addresses.extend(config.nat.address_v4.map(IpAddr::V4));
-        addresses.extend(config.nat.address_v6.map(IpAddr::V6));
-    }
-    addresses.sort_unstable();
-    addresses.dedup();
-    addresses
 }
 
 fn xdp_forced_local_ips(config: &ApplianceConfig, tunnel_local_ips: &[IpAddr]) -> Vec<IpAddr> {
@@ -1984,7 +2408,7 @@ fn dns_flow_config(config: &ApplianceConfig) -> Option<DnsFlowConfig> {
         listen: dns.listen,
         local_resolver: dns.local_resolver,
         remote_resolver: dns.remote_resolver,
-        remote_domains: dns.remote_domains.clone(),
+        remote_domains: dns.remote_domains.clone().into(),
         transaction_capacity: dns.transaction_capacity,
         timeout: Duration::from_secs(dns.timeout_seconds),
         remote_available: false,
@@ -2012,6 +2436,9 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RECONNECT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
+static RELOAD_POLICY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
 extern "C" fn request_exit(_signal: libc::c_int) {
     EXIT_REQUESTED.store(true, Ordering::Release);
 }
@@ -2019,6 +2446,11 @@ extern "C" fn request_exit(_signal: libc::c_int) {
 #[cfg(target_os = "linux")]
 extern "C" fn request_reconnect(_signal: libc::c_int) {
     RECONNECT_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn request_reload_policy(_signal: libc::c_int) {
+    RELOAD_POLICY_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(target_os = "linux")]
@@ -2036,20 +2468,24 @@ fn install_signal_handlers() {
             libc::SIGHUP,
             request_reconnect as *const () as libc::sighandler_t,
         );
+        libc::signal(
+            libc::SIGUSR1,
+            request_reload_policy as *const () as libc::sighandler_t,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime, forced_local_ips, nat_return_ips, validate_dns_runtime_addresses,
-        xdp_forced_local_ips, InterfaceInfo, InterfaceSpec, IoClassifiers, PendingInner,
+        build_runtime, nat_return_ips, validate_dns_runtime_addresses, xdp_forced_local_ips,
+        InterfaceInfo, InterfaceSpec, IoClassifiers, IoTxChannel, IoWakeup, PendingInner,
         RuntimeBuildError, XskFactory,
     };
     use crate::flow_plane::IoOwnerKey;
     use crate::v1_config::{
-        ApplianceConfig, DnsConfig, InterceptConfig, InterfaceName, IpPolicy, MacAddress,
-        NatConfig, Role, XdpAttachMode,
+        ApplianceConfig, AutoReservePorts, DnsConfig, InterceptConfig, InterfaceName, IpPolicy,
+        MacAddress, NatConfig, Role, XdpAttachMode,
     };
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2123,6 +2559,7 @@ mod tests {
                 address_v4: Some("192.0.2.1".parse().unwrap()),
                 address_v6: None,
                 ports: 40000..=40010,
+                auto_reserve_ports: AutoReservePorts::No,
             },
             ip_policy: IpPolicy::TunnelPrefixes(Vec::new()),
             dns: Some(DnsConfig {
@@ -2134,6 +2571,7 @@ mod tests {
                 timeout_seconds: 5,
             }),
             xdp_mode: XdpAttachMode::Skb,
+            config_source_path: None,
         }
     }
 
@@ -2210,12 +2648,10 @@ mod tests {
     }
 
     #[test]
-    fn v1_unit_xdp_runtime_nat_hosts_redirect_before_io_forced_local_fallback() {
+    fn v1_unit_xdp_runtime_nat_hosts_are_dedicated_reverse_nat_addresses() {
         let config = dns_config("10.30.1.53:53");
         let tunnel_ips = vec!["192.0.2.30".parse().unwrap()];
 
-        assert!(forced_local_ips(&config, &tunnel_ips)
-            .contains(&IpAddr::V4("192.0.2.1".parse().unwrap())));
         assert!(!xdp_forced_local_ips(&config, &tunnel_ips)
             .contains(&IpAddr::V4("192.0.2.1".parse().unwrap())));
         assert_eq!(
@@ -2380,14 +2816,28 @@ mod tests {
 
         let (full_sender, _full_receiver) = mpsc::sync_channel(1);
         full_sender.send(transmit.clone()).unwrap();
-        senders.register(owner, full_sender).unwrap();
+        senders
+            .register(
+                owner,
+                IoTxChannel {
+                    sender: full_sender,
+                    wakeup: Arc::new(IoWakeup::new().unwrap()),
+                },
+            )
+            .unwrap();
         super::send_io(&senders, transmit.clone(), &stats);
 
         let disconnected_owner = IoOwnerKey::new(11, 0);
         let (disconnected_sender, disconnected_receiver) = mpsc::sync_channel(1);
         drop(disconnected_receiver);
         senders
-            .register(disconnected_owner, disconnected_sender)
+            .register(
+                disconnected_owner,
+                IoTxChannel {
+                    sender: disconnected_sender,
+                    wakeup: Arc::new(IoWakeup::new().unwrap()),
+                },
+            )
             .unwrap();
         super::send_io(
             &senders,
@@ -2399,6 +2849,82 @@ mod tests {
         );
 
         assert_eq!(stats.io_delivery_drop_counts(), (1, 1, 1));
+    }
+
+    #[test]
+    fn v1_unit_xdp_runtime_successful_flow_to_io_delivery_wakes_owner() {
+        let owner = IoOwnerKey::new(10, 0);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let wakeup = Arc::new(IoWakeup::new().unwrap());
+        let mut senders = crate::flow_plane::IoRegistry::new();
+        senders
+            .register(
+                owner,
+                IoTxChannel {
+                    sender,
+                    wakeup: wakeup.clone(),
+                },
+            )
+            .unwrap();
+
+        super::send_io(
+            &senders,
+            crate::flow_plane::IoTransmit {
+                target: owner,
+                packet: bytes::Bytes::from_static(b"packet"),
+                outer: None,
+            },
+            &crate::xdp_datapath::stats::FlowStatsSlot::default(),
+        );
+
+        assert_eq!(receiver.try_recv().unwrap().target, owner);
+        let mut descriptor = libc::pollfd {
+            fd: wakeup.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_ne!(descriptor.revents & libc::POLLIN, 0);
+    }
+
+    #[test]
+    fn v1_unit_xdp_runtime_coalesces_flow_to_io_wakeups_while_pending() {
+        let owner = IoOwnerKey::new(10, 0);
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let wakeup = Arc::new(IoWakeup::new().unwrap());
+        let mut senders = crate::flow_plane::IoRegistry::new();
+        senders
+            .register(
+                owner,
+                IoTxChannel {
+                    sender,
+                    wakeup: wakeup.clone(),
+                },
+            )
+            .unwrap();
+        let stats = crate::xdp_datapath::stats::FlowStatsSlot::default();
+        let transmit = crate::flow_plane::IoTransmit {
+            target: owner,
+            packet: bytes::Bytes::from_static(b"packet"),
+            outer: None,
+        };
+
+        super::send_io(&senders, transmit.clone(), &stats);
+        super::send_io(&senders, transmit, &stats);
+
+        assert_eq!(receiver.try_iter().count(), 2);
+        let mut value = 0u64;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    wakeup.fd(),
+                    (&mut value as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            },
+            std::mem::size_of::<u64>() as isize
+        );
+        assert_eq!(value, 1);
     }
 
     #[test]
@@ -2436,6 +2962,55 @@ mod tests {
         checksum_input.extend_from_slice(&[0, 0, 0, 17]);
         checksum_input.extend_from_slice(&packet[40..]);
         assert_eq!(super::checksum(&checksum_input), 0);
+    }
+
+    #[test]
+    fn v1_unit_xdp_runtime_scatter_checksum_matches_contiguous_bytes() {
+        let parts = [&b"odd"[..], &b"-"[..], &b"length"[..], &b"-payload"[..]];
+        let contiguous = parts.concat();
+
+        assert_eq!(super::checksum_parts(&parts), super::checksum(&contiguous));
+    }
+
+    #[test]
+    fn v1_unit_xdp_runtime_reuses_tx_frame_buffer_without_stale_bytes() {
+        let link = super::IoLinkConfig {
+            interface: interface("eth0", 10, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]),
+            tunnel_next_hop: Some([2, 0, 0, 0, 0, 1]),
+            intercept_next_hop: Some([2, 0, 0, 0, 0, 2]),
+        };
+        let owner = IoOwnerKey::new(10, 0);
+        let mut frame = Vec::with_capacity(4096);
+        assert!(super::fill_ethernet_frame(
+            &link,
+            &crate::flow_plane::IoTransmit {
+                target: owner,
+                packet: bytes::Bytes::from(vec![0x55; 1200]),
+                outer: Some(crate::flow_plane::OuterRoute {
+                    source_ip: None,
+                    source_port: 40000,
+                    destination: "198.51.100.20:4433".parse().unwrap(),
+                }),
+            },
+            &mut frame,
+        ));
+        assert_eq!(frame.len(), 14 + 20 + 8 + 1200);
+
+        let inner = bytes::Bytes::from_static(&[
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 192, 0, 2, 1, 198, 51, 100, 1,
+        ]);
+        assert!(super::fill_ethernet_frame(
+            &link,
+            &crate::flow_plane::IoTransmit {
+                target: owner,
+                packet: inner.clone(),
+                outer: None,
+            },
+            &mut frame,
+        ));
+        assert_eq!(frame.len(), 14 + inner.len());
+        assert_eq!(&frame[12..14], &0x0800u16.to_be_bytes());
+        assert_eq!(&frame[14..], inner.as_ref());
     }
 
     #[test]

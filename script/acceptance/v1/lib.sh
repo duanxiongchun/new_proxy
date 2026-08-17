@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BIN="${V1_BIN:-$ROOT_DIR/target/release/new_proxy}"
+BPF_OBJECT="${V1_BPF_OBJECT:-}"
 SCENARIO="${SCENARIO:-v1}"
 TOKEN="v1$$_"
-ARTIFACT_DIR="${V1_ARTIFACT_DIR:-/tmp/new_proxy_${SCENARIO}_$$}"
+ARTIFACT_BASE="/tmp/new_proxy-v1"
+if [[ "$EUID" -ne 0 ]]; then
+  echo "v1 E2E requires root" >&2
+  exit 1
+fi
+install -d -o root -g root -m 0700 "$ARTIFACT_BASE"
+ARTIFACT_DIR="$(mktemp -d "$ARTIFACT_BASE/${SCENARIO}.XXXXXX")"
+KEEP_ARTIFACTS="${V1_KEEP_ARTIFACTS:-0}"
+CLEANUP_ARTIFACTS=0
 CLIENT_NS="${TOKEN}c"
 TRANSIT_NS="${TOKEN}r"
 SERVER_NS="${TOKEN}s"
@@ -27,8 +37,12 @@ SOURCE2_MAC="02:00:00:00:31:02"
 SERVER_INTERCEPT_MAC="02:00:00:00:20:01"
 TARGET_MAC="02:00:00:00:20:02"
 SHARED_KEY="0101010101010101010101010101010101010101010101010101010101010101"
-FLOW_WORKER_COUNT="${V1_FLOW_WORKER_COUNT:-1}"
+FLOW_WORKER_COUNT="${V1_FLOW_WORKER_COUNT:-2}"
 CHANNEL_CAPACITY="${V1_CHANNEL_CAPACITY:-8192}"
+CLIENT_NAT_PORT_START="${V1_CLIENT_NAT_PORT_START:-40000}"
+CLIENT_NAT_PORT_END="${V1_CLIENT_NAT_PORT_END:-49999}"
+SERVER_NAT_PORT_START="${V1_SERVER_NAT_PORT_START:-50000}"
+SERVER_NAT_PORT_END="${V1_SERVER_NAT_PORT_END:-59999}"
 CLIENT_ALLOWED_IPS_PREFIXES="${CLIENT_ALLOWED_IPS_PREFIXES:-10.20.1.0/24,2001:db8:20::/64}"
 SERVER_ALLOWED_IPS_PREFIXES="${SERVER_ALLOWED_IPS_PREFIXES:-10.30.0.0/15,2001:db8:30::/47}"
 
@@ -37,14 +51,21 @@ require_root() {
     echo "v1 E2E requires root" >&2
     exit 1
   fi
-  for command in bpftool ip mount openssl python3 timeout unshare; do
+  for command in bpftool ip mount openssl python3 tcpdump timeout unshare; do
     command -v "$command" >/dev/null || {
       echo "missing required command: $command" >&2
       exit 1
     }
   done
-  if [[ ! -x "$BIN" ]] || ! "$BIN" --help 2>&1 | grep -q 'Usage: new_proxy'; then
+  if [[ ! -x "$BIN" ]] || [[ "$("$BIN" --help 2>&1)" != 'Usage: new_proxy --config PATH' ]]; then
     echo "missing or stale v1 release binary; run: cargo build --release --bin new_proxy" >&2
+    exit 1
+  fi
+  if [[ -z "$BPF_OBJECT" ]]; then
+    BPF_OBJECT="$(find "$ROOT_DIR/target/release/build" -path '*/out/xdp_filter.o' -print -quit)"
+  fi
+  if [[ ! -r "$BPF_OBJECT" ]]; then
+    echo "missing release XDP object; run: cargo build --release --bin new_proxy" >&2
     exit 1
   fi
 }
@@ -66,6 +87,9 @@ cleanup() {
   for namespace in "$CLIENT_NS" "$TRANSIT_NS" "$SERVER_NS" "$SOURCE_NS" "$SOURCE2_NS" "$TARGET_NS"; do
     ip netns delete "$namespace" 2>/dev/null || true
   done
+  if [[ "$CLEANUP_ARTIFACTS" == "1" && "$KEEP_ARTIFACTS" != "1" ]]; then
+    rm -rf -- "$ARTIFACT_DIR"
+  fi
 }
 
 create_veth() {
@@ -229,8 +253,9 @@ $CLIENT_INTERCEPTS
 [NAT]
 AddressV4=$CLIENT_NAT_V4
 AddressV6=$CLIENT_NAT_V6
-PortStart=40000
-PortEnd=49999
+PortStart=$CLIENT_NAT_PORT_START
+PortEnd=$CLIENT_NAT_PORT_END
+AutoReservePorts=no
 
 ${CLIENT_DNS_SECTION:-}
 [AllowedIPs]
@@ -262,8 +287,9 @@ NextHopMac=$TARGET_MAC
 [NAT]
 AddressV4=10.20.1.1
 AddressV6=2001:db8:20::1
-PortStart=50000
-PortEnd=59999
+PortStart=$SERVER_NAT_PORT_START
+PortEnd=$SERVER_NAT_PORT_END
+AutoReservePorts=no
 
 [XDP]
 Mode=skb
@@ -274,9 +300,10 @@ start_in_namespace() {
   local namespace="$1"
   local config="$2"
   local log="$3"
+  local rust_log="${V1_RUST_LOG:-new_proxy=info}"
   ip netns exec "$namespace" unshare -m -- bash -c \
-    'mount --make-rprivate /; umount /sys/fs/bpf 2>/dev/null || true; mount -t bpf bpf /sys/fs/bpf; cd "$1"; exec env RUST_LOG=new_proxy=trace "$2" --config "$3"' \
-    bash "$ARTIFACT_DIR" "$BIN" "$config" >"$log" 2>&1 &
+    'mount --make-rprivate /; umount /sys/fs/bpf 2>/dev/null || true; mount -t bpf bpf /sys/fs/bpf; cd "$1"; exec env RUST_LOG="$4" "$2" --config "$3"' \
+    bash "$ARTIFACT_DIR" "$BIN" "$config" "$rust_log" >"$log" 2>&1 &
   local launcher_pid=$!
   for _ in $(seq 1 100); do
     local daemon_pid
@@ -297,6 +324,35 @@ start_in_namespace() {
   return 1
 }
 
+expect_startup_failure() {
+  local namespace="$1"
+  local config="$2"
+  local log="$3"
+  local rust_log="${V1_RUST_LOG:-new_proxy=info}"
+  ip netns exec "$namespace" unshare -m -- bash -c \
+    'mount --make-rprivate /; umount /sys/fs/bpf 2>/dev/null || true; mount -t bpf bpf /sys/fs/bpf; cd "$1"; exec env RUST_LOG="$4" "$2" --config "$3"' \
+    bash "$ARTIFACT_DIR" "$BIN" "$config" "$rust_log" >"$log" 2>&1 &
+  local launcher_pid=$!
+  for _ in $(seq 1 500); do
+    if ! kill -0 "$launcher_pid" 2>/dev/null; then
+      if wait "$launcher_pid"; then
+        echo "daemon unexpectedly exited successfully: $config" >&2
+        cat "$log" >&2
+        return 1
+      fi
+      return 0
+    fi
+    sleep 0.01
+  done
+  echo "daemon remained running when startup failure was expected: $config" >&2
+  kill -TERM "$launcher_pid" 2>/dev/null || true
+  sleep 0.1
+  kill -KILL "$launcher_pid" 2>/dev/null || true
+  wait "$launcher_pid" 2>/dev/null || true
+  cat "$log" >&2
+  return 1
+}
+
 find_daemon_pid() {
   local config="$1"
   python3 - "$BIN" "$config" <<'PY'
@@ -313,7 +369,7 @@ for path in glob.glob("/proc/[0-9]*/cmdline"):
         if not arguments or os.path.realpath(arguments[0]) != binary:
             continue
         for index, argument in enumerate(arguments[:-1]):
-            if argument in ("-config", "--config") and os.path.realpath(arguments[index + 1]) == config:
+            if argument == "--config" and os.path.realpath(arguments[index + 1]) == config:
                 print(path.split("/")[2])
                 raise SystemExit(0)
     except (FileNotFoundError, PermissionError, ProcessLookupError, UnicodeDecodeError):
@@ -333,6 +389,59 @@ kill_daemon_and_wait() {
   done
   echo "daemon did not exit after SIGKILL: pid=$pid config=$config" >&2
   return 1
+}
+
+stop_daemon_and_wait() {
+  local pid="$1"
+  local config="$2"
+  kill -TERM "$pid"
+  for _ in $(seq 1 500); do
+    if [[ -z "$(find_daemon_pid "$config")" ]]; then
+      return 0
+    fi
+    sleep 0.01
+  done
+  echo "daemon did not exit after SIGTERM: pid=$pid config=$config" >&2
+  return 1
+}
+
+xdp_program_id() {
+  local namespace="$1"
+  local interface="$2"
+  ip netns exec "$namespace" bpftool -j net show dev "$interface" |
+    python3 -c 'import json, sys
+value = json.load(sys.stdin)
+def find_id(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("id"), int):
+            return node["id"]
+        for child in node.values():
+            found = find_id(child)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for child in node:
+            found = find_id(child)
+            if found is not None:
+                return found
+    return None
+program_id = find_id(value)
+if program_id is None:
+    raise SystemExit("no XDP program attached")
+print(program_id)'
+}
+
+attach_foreign_xdp() {
+  local namespace="$1"
+  local interface="$2"
+  ip netns exec "$namespace" unshare -m -- bash -c \
+    'set -euo pipefail
+mount --make-rprivate /
+umount /sys/fs/bpf 2>/dev/null || true
+mount -t bpf bpf /sys/fs/bpf
+bpftool prog load "$1" /sys/fs/bpf/foreign-xdp type xdp
+bpftool net attach xdpgeneric pinned /sys/fs/bpf/foreign-xdp dev "$2"' \
+    bash "$BPF_OBJECT" "$interface"
 }
 
 wait_for_json() {
@@ -366,6 +475,26 @@ PY
   return 1
 }
 
+wait_for_ready() {
+  local path="$1"
+  local pid="$2"
+  local log="$3"
+  for _ in $(seq 1 100); do
+    if [[ -f "$path" && ! -L "$path" ]]; then
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "helper exited before publishing readiness: $path" >&2
+      cat "$log" >&2
+      return 1
+    fi
+    sleep 0.01
+  done
+  echo "timed out waiting for helper readiness: $path" >&2
+  cat "$log" >&2
+  return 1
+}
+
 assert_daemon_running() {
   local pid="$1"
   local log="$2"
@@ -379,10 +508,19 @@ assert_daemon_running() {
 start_runtime() {
   generate_certificate
   write_configs
+  ip netns exec "$CLIENT_NS" sysctl -qw \
+    net.ipv4.ip_local_reserved_ports="$CLIENT_NAT_PORT_START-$CLIENT_NAT_PORT_END"
+  ip netns exec "$SERVER_NS" sysctl -qw \
+    net.ipv4.ip_local_reserved_ports="$SERVER_NAT_PORT_START-$SERVER_NAT_PORT_END"
   : >"$ARTIFACT_DIR/target.log"
   ip netns exec "$TARGET_NS" python3 "$ROOT_DIR/script/acceptance/v1/traffic.py" \
-    server --log "$ARTIFACT_DIR/target.log" >"$ARTIFACT_DIR/target-server.log" 2>&1 &
+    server --log "$ARTIFACT_DIR/target.log" \
+    --log-every "${V1_TARGET_LOG_EVERY:-1}" \
+    --ready "$ARTIFACT_DIR/target.ready" \
+    >"$ARTIFACT_DIR/target-server.log" 2>&1 &
   TARGET_PID=$!
+  wait_for_ready "$ARTIFACT_DIR/target.ready" "$TARGET_PID" \
+    "$ARTIFACT_DIR/target-server.log"
   SERVER_PID="$(start_in_namespace "$SERVER_NS" "$ARTIFACT_DIR/server.conf" "$ARTIFACT_DIR/server.log")"
   sleep 0.5
   assert_daemon_running "$SERVER_PID" "$ARTIFACT_DIR/server.log"
@@ -404,10 +542,14 @@ start_runtime() {
 setup_runtime() {
   local mode="${1:-standard}"
   require_root
-  mkdir -p "$ARTIFACT_DIR"
+  if [[ ! -d "$ARTIFACT_DIR" || -L "$ARTIFACT_DIR" ]]; then
+    echo "unsafe artifact directory: $ARTIFACT_DIR" >&2
+    exit 1
+  fi
   trap cleanup EXIT INT TERM
   cleanup
   set -e
+  CLEANUP_ARTIFACTS=1
   if [[ "$mode" == "same" ]]; then
     setup_same_interface_topology
   else
@@ -422,23 +564,41 @@ setup_runtime() {
 exercise_matrix() {
   local namespace="${1:-$SOURCE_NS}"
   local tag="${2:-v1}"
+  local capture="$ARTIFACT_DIR/icmp-${tag//[^a-zA-Z0-9_.-]/_}.log"
+  capture_success_baseline
   ip netns exec "$namespace" timeout 20s python3 \
     "$ROOT_DIR/script/acceptance/v1/traffic.py" client --tag "$tag"
+  ip netns exec "$TARGET_NS" timeout 5s tcpdump -i tg0 -nn -l -c 2 \
+    '(icmp and icmp[icmptype] = icmp-echo) or (icmp6 and ip6[40] = 128)' \
+    >"$capture" 2>"$capture.stderr" &
+  local tcpdump_pid=$!
+  sleep 0.2
   ip netns exec "$namespace" timeout 5s ping -c 1 10.20.1.2 >/dev/null
   ip netns exec "$namespace" timeout 5s ping -6 -c 1 2001:db8:20::2 >/dev/null
+  wait "$tcpdump_pid" || {
+    cat "$capture" "$capture.stderr" >&2
+    return 1
+  }
+  grep -Fq 'IP 10.20.1.1 > 10.20.1.2: ICMP echo request' "$capture"
+  grep -Fq 'IP6 2001:db8:20::1 > 2001:db8:20::2: ICMP6, echo request' "$capture"
+  assert_success_counters_unchanged
 }
 
 exercise_large_packets() {
   local namespace="${1:-$SOURCE_NS}"
+  capture_success_baseline
   ip netns exec "$namespace" timeout 20s python3 \
     "$ROOT_DIR/script/acceptance/v1/traffic.py" client \
     --tag standard-mtu --payload-size 1472
+  assert_success_counters_unchanged
 }
 
 exercise_idle_connections() {
   local namespace="${1:-$SOURCE_NS}"
+  capture_success_baseline
   ip netns exec "$namespace" timeout 30s python3 \
     "$ROOT_DIR/script/acceptance/v1/traffic.py" idle-client --seconds 12
+  assert_success_counters_unchanged
 }
 
 assert_target_snat() {
@@ -447,10 +607,144 @@ import json
 import sys
 
 records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-peers = {record["peer"] for record in records}
-if "10.20.1.1" not in peers or "2001:db8:20::1" not in peers:
-    raise SystemExit(f"target did not observe both server SNAT addresses: {sorted(peers)}")
+expected = {
+    "tcp4": "10.20.1.1",
+    "udp4": "10.20.1.1",
+    "tcp6": "2001:db8:20::1",
+    "udp6": "2001:db8:20::1",
+}
+observed = {}
+for record in records:
+    observed.setdefault(record["protocol"], set()).add(record["peer"])
+for protocol, expected_peer in expected.items():
+    peers = observed.get(protocol, set())
+    if peers != {expected_peer}:
+        raise SystemExit(
+            f"{protocol} target peers were {sorted(peers)}, expected only {expected_peer}"
+        )
 PY
+}
+
+failure_counter_expression() {
+  cat <<'PY'
+sum(
+    owner["tx_drops"]
+    + owner["dropped_frames"]
+    + owner["unknown_dcid_drops"]
+    + owner["invalid_quic_drops"]
+    + owner["malformed_drops"]
+    + owner["dispatch_drops"]
+    + owner["unknown_nat_tuple_drops"]
+    + owner["dns_unknown_transaction_drops"]
+    + owner["dns_fragmented_drops"]
+    for owner in value["io_owners"]
+) + sum(
+    worker["queue_mismatch_drops"]
+    + worker["session_nat_exhausted"]
+    + worker["pending_inner_drops"]
+    + worker["quic_send_drops"]
+    + worker["io_missing_owner_drops"]
+    + worker["io_channel_full_drops"]
+    + worker["io_channel_disconnected_drops"]
+    + worker["reverse_nat_publish_drops"]
+    + worker["dcid_publish_drops"]
+    + worker["reconnect_failures"]
+    + worker["dns_capacity_exhausted"]
+    + worker["dns_nat_exhausted"]
+    + worker["dns_spoofed_response_drop"]
+    + worker["dns_late_response_drop"]
+    for worker in value["flow_workers"]
+) + value["xdp_parser_drops"] + value["xdp_dns_fragment_drops"] + value["dispatch"]["channel_full_drops"] + value["dispatch"]["channel_disconnected_drops"] + value["dispatch"]["invalid_worker_drops"]
+PY
+}
+
+read_stats_metric() {
+  local path="$1"
+  local expression="$2"
+  python3 - "$path" "$expression" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+print(eval(sys.argv[2], {"__builtins__": {}, "sum": sum}, {"value": value}))
+PY
+}
+
+read_owner_metric() {
+  local path="$1"
+  local selector="$2"
+  local metric="$3"
+  python3 - "$path" "$selector" "$metric" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+selector = sys.argv[2]
+metric = sys.argv[3]
+matches = [
+    owner
+    for owner in value["io_owners"]
+    if (
+        selector == "intercept"
+        and owner["intercept"]
+        and not owner["tunnel"]
+    )
+    or (
+        selector == "tunnel"
+        and owner["tunnel"]
+        and not owner["intercept"]
+    )
+]
+if len(matches) != 1:
+    raise SystemExit(
+        f"{sys.argv[1]}: expected one {selector} owner, found {len(matches)}"
+    )
+print(matches[0][metric])
+PY
+}
+
+wait_for_owner_metric_gt() {
+  local path="$1"
+  local selector="$2"
+  local metric="$3"
+  local baseline="$4"
+  for _ in $(seq 1 100); do
+    if [[ "$(read_owner_metric "$path" "$selector" "$metric")" -gt "$baseline" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "timed out waiting for $selector owner $metric to exceed $baseline in $path" >&2
+  cat "$path" >&2
+  return 1
+}
+
+capture_success_baseline() {
+  local failure_expression
+  failure_expression="$(failure_counter_expression)"
+  CLIENT_SUCCESS_SEQUENCE="$(read_stats_metric "$CLIENT_STATS" 'value["sequence"]')"
+  SERVER_SUCCESS_SEQUENCE="$(read_stats_metric "$SERVER_STATS" 'value["sequence"]')"
+  CLIENT_SUCCESS_FAILURES="$(read_stats_metric "$CLIENT_STATS" "$failure_expression")"
+  SERVER_SUCCESS_FAILURES="$(read_stats_metric "$SERVER_STATS" "$failure_expression")"
+}
+
+assert_success_counters_unchanged() {
+  local failure_expression
+  failure_expression="$(failure_counter_expression)"
+  wait_for_json "$CLIENT_STATS" \
+    "value[\"sequence\"] > $CLIENT_SUCCESS_SEQUENCE and ($failure_expression) == $CLIENT_SUCCESS_FAILURES"
+  wait_for_json "$SERVER_STATS" \
+    "value[\"sequence\"] > $SERVER_SUCCESS_SEQUENCE and ($failure_expression) == $SERVER_SUCCESS_FAILURES"
+  local client_quiescent_sequence
+  local server_quiescent_sequence
+  client_quiescent_sequence="$(read_stats_metric "$CLIENT_STATS" 'value["sequence"]')"
+  server_quiescent_sequence="$(read_stats_metric "$SERVER_STATS" 'value["sequence"]')"
+  wait_for_json "$CLIENT_STATS" \
+    "value[\"sequence\"] > $client_quiescent_sequence and ($failure_expression) == $CLIENT_SUCCESS_FAILURES"
+  wait_for_json "$SERVER_STATS" \
+    "value[\"sequence\"] > $server_quiescent_sequence and ($failure_expression) == $SERVER_SUCCESS_FAILURES"
 }
 
 assert_runtime_state() {
@@ -506,9 +800,9 @@ force_reconnect() {
   kill -HUP "$SERVER_PID"
   kill -HUP "$CLIENT_PID"
   wait_for_json "$CLIENT_STATS" \
-    "'$old_client' != \",\".join(str(worker[\"quic_flow_id\"]) for worker in value[\"flow_workers\"]) and all(worker[\"session_count\"] == 0 for worker in value[\"flow_workers\"])"
+    "'$old_client' != \",\".join(str(worker[\"quic_flow_id\"]) for worker in value[\"flow_workers\"])"
   wait_for_json "$SERVER_STATS" \
-    "'$old_server' != \",\".join(str(worker[\"quic_flow_id\"]) for worker in value[\"flow_workers\"]) and all(worker[\"session_count\"] == 0 for worker in value[\"flow_workers\"])"
+    "'$old_server' != \",\".join(str(worker[\"quic_flow_id\"]) for worker in value[\"flow_workers\"])"
   wait_for_json "$CLIENT_STATS" 'all(worker["authenticated"] for worker in value["flow_workers"])'
   wait_for_json "$SERVER_STATS" 'all(worker["authenticated"] for worker in value["flow_workers"])'
 }

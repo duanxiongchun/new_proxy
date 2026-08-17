@@ -443,6 +443,7 @@ impl Drop for BpfLinkManager {
     fn drop(&mut self) {
         #[cfg(not(test))]
         {
+            let mut remove_artifacts = self.owned_program_id.is_none();
             if let Some(owned_program_id) = self.owned_program_id {
                 match self.attached_program_id() {
                     Ok(Some(attached_program_id)) if attached_program_id == owned_program_id => {
@@ -450,15 +451,32 @@ impl Drop for BpfLinkManager {
                             .args(["net", "detach", self.attach_type(), "dev", &self.interface])
                             .status();
                         match status {
-                            Ok(status) if status.success() => {
-                                log::info!(
-                                    "Successfully detached XDP program from interface {}",
-                                    self.interface
-                                );
-                            }
+                            Ok(status) if status.success() => match self.attached_program_id() {
+                                Ok(Some(attached_program_id))
+                                    if attached_program_id == owned_program_id =>
+                                {
+                                    log::warn!(
+                                            "XDP program {owned_program_id} still appears attached to {}; preserving owner record and pins",
+                                            self.interface
+                                        );
+                                }
+                                Ok(_) => {
+                                    remove_artifacts = true;
+                                    log::info!(
+                                        "Successfully detached XDP program from interface {}",
+                                        self.interface
+                                    );
+                                }
+                                Err(error) => {
+                                    log::warn!(
+                                            "failed to verify XDP detach on {}; preserving owner record and pins: {error}",
+                                            self.interface
+                                        );
+                                }
+                            },
                             other => {
                                 log::warn!(
-                                    "Failed to detach XDP program from interface {}: {:?}",
+                                    "Failed to detach XDP program from {}; preserving owner record and pins: {:?}",
                                     self.interface,
                                     other
                                 );
@@ -470,25 +488,31 @@ impl Drop for BpfLinkManager {
                             "leaving replacement XDP program {attached_program_id} attached to {}; owned program was {owned_program_id}",
                             self.interface
                         );
+                        remove_artifacts = true;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        remove_artifacts = true;
+                    }
                     Err(error) => {
                         log::warn!(
-                            "failed to verify XDP ownership on {} during shutdown: {error}",
+                            "failed to verify XDP ownership on {} during shutdown; preserving owner record and pins: {error}",
                             self.interface
                         );
                     }
                 }
+            }
+            if remove_artifacts {
                 if let Err(error) = remove_owner_record(&self.owner_path) {
                     log::warn!(
                         "failed to remove owner record {}: {error}",
                         self.owner_path.display()
                     );
                 }
-            }
-
-            if let Err(error) = std::fs::remove_dir_all(&self.pin_dir) {
-                log::warn!("failed to remove {}: {error}", self.pin_dir.display());
+                if let Err(error) = std::fs::remove_dir_all(&self.pin_dir) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        log::warn!("failed to remove {}: {error}", self.pin_dir.display());
+                    }
+                }
             }
         }
     }
